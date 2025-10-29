@@ -1,0 +1,59 @@
+{
+  "name": "derivative-trades-truex-mm",
+  "version": "1.0.0",
+  "description": "TrueX FIX 5.0 SP2 Market Maker - Standalone Repository",
+  "type": "module",
+  "main": "src/core/truex-market-maker.js",
+  "scripts": {
+    "start": "node src/core/run-truex-mm-with-fix.js",
+    "start:rest": "node src/core/run-truex-market-maker.js",
+    "start:coinbase": "node src/core/truex-coinbase-market-maker.js",
+    "test": "node --test tests/**/*.test.js",
+    "test:unit": "node --test tests/**/!(integration)*.test.js",
+    "test:integration": "node --test tests/integration/*.test.js",
+    "test:fix": "node src/core/test-single-order.js",
+    "test:pipeline": "node src/core/test-data-pipeline-only.js",
+    "simulate:maker": "node src/simulation/market-maker-ladder.js",
+    "simulate:taker": "node src/simulation/market-taker-simple.js",
+    "simulate:full": "node src/simulation/run-two-sided-market-test.js"
+  },
+  "keywords": [
+    "market-maker",
+    "truex",
+    "fix-protocol",
+    "crypto-trading",
+    "algorithmic-trading",
+    "derivatives",
+    "bitcoin",
+    "btc-pyusd"
+  ],
+  "author": "Derivative Trades",
+  "license": "MIT",
+  "dependencies": {
+    "jspurefix": "^4.0.0",
+    "reflect-metadata": "^0.2.0",
+    "ioredis": "^5.3.2",
+    "pg": "^8.11.3",
+    "ws": "^8.14.2",
+    "dotenv": "^16.3.1",
+    "axios": "^1.6.0",
+    "winston": "^3.11.0",
+    "joi": "^17.11.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "eslint": "^8.55.0",
+    "prettier": "^3.1.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dundas/derivative-trades-truex-mm.git"
+  },
+  "bugs": {
+    "url": "https://github.com/dundas/derivative-trades-truex-mm/issues"
+  },
+  "homepage": "https://github.com/dundas/derivative-trades-truex-mm#readme"
+}

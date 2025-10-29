@@ -1,0 +1,43 @@
+🔍 TrueX Order Test Summary Report
+=====================================
+
+Test Duration: 32.145s
+Symbol: BTC-USD
+Orders Sent: 3
+TrueX Responses: 3
+Response Rate: 100.0%
+
+ORDER DETAILS:
+==============
+
+1. Order BUY26492169
+   Side: BUY
+   Price: $113682.00 (Kraken mid: $113681.75)
+   Quantity: 0.001
+   Status: 8
+   TrueX Responses: 1
+     - ExecutionReport: Status=8, ExecType=8
+
+2. Order SELL26502171
+   Side: SELL
+   Price: $113693.00 (Kraken mid: $113692.75)
+   Quantity: 0.001
+   Status: 8
+   TrueX Responses: 1
+     - ExecutionReport: Status=8, ExecType=8
+
+3. Order BUY26512172
+   Side: BUY
+   Price: $113688.00 (Kraken mid: $113688.10)
+   Quantity: 0.001
+   Status: 8
+   TrueX Responses: 1
+     - ExecutionReport: Status=8, ExecType=8
+
+
+TRUEX DOCUMENTATION COMPLIANCE:
+===============================
+✅ Using required fields per https://docs.truemarkets.co/apis/cefi/fix/order_entry
+✅ Including NoPartyIDs (453), PartyID (448), PartyRole (452)
+✅ Using TrueX price increments (.00 and .50)
+✅ Proper FIX message format with HMAC authentication

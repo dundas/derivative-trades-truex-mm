@@ -1,0 +1,182 @@
+{
+  "testSummary": {
+    "startTime": "2025-09-12T12:45:43.823Z",
+    "endTime": "2025-09-12T12:46:09.011Z",
+    "duration": "25.188s",
+    "symbol": "BTC-PYUSD",
+    "krakenSymbol": "XBT/USD"
+  },
+  "statistics": {
+    "ordersSent": 2,
+    "truexResponses": 1,
+    "krakenUpdates": 123,
+    "ordersVisible": 0
+  },
+  "ordersSent": [
+    {
+      "timestamp": "2025-09-12T12:45:59.000Z",
+      "clOrdID": "BUY81159000",
+      "side": "BUY",
+      "symbol": "BTC-PYUSD",
+      "orderQty": "0.001",
+      "price": "114980.00",
+      "krakenMidpoint": 114979.9,
+      "orderData": {
+        "clOrdID": "BUY81159000",
+        "symbol": "BTC-PYUSD",
+        "side": "1",
+        "orderQty": "0.001",
+        "ordType": "2",
+        "price": "114980.00",
+        "timeInForce": "1"
+      }
+    },
+    {
+      "timestamp": "2025-09-12T12:46:09.003Z",
+      "clOrdID": "SELL81169003",
+      "side": "SELL",
+      "symbol": "BTC-PYUSD",
+      "orderQty": "0.001",
+      "price": "114978.50",
+      "krakenMidpoint": 114978.7,
+      "orderData": {
+        "clOrdID": "SELL81169003",
+        "symbol": "BTC-PYUSD",
+        "side": "2",
+        "orderQty": "0.001",
+        "ordType": "2",
+        "price": "114978.50",
+        "timeInForce": "1"
+      }
+    }
+  ],
+  "truexResponses": [
+    {
+      "timestamp": "2025-09-12T12:45:59.052Z",
+      "messageType": "ExecutionReport",
+      "clOrdID": "BUY81159000",
+      "ordStatus": "8",
+      "price": "114980.00",
+      "orderQty": "0.001",
+      "side": "1",
+      "execType": "8",
+      "rawMessage": "8=FIXT.1.1\u00019=257\u000135=8\u000149=TRUEX_UAT_GW\u000156=CLI_CLIENT\u000134=3\u000152=20250912-12:45:59.095205\u000137=NONE\u000111=BUY81159000\u000117=3511787778\u000138=0.001\u000139=8\u000140=2\u000144=114980.00\u000154=1\u000155=BTC-PYUSD\u0001150=8\u000159=1\u0001151=0\u000114=0\u000158=Invalid client\u000160=20250912-12:45:59.095205\u0001453=1\u0001448=78922880101777426\u0001452=3\u000110=039\u0001",
+      "fields": {
+        "8": "FIXT.1.1",
+        "9": "257",
+        "10": "039",
+        "11": "BUY81159000",
+        "14": "0",
+        "17": "3511787778",
+        "34": "3",
+        "35": "8",
+        "37": "NONE",
+        "38": "0.001",
+        "39": "8",
+        "40": "2",
+        "44": "114980.00",
+        "49": "TRUEX_UAT_GW",
+        "52": "20250912-12:45:59.095205",
+        "54": "1",
+        "55": "BTC-PYUSD",
+        "56": "CLI_CLIENT",
+        "58": "Invalid client",
+        "59": "1",
+        "60": "20250912-12:45:59.095205",
+        "150": "8",
+        "151": "0",
+        "448": "78922880101777426",
+        "452": "3",
+        "453": "1"
+      }
+    }
+  ],
+  "orderMatching": [
+    {
+      "order": {
+        "timestamp": "2025-09-12T12:45:59.000Z",
+        "clOrdID": "BUY81159000",
+        "side": "BUY",
+        "symbol": "BTC-PYUSD",
+        "orderQty": "0.001",
+        "price": "114980.00",
+        "krakenMidpoint": 114979.9,
+        "orderData": {
+          "clOrdID": "BUY81159000",
+          "symbol": "BTC-PYUSD",
+          "side": "1",
+          "orderQty": "0.001",
+          "ordType": "2",
+          "price": "114980.00",
+          "timeInForce": "1"
+        }
+      },
+      "responses": [
+        {
+          "timestamp": "2025-09-12T12:45:59.052Z",
+          "messageType": "ExecutionReport",
+          "clOrdID": "BUY81159000",
+          "ordStatus": "8",
+          "price": "114980.00",
+          "orderQty": "0.001",
+          "side": "1",
+          "execType": "8",
+          "rawMessage": "8=FIXT.1.1\u00019=257\u000135=8\u000149=TRUEX_UAT_GW\u000156=CLI_CLIENT\u000134=3\u000152=20250912-12:45:59.095205\u000137=NONE\u000111=BUY81159000\u000117=3511787778\u000138=0.001\u000139=8\u000140=2\u000144=114980.00\u000154=1\u000155=BTC-PYUSD\u0001150=8\u000159=1\u0001151=0\u000114=0\u000158=Invalid client\u000160=20250912-12:45:59.095205\u0001453=1\u0001448=78922880101777426\u0001452=3\u000110=039\u0001",
+          "fields": {
+            "8": "FIXT.1.1",
+            "9": "257",
+            "10": "039",
+            "11": "BUY81159000",
+            "14": "0",
+            "17": "3511787778",
+            "34": "3",
+            "35": "8",
+            "37": "NONE",
+            "38": "0.001",
+            "39": "8",
+            "40": "2",
+            "44": "114980.00",
+            "49": "TRUEX_UAT_GW",
+            "52": "20250912-12:45:59.095205",
+            "54": "1",
+            "55": "BTC-PYUSD",
+            "56": "CLI_CLIENT",
+            "58": "Invalid client",
+            "59": "1",
+            "60": "20250912-12:45:59.095205",
+            "150": "8",
+            "151": "0",
+            "448": "78922880101777426",
+            "452": "3",
+            "453": "1"
+          }
+        }
+      ],
+      "hasResponse": true,
+      "status": "8"
+    },
+    {
+      "order": {
+        "timestamp": "2025-09-12T12:46:09.003Z",
+        "clOrdID": "SELL81169003",
+        "side": "SELL",
+        "symbol": "BTC-PYUSD",
+        "orderQty": "0.001",
+        "price": "114978.50",
+        "krakenMidpoint": 114978.7,
+        "orderData": {
+          "clOrdID": "SELL81169003",
+          "symbol": "BTC-PYUSD",
+          "side": "2",
+          "orderQty": "0.001",
+          "ordType": "2",
+          "price": "114978.50",
+          "timeInForce": "1"
+        }
+      },
+      "responses": [],
+      "hasResponse": false,
+      "status": "NO_RESPONSE"
+    }
+  ]
+}

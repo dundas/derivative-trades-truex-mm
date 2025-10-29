@@ -1,0 +1,103 @@
+🔍 TrueX Order Test Summary Report
+=====================================
+
+Test Duration: 123.677s
+Symbol: BTC-USD
+Orders Sent: 12
+TrueX Responses: 0
+Response Rate: 0.0%
+
+ORDER DETAILS:
+==============
+
+1. Order TEST_BUY_1757525490647
+   Side: BUY
+   Price: $113474.50 (Kraken mid: $113474.70)
+   Quantity: 0.001
+   Status: NO_RESPONSE
+   TrueX Response: ❌ NO RESPONSE
+
+2. Order TEST_BUY_1757525500653
+   Side: BUY
+   Price: $113500.50 (Kraken mid: $113500.45)
+   Quantity: 0.001
+   Status: NO_RESPONSE
+   TrueX Response: ❌ NO RESPONSE
+
+3. Order TEST_BUY_1757525510654
+   Side: BUY
+   Price: $113500.00 (Kraken mid: $113500.05)
+   Quantity: 0.001
+   Status: NO_RESPONSE
+   TrueX Response: ❌ NO RESPONSE
+
+4. Order TEST_BUY_1757525520655
+   Side: BUY
+   Price: $113493.00 (Kraken mid: $113493.15)
+   Quantity: 0.001
+   Status: NO_RESPONSE
+   TrueX Response: ❌ NO RESPONSE
+
+5. Order TEST_BUY_1757525530655
+   Side: BUY
+   Price: $113517.00 (Kraken mid: $113516.75)
+   Quantity: 0.001
+   Status: NO_RESPONSE
+   TrueX Response: ❌ NO RESPONSE
+
+6. Order TEST_BUY_1757525540656
+   Side: BUY
+   Price: $113507.00 (Kraken mid: $113507.10)
+   Quantity: 0.001
+   Status: NO_RESPONSE
+   TrueX Response: ❌ NO RESPONSE
+
+7. Order TEST_BUY_1757525550657
+   Side: BUY
+   Price: $113512.50 (Kraken mid: $113512.25)
+   Quantity: 0.001
+   Status: NO_RESPONSE
+   TrueX Response: ❌ NO RESPONSE
+
+8. Order TEST_BUY_1757525560657
+   Side: BUY
+   Price: $113514.50 (Kraken mid: $113514.55)
+   Quantity: 0.001
+   Status: NO_RESPONSE
+   TrueX Response: ❌ NO RESPONSE
+
+9. Order TEST_BUY_1757525570658
+   Side: BUY
+   Price: $113521.00 (Kraken mid: $113521.15)
+   Quantity: 0.001
+   Status: NO_RESPONSE
+   TrueX Response: ❌ NO RESPONSE
+
+10. Order TEST_BUY_1757525580660
+   Side: BUY
+   Price: $113545.00 (Kraken mid: $113545.10)
+   Quantity: 0.001
+   Status: NO_RESPONSE
+   TrueX Response: ❌ NO RESPONSE
+
+11. Order TEST_BUY_1757525590660
+   Side: BUY
+   Price: $113529.50 (Kraken mid: $113529.35)
+   Quantity: 0.001
+   Status: NO_RESPONSE
+   TrueX Response: ❌ NO RESPONSE
+
+12. Order TEST_BUY_1757525600661
+   Side: BUY
+   Price: $113513.00 (Kraken mid: $113513.15)
+   Quantity: 0.001
+   Status: NO_RESPONSE
+   TrueX Response: ❌ NO RESPONSE
+
+
+TRUEX DOCUMENTATION COMPLIANCE:
+===============================
+✅ Using required fields per https://docs.truemarkets.co/apis/cefi/fix/order_entry
+✅ Including NoPartyIDs (453), PartyID (448), PartyRole (452)
+✅ Using TrueX price increments (.00 and .50)
+✅ Proper FIX message format with HMAC authentication

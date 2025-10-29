@@ -1,0 +1,38 @@
+{
+  "name": "truex-fix-tests",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Test suite for TrueX FIX protocol implementation",
+  "scripts": {
+    "test": "NODE_OPTIONS=--experimental-vm-modules jest",
+    "test:watch": "NODE_OPTIONS=--experimental-vm-modules jest --watch",
+    "test:coverage": "NODE_OPTIONS=--experimental-vm-modules jest --coverage",
+    "test:fix": "jest fix-message-builder.test.js",
+    "test:auth": "jest auth-flow.test.js",
+    "test:errors": "jest error-handling.test.js",
+    "test:resend": "NODE_OPTIONS=--experimental-vm-modules jest fix-connection-resend.test.js"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "@types/jest": "^29.5.5"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "transform": {},
+    "collectCoverageFrom": [
+      "../proxy/*.cjs",
+      "../*.cjs",
+      "../fix-protocol/*.js",
+      "!**/node_modules/**"
+    ],
+    "coverageReporters": [
+      "text",
+      "html",
+      "lcov"
+    ],
+    "testMatch": [
+      "**/*.test.js"
+    ]
+  }
+}
+

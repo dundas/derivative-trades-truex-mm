@@ -1,0 +1,143 @@
+{
+  "testSummary": {
+    "startTime": "2025-09-10T18:01:50.083Z",
+    "endTime": "2025-09-10T18:02:23.446Z",
+    "duration": "33.363s",
+    "symbol": "BTC-PYUSD",
+    "krakenSymbol": "XBT/USD"
+  },
+  "statistics": {
+    "ordersSent": 3,
+    "truexResponses": 0,
+    "krakenUpdates": 653,
+    "ordersVisible": 0
+  },
+  "ordersSent": [
+    {
+      "timestamp": "2025-09-10T18:01:53.439Z",
+      "clOrdID": "BUY27313439",
+      "side": "BUY",
+      "symbol": "BTC-PYUSD",
+      "orderQty": "0.001",
+      "price": "113775.50",
+      "krakenMidpoint": 113775.70000000001,
+      "orderData": {
+        "clOrdID": "BUY27313439",
+        "symbol": "BTC-PYUSD",
+        "side": "1",
+        "orderQty": "0.001",
+        "ordType": "2",
+        "price": "113775.50",
+        "timeInForce": "3"
+      }
+    },
+    {
+      "timestamp": "2025-09-10T18:02:03.442Z",
+      "clOrdID": "SELL27323442",
+      "side": "SELL",
+      "symbol": "BTC-PYUSD",
+      "orderQty": "0.001",
+      "price": "113783.00",
+      "krakenMidpoint": 113783,
+      "orderData": {
+        "clOrdID": "SELL27323442",
+        "symbol": "BTC-PYUSD",
+        "side": "2",
+        "orderQty": "0.001",
+        "ordType": "2",
+        "price": "113783.00",
+        "timeInForce": "3"
+      }
+    },
+    {
+      "timestamp": "2025-09-10T18:02:13.441Z",
+      "clOrdID": "BUY27333441",
+      "side": "BUY",
+      "symbol": "BTC-PYUSD",
+      "orderQty": "0.001",
+      "price": "113777.50",
+      "krakenMidpoint": 113777.5,
+      "orderData": {
+        "clOrdID": "BUY27333441",
+        "symbol": "BTC-PYUSD",
+        "side": "1",
+        "orderQty": "0.001",
+        "ordType": "2",
+        "price": "113777.50",
+        "timeInForce": "3"
+      }
+    }
+  ],
+  "truexResponses": [],
+  "orderMatching": [
+    {
+      "order": {
+        "timestamp": "2025-09-10T18:01:53.439Z",
+        "clOrdID": "BUY27313439",
+        "side": "BUY",
+        "symbol": "BTC-PYUSD",
+        "orderQty": "0.001",
+        "price": "113775.50",
+        "krakenMidpoint": 113775.70000000001,
+        "orderData": {
+          "clOrdID": "BUY27313439",
+          "symbol": "BTC-PYUSD",
+          "side": "1",
+          "orderQty": "0.001",
+          "ordType": "2",
+          "price": "113775.50",
+          "timeInForce": "3"
+        }
+      },
+      "responses": [],
+      "hasResponse": false,
+      "status": "NO_RESPONSE"
+    },
+    {
+      "order": {
+        "timestamp": "2025-09-10T18:02:03.442Z",
+        "clOrdID": "SELL27323442",
+        "side": "SELL",
+        "symbol": "BTC-PYUSD",
+        "orderQty": "0.001",
+        "price": "113783.00",
+        "krakenMidpoint": 113783,
+        "orderData": {
+          "clOrdID": "SELL27323442",
+          "symbol": "BTC-PYUSD",
+          "side": "2",
+          "orderQty": "0.001",
+          "ordType": "2",
+          "price": "113783.00",
+          "timeInForce": "3"
+        }
+      },
+      "responses": [],
+      "hasResponse": false,
+      "status": "NO_RESPONSE"
+    },
+    {
+      "order": {
+        "timestamp": "2025-09-10T18:02:13.441Z",
+        "clOrdID": "BUY27333441",
+        "side": "BUY",
+        "symbol": "BTC-PYUSD",
+        "orderQty": "0.001",
+        "price": "113777.50",
+        "krakenMidpoint": 113777.5,
+        "orderData": {
+          "clOrdID": "BUY27333441",
+          "symbol": "BTC-PYUSD",
+          "side": "1",
+          "orderQty": "0.001",
+          "ordType": "2",
+          "price": "113777.50",
+          "timeInForce": "3"
+        }
+      },
+      "responses": [],
+      "hasResponse": false,
+      "status": "NO_RESPONSE"
+    }
+  ]
+}

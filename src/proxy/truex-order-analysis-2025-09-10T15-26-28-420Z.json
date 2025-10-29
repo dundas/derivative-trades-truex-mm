@@ -1,0 +1,61 @@
+{
+  "testSummary": {
+    "startTime": "2025-09-10T15:24:26.261Z",
+    "endTime": "2025-09-10T15:26:28.421Z",
+    "duration": "122.16s",
+    "symbol": "BTC-USD",
+    "krakenSymbol": "XBT/USD"
+  },
+  "statistics": {
+    "ordersSent": 1,
+    "truexResponses": 0,
+    "krakenUpdates": 1257,
+    "ordersVisible": 0
+  },
+  "ordersSent": [
+    {
+      "timestamp": "2025-09-10T15:24:38.415Z",
+      "clOrdID": "TEST_BUY_1757517878415",
+      "side": "BUY",
+      "symbol": "BTC-USD",
+      "orderQty": "0.001",
+      "price": "113806.50",
+      "krakenMidpoint": 113806.65,
+      "orderData": {
+        "clOrdID": "TEST_BUY_1757517878415",
+        "symbol": "BTC-USD",
+        "side": "1",
+        "orderQty": "0.001",
+        "ordType": "2",
+        "price": "113806.50",
+        "timeInForce": "3"
+      }
+    }
+  ],
+  "truexResponses": [],
+  "orderMatching": [
+    {
+      "order": {
+        "timestamp": "2025-09-10T15:24:38.415Z",
+        "clOrdID": "TEST_BUY_1757517878415",
+        "side": "BUY",
+        "symbol": "BTC-USD",
+        "orderQty": "0.001",
+        "price": "113806.50",
+        "krakenMidpoint": 113806.65,
+        "orderData": {
+          "clOrdID": "TEST_BUY_1757517878415",
+          "symbol": "BTC-USD",
+          "side": "1",
+          "orderQty": "0.001",
+          "ordType": "2",
+          "price": "113806.50",
+          "timeInForce": "3"
+        }
+      },
+      "responses": [],
+      "hasResponse": false,
+      "status": "NO_RESPONSE"
+    }
+  ]
+}
