@@ -1,4 +1,4 @@
-import { describe, it, expect, jest, beforeEach } from '@jest/globals';
+import { describe, it, expect, jest, beforeEach, mock } from 'bun:test';
 
 // Mock redis-backend-api
 const mockSessionManager = {
@@ -21,7 +21,7 @@ const mockKeyGenerator = {
 
 const mockValidationUtils = {};
 
-jest.unstable_mockModule('../../../../lib/redis-backend-api/index.js', () => ({
+mock.module('../../lib/redis-backend-api/index.js', () => ({
   SessionManager: jest.fn(() => mockSessionManager),
   OrderManager: jest.fn(() => mockOrderManager),
   FillManager: jest.fn(() => mockFillManager),

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from '@jest/globals';
+import { describe, it, expect, beforeEach } from 'bun:test';
 import { TrueXOhlcBuilder } from './ohlc-builder.js';
 
 describe('TrueXOhlcBuilder', () => {

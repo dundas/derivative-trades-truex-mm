@@ -1,4 +1,4 @@
-import { describe, it, expect, jest, beforeEach } from '@jest/globals';
+import { describe, it, expect, jest, beforeEach, mock } from 'bun:test';
 
 // Mock PostgreSQL API
 const mockDb = {
@@ -32,7 +32,7 @@ const mockDb = {
   close: jest.fn().mockResolvedValue(true)
 };
 
-jest.unstable_mockModule('../../../../lib/postgresql-api/index.js', () => ({
+mock.module('../../lib/postgresql-api/index.js', () => ({
   createPostgreSQLAPIFromEnv: jest.fn(() => mockDb)
 }));
 
@@ -278,7 +278,7 @@ describe('TrueXPostgreSQLManager', () => {
       
       expect(results.success).toBe(1);
       const savedFills = mockDb.bulk.fills.save.mock.calls[0][0];
-      expect(savedFills[0].exec_id).toBe('EXEC-1');
+      expect(savedFills[0].execid).toBe('EXEC-1');
       expect(savedFills[0].data.executionReport).toBeDefined();
     });
   });

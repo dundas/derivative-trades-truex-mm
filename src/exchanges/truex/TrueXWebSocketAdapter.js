@@ -1,4 +1,4 @@
-import { AdaptiveMarketMakerExchangeAdapter } from './AdaptiveMarketMakerExchangeAdapter.js';
+import { AdaptiveMarketMakerExchangeAdapter } from '../base/AdaptiveMarketMakerExchangeAdapter.js';
 import WebSocket from 'ws';
 import crypto from 'crypto';
 import { EventEmitter } from 'events';

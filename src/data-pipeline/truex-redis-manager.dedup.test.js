@@ -1,4 +1,4 @@
-import { describe, it, expect, jest, beforeEach } from '@jest/globals';
+import { describe, it, expect, jest, beforeEach, mock } from 'bun:test';
 
 const makeLogger = () => ({ info: jest.fn(), debug: jest.fn(), warn: jest.fn(), error: jest.fn() });
 
@@ -17,7 +17,7 @@ const makeRedis = (impl = 'set') => {
 };
 
 // Minimal stub for FillManager.add used internally via redis-backend-api
-jest.unstable_mockModule('../../../../lib/redis-backend-api/index.js', () => ({
+mock.module('../../lib/redis-backend-api/index.js', () => ({
   default: {},
   SessionManager: jest.fn().mockImplementation(() => ({ update: jest.fn() })),
   OrderManager: jest.fn().mockImplementation(() => ({ add: jest.fn() })),

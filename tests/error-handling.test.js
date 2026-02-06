@@ -14,7 +14,7 @@ const {
   buildNewOrderSingle,
   buildOrderCancelRequest,
   SOH
-} = require('../proxy/fix-message-builder.cjs');
+} = require('../src/proxy/fix-message-builder.cjs');
 
 // Mock market maker for testing error scenarios
 class MockMarketMaker extends EventEmitter {

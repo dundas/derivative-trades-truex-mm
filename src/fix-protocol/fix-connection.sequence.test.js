@@ -1,4 +1,4 @@
-import { describe, it, expect, jest, beforeEach } from '@jest/globals';
+import { describe, it, expect, jest, beforeEach } from 'bun:test';
 import { FIXConnection } from './fix-connection.js';
 
 describe('FIXConnection sequence handling (7.4)', () => {

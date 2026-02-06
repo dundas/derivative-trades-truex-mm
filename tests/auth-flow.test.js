@@ -14,7 +14,7 @@ const {
   buildTrueXLogonMessage,
   buildMarketDataRequest,
   SOH
-} = require('../proxy/fix-message-builder.cjs');
+} = require('../src/proxy/fix-message-builder.cjs');
 
 // Mock TrueX server for testing
 class MockTrueXServer extends EventEmitter {
