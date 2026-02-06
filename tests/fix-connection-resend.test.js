@@ -3,18 +3,13 @@
  * Tests message storage, resend logic, PossDupFlag, and memory management
  */
 
-import { FIXConnection } from '../fix-protocol/fix-connection.js';
+import { jest, describe, it, test, expect, beforeEach, afterEach } from 'bun:test';
+import { FIXConnection } from '../src/fix-protocol/fix-connection.js';
 import { EventEmitter } from 'events';
 
-// Simple mock function factory
+// Use jest.fn() for bun:test compatibility with matchers
 function createMockFn() {
-  const calls = [];
-  const fn = (...args) => {
-    calls.push(args);
-  };
-  fn.mock = { calls };
-  fn.mockClear = () => { calls.length = 0; };
-  return fn;
+  return jest.fn();
 }
 
 describe('FIXConnection - Message Storage', () => {
@@ -129,14 +124,12 @@ describe('FIXConnection - Resend Request Handling', () => {
   beforeEach(() => {
     mockSocket = new EventEmitter();
     mockSocket.write = createMockFn();
-    mockSocket.connect = (port, host, cb => {
+    mockSocket.connect = (port, host, cb) => {
       setTimeout(cb, 0);
       return mockSocket;
-    });
+    };
     mockSocket.destroy = createMockFn();
     mockSocket.destroyed = false;
-
-    net.Socket.mockImplementation(() => mockSocket);
 
     mockLogger = {
       info: createMockFn(),
@@ -296,14 +289,12 @@ describe('FIXConnection - PossDupFlag Support', () => {
   beforeEach(() => {
     mockSocket = new EventEmitter();
     mockSocket.write = createMockFn();
-    mockSocket.connect = (port, host, cb => {
+    mockSocket.connect = (port, host, cb) => {
       setTimeout(cb, 0);
       return mockSocket;
-    });
+    };
     mockSocket.destroy = createMockFn();
     mockSocket.destroyed = false;
-
-    net.Socket.mockImplementation(() => mockSocket);
 
     mockLogger = {
       info: createMockFn(),
@@ -371,7 +362,7 @@ describe('FIXConnection - PossDupFlag Support', () => {
     expect(resentMessage).toContain(`122=${originalSendingTime}`);
   });
 
-  test('adds OrigSendingTime if not present', async () => {
+  test('omits OrigSendingTime if not present (TrueX rejects tag 122)', async () => {
     // Arrange
     const sendingTime = '20251009-10:30:00';
     await fixConnection.sendMessage({
@@ -388,9 +379,9 @@ describe('FIXConnection - PossDupFlag Support', () => {
     const resendRequest = { fields: { '35': '2', '7': '1', '16': '1' } };
     fixConnection.handleResendRequest(resendRequest);
 
-    // Assert
+    // Assert - TrueX rejects messages with field 122, so it should NOT be added
     const resentMessage = mockSocket.write.mock.calls[0][0];
-    expect(resentMessage).toContain(`122=${sendingTime}`);
+    expect(resentMessage).not.toContain('122=');
   });
 });
 
@@ -516,14 +507,12 @@ describe('FIXConnection - Integration Scenarios', () => {
   beforeEach(() => {
     mockSocket = new EventEmitter();
     mockSocket.write = createMockFn();
-    mockSocket.connect = (port, host, cb => {
+    mockSocket.connect = (port, host, cb) => {
       setTimeout(cb, 0);
       return mockSocket;
-    });
+    };
     mockSocket.destroy = createMockFn();
     mockSocket.destroyed = false;
-
-    net.Socket.mockImplementation(() => mockSocket);
 
     mockLogger = {
       info: createMockFn(),

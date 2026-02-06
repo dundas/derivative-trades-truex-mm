@@ -8,7 +8,7 @@
 
 import { EventEmitter } from 'events';
 import { TradingLogger } from '../../../lib/utils/trading-logger.js';
-import { OrderStatus } from '../order/OrderStatus.js';
+import { OrderStatus } from './OrderStatus.js';
 
 /**
  * Adaptive Market Maker Exchange Adapter

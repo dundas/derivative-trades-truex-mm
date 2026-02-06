@@ -12,7 +12,7 @@ const {
   buildNewOrderSingle,
   buildOrderCancelRequest,
   calculateChecksum
-} = require('../proxy/fix-message-builder.cjs');
+} = require('../src/proxy/fix-message-builder.cjs');
 
 describe('FIX Message Builder', () => {
   

@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, jest } from '@jest/globals';
-import { ExecutionReportRecovery } from './execution-report-recovery.js';
+import { describe, it, expect, beforeEach, jest } from 'bun:test';
+import { ExecutionReportRecovery } from '../src/core/recovery/execution-report-recovery.js';
 
 describe('ExecutionReportRecovery (7.1)', () => {
   let auditLogger;

@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, jest } from '@jest/globals';
-import { AuditLogRecovery } from './audit-log-recovery.js';
+import { describe, it, expect, beforeEach, jest } from 'bun:test';
+import { AuditLogRecovery } from '../src/core/recovery/audit-log-recovery.js';
 
 class MockDataManager {
   constructor() {

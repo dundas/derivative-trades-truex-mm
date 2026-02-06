@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, jest } from '@jest/globals';
-import { TrueXMarketMaker } from '../truex-market-maker.js';
+import { describe, it, expect, beforeEach, jest } from 'bun:test';
+import { TrueXMarketMaker } from '../src/core/truex-market-maker.js';
 
 class StubRedisManager {
   constructor() {

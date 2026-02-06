@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, jest } from '@jest/globals';
+import { describe, it, expect, beforeEach, jest } from 'bun:test';
 import { EventEmitter } from 'events';
 import { TrueXMarketMaker } from './truex-market-maker.js';
 

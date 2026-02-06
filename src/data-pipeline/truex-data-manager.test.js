@@ -1,4 +1,4 @@
-import { describe, it, expect, jest, beforeEach } from '@jest/globals';
+import { describe, it, expect, jest, beforeEach } from 'bun:test';
 import { TrueXDataManager } from './truex-data-manager.js';
 
 describe('TrueXDataManager', () => {
