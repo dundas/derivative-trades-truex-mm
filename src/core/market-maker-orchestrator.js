@@ -7,6 +7,7 @@ import { PnLTracker } from './pnl-tracker.js';
 import { QuoteEngine } from './quote-engine.js';
 import { HedgeExecutor } from './hedge-executor.js';
 import { TrueXMarketDataFeed } from './truex-market-data.js';
+import { TrueXRESTClient } from '../exchanges/truex/TrueXRESTClient.ts';
 
 /**
  * MarketMakerOrchestrator - Wires all components and manages lifecycle.
@@ -66,15 +67,20 @@ export class MarketMakerOrchestrator extends EventEmitter {
       levels: options.levels || 5,
       baseSpreadBps: options.baseSpreadBps || 50,
       levelSpacingTicks: options.levelSpacingTicks || 1,
+      randomLevelSpacingBpsMin: options.randomLevelSpacingBpsMin || null,
+      randomLevelSpacingBpsMax: options.randomLevelSpacingBpsMax || null,
       repriceThresholdTicks: options.repriceThresholdTicks || 1,
       baseSizeBTC: options.baseSizeBTC || 0.1,
       sizeDecayFactor: options.sizeDecayFactor || 0.8,
+      sizeDecimalPlaces: options.sizeDecimalPlaces || 8,
       maxOrdersPerSecond: options.maxOrdersPerSecond || 8,
+      minRepriceIntervalMs: options.minRepriceIntervalMs || 0,
       tickSize: options.tickSize || 0.50,
       minNotional: options.minNotional || 1.0,
       priceBandPct: options.priceBandPct || 2.5,
       confidenceThreshold: options.confidenceThreshold || 0.3,
       symbol: this.symbol,
+      clientId: options.clientId || null,
       logger: this.logger,
     });
 
@@ -95,8 +101,22 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this.priceAggregator = options.priceAggregator || null;
 
     // Data pipeline (optional)
+    // Prefer unified DataPipelineManager; fall back to legacy dataManager/auditLogger
+    this.dataPipeline = options.dataPipeline || null;
     this.dataManager = options.dataManager || null;
     this.auditLogger = options.auditLogger || null;
+
+    // REST client for order reconciliation (optional)
+    this.restClient = null;
+    if (options.restUrl) {
+      this.restClient = new TrueXRESTClient({
+        baseURL: options.restUrl.replace(/\/$/, '') + '/api/v1',
+        apiKey: options.apiKey,
+        apiSecret: options.apiSecret,
+        userId: options.clientId,
+      });
+    }
+    this.reconcileIntervalMs = options.reconcileIntervalMs || 300000; // 5 min
 
     // State
     this.isRunning = false;
@@ -105,6 +125,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     // Timers
     this.drainQueueTimer = null;
     this.drainQueueIntervalMs = options.drainQueueIntervalMs || 200;
+    this._reconcileTimer = null;
 
     // Bind handlers to preserve context
     this._onPriceUpdate = this._onPriceUpdate.bind(this);
@@ -141,13 +162,29 @@ export class MarketMakerOrchestrator extends EventEmitter {
       }
     }
 
-    // 4. Start PnL periodic logging
+    // 4. Start data pipeline (optional, non-blocking)
+    if (this.dataPipeline) {
+      try {
+        await this.dataPipeline.start();
+        this.logger.info('[Orchestrator] Data pipeline started');
+      } catch (err) {
+        this.logger.warn(`[Orchestrator] Data pipeline start failed (non-fatal): ${err.message}`);
+      }
+    }
+
+    // 5. Start PnL periodic logging
     this.pnlTracker.startPeriodicLogging();
 
-    // 5. Start quote engine drain queue timer
+    // 6. Start quote engine drain queue timer
     this.drainQueueTimer = setInterval(() => {
       this.quoteEngine.drainQueue();
     }, this.drainQueueIntervalMs);
+
+    // 7. Start REST reconciliation timer (if REST client configured)
+    if (this.restClient) {
+      this._reconcileTimer = setInterval(() => this._restReconcile(), this.reconcileIntervalMs);
+      this.logger.info(`[Orchestrator] REST reconciliation enabled (every ${this.reconcileIntervalMs / 1000}s)`);
+    }
 
     this.isRunning = true;
     this.startedAt = Date.now();
@@ -187,25 +224,39 @@ export class MarketMakerOrchestrator extends EventEmitter {
       clearInterval(this.drainQueueTimer);
       this.drainQueueTimer = null;
     }
+    if (this._reconcileTimer) {
+      clearInterval(this._reconcileTimer);
+      this._reconcileTimer = null;
+    }
     this.pnlTracker.stopPeriodicLogging();
 
-    // 4. Disconnect market data feed
+    // 4. Stop data pipeline (flush remaining data)
+    if (this.dataPipeline) {
+      try {
+        await this.dataPipeline.stop();
+        this.logger.info('[Orchestrator] Data pipeline stopped');
+      } catch (err) {
+        this.logger.error(`[Orchestrator] Data pipeline stop failed: ${err.message}`);
+      }
+    }
+
+    // 5. Disconnect market data feed
     if (this.marketDataFeed) {
       try {
         await this.marketDataFeed.disconnect();
       } catch (_) { /* best effort */ }
     }
 
-    // 5. Disconnect FIX OE
+    // 6. Disconnect FIX OE
     try {
       await this.fixOE.disconnect();
     } catch (_) { /* best effort */ }
 
-    // 6. Log final session report
+    // 7. Log final session report
     const report = this.pnlTracker.getSessionReport();
     this.logger.info(`[Orchestrator] Final PnL Report:\n${report}`);
 
-    // 7. Unwire events
+    // 8. Unwire events
     this._unwireEvents();
 
     this.isRunning = false;
@@ -246,6 +297,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
         isSubscribed: this.marketDataFeed.isSubscribed,
         spread: this.marketDataFeed.getSpread(),
       } : null,
+      dataPipeline: this.dataPipeline ? this.dataPipeline.getStats() : null,
     };
   }
 
@@ -302,21 +354,58 @@ export class MarketMakerOrchestrator extends EventEmitter {
     if (!message || !message.fields) return;
     const msgType = message.fields['35'];
 
-    // Only handle execution reports (35=8)
+    // Log all FIX messages to data pipeline
+    if (this.dataPipeline) {
+      this.dataPipeline.logFIXMessage(message, {
+        direction: 'INBOUND',
+        msgType,
+        sessionId: this.sessionId,
+        msgSeqNum: message.fields['34'],
+      });
+    }
+
+    // Route OrderCancelReject (35=9) to QuoteEngine
+    if (msgType === '9') {
+      this.quoteEngine.onOrderCancelReject(message.fields);
+      return;
+    }
+
+    // Only handle execution reports (35=8) beyond this point
     if (msgType !== '8') return;
 
     // Route to QuoteEngine for order state management
     this.quoteEngine.onExecutionReport(message.fields);
 
-    // Log to data pipeline if available
-    if (this.dataManager) {
+    // Track order state and fills in data pipeline
+    const pipeline = this.dataPipeline || this.dataManager;
+    if (pipeline) {
       const orderId = message.fields['11'];
-      const execID = message.fields['17'];
       const ordStatus = message.fields['39'];
+      const execID = message.fields['17'];
       const lastQty = message.fields['32'] ? Number(message.fields['32']) : 0;
       const lastPx = message.fields['31'] ? Number(message.fields['31']) : 0;
+      const orderQty = message.fields['38'] ? Number(message.fields['38']) : null;
+      const orderPx = message.fields['44'] ? Number(message.fields['44']) : null;
       const side = message.fields['54'] === '1' ? 'buy' : 'sell';
 
+      // Map FIX ordStatus to readable status
+      const statusMap = { 'A': 'pending_new', '0': 'new', '1': 'partial_fill', '2': 'filled', '4': 'cancelled', '8': 'rejected' };
+
+      // Track order state changes
+      if (pipeline.addOrder && orderId) {
+        pipeline.addOrder({
+          orderId,
+          sessionId: this.sessionId,
+          symbol: this.symbol,
+          side,
+          status: statusMap[ordStatus] || ordStatus,
+          size: orderQty,
+          price: orderPx,
+          timestamp: Date.now(),
+        });
+      }
+
+      // Track fills
       if (execID && lastQty > 0) {
         const fill = {
           fillId: `${orderId}-${execID}`,
@@ -329,7 +418,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
           price: lastPx,
           timestamp: Date.now(),
         };
-        this.dataManager.addFill(fill);
+        pipeline.addFill(fill);
       }
     }
   }
@@ -355,19 +444,22 @@ export class MarketMakerOrchestrator extends EventEmitter {
       timestamp: Date.now(),
     });
 
-    // Audit log if available
-    if (this.auditLogger) {
-      this.auditLogger.logFillEvent({
-        fillId: `${clOrdID}-${execID}`,
-        execID,
-        orderId: clOrdID,
-        sessionId: this.sessionId,
-        symbol: this.symbol,
-        side,
-        quantity: size,
-        price,
-        timestamp: Date.now(),
-      });
+    // Route fill to data pipeline (unified or legacy audit logger)
+    const fillRecord = {
+      fillId: `${clOrdID}-${execID}`,
+      execID,
+      orderId: clOrdID,
+      sessionId: this.sessionId,
+      symbol: this.symbol,
+      side,
+      quantity: size,
+      price,
+      timestamp: Date.now(),
+    };
+    if (this.dataPipeline) {
+      this.dataPipeline.addFill(fillRecord);
+    } else if (this.auditLogger) {
+      this.auditLogger.logFillEvent(fillRecord);
     }
 
     this.emit('fill', { side, price, size, clOrdID, execID, venue: 'truex' });
@@ -413,5 +505,79 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this.quoteEngine.cancelAllQuotes(`emergency: ${reason}`);
 
     this.emit('emergency', { netPosition, reason });
+  }
+
+  // --- REST-based Order Reconciliation ---
+
+  async _restReconcile() {
+    if (!this.restClient || !this.isRunning) return;
+
+    try {
+      // 1. Fetch active orders from exchange via REST
+      const exchangeOrders = await this.restClient.getActiveOrders();
+
+      // 2. Build lookup of exchange orders by external_id (our clOrdID)
+      const exchangeByClOrdID = new Map();
+      for (const raw of exchangeOrders) {
+        const parsed = TrueXRESTClient.parseOrder(raw);
+        // Skip transitional states
+        if (parsed.status === 'NEW_PENDING' || parsed.status === 'CANCEL_PENDING') continue;
+        exchangeByClOrdID.set(parsed.externalId, { ...parsed, rawId: raw.id });
+      }
+
+      // 3. Build set of local clOrdIDs (skip in-flight orders)
+      const localClOrdIDs = new Set();
+      for (const [clOrdID, order] of this.quoteEngine.activeOrders) {
+        if (order.status === 'pending' || order.status === 'cancelling') continue;
+        localClOrdIDs.add(clOrdID);
+      }
+
+      // 4. Detect discrepancies
+      let matched = 0;
+      let orphansCancelled = 0;
+      let ghostsRemoved = 0;
+
+      // Orphans: on exchange but not in local state → cancel via REST
+      for (const [extId, order] of exchangeByClOrdID) {
+        if (localClOrdIDs.has(extId) || this.quoteEngine.activeOrders.has(extId)) {
+          matched++;
+        } else {
+          this.logger.warn(`[Reconcile] Orphan on exchange: ${extId} ${order.side} ${order.qty} @ ${order.price} — cancelling`);
+          try {
+            await this.restClient.cancelOrder(order.rawId);
+            orphansCancelled++;
+          } catch (err) {
+            this.logger.warn(`[Reconcile] Failed to cancel orphan ${extId}: ${err.message}`);
+          }
+        }
+      }
+
+      // Ghosts: in local state but not on exchange → remove from activeOrders
+      for (const clOrdID of localClOrdIDs) {
+        if (!exchangeByClOrdID.has(clOrdID)) {
+          this.logger.warn(`[Reconcile] Ghost in local state: ${clOrdID} — removing`);
+          this.quoteEngine.removeStaleOrder(clOrdID);
+          ghostsRemoved++;
+        }
+      }
+
+      const stats = {
+        exchange: exchangeByClOrdID.size,
+        local: localClOrdIDs.size,
+        matched,
+        orphansCancelled,
+        ghostsRemoved,
+      };
+
+      this.logger.info(
+        `[Reconcile] exchange=${stats.exchange} local=${stats.local} matched=${stats.matched} ` +
+        `orphans=${stats.orphansCancelled} ghosts=${stats.ghostsRemoved}`
+      );
+
+      this.emit('reconcile', stats);
+    } catch (err) {
+      this.logger.error(`[Reconcile] REST reconciliation failed: ${err.message}`);
+      this.emit('error', { phase: 'reconcile', error: err });
+    }
   }
 }

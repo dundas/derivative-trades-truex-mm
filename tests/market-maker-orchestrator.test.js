@@ -59,6 +59,7 @@ function createMockQuoteEngine() {
   const qe = new EventEmitter();
   qe.onPriceUpdate = jest.fn();
   qe.onExecutionReport = jest.fn();
+  qe.onOrderCancelReject = jest.fn();
   qe.cancelAllQuotes = jest.fn();
   qe.drainQueue = jest.fn();
   qe.getQuoteStatus = jest.fn(() => ({
@@ -580,6 +581,27 @@ describe('MarketMakerOrchestrator', () => {
       await orchestrator.stop();
     });
 
+    test('routes OrderCancelReject (35=9) to QuoteEngine', async () => {
+      const { orchestrator, mocks } = createOrchestrator();
+      await orchestrator.start();
+
+      const message = {
+        fields: {
+          '35': '9',       // OrderCancelReject
+          '11': 'CX001',   // Cancel ClOrdID
+          '41': 'ORIG001', // OrigClOrdID
+          '58': 'Too late to cancel',
+          '102': '0',
+        },
+      };
+      mocks.fixConnection.emit('message', message);
+
+      expect(mocks.quoteEngine.onOrderCancelReject).toHaveBeenCalledWith(message.fields);
+      // Should NOT also route to onExecutionReport
+      expect(mocks.quoteEngine.onExecutionReport).not.toHaveBeenCalled();
+      await orchestrator.stop();
+    });
+
     test('logs fills to data manager when available', async () => {
       const { orchestrator, mocks } = createOrchestrator();
       await orchestrator.start();
@@ -1035,6 +1057,224 @@ describe('MarketMakerOrchestrator', () => {
       expect(fill.side).toBe('sell');
       expect(fill.quantity).toBe(0.1);
 
+      await orchestrator.stop();
+    });
+  });
+
+  describe('data pipeline integration', () => {
+    function createMockDataPipeline() {
+      return {
+        start: jest.fn(async () => {}),
+        stop: jest.fn(async () => {}),
+        addFill: jest.fn(),
+        addOrder: jest.fn(),
+        logFIXMessage: jest.fn(),
+        logError: jest.fn(),
+        getStats: jest.fn(() => ({
+          pipeline: { flushCycles: 0, migrationCycles: 0 },
+          memory: { ordersInMemory: 0, fillsInMemory: 0 },
+          isRunning: true,
+          hasRedis: true,
+          hasPostgres: true,
+        })),
+      };
+    }
+
+    test('calls dataPipeline.start() on start', async () => {
+      const dataPipeline = createMockDataPipeline();
+      const { orchestrator } = createOrchestrator({ dataPipeline });
+      await orchestrator.start();
+      expect(dataPipeline.start).toHaveBeenCalledTimes(1);
+      await orchestrator.stop();
+    });
+
+    test('calls dataPipeline.stop() on stop', async () => {
+      const dataPipeline = createMockDataPipeline();
+      const { orchestrator } = createOrchestrator({ dataPipeline });
+      await orchestrator.start();
+      await orchestrator.stop();
+      expect(dataPipeline.stop).toHaveBeenCalledTimes(1);
+    });
+
+    test('handles dataPipeline.start() failure gracefully', async () => {
+      const dataPipeline = createMockDataPipeline();
+      dataPipeline.start = jest.fn(async () => { throw new Error('Redis down'); });
+      const { orchestrator, mocks } = createOrchestrator({ dataPipeline });
+      await orchestrator.start();
+      expect(orchestrator.isRunning).toBe(true);
+      expect(mocks.logger.warn).toHaveBeenCalled();
+      await orchestrator.stop();
+    });
+
+    test('handles dataPipeline.stop() failure gracefully', async () => {
+      const dataPipeline = createMockDataPipeline();
+      dataPipeline.stop = jest.fn(async () => { throw new Error('Flush failed'); });
+      const { orchestrator, mocks } = createOrchestrator({ dataPipeline });
+      await orchestrator.start();
+      await orchestrator.stop();
+      expect(orchestrator.isRunning).toBe(false);
+      expect(mocks.logger.error).toHaveBeenCalled();
+    });
+
+    test('routes quote fills to dataPipeline.addFill()', async () => {
+      const dataPipeline = createMockDataPipeline();
+      const { orchestrator, mocks } = createOrchestrator({ dataPipeline, auditLogger: null });
+      await orchestrator.start();
+
+      mocks.quoteEngine.emit('fill', {
+        side: 'buy',
+        price: 100000,
+        size: 0.1,
+        clOrdID: 'Q001',
+        execID: 'exec-1',
+      });
+
+      expect(dataPipeline.addFill).toHaveBeenCalledTimes(1);
+      const fill = dataPipeline.addFill.mock.calls[0][0];
+      expect(fill.fillId).toBe('Q001-exec-1');
+      expect(fill.side).toBe('buy');
+      expect(fill.quantity).toBe(0.1);
+      expect(fill.price).toBe(100000);
+      await orchestrator.stop();
+    });
+
+    test('routes FIX execution report fills to dataPipeline.addFill()', async () => {
+      const dataPipeline = createMockDataPipeline();
+      const { orchestrator, mocks } = createOrchestrator({ dataPipeline, dataManager: null });
+      await orchestrator.start();
+
+      mocks.fixConnection.emit('message', {
+        fields: {
+          '35': '8',
+          '11': 'Q001',
+          '17': 'exec-1',
+          '39': '2',
+          '31': '100000',
+          '32': '0.5',
+          '54': '1',
+        },
+      });
+
+      expect(dataPipeline.addFill).toHaveBeenCalledTimes(1);
+      const fill = dataPipeline.addFill.mock.calls[0][0];
+      expect(fill.orderId).toBe('Q001');
+      expect(fill.side).toBe('buy');
+      expect(fill.quantity).toBe(0.5);
+      await orchestrator.stop();
+    });
+
+    test('logs all FIX messages to dataPipeline.logFIXMessage()', async () => {
+      const dataPipeline = createMockDataPipeline();
+      const { orchestrator, mocks } = createOrchestrator({ dataPipeline });
+      await orchestrator.start();
+
+      // Send heartbeat (not an exec report)
+      mocks.fixConnection.emit('message', {
+        fields: { '35': '0', '34': '5' },
+      });
+
+      expect(dataPipeline.logFIXMessage).toHaveBeenCalledTimes(1);
+      const args = dataPipeline.logFIXMessage.mock.calls[0];
+      expect(args[1].direction).toBe('INBOUND');
+      expect(args[1].msgType).toBe('0');
+      await orchestrator.stop();
+    });
+
+    test('includes dataPipeline stats in getStatus()', async () => {
+      const dataPipeline = createMockDataPipeline();
+      const { orchestrator } = createOrchestrator({ dataPipeline });
+      await orchestrator.start();
+
+      const status = orchestrator.getStatus();
+      expect(status.dataPipeline).not.toBeNull();
+      expect(status.dataPipeline.hasRedis).toBe(true);
+      expect(status.dataPipeline.hasPostgres).toBe(true);
+      await orchestrator.stop();
+    });
+
+    test('returns null dataPipeline in getStatus() when not configured', () => {
+      const { orchestrator } = createOrchestrator();
+      const status = orchestrator.getStatus();
+      expect(status.dataPipeline).toBeNull();
+    });
+
+    test('prefers dataPipeline over legacy auditLogger for quote fills', async () => {
+      const dataPipeline = createMockDataPipeline();
+      const auditLogger = createMockAuditLogger();
+      const { orchestrator, mocks } = createOrchestrator({ dataPipeline, auditLogger });
+      await orchestrator.start();
+
+      mocks.quoteEngine.emit('fill', {
+        side: 'buy',
+        price: 100000,
+        size: 0.1,
+        clOrdID: 'Q001',
+        execID: 'exec-1',
+      });
+
+      expect(dataPipeline.addFill).toHaveBeenCalledTimes(1);
+      expect(auditLogger.logFillEvent).not.toHaveBeenCalled();
+      await orchestrator.stop();
+    });
+
+    test('prefers dataPipeline over legacy dataManager for FIX fills', async () => {
+      const dataPipeline = createMockDataPipeline();
+      const dataManager = createMockDataManager();
+      const { orchestrator, mocks } = createOrchestrator({ dataPipeline, dataManager });
+      await orchestrator.start();
+
+      mocks.fixConnection.emit('message', {
+        fields: {
+          '35': '8',
+          '11': 'Q001',
+          '17': 'exec-1',
+          '39': '2',
+          '31': '100000',
+          '32': '0.1',
+          '54': '2',
+        },
+      });
+
+      expect(dataPipeline.addFill).toHaveBeenCalledTimes(1);
+      expect(dataManager.addFill).not.toHaveBeenCalled();
+      await orchestrator.stop();
+    });
+
+    test('backward compat: legacy dataManager still works without dataPipeline', async () => {
+      const dataManager = createMockDataManager();
+      const { orchestrator, mocks } = createOrchestrator({ dataPipeline: null, dataManager });
+      await orchestrator.start();
+
+      mocks.fixConnection.emit('message', {
+        fields: {
+          '35': '8',
+          '11': 'Q001',
+          '17': 'exec-1',
+          '39': '2',
+          '31': '100000',
+          '32': '0.1',
+          '54': '1',
+        },
+      });
+
+      expect(dataManager.addFill).toHaveBeenCalledTimes(1);
+      await orchestrator.stop();
+    });
+
+    test('backward compat: legacy auditLogger still works without dataPipeline', async () => {
+      const auditLogger = createMockAuditLogger();
+      const { orchestrator, mocks } = createOrchestrator({ dataPipeline: null, auditLogger });
+      await orchestrator.start();
+
+      mocks.quoteEngine.emit('fill', {
+        side: 'buy',
+        price: 100000,
+        size: 0.1,
+        clOrdID: 'Q001',
+        execID: 'exec-1',
+      });
+
+      expect(auditLogger.logFillEvent).toHaveBeenCalledTimes(1);
       await orchestrator.stop();
     });
   });

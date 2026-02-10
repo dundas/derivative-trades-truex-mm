@@ -65,3 +65,6 @@ dump.rdb
 # FIX protocol logs
 fix-logs/
 *.fix.log
+
+# Brain - secret key stored after registration
+brain/config.json
