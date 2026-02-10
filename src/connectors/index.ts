@@ -21,7 +21,6 @@ export * from "./kraken/KrakenSpotTradesWsClient";
 export * from "./kraken/KrakenPrivateWsClient";
 
 // Gemini
-export * from "./gemini/GeminiConnector";
 export * from "./gemini/GeminiRestClient";
 export * from "./gemini/GeminiWebSocketClient";
 export * from "./gemini/GeminiSymbolMapper";

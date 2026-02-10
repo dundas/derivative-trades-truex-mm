@@ -116,7 +116,7 @@ export class DataPipelineManager extends EventEmitter {
     // Connect PG if not injected but pgUrl is configured
     if (!this.pgManager && this.pgUrl) {
       try {
-        this.pgManager = new TrueXPostgreSQLManager({ logger: this.logger });
+        this.pgManager = new TrueXPostgreSQLManager({ logger: this.logger, pgUrl: this.pgUrl });
         await this.pgManager.initialize();
         this.logger.info('[DataPipeline] PostgreSQL connected');
       } catch (err) {
@@ -385,6 +385,7 @@ export class DataPipelineManager extends EventEmitter {
           side: f.side,
           size: f.quantity || f.size,
           quantity: f.quantity || f.size,
+          amount: f.quantity || f.size,
           price: f.price,
           execid: f.execID,
           timestamp: f.timestamp || Date.now(),

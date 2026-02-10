@@ -522,7 +522,7 @@ async function handleAnalyticsParameters(params) {
         SUM(CASE WHEN side = 'buy' THEN COALESCE(size, amount, 0)::numeric ELSE 0 END) AS buy_volume,
         SUM(CASE WHEN side = 'sell' THEN COALESCE(size, amount, 0)::numeric ELSE 0 END) AS sell_volume,
         COUNT(*) AS fill_count
-      FROM fills WHERE sessionid = s.id
+      FROM fills WHERE sessionid = s.sessionid
     ) fs ON true
     LEFT JOIN LATERAL (
       SELECT
@@ -531,7 +531,7 @@ async function handleAnalyticsParameters(params) {
           THEN ROUND(COUNT(CASE WHEN status IN ('filled', 'FILLED', '2') THEN 1 END)::numeric / COUNT(*) * 100, 2)
           ELSE 0
         END AS fill_rate
-      FROM orders WHERE sessionid = s.id
+      FROM orders WHERE sessionid = s.sessionid
     ) os ON true
     ${where}
     ORDER BY s.startedat DESC NULLS LAST
