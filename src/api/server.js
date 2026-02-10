@@ -586,7 +586,7 @@ Bun.serve({
       return jsonError('Not found', 404);
     } catch (err) {
       console.error(`[API Error] ${path}:`, err);
-      return jsonError(err.message, 500);
+      return jsonError('Internal server error', 500);
     }
   },
 });

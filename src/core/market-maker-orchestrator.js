@@ -7,7 +7,7 @@ import { PnLTracker } from './pnl-tracker.js';
 import { QuoteEngine } from './quote-engine.js';
 import { HedgeExecutor } from './hedge-executor.js';
 import { TrueXMarketDataFeed } from './truex-market-data.js';
-import { TrueXRESTClient } from '../exchanges/truex/TrueXRESTClient.ts';
+import { TrueXRESTClient } from '../exchanges/truex/TrueXRESTClient.js';
 
 /**
  * MarketMakerOrchestrator - Wires all components and manages lifecycle.

@@ -105,8 +105,8 @@ export class CoinbaseRestClient {
 
       return {
         price: Number(data.price),
-        bid: Number(data.quote_increment), // Note: Coinbase doesn't provide bid/ask in product endpoint
-        ask: Number(data.quote_increment),
+        bid: Number(data.price), // Product endpoint lacks bid/ask; use price as approximation
+        ask: Number(data.price),
         volume: Number(data.volume_24h || 0),
         timestamp: Date.now(),
       };

@@ -405,7 +405,7 @@ export class QuoteEngine extends EventEmitter {
     const ordStatus = fields['39'];
     const execID = fields['17'];
     const lastPx = parseFloat(fields['31'] || fields['44'] || '0');
-    const lastQty = parseFloat(fields['32'] || fields['38'] || '0');
+    const lastQty = fields['32'] ? parseFloat(fields['32']) : null;
     const side = fields['54'] === '1' ? 'buy' : 'sell';
 
     // Resolve cancel ClOrdID → original ClOrdID if this is a cancel ack
