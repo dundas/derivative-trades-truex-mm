@@ -1,0 +1,104 @@
+# TrueX Market Maker - Docker Compose
+# Usage: docker compose up -d
+
+services:
+  # Redis - In-memory data store for pipeline Layer 2
+  redis:
+    image: redis:7-alpine
+    container_name: truex-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    networks:
+      - truex-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # FIX Proxy Server - Forwards to TrueX UAT
+  fix-proxy:
+    build: .
+    container_name: truex-fix-proxy
+    restart: unless-stopped
+    ports:
+      - "3004:3004"
+    environment:
+      - NODE_ENV=production
+      - FIX_PROXY_PORT=3004
+      - TRUEX_UPSTREAM_HOST=38.32.101.229
+      - TRUEX_UPSTREAM_PORT=19484
+    command: ["bun", "src/proxy/fix-proxy-server.js"]
+    networks:
+      - truex-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Market Maker - Connects through FIX proxy
+  market-maker:
+    build: .
+    container_name: truex-market-maker
+    restart: unless-stopped
+    depends_on:
+      fix-proxy:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    environment:
+      - NODE_ENV=production
+      - TRUEX_FIX_HOST=fix-proxy
+      - TRUEX_FIX_PORT=3004
+      - TRUEX_API_KEY=${TRUEX_API_KEY}
+      - TRUEX_SECRET_KEY=${TRUEX_SECRET_KEY}
+      - TRUEX_CLIENT_ID=${TRUEX_CLIENT_ID}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+      - DO_REDIS_URL=${DO_REDIS_URL}
+      - DATABASE_URL=${DATABASE_URL}
+      - LOG_LEVEL=info
+    command: ["bun", "run", "start"]
+    networks:
+      - truex-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # Test Runner - For running integration tests
+  test-runner:
+    build: .
+    container_name: truex-test-runner
+    profiles:
+      - test
+    environment:
+      - NODE_ENV=test
+      - TRUEX_FIX_HOST=fix-proxy
+      - TRUEX_FIX_PORT=3004
+      - TRUEX_API_KEY=${TRUEX_API_KEY}
+      - TRUEX_SECRET_KEY=${TRUEX_SECRET_KEY}
+      - TRUEX_CLIENT_ID=${TRUEX_CLIENT_ID}
+    command: ["bun", "scripts/test-fix-order.ts"]
+    depends_on:
+      - fix-proxy
+    networks:
+      - truex-network
+
+volumes:
+  redis-data:
+    driver: local
+
+networks:
+  truex-network:
+    driver: bridge

@@ -1,11 +1,11 @@
-import { createPostgreSQLAPIFromEnv } from '../../lib/postgresql-api/index.js';
+import { PostgreSQLAPI, createPostgreSQLAPIFromEnv } from '../../lib/postgresql-api/index.js';
 
 /**
  * TrueX PostgreSQL Manager - Layer 3: Analytics & Long-term Storage
- * 
+ *
  * Manages PostgreSQL persistence using the unified PostgreSQL API.
  * Provides batch migration from Redis to PostgreSQL for analytics and backup.
- * 
+ *
  * Performance targets:
  * - Migration frequency: Every 5 minutes
  * - Batch size: 1000 records per bulk insert
@@ -15,10 +15,12 @@ import { createPostgreSQLAPIFromEnv } from '../../lib/postgresql-api/index.js';
 export class TrueXPostgreSQLManager {
   constructor(options = {}) {
     this.logger = options.logger || console;
-    
+
     // Create PostgreSQL API instance
     if (options.db) {
       this.db = options.db;
+    } else if (options.pgUrl) {
+      this.db = new PostgreSQLAPI({ connectionString: options.pgUrl, logger: this.logger });
     } else {
       this.db = createPostgreSQLAPIFromEnv();
     }

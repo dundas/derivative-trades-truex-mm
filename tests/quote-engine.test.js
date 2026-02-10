@@ -511,10 +511,12 @@ describe('QuoteEngine', () => {
       // Should have sent 3 cancel messages
       expect(mockFix.sendMessage.mock.calls.length).toBe(3);
 
-      // Each should be a cancel (35=F)
+      // Each should be a cancel (35=F per TrueX — tag 11, 41, party info, no Side)
       for (const call of mockFix.sendMessage.mock.calls) {
         const fields = call[0];
         expect(fields['35']).toBe('F');
+        expect(fields['38']).toBeUndefined(); // No OrderQty in 35=F cancel
+        expect(fields['54']).toBeUndefined(); // No Side per Spencer
       }
     });
 
@@ -612,6 +614,82 @@ describe('QuoteEngine', () => {
       engine.onExecutionReport(null);
       engine.onExecutionReport(undefined);
       engine.onExecutionReport({});
+    });
+  });
+
+  describe('onOrderCancelReject (35=9)', () => {
+    it('should restore original order to active when cancel is rejected', () => {
+      const engine = createEngine();
+      // Original order being cancelled
+      engine.activeOrders.set('ORIG001', { side: 'buy', price: 70000, size: 0.02, level: 1, status: 'cancelling', placedAt: Date.now() });
+      // Track the cancel mapping
+      engine.cancelToOrigMap.set('CX001', 'ORIG001');
+
+      engine.onOrderCancelReject({
+        '35': '9',
+        '11': 'CX001',    // Cancel ClOrdID
+        '41': 'ORIG001',  // OrigClOrdID
+        '58': 'Too late to cancel',
+        '102': '0',       // CxlRejReason = Too late
+      });
+
+      // Original order should be restored to 'active'
+      expect(engine.activeOrders.has('ORIG001')).toBe(true);
+      expect(engine.activeOrders.get('ORIG001').status).toBe('active');
+      // Cancel mapping should be cleaned up
+      expect(engine.cancelToOrigMap.has('CX001')).toBe(false);
+    });
+
+    it('should remove order when CxlRejReason=1 (Unknown order)', () => {
+      const engine = createEngine();
+      engine.activeOrders.set('ORIG002', { side: 'sell', price: 71000, size: 0.02, level: 1, status: 'cancelling', placedAt: Date.now() });
+      engine.cancelToOrigMap.set('CX002', 'ORIG002');
+
+      engine.onOrderCancelReject({
+        '35': '9',
+        '11': 'CX002',
+        '41': 'ORIG002',
+        '58': 'Unknown order',
+        '102': '1',       // CxlRejReason = Unknown order
+      });
+
+      // Order gone from exchange, remove from tracking
+      expect(engine.activeOrders.has('ORIG002')).toBe(false);
+      expect(engine.cancelToOrigMap.has('CX002')).toBe(false);
+    });
+
+    it('should resolve origClOrdID via cancelToOrigMap when tag 41 is missing', () => {
+      const engine = createEngine();
+      engine.activeOrders.set('ORIG003', { side: 'buy', price: 70500, size: 0.02, level: 2, status: 'cancelling', placedAt: Date.now() });
+      engine.cancelToOrigMap.set('CX003', 'ORIG003');
+
+      // No tag 41 in message — rely on cancelToOrigMap
+      engine.onOrderCancelReject({
+        '35': '9',
+        '11': 'CX003',
+        '58': 'Rate limit',
+      });
+
+      expect(engine.activeOrders.get('ORIG003').status).toBe('active');
+      expect(engine.cancelToOrigMap.has('CX003')).toBe(false);
+    });
+
+    it('should increment consecutiveRejects and trigger backoff after 3', () => {
+      const engine = createEngine();
+      engine.consecutiveRejects = 2; // Already at 2
+
+      engine.onOrderCancelReject({ '35': '9', '11': 'CX004', '58': 'error' });
+
+      expect(engine.consecutiveRejects).toBe(3);
+      expect(engine.rejectBackoffUntil).toBeGreaterThan(Date.now());
+    });
+
+    it('should handle null/undefined fields gracefully', () => {
+      const engine = createEngine();
+      // Should not throw
+      engine.onOrderCancelReject(null);
+      engine.onOrderCancelReject(undefined);
+      engine.onOrderCancelReject({});
     });
   });
 
@@ -745,7 +823,7 @@ describe('QuoteEngine', () => {
       expect(['1', '2']).toContain(fields['54']); // Side
     });
 
-    it('should send Cancel Request (35=F) with OrigClOrdID', () => {
+    it('should send OrderCancelRequest (35=F) with OrigClOrdID per TrueX spec', () => {
       const mockFix = createMockFix();
       const engine = createEngine({ fixConnection: mockFix });
 
@@ -758,8 +836,8 @@ describe('QuoteEngine', () => {
       const fields = cancelCall[0];
       expect(fields['35']).toBe('F');
       expect(fields['41']).toBe('ORIG1'); // OrigClOrdID
-      expect(fields['55']).toBe('BTC-PYUSD');
-      expect(fields['54']).toBe('1'); // Buy side
+      expect(fields['38']).toBeUndefined(); // No OrderQty in 35=F cancel
+      expect(fields['54']).toBeUndefined(); // No Side per Spencer
     });
   });
 
