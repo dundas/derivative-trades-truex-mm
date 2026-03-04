@@ -69,7 +69,13 @@ export class InventoryManager extends EventEmitter {
       // Update tracked balances: buying BTC means +BTC, -PYUSD
       if (this.balancesInitialized) {
         if (this.baseBalance) this.baseBalance.available += quantity;
-        if (this.quoteBalance) this.quoteBalance.available -= quantity * price;
+        if (this.quoteBalance) {
+          this.quoteBalance.available -= quantity * price;
+          if (this.quoteBalance.available < 0) {
+            this.logger.warn(`[InventoryManager] Quote balance went negative (${this.quoteBalance.available.toFixed(2)}) — clamping to 0. Will correct on next balance refresh.`);
+            this.quoteBalance.available = 0;
+          }
+        }
       }
     } else if (normalizedSide === 'sell') {
       this.netPosition -= quantity;
@@ -78,7 +84,13 @@ export class InventoryManager extends EventEmitter {
       this.totalSellQty += quantity;
       // Update tracked balances: selling BTC means -BTC, +PYUSD
       if (this.balancesInitialized) {
-        if (this.baseBalance) this.baseBalance.available -= quantity;
+        if (this.baseBalance) {
+          this.baseBalance.available -= quantity;
+          if (this.baseBalance.available < 0) {
+            this.logger.warn(`[InventoryManager] Base balance went negative (${this.baseBalance.available.toFixed(8)}) — clamping to 0. Will correct on next balance refresh.`);
+            this.baseBalance.available = 0;
+          }
+        }
         if (this.quoteBalance) this.quoteBalance.available += quantity * price;
       }
     } else {
@@ -163,19 +175,24 @@ export class InventoryManager extends EventEmitter {
   }
 
   /**
-   * Initialize balances from REST API response.
-   * Sets netPosition from base asset balance and tracks both sides.
+   * One-time startup initialization from REST API balances.
+   * Sets netPosition from base asset total and stores balance snapshots.
+   * Only call this ONCE at startup — use refreshBalances() for periodic sync.
    *
    * @param {object} params
    * @param {object} params.baseBalance - { available, held, total } for base asset (e.g. BTC)
    * @param {object} params.quoteBalance - { available, held, total } for quote asset (e.g. PYUSD)
    */
   initializeFromBalances({ baseBalance, quoteBalance }) {
-    this.baseBalance = baseBalance || { available: 0, held: 0, total: 0 };
-    this.quoteBalance = quoteBalance || { available: 0, held: 0, total: 0 };
+    const base = baseBalance || { available: 0, held: 0, total: 0 };
+    const quote = quoteBalance || { available: 0, held: 0, total: 0 };
+
+    // Shallow copy to avoid mutable reference hazard
+    this.baseBalance = { ...base };
+    this.quoteBalance = { ...quote };
     this.balancesInitialized = true;
 
-    // Initialize net position from actual BTC holdings
+    // Initialize net position from actual BTC holdings (one-time only)
     this.netPosition = this.baseBalance.total;
 
     this.logger.info(
@@ -184,6 +201,45 @@ export class InventoryManager extends EventEmitter {
       `quote=${this.quoteBalance.available} avail / ${this.quoteBalance.total} total, ` +
       `netPosition=${this.netPosition}`
     );
+  }
+
+  /**
+   * Periodic balance refresh — updates available balances from exchange WITHOUT
+   * resetting netPosition, VWAP, or counters. Safe to call during active trading.
+   * Logs discrepancies between tracked and exchange balances.
+   *
+   * @param {object} params
+   * @param {object} params.baseBalance - { available, held, total } for base asset
+   * @param {object} params.quoteBalance - { available, held, total } for quote asset
+   */
+  refreshBalances({ baseBalance, quoteBalance }) {
+    if (!this.balancesInitialized) {
+      // First call — delegate to full initialization
+      this.initializeFromBalances({ baseBalance, quoteBalance });
+      return;
+    }
+
+    const newBase = baseBalance || { available: 0, held: 0, total: 0 };
+    const newQuote = quoteBalance || { available: 0, held: 0, total: 0 };
+
+    // Log discrepancies between tracked and exchange balances
+    const baseDrift = Math.abs((this.baseBalance?.available || 0) - newBase.available);
+    const quoteDrift = Math.abs((this.quoteBalance?.available || 0) - newQuote.available);
+
+    if (baseDrift > 0.0001) {
+      this.logger.info(
+        `[InventoryManager] Balance drift (base): tracked=${this.baseBalance?.available?.toFixed(8)} exchange=${newBase.available.toFixed(8)} drift=${baseDrift.toFixed(8)}`
+      );
+    }
+    if (quoteDrift > 0.01) {
+      this.logger.info(
+        `[InventoryManager] Balance drift (quote): tracked=${this.quoteBalance?.available?.toFixed(2)} exchange=${newQuote.available.toFixed(2)} drift=${quoteDrift.toFixed(2)}`
+      );
+    }
+
+    // Update balances from exchange (authoritative source) — do NOT touch netPosition/VWAP
+    this.baseBalance = { ...newBase };
+    this.quoteBalance = { ...newQuote };
   }
 
   /**

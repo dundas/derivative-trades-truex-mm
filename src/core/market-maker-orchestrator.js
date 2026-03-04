@@ -148,8 +148,12 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this._wireEvents();
 
     // 2. Fetch account balances via REST (before connecting FIX)
+    //    This is MANDATORY when a REST client is configured — fail-open is too dangerous
     if (this.restClient) {
       await this._initializeBalances();
+      if (!this.inventoryManager.balancesInitialized) {
+        throw new Error('Balance initialization failed — cannot start quoting without balance data');
+      }
     } else {
       this.logger.warn('[Orchestrator] No REST client — skipping balance initialization (quoting both sides)');
     }
@@ -528,67 +532,69 @@ export class MarketMakerOrchestrator extends EventEmitter {
 
   /**
    * Fetch account balances from TrueX REST API and initialize inventory manager.
-   * Determines which sides we can quote based on actual holdings.
+   * Called ONCE at startup. Throws on failure (startup is mandatory).
    */
   async _initializeBalances() {
-    try {
-      this.logger.info('[Orchestrator] Fetching account balances via REST...');
-      const summary = await this.restClient.getAccountSummary();
+    this.logger.info('[Orchestrator] Fetching account balances via REST...');
+    const { baseBalance, quoteBalance } = await this._fetchBalances();
 
-      if (!summary || !summary.balances) {
-        this.logger.warn('[Orchestrator] No balance data returned — quoting both sides');
-        return;
-      }
+    // Initialize inventory manager (sets netPosition from base total)
+    this.inventoryManager.initializeFromBalances({ baseBalance, quoteBalance });
 
-      // Parse symbol to get base/quote asset names (e.g. BTC-PYUSD → BTC, PYUSD)
-      const [baseAsset, quoteAsset] = this.symbol.split('-');
-
-      let baseBalance = null;
-      let quoteBalance = null;
-
-      for (const bal of summary.balances) {
-        const parsed = TrueXRESTClient.parseBalance(bal);
-        const name = (parsed.assetName || '').toUpperCase();
-        if (name === baseAsset) {
-          baseBalance = parsed;
-        } else if (name === quoteAsset) {
-          quoteBalance = parsed;
-        }
-      }
-
-      this.logger.info(
-        `[Orchestrator] Balances: ${baseAsset}=${baseBalance ? baseBalance.available : 0} avail / ${baseBalance ? baseBalance.total : 0} total, ` +
-        `${quoteAsset}=${quoteBalance ? quoteBalance.available : 0} avail / ${quoteBalance ? quoteBalance.total : 0} total`
-      );
-
-      // Initialize inventory manager with actual balances
-      this.inventoryManager.initializeFromBalances({
-        baseBalance: baseBalance ? { available: baseBalance.available, held: baseBalance.held, total: baseBalance.total } : null,
-        quoteBalance: quoteBalance ? { available: quoteBalance.available, held: quoteBalance.held, total: quoteBalance.total } : null,
-      });
-
-      // Log which sides we'll quote
-      const canBid = this.inventoryManager.canQuote('buy');
-      const canAsk = this.inventoryManager.canQuote('sell');
-      this.logger.info(`[Orchestrator] Quoting: bids=${canBid ? 'YES' : 'NO (no ' + quoteAsset + ')'}, asks=${canAsk ? 'YES' : 'NO (no ' + baseAsset + ')'}`);
-
-    } catch (err) {
-      this.logger.warn(`[Orchestrator] Balance fetch failed (non-fatal): ${err.message} — quoting both sides`);
-    }
+    // Log which sides we'll quote
+    const [, quoteAsset] = this.symbol.split('-');
+    const [baseAsset] = this.symbol.split('-');
+    const canBid = this.inventoryManager.canQuote('buy');
+    const canAsk = this.inventoryManager.canQuote('sell');
+    this.logger.info(`[Orchestrator] Quoting: bids=${canBid ? 'YES' : 'NO (no ' + quoteAsset + ')'}, asks=${canAsk ? 'YES' : 'NO (no ' + baseAsset + ')'}`);
   }
 
   /**
-   * Periodic balance refresh — re-syncs tracked balances with exchange.
-   * Corrects drift from fees, missed fills, deposits/withdrawals.
+   * Periodic balance refresh — re-syncs tracked balances from exchange.
+   * Uses refreshBalances() which does NOT reset netPosition/VWAP.
+   * Safe to call during active trading.
    */
   async _refreshBalances() {
     if (!this.restClient || !this.isRunning) return;
 
     try {
-      await this._initializeBalances();
+      const { baseBalance, quoteBalance } = await this._fetchBalances();
+      this.inventoryManager.refreshBalances({ baseBalance, quoteBalance });
     } catch (err) {
       this.logger.warn(`[Orchestrator] Balance refresh failed (non-fatal): ${err.message}`);
     }
+  }
+
+  /**
+   * Shared helper: fetch and parse balances from REST API.
+   */
+  async _fetchBalances() {
+    const summary = await this.restClient.getAccountSummary();
+
+    if (!summary || !summary.balances) {
+      throw new Error('No balance data returned from REST API');
+    }
+
+    const [baseAsset, quoteAsset] = this.symbol.split('-');
+    let baseBalance = null;
+    let quoteBalance = null;
+
+    for (const bal of summary.balances) {
+      const parsed = TrueXRESTClient.parseBalance(bal);
+      const name = (parsed.assetName || '').toUpperCase();
+      if (name === baseAsset) {
+        baseBalance = { available: parsed.available, held: parsed.held, total: parsed.total };
+      } else if (name === quoteAsset) {
+        quoteBalance = { available: parsed.available, held: parsed.held, total: parsed.total };
+      }
+    }
+
+    this.logger.info(
+      `[Orchestrator] Balances: ${baseAsset}=${baseBalance ? baseBalance.available : 0} avail / ${baseBalance ? baseBalance.total : 0} total, ` +
+      `${quoteAsset}=${quoteBalance ? quoteBalance.available : 0} avail / ${quoteBalance ? quoteBalance.total : 0} total`
+    );
+
+    return { baseBalance, quoteBalance };
   }
 
   // --- REST-based Order Reconciliation ---

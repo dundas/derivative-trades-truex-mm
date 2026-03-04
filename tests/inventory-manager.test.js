@@ -560,6 +560,68 @@ describe('InventoryManager', () => {
       expect(im.canQuote('sell')).toBe(false);
     });
 
+    it('should clamp base balance to zero on oversell', () => {
+      im.initializeFromBalances({
+        baseBalance: { available: 0.01, held: 0, total: 0.01 },
+        quoteBalance: { available: 0, held: 0, total: 0 },
+      });
+
+      // Sell more than available (e.g. race condition or partial fill mismatch)
+      im.onFill({ side: 'sell', quantity: 0.02, price: 100000, venue: 'truex', execID: 'E1' });
+
+      expect(im.baseBalance.available).toBe(0); // Clamped, not negative
+      expect(logger.warn).toHaveBeenCalled();
+    });
+
+    it('should clamp quote balance to zero on overbuy', () => {
+      im.initializeFromBalances({
+        baseBalance: { available: 0, held: 0, total: 0 },
+        quoteBalance: { available: 100, held: 0, total: 100 },
+      });
+
+      // Buy more PYUSD worth than available
+      im.onFill({ side: 'buy', quantity: 0.01, price: 100000, venue: 'truex', execID: 'E1' });
+
+      expect(im.quoteBalance.available).toBe(0); // Clamped, not -900
+      expect(logger.warn).toHaveBeenCalled();
+    });
+
+    it('should refresh balances without resetting netPosition or VWAP', () => {
+      im.initializeFromBalances({
+        baseBalance: { available: 0.044, held: 0, total: 0.044 },
+        quoteBalance: { available: 0, held: 0, total: 0 },
+      });
+
+      // Simulate a fill that changes netPosition
+      im.onFill({ side: 'sell', quantity: 0.01, price: 100000, venue: 'truex', execID: 'E1' });
+      const posAfterFill = im.netPosition;
+      const fillCount = im.fillCount;
+
+      // Periodic refresh should update balances but NOT reset netPosition
+      im.refreshBalances({
+        baseBalance: { available: 0.034, held: 0, total: 0.034 },
+        quoteBalance: { available: 1000, held: 0, total: 1000 },
+      });
+
+      expect(im.netPosition).toBe(posAfterFill);  // NOT reset
+      expect(im.fillCount).toBe(fillCount);         // NOT reset
+      expect(im.baseBalance.available).toBe(0.034); // Updated from exchange
+      expect(im.quoteBalance.available).toBe(1000); // Updated from exchange
+    });
+
+    it('should delegate to initializeFromBalances on first refreshBalances call', () => {
+      const fresh = new InventoryManager({ maxPositionBTC: 1.0, logger });
+      expect(fresh.balancesInitialized).toBe(false);
+
+      fresh.refreshBalances({
+        baseBalance: { available: 0.05, held: 0, total: 0.05 },
+        quoteBalance: { available: 1000, held: 0, total: 1000 },
+      });
+
+      expect(fresh.balancesInitialized).toBe(true);
+      expect(fresh.netPosition).toBe(0.05); // Set from total on first call
+    });
+
     it('should include balance info in getPositionSummary', () => {
       im.initializeFromBalances({
         baseBalance: { available: 0.044, held: 0, total: 0.044 },

@@ -149,9 +149,19 @@ export class QuoteEngine extends EventEmitter {
     const bids = [];
     const asks = [];
 
-    // Track cumulative committed balance across levels to prevent over-commitment
-    let bidCommittedQuote = 0;  // PYUSD committed to bids
-    let askCommittedBase = 0;   // BTC committed to asks
+    // Track cumulative committed balance: start from what's already committed in active orders
+    // This prevents double-commitment when orders from previous reprice are still live
+    let bidCommittedQuote = 0;
+    let askCommittedBase = 0;
+    for (const [, order] of this.activeOrders) {
+      if (order.status === 'active' || order.status === 'pending') {
+        if (order.side === 'buy') {
+          bidCommittedQuote += order.size * order.price;
+        } else if (order.side === 'sell') {
+          askCommittedBase += order.size;
+        }
+      }
+    }
 
     for (let level = 1; level <= levels; level++) {
       const levelOffset = this._getLevelOffset(mid, level, levelSpacingTicks, tickSize);
