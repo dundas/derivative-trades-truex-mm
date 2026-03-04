@@ -82,7 +82,7 @@ const config = {
 
   // PnL Tracker
   truexMakerFeeBps: 0,         // Zero fees on maker
-  truexTakerFeeBps: 10,        // 1bp taker
+  truexTakerFeeBps: 10,        // 10bps (0.10%) taker
   hedgeMakerFeeBps: 0,
   hedgeTakerFeeBps: 0,
   pnlLogIntervalMs: 30000,
@@ -179,11 +179,9 @@ async function main() {
       userId: config.clientId,
     });
 
-    const active = await restClient.getActiveOrders();
-    if (active.length > 0) {
-      logger.info(`Found ${active.length} orphaned orders — cancelling...`);
-      const result = await restClient.cancelAllOrders();
-      logger.info(`Cancelled: ${result.canceled.length}, Failed: ${result.failed.length}`);
+    const result = await restClient.cancelAllOrders();
+    if (result.canceled.length > 0) {
+      logger.info(`Cancelled ${result.canceled.length} orphaned orders`);
       if (result.failed.length > 0) {
         logger.warn(`Cancel failures: ${result.failed.map(f => f.error).join(', ')}`);
       }

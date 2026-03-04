@@ -769,17 +769,18 @@ export class TrueXRESTClient {
     try {
       const assets = await this.request("GET", "/asset") as Array<{
         id: string;
-        fields: { name: string };
+        name: string;
       }>;
       const map: Record<string, string> = {};
       for (const a of assets) {
-        map[a.id] = a.fields.name;
+        map[a.id] = a.name;
       }
       this.assetMap = map;
       return map;
     } catch {
-      // /asset endpoint failed — use hardcoded fallback
-      return TrueXRESTClient.KNOWN_ASSETS;
+      // /asset endpoint failed — cache and use hardcoded fallback
+      this.assetMap = { ...TrueXRESTClient.KNOWN_ASSETS };
+      return this.assetMap;
     }
   }
 
