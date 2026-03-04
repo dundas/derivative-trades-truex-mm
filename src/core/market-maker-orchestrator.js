@@ -163,7 +163,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     await this.fixOE.connect();
     this.logger.info('[Orchestrator] FIX OE connected');
 
-    // 3. Connect market data feed (optional, non-blocking)
+    // 4. Connect market data feed (optional, non-blocking)
     if (this.marketDataFeed) {
       try {
         this.logger.info('[Orchestrator] Connecting TrueX market data feed...');
@@ -175,7 +175,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       }
     }
 
-    // 4. Start data pipeline (optional, non-blocking)
+    // 5. Start data pipeline (optional, non-blocking)
     if (this.dataPipeline) {
       try {
         await this.dataPipeline.start();
@@ -185,20 +185,20 @@ export class MarketMakerOrchestrator extends EventEmitter {
       }
     }
 
-    // 5. Start PnL periodic logging
+    // 6. Start PnL periodic logging
     this.pnlTracker.startPeriodicLogging();
 
-    // 6. Start quote engine drain queue timer
+    // 7. Start quote engine drain queue timer
     this.drainQueueTimer = setInterval(() => {
       this.quoteEngine.drainQueue();
     }, this.drainQueueIntervalMs);
 
-    // 7. Start REST reconciliation timer (if REST client configured)
+    // 8. Start REST reconciliation timer (if REST client configured)
     if (this.restClient) {
       this._reconcileTimer = setInterval(() => this._restReconcile(), this.reconcileIntervalMs);
       this.logger.info(`[Orchestrator] REST reconciliation enabled (every ${this.reconcileIntervalMs / 1000}s)`);
 
-      // 8. Start periodic balance refresh (re-syncs tracked balances with exchange)
+      // 9. Start periodic balance refresh (re-syncs tracked balances with exchange)
       this._balanceRefreshTimer = setInterval(() => this._refreshBalances(), this.balanceRefreshIntervalMs);
       this.logger.info(`[Orchestrator] Balance refresh enabled (every ${this.balanceRefreshIntervalMs / 1000}s)`);
     }

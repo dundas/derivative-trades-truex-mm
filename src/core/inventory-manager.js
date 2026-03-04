@@ -67,6 +67,8 @@ export class InventoryManager extends EventEmitter {
       this.totalBuyCost += quantity * price;
       this.totalBuyQty += quantity;
       // Update tracked balances: buying BTC means +BTC, -PYUSD
+      // Note: fee deduction not included — maker fees are 0 bps per TrueX agreement.
+      // Any taker fills (rare, from cancel-replace races) cause minor drift corrected by 60s refresh.
       if (this.balancesInitialized) {
         if (this.baseBalance) this.baseBalance.available += quantity;
         if (this.quoteBalance) {
