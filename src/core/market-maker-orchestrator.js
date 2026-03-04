@@ -117,6 +117,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       });
     }
     this.reconcileIntervalMs = options.reconcileIntervalMs || 300000; // 5 min
+    this.balanceRefreshIntervalMs = options.balanceRefreshIntervalMs || 60000; // 1 min
 
     // State
     this.isRunning = false;
@@ -126,6 +127,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this.drainQueueTimer = null;
     this.drainQueueIntervalMs = options.drainQueueIntervalMs || 200;
     this._reconcileTimer = null;
+    this._balanceRefreshTimer = null;
 
     // Bind handlers to preserve context
     this._onPriceUpdate = this._onPriceUpdate.bind(this);
@@ -145,7 +147,14 @@ export class MarketMakerOrchestrator extends EventEmitter {
     // 1. Wire event handlers
     this._wireEvents();
 
-    // 2. Connect FIX OE
+    // 2. Fetch account balances via REST (before connecting FIX)
+    if (this.restClient) {
+      await this._initializeBalances();
+    } else {
+      this.logger.warn('[Orchestrator] No REST client — skipping balance initialization (quoting both sides)');
+    }
+
+    // 3. Connect FIX OE
     this.logger.info('[Orchestrator] Connecting FIX OE...');
     await this.fixOE.connect();
     this.logger.info('[Orchestrator] FIX OE connected');
@@ -184,6 +193,10 @@ export class MarketMakerOrchestrator extends EventEmitter {
     if (this.restClient) {
       this._reconcileTimer = setInterval(() => this._restReconcile(), this.reconcileIntervalMs);
       this.logger.info(`[Orchestrator] REST reconciliation enabled (every ${this.reconcileIntervalMs / 1000}s)`);
+
+      // 8. Start periodic balance refresh (re-syncs tracked balances with exchange)
+      this._balanceRefreshTimer = setInterval(() => this._refreshBalances(), this.balanceRefreshIntervalMs);
+      this.logger.info(`[Orchestrator] Balance refresh enabled (every ${this.balanceRefreshIntervalMs / 1000}s)`);
     }
 
     this.isRunning = true;
@@ -227,6 +240,10 @@ export class MarketMakerOrchestrator extends EventEmitter {
     if (this._reconcileTimer) {
       clearInterval(this._reconcileTimer);
       this._reconcileTimer = null;
+    }
+    if (this._balanceRefreshTimer) {
+      clearInterval(this._balanceRefreshTimer);
+      this._balanceRefreshTimer = null;
     }
     this.pnlTracker.stopPeriodicLogging();
 
@@ -505,6 +522,73 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this.quoteEngine.cancelAllQuotes(`emergency: ${reason}`);
 
     this.emit('emergency', { netPosition, reason });
+  }
+
+  // --- Balance Initialization ---
+
+  /**
+   * Fetch account balances from TrueX REST API and initialize inventory manager.
+   * Determines which sides we can quote based on actual holdings.
+   */
+  async _initializeBalances() {
+    try {
+      this.logger.info('[Orchestrator] Fetching account balances via REST...');
+      const summary = await this.restClient.getAccountSummary();
+
+      if (!summary || !summary.balances) {
+        this.logger.warn('[Orchestrator] No balance data returned — quoting both sides');
+        return;
+      }
+
+      // Parse symbol to get base/quote asset names (e.g. BTC-PYUSD → BTC, PYUSD)
+      const [baseAsset, quoteAsset] = this.symbol.split('-');
+
+      let baseBalance = null;
+      let quoteBalance = null;
+
+      for (const bal of summary.balances) {
+        const parsed = TrueXRESTClient.parseBalance(bal);
+        const name = (parsed.assetName || '').toUpperCase();
+        if (name === baseAsset) {
+          baseBalance = parsed;
+        } else if (name === quoteAsset) {
+          quoteBalance = parsed;
+        }
+      }
+
+      this.logger.info(
+        `[Orchestrator] Balances: ${baseAsset}=${baseBalance ? baseBalance.available : 0} avail / ${baseBalance ? baseBalance.total : 0} total, ` +
+        `${quoteAsset}=${quoteBalance ? quoteBalance.available : 0} avail / ${quoteBalance ? quoteBalance.total : 0} total`
+      );
+
+      // Initialize inventory manager with actual balances
+      this.inventoryManager.initializeFromBalances({
+        baseBalance: baseBalance ? { available: baseBalance.available, held: baseBalance.held, total: baseBalance.total } : null,
+        quoteBalance: quoteBalance ? { available: quoteBalance.available, held: quoteBalance.held, total: quoteBalance.total } : null,
+      });
+
+      // Log which sides we'll quote
+      const canBid = this.inventoryManager.canQuote('buy');
+      const canAsk = this.inventoryManager.canQuote('sell');
+      this.logger.info(`[Orchestrator] Quoting: bids=${canBid ? 'YES' : 'NO (no ' + quoteAsset + ')'}, asks=${canAsk ? 'YES' : 'NO (no ' + baseAsset + ')'}`);
+
+    } catch (err) {
+      this.logger.warn(`[Orchestrator] Balance fetch failed (non-fatal): ${err.message} — quoting both sides`);
+    }
+  }
+
+  /**
+   * Periodic balance refresh — re-syncs tracked balances with exchange.
+   * Corrects drift from fees, missed fills, deposits/withdrawals.
+   */
+  async _refreshBalances() {
+    if (!this.restClient || !this.isRunning) return;
+
+    try {
+      await this._initializeBalances();
+    } catch (err) {
+      this.logger.warn(`[Orchestrator] Balance refresh failed (non-fatal): ${err.message}`);
+    }
   }
 
   // --- REST-based Order Reconciliation ---

@@ -149,6 +149,10 @@ export class QuoteEngine extends EventEmitter {
     const bids = [];
     const asks = [];
 
+    // Track cumulative committed balance across levels to prevent over-commitment
+    let bidCommittedQuote = 0;  // PYUSD committed to bids
+    let askCommittedBase = 0;   // BTC committed to asks
+
     for (let level = 1; level <= levels; level++) {
       const levelOffset = this._getLevelOffset(mid, level, levelSpacingTicks, tickSize);
       const rawSize = baseSizeBTC * Math.pow(sizeDecayFactor, level - 1);
@@ -162,22 +166,30 @@ export class QuoteEngine extends EventEmitter {
       const rawAsk = mid + halfSpread + levelOffset + (skew.askSkewTicks * tickSize);
       const askPrice = this.snapToTick(rawAsk);
 
-      // Filter bids
+      // Filter bids — cap size to remaining available quote balance
       if (
         this._canQuoteSide('buy') &&
         this.withinPriceBand(bidPrice, mid) &&
         bidPrice * size >= minNotional
       ) {
-        bids.push({ side: 'buy', price: bidPrice, size, level });
+        const cappedBidSize = this._capSizeToBalance('buy', size, bidPrice, bidCommittedQuote);
+        if (cappedBidSize > 0 && bidPrice * cappedBidSize >= minNotional) {
+          bids.push({ side: 'buy', price: bidPrice, size: cappedBidSize, level });
+          bidCommittedQuote += cappedBidSize * bidPrice;
+        }
       }
 
-      // Filter asks
+      // Filter asks — cap size to remaining available base balance
       if (
         this._canQuoteSide('sell') &&
         this.withinPriceBand(askPrice, mid) &&
         askPrice * size >= minNotional
       ) {
-        asks.push({ side: 'sell', price: askPrice, size, level });
+        const cappedAskSize = this._capSizeToBalance('sell', size, askPrice, askCommittedBase);
+        if (cappedAskSize > 0 && askPrice * cappedAskSize >= minNotional) {
+          asks.push({ side: 'sell', price: askPrice, size: cappedAskSize, level });
+          askCommittedBase += cappedAskSize;
+        }
       }
     }
 
@@ -456,7 +468,7 @@ export class QuoteEngine extends EventEmitter {
           // New order was rejected — remove from tracking (never made it to exchange)
           this.activeOrders.delete(resolvedClOrdID);
         }
-        this.logger.error(`[QuoteEngine] Order rejected: clOrdID=${clOrdID}, reason=${fields['58'] || 'unknown'}`);
+        this.logger.error(`[QuoteEngine] Order rejected: clOrdID=${clOrdID}, reason=${fields['58'] || 'unknown'}, code=${fields['103'] || 'n/a'}`);
         break;
     }
   }
@@ -572,6 +584,40 @@ export class QuoteEngine extends EventEmitter {
   _canQuoteSide(side) {
     if (!this.inventoryManager) return true;
     return this.inventoryManager.canQuote(side);
+  }
+
+  /**
+   * Cap order size to available balance minus already-committed amounts.
+   * For sells: cap to available BTC minus already committed BTC across prior levels.
+   * For buys: cap to (available PYUSD - committed PYUSD) / price.
+   * @param {string} side - 'buy' or 'sell'
+   * @param {number} desiredSize - desired order size in BTC
+   * @param {number} price - order price
+   * @param {number} alreadyCommitted - amount already committed across prior levels
+   *   For sells: BTC already committed. For buys: PYUSD already committed.
+   * Returns capped size rounded to sizeDecimalPlaces.
+   */
+  _capSizeToBalance(side, desiredSize, price, alreadyCommitted = 0) {
+    if (!this.inventoryManager || !this.inventoryManager.balancesInitialized) {
+      return desiredSize; // No balance info — use full size
+    }
+
+    const available = this.inventoryManager.getAvailableForSide(side);
+    if (available === Infinity) return desiredSize;
+
+    let maxSize;
+    if (side === 'sell') {
+      // Selling BTC: cap to (available BTC - already committed BTC)
+      const remaining = available - alreadyCommitted;
+      maxSize = Math.max(0, remaining);
+    } else {
+      // Buying BTC: cap to (available PYUSD - already committed PYUSD) / price
+      const remaining = available - alreadyCommitted;
+      maxSize = price > 0 ? Math.max(0, remaining) / price : 0;
+    }
+
+    const cappedSize = Math.min(desiredSize, maxSize);
+    return parseFloat(Math.max(0, cappedSize).toFixed(this.config.sizeDecimalPlaces));
   }
 
   /**

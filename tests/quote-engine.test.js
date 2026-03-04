@@ -910,6 +910,189 @@ describe('QuoteEngine', () => {
     });
   });
 
+  describe('balance-aware quoting', () => {
+    function createBalanceAwareInventory({ baseAvailable, quoteAvailable, canQuoteBuy = true, canQuoteSell = true }) {
+      return {
+        getSkew: mock(() => ({ bidSkewTicks: 0, askSkewTicks: 0 })),
+        canQuote: mock((side) => {
+          if (side.toLowerCase() === 'buy') return canQuoteBuy;
+          if (side.toLowerCase() === 'sell') return canQuoteSell;
+          return true;
+        }),
+        balancesInitialized: true,
+        getAvailableForSide: mock((side) => {
+          if (side === 'buy') return quoteAvailable;
+          if (side === 'sell') return baseAvailable;
+          return 0;
+        }),
+      };
+    }
+
+    it('should cap total ask size across levels to available BTC', () => {
+      const inv = createBalanceAwareInventory({ baseAvailable: 0.044, quoteAvailable: 0 });
+      const engine = createEngine({
+        inventoryManager: inv,
+        levels: 5,
+        baseSizeBTC: 0.02,
+        sizeDecayFactor: 0.8,
+        sizeDecimalPlaces: 4,
+      });
+
+      const quotes = engine.computeDesiredQuotes(100000, { bidSkewTicks: 0, askSkewTicks: 0 });
+      const asks = quotes.filter(q => q.side === 'sell');
+
+      // Total ask size across all levels should not exceed 0.044 BTC
+      const totalAskSize = asks.reduce((sum, q) => sum + q.size, 0);
+      expect(totalAskSize).toBeLessThanOrEqual(0.044 + 0.0001); // small rounding tolerance
+      expect(totalAskSize).toBeGreaterThan(0);
+    });
+
+    it('should cap total bid notional across levels to available PYUSD', () => {
+      const inv = createBalanceAwareInventory({ baseAvailable: 0, quoteAvailable: 3000, canQuoteSell: false });
+      const engine = createEngine({
+        inventoryManager: inv,
+        levels: 5,
+        baseSizeBTC: 0.02,
+        sizeDecayFactor: 0.8,
+        sizeDecimalPlaces: 4,
+      });
+
+      const quotes = engine.computeDesiredQuotes(100000, { bidSkewTicks: 0, askSkewTicks: 0 });
+      const bids = quotes.filter(q => q.side === 'buy');
+
+      // Total bid notional should not exceed 3000 PYUSD (with rounding tolerance
+      // from size quantization at 4 decimal places × price)
+      const totalBidNotional = bids.reduce((sum, q) => sum + q.size * q.price, 0);
+      expect(totalBidNotional).toBeLessThanOrEqual(3000 + 10); // rounding tolerance for size quantization
+    });
+
+    it('should produce no bids when canQuote buy returns false', () => {
+      const inv = createBalanceAwareInventory({ baseAvailable: 0.044, quoteAvailable: 0, canQuoteBuy: false });
+      const engine = createEngine({
+        inventoryManager: inv,
+        levels: 3,
+      });
+
+      const quotes = engine.computeDesiredQuotes(100000, { bidSkewTicks: 0, askSkewTicks: 0 });
+      const bids = quotes.filter(q => q.side === 'buy');
+      expect(bids.length).toBe(0);
+    });
+
+    it('should produce no asks when canQuote sell returns false', () => {
+      const inv = createBalanceAwareInventory({ baseAvailable: 0, quoteAvailable: 5000, canQuoteSell: false });
+      const engine = createEngine({
+        inventoryManager: inv,
+        levels: 3,
+      });
+
+      const quotes = engine.computeDesiredQuotes(100000, { bidSkewTicks: 0, askSkewTicks: 0 });
+      const asks = quotes.filter(q => q.side === 'sell');
+      expect(asks.length).toBe(0);
+    });
+
+    it('should produce both sides when both balances available', () => {
+      const inv = createBalanceAwareInventory({ baseAvailable: 1.0, quoteAvailable: 100000 });
+      const engine = createEngine({
+        inventoryManager: inv,
+        levels: 3,
+      });
+
+      const quotes = engine.computeDesiredQuotes(100000, { bidSkewTicks: 0, askSkewTicks: 0 });
+      const bids = quotes.filter(q => q.side === 'buy');
+      const asks = quotes.filter(q => q.side === 'sell');
+      expect(bids.length).toBe(3);
+      expect(asks.length).toBe(3);
+    });
+
+    it('should not cap sizes when balances not initialized', () => {
+      const inv = {
+        getSkew: mock(() => ({ bidSkewTicks: 0, askSkewTicks: 0 })),
+        canQuote: mock(() => true),
+        balancesInitialized: false,
+        getAvailableForSide: mock(() => Infinity),
+      };
+      const engine = createEngine({
+        inventoryManager: inv,
+        levels: 1,
+        baseSizeBTC: 0.1,
+      });
+
+      const quotes = engine.computeDesiredQuotes(100000, { bidSkewTicks: 0, askSkewTicks: 0 });
+      const asks = quotes.filter(q => q.side === 'sell');
+      expect(asks.length).toBe(1);
+      expect(asks[0].size).toBe(0.1); // Full uncapped size
+    });
+
+    it('should reduce later levels when early levels consume available balance', () => {
+      const inv = createBalanceAwareInventory({ baseAvailable: 0.025, quoteAvailable: 0, canQuoteBuy: false });
+      const engine = createEngine({
+        inventoryManager: inv,
+        levels: 3,
+        baseSizeBTC: 0.02,
+        sizeDecayFactor: 0.8,
+        sizeDecimalPlaces: 4,
+      });
+
+      const quotes = engine.computeDesiredQuotes(100000, { bidSkewTicks: 0, askSkewTicks: 0 });
+      const asks = quotes.filter(q => q.side === 'sell');
+
+      // Level 1: min(0.02, 0.025) = 0.02, remaining = 0.005
+      // Level 2: min(0.016, 0.005) = 0.005, remaining = 0
+      // Level 3: min(0.0128, 0) = 0 — dropped (below minNotional or zero)
+      expect(asks.length).toBeLessThanOrEqual(2);
+      const totalAskSize = asks.reduce((sum, q) => sum + q.size, 0);
+      expect(totalAskSize).toBeLessThanOrEqual(0.025 + 0.0001);
+    });
+
+    describe('_capSizeToBalance edge cases', () => {
+      it('should return 0 when available is 0', () => {
+        const inv = createBalanceAwareInventory({ baseAvailable: 0, quoteAvailable: 0 });
+        const engine = createEngine({ inventoryManager: inv });
+
+        expect(engine._capSizeToBalance('sell', 0.1, 100000, 0)).toBe(0);
+        expect(engine._capSizeToBalance('buy', 0.1, 100000, 0)).toBe(0);
+      });
+
+      it('should return 0 when alreadyCommitted >= available', () => {
+        const inv = createBalanceAwareInventory({ baseAvailable: 0.05, quoteAvailable: 5000 });
+        const engine = createEngine({ inventoryManager: inv });
+
+        // Sell: 0.05 BTC available, 0.05 already committed
+        expect(engine._capSizeToBalance('sell', 0.1, 100000, 0.05)).toBe(0);
+        // Buy: 5000 PYUSD available, 5000 already committed
+        expect(engine._capSizeToBalance('buy', 0.1, 100000, 5000)).toBe(0);
+      });
+
+      it('should return remainder when alreadyCommitted + desired > available', () => {
+        const inv = createBalanceAwareInventory({ baseAvailable: 0.05, quoteAvailable: 5000 });
+        const engine = createEngine({ inventoryManager: inv, sizeDecimalPlaces: 4 });
+
+        // Sell: 0.05 available, 0.03 committed, want 0.1 → get 0.02
+        expect(engine._capSizeToBalance('sell', 0.1, 100000, 0.03)).toBeCloseTo(0.02, 4);
+      });
+
+      it('should return desiredSize when balancesInitialized is false', () => {
+        const inv = {
+          getSkew: mock(() => ({ bidSkewTicks: 0, askSkewTicks: 0 })),
+          canQuote: mock(() => true),
+          balancesInitialized: false,
+          getAvailableForSide: mock(() => Infinity),
+        };
+        const engine = createEngine({ inventoryManager: inv });
+
+        expect(engine._capSizeToBalance('sell', 0.1, 100000, 0)).toBe(0.1);
+        expect(engine._capSizeToBalance('buy', 0.1, 100000, 0)).toBe(0.1);
+      });
+
+      it('should return 0 when price is 0 on buy side', () => {
+        const inv = createBalanceAwareInventory({ baseAvailable: 1, quoteAvailable: 5000 });
+        const engine = createEngine({ inventoryManager: inv });
+
+        expect(engine._capSizeToBalance('buy', 0.1, 0, 0)).toBe(0);
+      });
+    });
+  });
+
   describe('edge cases', () => {
     it('should work with no inventoryManager injected', () => {
       const engine = new QuoteEngine({
