@@ -52,10 +52,10 @@ export class MarketMakerOrchestrator extends EventEmitter {
     });
 
     this.pnlTracker = options.pnlTracker || new PnLTracker({
-      truexMakerFeeBps: options.truexMakerFeeBps || 0,
-      truexTakerFeeBps: options.truexTakerFeeBps || 10,
-      hedgeMakerFeeBps: options.hedgeMakerFeeBps || 16,
-      hedgeTakerFeeBps: options.hedgeTakerFeeBps || 26,
+      truexMakerFeeBps: options.truexMakerFeeBps ?? 0,
+      truexTakerFeeBps: options.truexTakerFeeBps ?? 0,
+      hedgeMakerFeeBps: options.hedgeMakerFeeBps ?? 0,
+      hedgeTakerFeeBps: options.hedgeTakerFeeBps ?? 0,
       logIntervalMs: options.pnlLogIntervalMs || 30000,
       significantPnlChange: options.significantPnlChange || 100,
       logger: this.logger,

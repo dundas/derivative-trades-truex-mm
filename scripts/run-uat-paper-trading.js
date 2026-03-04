@@ -40,6 +40,21 @@ import { PriceAggregator } from '../src/connectors/aggregator/PriceAggregator.ts
 import { CoinbaseWsIngest } from '../src/data-pipeline/coinbase-ws-ingest.js';
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Parse fee env var with NaN guard and sanity bound (max 500bps = 5%) */
+function parseFee(envVar, defaultVal = 0) {
+  const val = parseInt(process.env[envVar] || String(defaultVal));
+  if (Number.isNaN(val)) return defaultVal;
+  if (val < 0 || val > 500) {
+    console.warn(`[WARN] ${envVar}=${val} out of range [0,500] — using default ${defaultVal}`);
+    return defaultVal;
+  }
+  return val;
+}
+
+// ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
@@ -83,11 +98,11 @@ const config = {
   skewExponent: 1.5,
   emergencyLimitBTC: 0.12,   // Emergency at $12k
 
-  // PnL Tracker — zero maker fees per TrueX agreement
-  truexMakerFeeBps: 0,       // Zero fees on maker
-  truexTakerFeeBps: 10,      // 1bp taker (if we ever cross)
-  hedgeMakerFeeBps: 0,       // No hedge venue in UAT
-  hedgeTakerFeeBps: 0,       // No hedge venue in UAT
+  // PnL Tracker — fees configurable via env (currently 0/0 per agreement)
+  truexMakerFeeBps: parseFee('TRUEX_MAKER_FEE_BPS', 0),
+  truexTakerFeeBps: parseFee('TRUEX_TAKER_FEE_BPS', 0),
+  hedgeMakerFeeBps: parseFee('HEDGE_MAKER_FEE_BPS', 0),
+  hedgeTakerFeeBps: parseFee('HEDGE_TAKER_FEE_BPS', 0),
   pnlLogIntervalMs: 30000,   // Log PnL every 30s
 
   // Data Pipeline
