@@ -769,11 +769,11 @@ export class TrueXRESTClient {
     try {
       const assets = await this.request("GET", "/asset") as Array<{
         id: string;
-        name: string;
+        fields: { name: string };
       }>;
       const map: Record<string, string> = {};
       for (const a of assets) {
-        map[a.id] = a.name;
+        map[a.id] = a.fields.name;
       }
       this.assetMap = map;
       return map;
