@@ -589,6 +589,14 @@ export class MarketMakerOrchestrator extends EventEmitter {
       }
     }
 
+    // Guard: if neither balance was matched, asset name resolution failed entirely
+    if (!baseBalance && !quoteBalance) {
+      throw new Error(
+        `Balance name resolution failed — no balances matched for ${baseAsset} or ${quoteAsset}. ` +
+        `Raw balances had ${summary.balances.length} entries. Check asset name mapping.`
+      );
+    }
+
     this.logger.info(
       `[Orchestrator] Balances: ${baseAsset}=${baseBalance ? baseBalance.available : 0} avail / ${baseBalance ? baseBalance.total : 0} total, ` +
       `${quoteAsset}=${quoteBalance ? quoteBalance.available : 0} avail / ${quoteBalance ? quoteBalance.total : 0} total`

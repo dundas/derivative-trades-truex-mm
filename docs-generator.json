@@ -1,0 +1,42 @@
+{
+  "project": "TrueX Market Maker",
+  "description": "Automated BTC-PYUSD market maker on TrueX exchange using FIX protocol, with Coinbase price feed, balance-aware quoting, and PostgreSQL data pipeline",
+  "baseUrl": "",
+  "sources": [
+    { "path": "src/core/market-maker-orchestrator.js", "extractor": "typescript-api", "provides": "Core orchestrator — wires all components, manages lifecycle, FIX connection, REST reconciliation, balance refresh" },
+    { "path": "src/core/quote-engine.js", "extractor": "typescript-api", "provides": "Quote engine — computes ladder quotes, manages order lifecycle, balance-aware size capping" },
+    { "path": "src/core/inventory-manager.js", "extractor": "typescript-api", "provides": "Inventory manager — position tracking, balance tracking, skew computation, hedge signals" },
+    { "path": "src/core/pnl-tracker.js", "extractor": "typescript-api", "provides": "PnL tracker — realized/unrealized PnL, fee tracking" },
+    { "path": "src/core/hedge-executor.js", "extractor": "typescript-api", "provides": "Hedge executor — offloads excess inventory to secondary venue" },
+    { "path": "src/exchanges/truex/TrueXRESTClient.ts", "extractor": "rest-api", "provides": "TrueX REST API client — orders, balances, assets, instruments, HMAC-SHA256 auth" },
+    { "path": "src/fix-protocol/fix-connection.js", "extractor": "typescript-api", "provides": "FIX 4.4 protocol client — logon, heartbeat, new order, cancel, exec reports" },
+    { "path": "src/data-pipeline/data-pipeline-manager.js", "extractor": "typescript-api", "provides": "Data pipeline — Memory → Redis → PostgreSQL, session tracking, audit logging" },
+    { "path": "src/connectors/aggregator/PriceAggregator.ts", "extractor": "typescript-api", "provides": "Price aggregator — weighted mid from multiple exchange feeds" },
+    { "path": "docker-compose.yml", "extractor": "architecture", "provides": "Docker services — FIX proxy, MD proxy, REST proxy, market maker" },
+    { "path": "Dockerfile", "extractor": "architecture", "provides": "Container build — Bun runtime, Alpine base" },
+    { "path": "scripts/run-prod.js", "extractor": "generic", "provides": "Production run script — configuration, startup sequence, shutdown" },
+    { "path": "scripts/run-uat-paper-trading.js", "extractor": "generic", "provides": "UAT paper trading script — configuration, startup sequence" }
+  ],
+  "outputs": [
+    {
+      "type": "architecture",
+      "path": "docs/ARCHITECTURE.md",
+      "diagrams": ["component", "data-flow", "deployment"],
+      "includeEnvVars": true,
+      "includeSecuritySection": true
+    },
+    {
+      "type": "llms-txt",
+      "path": "llms.txt",
+      "maxLines": 250,
+      "audience": "AI agents operating or debugging this system"
+    }
+  ],
+  "validate": [],
+  "deploy": "",
+  "rules": {
+    "sourceIsTruth": true,
+    "preserveExamples": true,
+    "addTimestamp": true
+  }
+}

@@ -194,6 +194,16 @@ export class TrueXRESTClient {
   private readonly userId: string;
   private readonly timeout: number;
 
+  // Cached asset_id → name mapping (fetched once, reused)
+  private assetMap: Record<string, string> | null = null;
+
+  // Known production asset IDs — hardcoded fallback if /asset endpoint fails
+  private static readonly KNOWN_ASSETS: Record<string, string> = {
+    "78873627519877132": "USD",
+    "78873627519877133": "PYUSD",
+    "78873627519877134": "BTC",
+  };
+
   constructor(config: TrueXRESTClientConfig) {
     this.baseURL = config.baseURL ?? "https://prod.truex.co/api/v1";
     this.apiKey = config.apiKey;
@@ -696,8 +706,33 @@ export class TrueXRESTClient {
     if (!response || response.length === 0) {
       return null;
     }
+
+    // Resolve asset names (cached after first call, hardcoded fallback)
+    const assetMap = await this.getAssetMap();
+
+    // Normalize raw balance fields to Balance interface
+    // API returns: { asset_id, balance, order_hold, transfer_hold, unsettled, state }
+    // Interface expects: { asset_id, asset_name, available, held, total }
+    const normalizedBalances: Balance[] = response[0].balances.map((raw: any) => {
+      const balance = parseFloat(raw.balance ?? raw.available ?? "0");
+      const orderHold = parseFloat(raw.order_hold ?? raw.held ?? "0");
+      const transferHold = parseFloat(raw.transfer_hold ?? "0");
+      const unsettled = parseFloat(raw.unsettled ?? raw.pending ?? "0");
+      const available = balance - orderHold - transferHold;
+      const total = balance;
+
+      return {
+        asset_id: raw.asset_id,
+        asset_name: assetMap[raw.asset_id] || raw.asset_name,
+        available: String(available),
+        held: String(orderHold + transferHold),
+        total: String(total),
+        pending: String(unsettled),
+      };
+    });
+
     return {
-      balances: response[0].balances,
+      balances: normalizedBalances,
       unsettledFees: parseFloat(response[0].unsettled_fees),
       feesHold: parseFloat(response[0].fees_hold),
     };
@@ -722,6 +757,30 @@ export class TrueXRESTClient {
       total: parseFloat(balance.total),
       pending: parseFloat(balance.pending ?? "0"),
     };
+  }
+
+  /**
+   * Get asset_id → name mapping. Cached after first successful call.
+   * Falls back to hardcoded KNOWN_ASSETS if /asset endpoint is unavailable.
+   */
+  async getAssetMap(): Promise<Record<string, string>> {
+    if (this.assetMap) return this.assetMap;
+
+    try {
+      const assets = await this.request("GET", "/asset") as Array<{
+        id: string;
+        fields: { name: string };
+      }>;
+      const map: Record<string, string> = {};
+      for (const a of assets) {
+        map[a.id] = a.fields.name;
+      }
+      this.assetMap = map;
+      return map;
+    } catch {
+      // /asset endpoint failed — use hardcoded fallback
+      return TrueXRESTClient.KNOWN_ASSETS;
+    }
   }
 
   // ==========================================================================
