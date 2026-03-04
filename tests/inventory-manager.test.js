@@ -447,6 +447,194 @@ describe('InventoryManager', () => {
     });
   });
 
+  // ─── Balance-Aware Quoting ──────────────────────────────────────
+
+  describe('balance-aware quoting', () => {
+    it('should not restrict quoting before balances initialized', () => {
+      expect(im.balancesInitialized).toBe(false);
+      expect(im.canQuote('buy')).toBe(true);
+      expect(im.canQuote('sell')).toBe(true);
+    });
+
+    it('should initialize from balances and set netPosition', () => {
+      im.initializeFromBalances({
+        baseBalance: { available: 0.044, held: 0, total: 0.044 },
+        quoteBalance: { available: 0, held: 0, total: 0 },
+      });
+
+      expect(im.balancesInitialized).toBe(true);
+      expect(im.netPosition).toBe(0.044);
+      expect(im.baseBalance.available).toBe(0.044);
+      expect(im.quoteBalance.available).toBe(0);
+    });
+
+    it('should block bids when no quote balance (PYUSD)', () => {
+      im.initializeFromBalances({
+        baseBalance: { available: 0.044, held: 0, total: 0.044 },
+        quoteBalance: { available: 0, held: 0, total: 0 },
+      });
+
+      expect(im.canQuote('buy')).toBe(false);  // No PYUSD to buy BTC
+      expect(im.canQuote('sell')).toBe(true);   // Have BTC to sell
+    });
+
+    it('should block asks when no base balance (BTC)', () => {
+      im.initializeFromBalances({
+        baseBalance: { available: 0, held: 0, total: 0 },
+        quoteBalance: { available: 5000, held: 0, total: 5000 },
+      });
+
+      expect(im.canQuote('buy')).toBe(true);   // Have PYUSD to buy BTC
+      expect(im.canQuote('sell')).toBe(false);  // No BTC to sell
+    });
+
+    it('should allow both sides when both balances available', () => {
+      im.initializeFromBalances({
+        baseBalance: { available: 0.5, held: 0, total: 0.5 },
+        quoteBalance: { available: 5000, held: 0, total: 5000 },
+      });
+
+      expect(im.canQuote('buy')).toBe(true);
+      expect(im.canQuote('sell')).toBe(true);
+    });
+
+    it('should block both sides when both balances zero', () => {
+      im.initializeFromBalances({
+        baseBalance: { available: 0, held: 0, total: 0 },
+        quoteBalance: { available: 0, held: 0, total: 0 },
+      });
+
+      expect(im.canQuote('buy')).toBe(false);
+      expect(im.canQuote('sell')).toBe(false);
+    });
+
+    it('should return available balance for each side', () => {
+      im.initializeFromBalances({
+        baseBalance: { available: 0.044, held: 0.01, total: 0.054 },
+        quoteBalance: { available: 3000, held: 500, total: 3500 },
+      });
+
+      expect(im.getAvailableForSide('sell')).toBe(0.044);  // BTC available
+      expect(im.getAvailableForSide('buy')).toBe(3000);     // PYUSD available
+    });
+
+    it('should return Infinity when balances not initialized', () => {
+      expect(im.getAvailableForSide('buy')).toBe(Infinity);
+      expect(im.getAvailableForSide('sell')).toBe(Infinity);
+    });
+
+    it('should update balances on fill (buy)', () => {
+      im.initializeFromBalances({
+        baseBalance: { available: 0.044, held: 0, total: 0.044 },
+        quoteBalance: { available: 5000, held: 0, total: 5000 },
+      });
+
+      im.onFill({ side: 'buy', quantity: 0.01, price: 100000, venue: 'truex', execID: 'E1' });
+
+      expect(im.baseBalance.available).toBeCloseTo(0.054, 8);  // +0.01 BTC
+      expect(im.quoteBalance.available).toBeCloseTo(4000, 2);   // -1000 PYUSD
+    });
+
+    it('should update balances on fill (sell)', () => {
+      im.initializeFromBalances({
+        baseBalance: { available: 0.044, held: 0, total: 0.044 },
+        quoteBalance: { available: 0, held: 0, total: 0 },
+      });
+
+      im.onFill({ side: 'sell', quantity: 0.01, price: 100000, venue: 'truex', execID: 'E1' });
+
+      expect(im.baseBalance.available).toBeCloseTo(0.034, 8);  // -0.01 BTC
+      expect(im.quoteBalance.available).toBeCloseTo(1000, 2);   // +1000 PYUSD
+    });
+
+    it('should handle null base/quote balance in initializeFromBalances', () => {
+      im.initializeFromBalances({
+        baseBalance: null,
+        quoteBalance: null,
+      });
+
+      expect(im.balancesInitialized).toBe(true);
+      expect(im.baseBalance.available).toBe(0);
+      expect(im.quoteBalance.available).toBe(0);
+      expect(im.canQuote('buy')).toBe(false);
+      expect(im.canQuote('sell')).toBe(false);
+    });
+
+    it('should clamp base balance to zero on oversell', () => {
+      im.initializeFromBalances({
+        baseBalance: { available: 0.01, held: 0, total: 0.01 },
+        quoteBalance: { available: 0, held: 0, total: 0 },
+      });
+
+      // Sell more than available (e.g. race condition or partial fill mismatch)
+      im.onFill({ side: 'sell', quantity: 0.02, price: 100000, venue: 'truex', execID: 'E1' });
+
+      expect(im.baseBalance.available).toBe(0); // Clamped, not negative
+      expect(logger.warn).toHaveBeenCalled();
+    });
+
+    it('should clamp quote balance to zero on overbuy', () => {
+      im.initializeFromBalances({
+        baseBalance: { available: 0, held: 0, total: 0 },
+        quoteBalance: { available: 100, held: 0, total: 100 },
+      });
+
+      // Buy more PYUSD worth than available
+      im.onFill({ side: 'buy', quantity: 0.01, price: 100000, venue: 'truex', execID: 'E1' });
+
+      expect(im.quoteBalance.available).toBe(0); // Clamped, not -900
+      expect(logger.warn).toHaveBeenCalled();
+    });
+
+    it('should refresh balances without resetting netPosition or VWAP', () => {
+      im.initializeFromBalances({
+        baseBalance: { available: 0.044, held: 0, total: 0.044 },
+        quoteBalance: { available: 0, held: 0, total: 0 },
+      });
+
+      // Simulate a fill that changes netPosition
+      im.onFill({ side: 'sell', quantity: 0.01, price: 100000, venue: 'truex', execID: 'E1' });
+      const posAfterFill = im.netPosition;
+      const fillCount = im.fillCount;
+
+      // Periodic refresh should update balances but NOT reset netPosition
+      im.refreshBalances({
+        baseBalance: { available: 0.034, held: 0, total: 0.034 },
+        quoteBalance: { available: 1000, held: 0, total: 1000 },
+      });
+
+      expect(im.netPosition).toBe(posAfterFill);  // NOT reset
+      expect(im.fillCount).toBe(fillCount);         // NOT reset
+      expect(im.baseBalance.available).toBe(0.034); // Updated from exchange
+      expect(im.quoteBalance.available).toBe(1000); // Updated from exchange
+    });
+
+    it('should delegate to initializeFromBalances on first refreshBalances call', () => {
+      const fresh = new InventoryManager({ maxPositionBTC: 1.0, logger });
+      expect(fresh.balancesInitialized).toBe(false);
+
+      fresh.refreshBalances({
+        baseBalance: { available: 0.05, held: 0, total: 0.05 },
+        quoteBalance: { available: 1000, held: 0, total: 1000 },
+      });
+
+      expect(fresh.balancesInitialized).toBe(true);
+      expect(fresh.netPosition).toBe(0.05); // Set from total on first call
+    });
+
+    it('should include balance info in getPositionSummary', () => {
+      im.initializeFromBalances({
+        baseBalance: { available: 0.044, held: 0, total: 0.044 },
+        quoteBalance: { available: 0, held: 0, total: 0 },
+      });
+
+      const summary = im.getPositionSummary();
+      expect(summary.balancesInitialized).toBe(true);
+      expect(summary.baseBalance.available).toBe(0.044);
+      expect(summary.quoteBalance.available).toBe(0);
+    });
+  });
+
   // ─── Constructor Defaults ────────────────────────────────────────
 
   describe('constructor defaults', () => {

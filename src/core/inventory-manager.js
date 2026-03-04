@@ -37,6 +37,11 @@ export class InventoryManager extends EventEmitter {
     this.totalSold = 0;
     this.fillCount = 0;
 
+    // Balance tracking (populated from REST API at startup)
+    this.baseBalance = null;   // e.g. { available: 0.044, held: 0, total: 0.044 } for BTC
+    this.quoteBalance = null;  // e.g. { available: 100, held: 0, total: 100 } for PYUSD
+    this.balancesInitialized = false;
+
     this.logger = options.logger || console;
   }
 
@@ -61,11 +66,35 @@ export class InventoryManager extends EventEmitter {
       this.totalBought += quantity;
       this.totalBuyCost += quantity * price;
       this.totalBuyQty += quantity;
+      // Update tracked balances: buying BTC means +BTC, -PYUSD
+      // Note: fee deduction not included — maker fees are 0 bps per TrueX agreement.
+      // Any taker fills (rare, from cancel-replace races) cause minor drift corrected by 60s refresh.
+      if (this.balancesInitialized) {
+        if (this.baseBalance) this.baseBalance.available += quantity;
+        if (this.quoteBalance) {
+          this.quoteBalance.available -= quantity * price;
+          if (this.quoteBalance.available < 0) {
+            this.logger.warn(`[InventoryManager] Quote balance went negative (${this.quoteBalance.available.toFixed(2)}) — clamping to 0. Will correct on next balance refresh.`);
+            this.quoteBalance.available = 0;
+          }
+        }
+      }
     } else if (normalizedSide === 'sell') {
       this.netPosition -= quantity;
       this.totalSold += quantity;
       this.totalSellCost += quantity * price;
       this.totalSellQty += quantity;
+      // Update tracked balances: selling BTC means -BTC, +PYUSD
+      if (this.balancesInitialized) {
+        if (this.baseBalance) {
+          this.baseBalance.available -= quantity;
+          if (this.baseBalance.available < 0) {
+            this.logger.warn(`[InventoryManager] Base balance went negative (${this.baseBalance.available.toFixed(8)}) — clamping to 0. Will correct on next balance refresh.`);
+            this.baseBalance.available = 0;
+          }
+        }
+        if (this.quoteBalance) this.quoteBalance.available += quantity * price;
+      }
     } else {
       this.logger.warn(`[InventoryManager] Unknown side: ${side}`);
       return;
@@ -148,8 +177,95 @@ export class InventoryManager extends EventEmitter {
   }
 
   /**
+   * One-time startup initialization from REST API balances.
+   * Sets netPosition from base asset total and stores balance snapshots.
+   * Only call this ONCE at startup — use refreshBalances() for periodic sync.
+   *
+   * @param {object} params
+   * @param {object} params.baseBalance - { available, held, total } for base asset (e.g. BTC)
+   * @param {object} params.quoteBalance - { available, held, total } for quote asset (e.g. PYUSD)
+   */
+  initializeFromBalances({ baseBalance, quoteBalance }) {
+    const base = baseBalance || { available: 0, held: 0, total: 0 };
+    const quote = quoteBalance || { available: 0, held: 0, total: 0 };
+
+    // Shallow copy to avoid mutable reference hazard
+    this.baseBalance = { ...base };
+    this.quoteBalance = { ...quote };
+    this.balancesInitialized = true;
+
+    // Initialize net position from actual BTC holdings (one-time only)
+    this.netPosition = this.baseBalance.total;
+
+    this.logger.info(
+      `[InventoryManager] Balances initialized: ` +
+      `base=${this.baseBalance.available} avail / ${this.baseBalance.total} total, ` +
+      `quote=${this.quoteBalance.available} avail / ${this.quoteBalance.total} total, ` +
+      `netPosition=${this.netPosition}`
+    );
+  }
+
+  /**
+   * Periodic balance refresh — updates available balances from exchange WITHOUT
+   * resetting netPosition, VWAP, or counters. Safe to call during active trading.
+   * Logs discrepancies between tracked and exchange balances.
+   *
+   * @param {object} params
+   * @param {object} params.baseBalance - { available, held, total } for base asset
+   * @param {object} params.quoteBalance - { available, held, total } for quote asset
+   */
+  refreshBalances({ baseBalance, quoteBalance }) {
+    if (!this.balancesInitialized) {
+      // First call — delegate to full initialization
+      this.initializeFromBalances({ baseBalance, quoteBalance });
+      return;
+    }
+
+    const newBase = baseBalance || { available: 0, held: 0, total: 0 };
+    const newQuote = quoteBalance || { available: 0, held: 0, total: 0 };
+
+    // Log discrepancies between tracked and exchange balances
+    const baseDrift = Math.abs((this.baseBalance?.available || 0) - newBase.available);
+    const quoteDrift = Math.abs((this.quoteBalance?.available || 0) - newQuote.available);
+
+    if (baseDrift > 0.0001) {
+      this.logger.info(
+        `[InventoryManager] Balance drift (base): tracked=${this.baseBalance?.available?.toFixed(8)} exchange=${newBase.available.toFixed(8)} drift=${baseDrift.toFixed(8)}`
+      );
+    }
+    if (quoteDrift > 0.01) {
+      this.logger.info(
+        `[InventoryManager] Balance drift (quote): tracked=${this.quoteBalance?.available?.toFixed(2)} exchange=${newQuote.available.toFixed(2)} drift=${quoteDrift.toFixed(2)}`
+      );
+    }
+
+    // Update balances from exchange (authoritative source) — do NOT touch netPosition/VWAP
+    this.baseBalance = { ...newBase };
+    this.quoteBalance = { ...newQuote };
+  }
+
+  /**
+   * Get available balance for a given side.
+   * Buy side needs quote currency (PYUSD), sell side needs base currency (BTC).
+   * Returns available minus held (order holds).
+   */
+  getAvailableForSide(side) {
+    const normalizedSide = side.toLowerCase();
+    if (!this.balancesInitialized) return Infinity; // No balance info — don't restrict
+
+    if (normalizedSide === 'buy') {
+      return this.quoteBalance ? this.quoteBalance.available : 0;
+    } else if (normalizedSide === 'sell') {
+      return this.baseBalance ? this.baseBalance.available : 0;
+    }
+    return 0;
+  }
+
+  /**
    * Check if we can quote on a given side.
-   * Returns false if at position limit for the accumulating side.
+   * Returns false if:
+   *   - At position limit for the accumulating side
+   *   - No available balance for the side (balance-aware check)
    */
   canQuote(side) {
     const normalizedSide = side.toLowerCase();
@@ -159,6 +275,12 @@ export class InventoryManager extends EventEmitter {
       // At limit: block the accumulating side
       if (this.netPosition > 0 && normalizedSide === 'buy') return false;
       if (this.netPosition < 0 && normalizedSide === 'sell') return false;
+    }
+
+    // Balance-aware check: don't quote a side we can't back
+    if (this.balancesInitialized) {
+      const available = this.getAvailableForSide(normalizedSide);
+      if (available <= 0) return false;
     }
 
     return true;
@@ -202,7 +324,10 @@ export class InventoryManager extends EventEmitter {
       askSkewTicks: skew.askSkewTicks,
       canQuoteBuy: this.canQuote('buy'),
       canQuoteSell: this.canQuote('sell'),
-      hedgeNeeded: this.shouldHedge().shouldHedge
+      hedgeNeeded: this.shouldHedge().shouldHedge,
+      balancesInitialized: this.balancesInitialized,
+      baseBalance: this.baseBalance,
+      quoteBalance: this.quoteBalance,
     };
   }
 
