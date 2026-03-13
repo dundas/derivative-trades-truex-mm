@@ -195,11 +195,13 @@ async function main() {
     });
 
     const result = await restClient.cancelAllOrders();
+    if (result.failed.length > 0) {
+      logger.error(`Orphan cancel failures: ${result.failed.map(f => `${f.id}:${f.error}`).join(', ')}`);
+      logger.error('Cannot start with live orphaned orders — exiting');
+      process.exit(1);
+    }
     if (result.canceled.length > 0) {
       logger.info(`Cancelled ${result.canceled.length} orphaned orders`);
-      if (result.failed.length > 0) {
-        logger.warn(`Cancel failures: ${result.failed.map(f => f.error).join(', ')}`);
-      }
     } else {
       logger.info('No orphaned orders found');
     }
@@ -219,6 +221,17 @@ async function main() {
     pgUrl: config.pgUrl,
     logger,
   });
+
+  // 1b. Analytics API (queries PostgreSQL, serves on port 3100)
+  if (config.pgUrl) {
+    const apiPort = process.env.API_PORT || '3100';
+    logger.info(`[1b/5] Starting Analytics API on port ${apiPort}...`);
+    try {
+      await import('../src/api/server.js');
+    } catch (err) {
+      logger.warn(`Analytics API failed to start: ${err.message} — continuing without it`);
+    }
+  }
 
   // 2. Price Aggregator (Coinbase only)
   logger.info('[2/5] Setting up Coinbase price feed...');
@@ -268,7 +281,7 @@ async function main() {
   const firstPrice = await waitForFirstPrice(priceAggregator, 30000);
   if (!firstPrice) {
     logger.error('Timed out waiting for Coinbase price — exiting');
-    await shutdown('NO_PRICE');
+    await shutdown('NO_PRICE', 1);
     return;
   }
   logger.info(`First price received: mid=$${firstPrice.weightedMidpoint.toFixed(2)} confidence=${firstPrice.confidence.toFixed(2)}`);
@@ -433,7 +446,7 @@ function wireOrchestratorEvents(orch) {
 // Graceful Shutdown
 // ---------------------------------------------------------------------------
 
-async function shutdown(signal) {
+async function shutdown(signal, exitCode = 0) {
   if (isShuttingDown) return;
   isShuttingDown = true;
 
@@ -451,7 +464,7 @@ async function shutdown(signal) {
   if (coinbaseIngest) coinbaseIngest.stop();
 
   logger.info('[SHUTDOWN] Complete. Goodbye.');
-  process.exit(0);
+  process.exit(exitCode);
 }
 
 process.on('SIGINT', () => shutdown('SIGINT'));
@@ -459,11 +472,11 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('uncaughtException', (err) => {
   logger.error(`Uncaught exception: ${err.message}`);
   logger.error(err.stack);
-  shutdown('UNCAUGHT_EXCEPTION');
+  shutdown('UNCAUGHT_EXCEPTION', 1);
 });
 process.on('unhandledRejection', (reason) => {
   logger.error(`Unhandled rejection: ${reason}`);
-  shutdown('UNHANDLED_REJECTION');
+  shutdown('UNHANDLED_REJECTION', 1);
 });
 
 // Run

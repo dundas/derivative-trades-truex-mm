@@ -162,3 +162,39 @@ describe('InventoryManager — transferHold stored on balances', () => {
     expect(im.getAvailableForSide('buy')).toBe(88); // 100 - 12
   });
 });
+
+// ---------------------------------------------------------------------------
+// fill-time total synchronisation
+// ---------------------------------------------------------------------------
+
+describe('InventoryManager — total kept in sync with fills', () => {
+  let im;
+
+  beforeEach(() => {
+    im = makeIM();
+    im.initializeFromBalances({
+      baseBalance: { available: 0.044, held: 0, total: 0.044 },
+      quoteBalance: { available: 1000, held: 0, total: 1000 },
+    });
+  });
+
+  it('buy fill decreases quoteBalance.total and increases baseBalance.total', () => {
+    im.onFill({ side: 'buy', quantity: 0.01, price: 70000, venue: 'truex', execID: 'e1' });
+    // PYUSD spent = 700, BTC received = 0.01
+    expect(im.quoteBalance.total).toBeCloseTo(300, 2);
+    expect(im.baseBalance.total).toBeCloseTo(0.054, 8);
+  });
+
+  it('sell fill decreases baseBalance.total and increases quoteBalance.total', () => {
+    im.onFill({ side: 'sell', quantity: 0.01, price: 70000, venue: 'truex', execID: 'e2' });
+    // BTC sold = 0.01, PYUSD received = 700
+    expect(im.baseBalance.total).toBeCloseTo(0.034, 8);
+    expect(im.quoteBalance.total).toBeCloseTo(1700, 2);
+  });
+
+  it('getAvailableForSide reflects updated total immediately after fill', () => {
+    im.onFill({ side: 'buy', quantity: 0.01, price: 70000, venue: 'truex', execID: 'e3' });
+    // total went from 1000 → 300; getAvailableForSide('buy') = total - transferHold = 300
+    expect(im.getAvailableForSide('buy')).toBeCloseTo(300, 2);
+  });
+});

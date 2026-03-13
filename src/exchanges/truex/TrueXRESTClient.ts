@@ -725,7 +725,7 @@ export class TrueXRESTClient {
         asset_id: raw.asset_id,
         asset_name: assetMap[raw.asset_id] || raw.asset_name,
         available: String(available),
-        held: String(orderHold + transferHold),
+        held: String(orderHold),
         transfer_hold: String(transferHold),
         total: String(total),
         pending: String(unsettled),

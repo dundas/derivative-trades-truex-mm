@@ -188,6 +188,12 @@ export class FIXConnection extends EventEmitter {
       this.lastHeartbeatReceived = null;
       this.lastHeartbeatSent = null;
 
+      // Cancel any pending reconnect timer so it cannot fire a second connection.
+      if (this.reconnectTimer) {
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+      }
+
       // Clear the reconnect guard so a fresh connect attempt is always allowed.
       this.isReconnecting = false;
       
@@ -834,6 +840,7 @@ export class FIXConnection extends EventEmitter {
     this.logger.info(`[FIXConnection] Reconnecting to ${this.targetCompID} in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
 
     this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
       this.connect().catch((error) => {
         this.logger.error(`[FIXConnection] Reconnection failed: ${error.message}`);
         this.attemptReconnect();

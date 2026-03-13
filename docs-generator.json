@@ -9,7 +9,7 @@
     { "path": "src/core/pnl-tracker.js", "extractor": "typescript-api", "provides": "PnL tracker — realized/unrealized PnL, fee tracking" },
     { "path": "src/core/hedge-executor.js", "extractor": "typescript-api", "provides": "Hedge executor — offloads excess inventory to secondary venue" },
     { "path": "src/exchanges/truex/TrueXRESTClient.ts", "extractor": "rest-api", "provides": "TrueX REST API client — orders, balances, assets, instruments, HMAC-SHA256 auth" },
-    { "path": "src/fix-protocol/fix-connection.js", "extractor": "typescript-api", "provides": "FIX 4.4 protocol client — logon, heartbeat, new order, cancel, exec reports" },
+    { "path": "src/fix-protocol/fix-connection.js", "extractor": "typescript-api", "provides": "FIXT.1.1 / FIX 5.0 SP2 client — logon, heartbeat, new order, cancel, exec reports" },
     { "path": "src/data-pipeline/data-pipeline-manager.js", "extractor": "typescript-api", "provides": "Data pipeline — Memory → Redis → PostgreSQL, session tracking, audit logging" },
     { "path": "src/connectors/aggregator/PriceAggregator.ts", "extractor": "typescript-api", "provides": "Price aggregator — weighted mid from multiple exchange feeds" },
     { "path": "docker-compose.yml", "extractor": "architecture", "provides": "Docker services — FIX proxy, MD proxy, REST proxy, market maker" },
