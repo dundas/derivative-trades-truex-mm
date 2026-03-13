@@ -460,6 +460,14 @@ async function shutdown(signal, exitCode = 0) {
     }
   }
 
+  if (dataPipeline) {
+    try {
+      await dataPipeline.stop();
+    } catch (err) {
+      logger.error(`[SHUTDOWN] Data pipeline stop error: ${err.message}`);
+    }
+  }
+
   if (priceAggregator) priceAggregator.stop();
   if (coinbaseIngest) coinbaseIngest.stop();
 
@@ -480,8 +488,8 @@ process.on('unhandledRejection', (reason) => {
 });
 
 // Run
-main().catch((err) => {
+main().catch(async (err) => {
   logger.error(`Fatal: ${err.message}`);
   logger.error(err.stack);
-  process.exit(1);
+  await shutdown('FATAL_MAIN', 1);
 });
