@@ -583,9 +583,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
       const parsed = TrueXRESTClient.parseBalance(bal);
       const name = (parsed.assetName || '').toUpperCase();
       if (name === baseAsset) {
-        baseBalance = { available: parsed.available, held: parsed.held, total: parsed.total };
+        baseBalance = { available: parsed.available, held: parsed.held, total: parsed.total, transferHold: parsed.transferHold || 0 };
       } else if (name === quoteAsset) {
-        quoteBalance = { available: parsed.available, held: parsed.held, total: parsed.total };
+        quoteBalance = { available: parsed.available, held: parsed.held, total: parsed.total, transferHold: parsed.transferHold || 0 };
       }
     }
 

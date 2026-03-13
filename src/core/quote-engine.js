@@ -627,7 +627,8 @@ export class QuoteEngine extends EventEmitter {
     }
 
     const cappedSize = Math.min(desiredSize, maxSize);
-    return parseFloat(Math.max(0, cappedSize).toFixed(this.config.sizeDecimalPlaces));
+    const factor = Math.pow(10, this.config.sizeDecimalPlaces);
+    return Math.floor(Math.max(0, cappedSize) * factor) / factor;
   }
 
   /**

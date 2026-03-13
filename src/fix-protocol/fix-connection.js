@@ -55,6 +55,7 @@ export class FIXConnection extends EventEmitter {
     this.maxReconnectDelay = options.maxReconnectDelay || 30000;
     this.reconnectTimer = null;
     this.intentionalClose = false;
+    this.isReconnecting = false; // guard against duplicate reconnect scheduling
     
     // Message buffer for incomplete messages
     this.messageBuffer = '';
@@ -181,6 +182,14 @@ export class FIXConnection extends EventEmitter {
       // Reset sequence numbers for new session (we use ResetSeqNumFlag=Y in logon)
       this.msgSeqNum = 1;
       this.expectedSeqNum = 1;
+
+      // Reset heartbeat timestamps so stale values from a previous session cannot
+      // trigger an immediate disconnect the moment startHeartbeat() fires.
+      this.lastHeartbeatReceived = null;
+      this.lastHeartbeatSent = null;
+
+      // Clear the reconnect guard so a fresh connect attempt is always allowed.
+      this.isReconnecting = false;
       
       this.socket = new net.Socket();
       let settled = false;
@@ -793,23 +802,37 @@ export class FIXConnection extends EventEmitter {
   }
   
   /**
-   * Attempt reconnection with exponential backoff
+   * Attempt reconnection with exponential backoff.
+   *
+   * Guards against duplicate reconnect scheduling: when both the logon-timeout
+   * promise rejection AND the socket 'close' event fire in the same tick, only
+   * the first call proceeds.  The guard is cleared at the start of connect() so
+   * the next connection attempt always gets a clean slate.
    */
   attemptReconnect() {
+    // Max-retry check always runs first so the flag is always cleaned up.
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
       this.logger.error(`[FIXConnection] Max reconnection attempts reached for ${this.targetCompID}`);
+      this.isReconnecting = false;
       this.emit('max-reconnect-attempts');
       return;
     }
-    
+
+    // Prevent two parallel reconnect timers (Bug 2 guard).
+    if (this.isReconnecting) {
+      this.logger.warn(`[FIXConnection] Reconnect already scheduled for ${this.targetCompID}, ignoring duplicate call`);
+      return;
+    }
+
+    this.isReconnecting = true;
     this.reconnectAttempts++;
     const delay = Math.min(
       this.initialReconnectDelay * Math.pow(2, this.reconnectAttempts - 1),
       this.maxReconnectDelay
     );
-    
+
     this.logger.info(`[FIXConnection] Reconnecting to ${this.targetCompID} in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
-    
+
     this.reconnectTimer = setTimeout(() => {
       this.connect().catch((error) => {
         this.logger.error(`[FIXConnection] Reconnection failed: ${error.message}`);

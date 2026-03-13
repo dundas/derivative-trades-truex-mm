@@ -726,9 +726,10 @@ export class TrueXRESTClient {
         asset_name: assetMap[raw.asset_id] || raw.asset_name,
         available: String(available),
         held: String(orderHold + transferHold),
+        transfer_hold: String(transferHold),
         total: String(total),
         pending: String(unsettled),
-      };
+      } as any;
     });
 
     return {
@@ -746,6 +747,7 @@ export class TrueXRESTClient {
     assetName: string | undefined;
     available: number;
     held: number;
+    transferHold: number;
     total: number;
     pending: number;
   } {
@@ -754,6 +756,7 @@ export class TrueXRESTClient {
       assetName: balance.asset_name,
       available: parseFloat(balance.available),
       held: parseFloat(balance.held),
+      transferHold: parseFloat((balance as any).transfer_hold ?? "0"),
       total: parseFloat(balance.total),
       pending: parseFloat(balance.pending ?? "0"),
     };

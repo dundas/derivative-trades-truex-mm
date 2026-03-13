@@ -254,9 +254,11 @@ export class InventoryManager extends EventEmitter {
     if (!this.balancesInitialized) return Infinity; // No balance info — don't restrict
 
     if (normalizedSide === 'buy') {
-      return this.quoteBalance ? this.quoteBalance.available : 0;
+      if (!this.quoteBalance) return 0;
+      return this.quoteBalance.total - (this.quoteBalance.transferHold || 0);
     } else if (normalizedSide === 'sell') {
-      return this.baseBalance ? this.baseBalance.available : 0;
+      if (!this.baseBalance) return 0;
+      return this.baseBalance.total - (this.baseBalance.transferHold || 0);
     }
     return 0;
   }
