@@ -624,7 +624,7 @@ function requireAdminToken(req) {
 const RATE_WINDOW_MS = parseInt(process.env.ADMIN_RATE_WINDOW_MS || '60000', 10);
 const _cancelRateLimitMap = new Map(); // ip -> lastAllowedMs
 
-function checkRateLimit(req) {
+function checkCancelRateLimit(req) {
   const ip = req.headers.get('x-forwarded-for')?.split(',')[0].trim()
     || req.headers.get('cf-connecting-ip')
     || 'unknown';
@@ -681,7 +681,7 @@ async function handleGetOrphanedOrders(req) {
 
 async function handleCancelOrphanedOrders(req) {
   if (!requireAdminToken(req)) return jsonError('Unauthorized', 401);
-  const wait = checkRateLimit(req);
+  const wait = checkCancelRateLimit(req);
   if (wait > 0) return jsonError(`Rate limited — retry after ${wait}s`, 429);
 
   const client = await makeTrueXClient();
