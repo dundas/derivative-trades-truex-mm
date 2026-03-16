@@ -617,6 +617,25 @@ function requireAdminToken(req) {
   return true;
 }
 
+// Rate limiter for destructive endpoints — 1 call per RATE_WINDOW_MS per IP.
+// Prevents automated abuse if ADMIN_API_TOKEN leaks.
+const RATE_WINDOW_MS = parseInt(process.env.ADMIN_RATE_WINDOW_MS || '60000', 10);
+const _rateLimitMap = new Map(); // ip -> lastAllowedMs
+
+function checkRateLimit(req) {
+  const ip = req.headers.get('x-forwarded-for')?.split(',')[0].trim()
+    || req.headers.get('cf-connecting-ip')
+    || 'unknown';
+  const now = Date.now();
+  const last = _rateLimitMap.get(ip) ?? 0;
+  if (now - last < RATE_WINDOW_MS) {
+    const retryAfter = Math.ceil((RATE_WINDOW_MS - (now - last)) / 1000);
+    return retryAfter; // seconds to wait
+  }
+  _rateLimitMap.set(ip, now);
+  return 0; // allowed
+}
+
 // ---------------------------------------------------------------------------
 // Orphaned Orders
 // ---------------------------------------------------------------------------
@@ -624,8 +643,12 @@ function requireAdminToken(req) {
 async function getOrphanedOrders(client) {
   const liveOrders = await client.getActiveOrders();
 
-  // external_id is the client-assigned order ID — matches clientorderid in DB
-  const tracked = await db.query(`SELECT clientorderid FROM orders WHERE status IN ('new','pending','cancelling')`);
+  // external_id is the client-assigned order ID — matches clientorderid in DB.
+  // Include partial fills: an order being filled right now must never be treated as orphaned.
+  const tracked = await db.query(`
+    SELECT clientorderid FROM orders
+    WHERE status IN ('new','pending','cancelling','partial_fill','1','PARTIALLY_FILLED')
+  `);
   const trackedIds = new Set(tracked.rows.map(r => r.clientorderid).filter(Boolean));
 
   const orphaned = liveOrders.filter(o => o.external_id && !trackedIds.has(o.external_id));
@@ -651,6 +674,8 @@ async function handleGetOrphanedOrders(req) {
 
 async function handleCancelOrphanedOrders(req) {
   if (!requireAdminToken(req)) return jsonError('Unauthorized', 401);
+  const wait = checkRateLimit(req);
+  if (wait > 0) return jsonError(`Rate limited — retry after ${wait}s`, 429);
 
   const client = await makeTrueXClient();
   const { orphaned } = await getOrphanedOrders(client);
@@ -681,6 +706,8 @@ async function handleCancelOrphanedOrders(req) {
 
 async function handleEmergencyStop(req) {
   if (!requireAdminToken(req)) return jsonError('Unauthorized', 401);
+  const wait = checkRateLimit(req);
+  if (wait > 0) return jsonError(`Rate limited — retry after ${wait}s`, 429);
 
   try {
     const client = await makeTrueXClient();

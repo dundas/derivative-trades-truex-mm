@@ -222,18 +222,50 @@ if (!LIVE_CANCEL && orphanedOrders.length > 0) {
 
     // ---------------------------------------------------------------------------
     // Scenario 6 — Second cancel is idempotent (0 orphans remain)
+    // Wait past rate-limit window before retrying.
     // ---------------------------------------------------------------------------
 
-    section('Scenario 6: Ops calls cancel again → idempotent (0 orphans)');
+    section('Scenario 6: Ops calls cancel again after rate window → idempotent (0 orphans)');
 
-    const { status: s2, body: b2 } = await post('/api/v1/cancel-orphaned-orders', ADMIN_TOKEN);
-    if (s2 === 200 && b2.data?.total === 0) {
-      ok('POST /api/v1/cancel-orphaned-orders (2nd call) → 0 orphans, idempotent');
-    } else if (s2 === 200) {
-      fail(`2nd cancel → still ${b2.data?.total} orphan(s) remaining`);
+    const rateWindowMs = parseInt(process.env.ADMIN_RATE_WINDOW_MS || '60000', 10);
+    if (rateWindowMs <= 10000) {
+      console.log(`     waiting ${rateWindowMs}ms for rate window to expire...`);
+      await new Promise(r => setTimeout(r, rateWindowMs + 200));
+      const { status: s2, body: b2 } = await post('/api/v1/cancel-orphaned-orders', ADMIN_TOKEN);
+      if (s2 === 200 && b2.data?.total === 0) {
+        ok('POST /api/v1/cancel-orphaned-orders (after window) → 0 orphans, idempotent');
+      } else if (s2 === 200) {
+        fail(`2nd cancel → still ${b2.data?.total} orphan(s) remaining`);
+      } else {
+        fail(`2nd cancel → unexpected status ${s2}`);
+      }
     } else {
-      fail(`2nd cancel → unexpected status ${s2}`);
+      skip('idempotency check', `rate window ${rateWindowMs}ms too long for smoke test — set ADMIN_RATE_WINDOW_MS<=10000`);
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 7 — Rate limiter rejects rapid repeated cancel calls
+// ---------------------------------------------------------------------------
+
+section('Scenario 7: Rate limiter blocks second cancel within window');
+
+{
+  // First call — should be allowed (resets the window)
+  await post('/api/v1/cancel-orphaned-orders', ADMIN_TOKEN);
+  // Second call immediately — should be rate limited
+  const { status, body } = await post('/api/v1/cancel-orphaned-orders', ADMIN_TOKEN);
+  if (status === 429) {
+    ok('POST /api/v1/cancel-orphaned-orders (rapid 2nd call) → 429 rate limited');
+    const msg: string = body?.error ?? '';
+    if (msg.includes('retry after')) {
+      ok(`rate limit message includes retry-after: "${msg}"`);
+    } else {
+      fail('rate limit response missing retry-after detail', msg);
+    }
+  } else {
+    fail(`rapid 2nd cancel → expected 429, got ${status} (rate limiter not working)`);
   }
 }
 
