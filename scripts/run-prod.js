@@ -538,17 +538,23 @@ async function shutdown(signal, exitCode = 0) {
 
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('uncaughtException', async (err) => {
+process.on('uncaughtException', (err) => {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
   logger.error(`Uncaught exception: ${err.message}`);
   logger.error(err.stack);
-  await sendAlert('crash', 'critical', `Uncaught exception: ${err.message}`, { stack: err.stack });
-  shutdown('UNCAUGHT_EXCEPTION', 1);
+  sendAlert('crash', 'critical', `Uncaught exception: ${err.message}`, { stack: err.stack })
+    .catch(() => {})
+    .finally(() => shutdown('UNCAUGHT_EXCEPTION', 1));
 });
-process.on('unhandledRejection', async (reason) => {
+process.on('unhandledRejection', (reason) => {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
   const msg = reason instanceof Error ? reason.message : String(reason);
   logger.error(`Unhandled rejection: ${msg}`);
-  await sendAlert('crash', 'critical', `Unhandled rejection: ${msg}`);
-  shutdown('UNHANDLED_REJECTION', 1);
+  sendAlert('crash', 'critical', `Unhandled rejection: ${msg}`)
+    .catch(() => {})
+    .finally(() => shutdown('UNHANDLED_REJECTION', 1));
 });
 
 // Run

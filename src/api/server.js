@@ -621,41 +621,39 @@ function requireAdminToken(req) {
 // Orphaned Orders
 // ---------------------------------------------------------------------------
 
-async function handleGetOrphanedOrders() {
-  const client = await makeTrueXClient();
+async function getOrphanedOrders(client) {
   const liveOrders = await client.getActiveOrders();
 
-  // Fetch order IDs tracked in PostgreSQL across all sessions
+  // external_id is the client-assigned order ID — matches clientorderid in DB
   const tracked = await db.query(`SELECT clientorderid FROM orders WHERE status IN ('new','pending','cancelling')`);
   const trackedIds = new Set(tracked.rows.map(r => r.clientorderid).filter(Boolean));
 
-  const orphaned = liveOrders.filter(o => {
-    const id = o.clOrdID ?? o.client_order_id ?? o.id;
-    return !trackedIds.has(id);
-  }).map(o => ({
-    exchange_id:     o.exchange_id ?? o.id,
-    client_order_id: o.clOrdID ?? o.client_order_id,
-    side:            o.side,
-    price:           o.price,
-    qty:             o.qty ?? o.quantity,
+  const orphaned = liveOrders.filter(o => !trackedIds.has(o.external_id));
+  return { liveOrders, orphaned };
+}
+
+async function handleGetOrphanedOrders(req) {
+  if (!requireAdminToken(req)) return jsonError('Unauthorized', 401);
+
+  const client = await makeTrueXClient();
+  const { liveOrders, orphaned } = await getOrphanedOrders(client);
+
+  const listed = orphaned.map(o => ({
+    exchange_id:     o.id,
+    client_order_id: o.external_id,
+    side:            o.order_info.side,
+    price:           o.order_info.price,
+    qty:             o.order_info.qty,
   }));
 
-  return jsonOk({ live_count: liveOrders.length, orphaned_count: orphaned.length, orphaned });
+  return jsonOk({ live_count: liveOrders.length, orphaned_count: orphaned.length, orphaned: listed });
 }
 
 async function handleCancelOrphanedOrders(req) {
   if (!requireAdminToken(req)) return jsonError('Unauthorized', 401);
 
   const client = await makeTrueXClient();
-  const liveOrders = await client.getActiveOrders();
-
-  const tracked = await db.query(`SELECT clientorderid FROM orders WHERE status IN ('new','pending','cancelling')`);
-  const trackedIds = new Set(tracked.rows.map(r => r.clientorderid).filter(Boolean));
-
-  const orphaned = liveOrders.filter(o => {
-    const id = o.clOrdID ?? o.client_order_id ?? o.id;
-    return !trackedIds.has(id);
-  });
+  const { orphaned } = await getOrphanedOrders(client);
 
   if (orphaned.length === 0) {
     return jsonOk({ cancelled: 0, failed: 0, message: 'No orphaned orders found' });
@@ -666,13 +664,12 @@ async function handleCancelOrphanedOrders(req) {
   const errors = [];
 
   for (const order of orphaned) {
-    const orderId = order.exchange_id ?? order.id;
     try {
-      await client.cancelOrder(orderId);
+      await client.cancelOrder(order.id);  // order.id = exchange order ID
       cancelled++;
     } catch (err) {
       failed++;
-      errors.push({ id: orderId, error: err.message });
+      errors.push({ id: order.id, error: err.message });
     }
   }
 
@@ -755,7 +752,7 @@ Bun.serve({
       if ((m = matchRoute(path, '/api/v1/sessions/:id')))        return await handleGetSession(m.id);
 
       // Operations
-      if (path === '/api/v1/orphaned-orders') return await handleGetOrphanedOrders();
+      if (path === '/api/v1/orphaned-orders') return await handleGetOrphanedOrders(req);
 
       // Collections
       if (path === '/api/v1/sessions') return await handleGetSessions(params);
