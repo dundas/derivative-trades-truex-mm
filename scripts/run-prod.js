@@ -111,17 +111,55 @@ const config = {
 };
 
 // ---------------------------------------------------------------------------
-// Logger
+// Webhook Alerting
 // ---------------------------------------------------------------------------
 
-const logLevel = process.env.LOG_LEVEL || 'info';
-const isDebug = logLevel === 'debug';
+const ALERT_WEBHOOK_URL = process.env.ALERT_WEBHOOK_URL || null;
+
+async function sendAlert(eventType, severity, message, context = {}) {
+  if (!ALERT_WEBHOOK_URL) return;
+  const payload = {
+    event_type: eventType,
+    severity,          // 'info' | 'warning' | 'error' | 'critical'
+    message,
+    timestamp: new Date().toISOString(),
+    session_id: `prod-${process.pid}`,
+    context,
+  };
+  try {
+    await fetch(ALERT_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(5000),
+    });
+  } catch {
+    // Never let alerting crash the process
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Logger (tees to stdout + file)
+// ---------------------------------------------------------------------------
+
+import { mkdirSync, appendFileSync } from 'fs';
+
+const logLevel  = process.env.LOG_LEVEL || 'info';
+const isDebug   = logLevel === 'debug';
+const LOG_FILE  = process.env.LOG_FILE || '/app/logs/market-maker.log';
+
+// Ensure log dir exists
+try { mkdirSync(LOG_FILE.replace(/\/[^/]+$/, ''), { recursive: true }); } catch {}
+
+function writeLog(line) {
+  try { appendFileSync(LOG_FILE, line + '\n'); } catch {}
+}
 
 const logger = {
-  info: (msg, meta) => console.log(`[INFO]  ${new Date().toISOString()} ${msg}`, meta ? JSON.stringify(meta) : ''),
-  warn: (msg, meta) => console.warn(`[WARN]  ${new Date().toISOString()} ${msg}`, meta ? JSON.stringify(meta) : ''),
-  error: (msg, meta) => console.error(`[ERROR] ${new Date().toISOString()} ${msg}`, meta ? JSON.stringify(meta) : ''),
-  debug: (msg, meta) => { if (isDebug) console.log(`[DEBUG] ${new Date().toISOString()} ${msg}`, meta ? JSON.stringify(meta) : ''); },
+  info:  (msg, meta) => { const l = `[INFO]  ${new Date().toISOString()} ${msg}${meta ? ' ' + JSON.stringify(meta) : ''}`; console.log(l);  writeLog(l); },
+  warn:  (msg, meta) => { const l = `[WARN]  ${new Date().toISOString()} ${msg}${meta ? ' ' + JSON.stringify(meta) : ''}`; console.warn(l); writeLog(l); },
+  error: (msg, meta) => { const l = `[ERROR] ${new Date().toISOString()} ${msg}${meta ? ' ' + JSON.stringify(meta) : ''}`; console.error(l); writeLog(l); },
+  debug: (msg, meta) => { if (isDebug) { const l = `[DEBUG] ${new Date().toISOString()} ${msg}${meta ? ' ' + JSON.stringify(meta) : ''}`; console.log(l); writeLog(l); } },
 };
 
 // ---------------------------------------------------------------------------
@@ -435,10 +473,33 @@ function wireOrchestratorEvents(orch) {
 
   orch.on('emergency', ({ reason }) => {
     logger.error(`[EMERGENCY] ${reason}`);
+    sendAlert('emergency', 'critical', `Emergency stop: ${reason}`, { reason });
   });
 
   orch.on('error', (err) => {
-    logger.error(`[ERROR] ${err.message || err}`);
+    const msg = err.message || String(err);
+    logger.error(`[ERROR] ${msg}`);
+    // Distinguish FIX connectivity errors from general errors
+    const isConnectError = /connect|socket|logon timeout|unreachable/i.test(msg);
+    if (isConnectError) {
+      sendAlert('fix_connection_failed', 'critical', `FIX connection error: ${msg}`, {
+        host: config.truexHost,
+        port: config.truexPort,
+        targetCompID: config.targetCompID,
+      });
+    } else {
+      sendAlert('orchestrator_error', 'error', msg);
+    }
+  });
+
+  orch.on('fix_disconnected', ({ reason } = {}) => {
+    const msg = reason || 'FIX session dropped unexpectedly';
+    logger.error(`[FIX] ${msg}`);
+    sendAlert('fix_disconnected', 'critical', msg, {
+      host: config.truexHost,
+      port: config.truexPort,
+      targetCompID: config.targetCompID,
+    });
   });
 }
 
@@ -460,6 +521,9 @@ async function shutdown(signal, exitCode = 0) {
     }
   }
 
+  if (priceAggregator) priceAggregator.stop();
+  if (coinbaseIngest) coinbaseIngest.stop();
+
   if (dataPipeline) {
     try {
       await dataPipeline.stop();
@@ -468,22 +532,22 @@ async function shutdown(signal, exitCode = 0) {
     }
   }
 
-  if (priceAggregator) priceAggregator.stop();
-  if (coinbaseIngest) coinbaseIngest.stop();
-
   logger.info('[SHUTDOWN] Complete. Goodbye.');
   process.exit(exitCode);
 }
 
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('uncaughtException', (err) => {
+process.on('uncaughtException', async (err) => {
   logger.error(`Uncaught exception: ${err.message}`);
   logger.error(err.stack);
+  await sendAlert('crash', 'critical', `Uncaught exception: ${err.message}`, { stack: err.stack });
   shutdown('UNCAUGHT_EXCEPTION', 1);
 });
-process.on('unhandledRejection', (reason) => {
-  logger.error(`Unhandled rejection: ${reason}`);
+process.on('unhandledRejection', async (reason) => {
+  const msg = reason instanceof Error ? reason.message : String(reason);
+  logger.error(`Unhandled rejection: ${msg}`);
+  await sendAlert('crash', 'critical', `Unhandled rejection: ${msg}`);
   shutdown('UNHANDLED_REJECTION', 1);
 });
 
@@ -491,5 +555,18 @@ process.on('unhandledRejection', (reason) => {
 main().catch(async (err) => {
   logger.error(`Fatal: ${err.message}`);
   logger.error(err.stack);
+  const isFixError = /connect|socket|logon timeout|unreachable/i.test(err.message);
+  try {
+    await sendAlert(
+      isFixError ? 'fix_connection_failed' : 'crash',
+      'critical',
+      isFixError
+        ? `Cannot connect to TrueX exchange (${config.truexHost}:${config.truexPort}): ${err.message}`
+        : `Fatal error: ${err.message}`,
+      { stack: err.stack, host: config.truexHost, port: config.truexPort }
+    );
+  } catch (alertErr) {
+    logger.error(`[SHUTDOWN] Alert send failed: ${alertErr.message}`);
+  }
   await shutdown('FATAL_MAIN', 1);
 });

@@ -20,9 +20,15 @@
  *   bun src/api/server.js
  */
 import { createPostgreSQLAPIFromEnv } from '../../lib/postgresql-api/index.js';
+import { readFileSync, existsSync } from 'fs';
 
-const PORT = parseInt(process.env.API_PORT || '3100', 10);
-const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
+const PORT         = parseInt(process.env.API_PORT || '3100', 10);
+const CORS_ORIGIN  = process.env.CORS_ORIGIN || '*';
+const ADMIN_TOKEN  = process.env.ADMIN_API_TOKEN || null;
+const LOG_FILE     = process.env.LOG_FILE || '/app/logs/market-maker.log';
+const MECH_APP_ID  = process.env.MECH_APP_ID;
+const MECH_API_KEY = process.env.MECH_API_KEY;
+const STORAGE_URL  = process.env.MECH_STORAGE_URL || 'https://storage.mechdna.net';
 
 // ---------------------------------------------------------------------------
 // Database
@@ -541,6 +547,162 @@ async function handleAnalyticsParameters(params) {
 }
 
 // ---------------------------------------------------------------------------
+// Logs — Tail
+// ---------------------------------------------------------------------------
+
+function handleLogsTail(params) {
+  const lines = Math.min(1000, Math.max(1, parseInt(params.get('lines') || '100', 10)));
+  if (!existsSync(LOG_FILE)) {
+    return jsonOk({ lines: [], file: LOG_FILE, message: 'Log file not yet created' });
+  }
+  const content = readFileSync(LOG_FILE, 'utf8');
+  const all     = content.split('\n').filter(Boolean);
+  const tail    = all.slice(-lines);
+  return jsonOk({ lines: tail, total_lines: all.length, returned: tail.length, file: LOG_FILE });
+}
+
+// ---------------------------------------------------------------------------
+// Logs — Archives (mech-storage)
+// ---------------------------------------------------------------------------
+
+async function handleLogsArchiveList(params) {
+  if (!MECH_APP_ID || !MECH_API_KEY) return jsonError('Mech storage not configured', 503);
+  const limit  = Math.min(100, parseInt(params.get('limit') || '20', 10));
+  const offset = parseInt(params.get('offset') || '0', 10);
+  const res = await fetch(
+    `${STORAGE_URL}/api/apps/${MECH_APP_ID}/storage/objects?limit=${limit}&offset=${offset}`,
+    { headers: { 'X-API-Key': MECH_API_KEY } }
+  );
+  const json = await res.json();
+  if (!json.success) return jsonError(json.error?.message || 'Storage error', 502);
+  // Filter to truex-mm logs only
+  const logs = json.data.filter(o => o.metadata?.source === 'truex-market-maker');
+  return jsonOk(logs, { total: logs.length, limit, offset });
+}
+
+async function handleLogsArchiveDownload(objectId) {
+  if (!MECH_APP_ID || !MECH_API_KEY) return jsonError('Mech storage not configured', 503);
+  const res = await fetch(
+    `${STORAGE_URL}/api/apps/${MECH_APP_ID}/storage/objects/${objectId}/presigned-download`,
+    { method: 'POST', headers: { 'X-API-Key': MECH_API_KEY, 'Content-Type': 'application/json' }, body: '{"ttl":3600}' }
+  );
+  const json = await res.json();
+  if (!json.success) return jsonError(json.error?.message || 'Not found', 404);
+  return jsonOk({ download_url: json.data.downloadUrl, filename: json.data.filename, expires_in: json.data.expiresIn });
+}
+
+// ---------------------------------------------------------------------------
+// Emergency Stop
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Shared REST client factory
+// ---------------------------------------------------------------------------
+
+function makeTrueXClient() {
+  return import('../../src/exchanges/truex/TrueXRESTClient.ts').then(({ TrueXRESTClient }) => {
+    const restUrl = process.env.TRUEX_REST_URL || 'http://10.20.1.11:9742';
+    return new TrueXRESTClient({
+      baseURL:   `${restUrl}/api/v1`,
+      apiKey:    process.env.TRUEX_PROD_API_KEY,
+      apiSecret: process.env.TRUEX_PROD_SECRET_KEY,
+      userId:    process.env.TRUEX_CLIENT_ID,
+    });
+  });
+}
+
+function requireAdminToken(req) {
+  const token = req.headers.get('x-api-token') || req.headers.get('authorization')?.replace('Bearer ', '');
+  if (!ADMIN_TOKEN || token !== ADMIN_TOKEN) return false;
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Orphaned Orders
+// ---------------------------------------------------------------------------
+
+async function handleGetOrphanedOrders() {
+  const client = await makeTrueXClient();
+  const liveOrders = await client.getActiveOrders();
+
+  // Fetch order IDs tracked in PostgreSQL across all sessions
+  const tracked = await db.query(`SELECT clientorderid FROM orders WHERE status IN ('new','pending','cancelling')`);
+  const trackedIds = new Set(tracked.rows.map(r => r.clientorderid).filter(Boolean));
+
+  const orphaned = liveOrders.filter(o => {
+    const id = o.clOrdID ?? o.client_order_id ?? o.id;
+    return !trackedIds.has(id);
+  }).map(o => ({
+    exchange_id:     o.exchange_id ?? o.id,
+    client_order_id: o.clOrdID ?? o.client_order_id,
+    side:            o.side,
+    price:           o.price,
+    qty:             o.qty ?? o.quantity,
+  }));
+
+  return jsonOk({ live_count: liveOrders.length, orphaned_count: orphaned.length, orphaned });
+}
+
+async function handleCancelOrphanedOrders(req) {
+  if (!requireAdminToken(req)) return jsonError('Unauthorized', 401);
+
+  const client = await makeTrueXClient();
+  const liveOrders = await client.getActiveOrders();
+
+  const tracked = await db.query(`SELECT clientorderid FROM orders WHERE status IN ('new','pending','cancelling')`);
+  const trackedIds = new Set(tracked.rows.map(r => r.clientorderid).filter(Boolean));
+
+  const orphaned = liveOrders.filter(o => {
+    const id = o.clOrdID ?? o.client_order_id ?? o.id;
+    return !trackedIds.has(id);
+  });
+
+  if (orphaned.length === 0) {
+    return jsonOk({ cancelled: 0, failed: 0, message: 'No orphaned orders found' });
+  }
+
+  let cancelled = 0;
+  let failed = 0;
+  const errors = [];
+
+  for (const order of orphaned) {
+    const orderId = order.exchange_id ?? order.id;
+    try {
+      await client.cancelOrder(orderId);
+      cancelled++;
+    } catch (err) {
+      failed++;
+      errors.push({ id: orderId, error: err.message });
+    }
+  }
+
+  console.log(`[cancel-orphaned] cancelled=${cancelled} failed=${failed} total=${orphaned.length}`);
+  return jsonOk({ cancelled, failed, total: orphaned.length, errors });
+}
+
+// ---------------------------------------------------------------------------
+
+async function handleEmergencyStop(req) {
+  if (!requireAdminToken(req)) return jsonError('Unauthorized', 401);
+
+  try {
+    const client = await makeTrueXClient();
+    await client.cancelAllOrders();
+  } catch (err) {
+    console.error(`[emergency-stop] Kill-switch error: ${err.message}`);
+  }
+
+  // Respond before killing process
+  const response = new Response(
+    JSON.stringify({ success: true, data: { message: 'Emergency stop initiated — orders cancelled, process shutting down' } }),
+    { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders() } }
+  );
+
+  setTimeout(() => process.kill(process.pid, 'SIGTERM'), 200);
+  return response;
+}
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
@@ -555,6 +717,14 @@ Bun.serve({
     if (req.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: corsHeaders() });
     }
+
+    // POST endpoints
+    if (req.method === 'POST') {
+      if (path === '/api/v1/emergency-stop')          return await handleEmergencyStop(req);
+      if (path === '/api/v1/cancel-orphaned-orders')  return await handleCancelOrphanedOrders(req);
+      return jsonError('Method not allowed', 405);
+    }
+
     if (req.method !== 'GET') {
       return jsonError('Method not allowed', 405);
     }
@@ -564,19 +734,28 @@ Bun.serve({
       if (path === '/api/v1/health') return await handleHealth();
       if (path === '/api/v1/stats')  return await handleStats();
 
+      let m;
+
+      // Logs
+      if (path === '/api/v1/logs/tail')     return handleLogsTail(params);
+      if (path === '/api/v1/logs/archives') return await handleLogsArchiveList(params);
+      if ((m = matchRoute(path, '/api/v1/logs/archives/:id'))) return await handleLogsArchiveDownload(m.id);
+
       // Analytics
-      if (path === '/api/v1/analytics/pnl')               return await handleAnalyticsPnl(params);
-      if (path === '/api/v1/analytics/fill-rate')          return await handleAnalyticsFillRate(params);
-      if (path === '/api/v1/analytics/spread-capture')     return await handleAnalyticsSpreadCapture(params);
-      if (path === '/api/v1/analytics/adverse-selection')   return await handleAnalyticsAdverseSelection(params);
-      if (path === '/api/v1/analytics/inventory')          return await handleAnalyticsInventory(params);
-      if (path === '/api/v1/analytics/parameters')         return await handleAnalyticsParameters(params);
+      if (path === '/api/v1/analytics/pnl')              return await handleAnalyticsPnl(params);
+      if (path === '/api/v1/analytics/fill-rate')         return await handleAnalyticsFillRate(params);
+      if (path === '/api/v1/analytics/spread-capture')    return await handleAnalyticsSpreadCapture(params);
+      if (path === '/api/v1/analytics/adverse-selection') return await handleAnalyticsAdverseSelection(params);
+      if (path === '/api/v1/analytics/inventory')         return await handleAnalyticsInventory(params);
+      if (path === '/api/v1/analytics/parameters')        return await handleAnalyticsParameters(params);
 
       // Parameterized routes (order matters — more specific first)
-      let m;
       if ((m = matchRoute(path, '/api/v1/sessions/:id/orders'))) return await handleGetSessionOrders(m.id, params);
       if ((m = matchRoute(path, '/api/v1/sessions/:id/fills')))  return await handleGetSessionFills(m.id, params);
       if ((m = matchRoute(path, '/api/v1/sessions/:id')))        return await handleGetSession(m.id);
+
+      // Operations
+      if (path === '/api/v1/orphaned-orders') return await handleGetOrphanedOrders();
 
       // Collections
       if (path === '/api/v1/sessions') return await handleGetSessions(params);
@@ -585,7 +764,7 @@ Bun.serve({
 
       return jsonError('Not found', 404);
     } catch (err) {
-      console.error(`[API Error] ${path}:`, err);
+      console.error('[API Error]', path, err);
       return jsonError('Internal server error', 500);
     }
   },
