@@ -518,6 +518,7 @@ async function shutdown(signal, exitCode = 0) {
       await orchestrator.stop();
     } catch (err) {
       logger.error(`[SHUTDOWN] Orchestrator stop error: ${err.message}`);
+      exitCode = Math.max(exitCode, 1);
     }
   }
 
@@ -529,6 +530,7 @@ async function shutdown(signal, exitCode = 0) {
       await dataPipeline.stop();
     } catch (err) {
       logger.error(`[SHUTDOWN] Data pipeline stop error: ${err.message}`);
+      exitCode = Math.max(exitCode, 1);
     }
   }
 

@@ -770,6 +770,9 @@ export class TrueXRESTClient {
     if (this.assetMap) return this.assetMap;
 
     try {
+      // NOTE: The raw /asset response nests name under fields: { id, status, fields: { name } }.
+      // This differs from the AssetResponse interface (which reflects a simplified internal view).
+      // Using a.fields.name is empirically correct — verified against production API responses.
       const assets = await this.request("GET", "/asset") as Array<{
         id: string;
         fields: { name: string };
