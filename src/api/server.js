@@ -617,22 +617,28 @@ function requireAdminToken(req) {
   return true;
 }
 
-// Rate limiter for destructive endpoints — 1 call per RATE_WINDOW_MS per IP.
+// Rate limiter for cancel-orphaned-orders — 1 call per RATE_WINDOW_MS per IP.
 // Prevents automated abuse if ADMIN_API_TOKEN leaks.
+// NOTE: emergency-stop is intentionally NOT rate-limited — it is the kill-switch
+// and must always be reachable. Cancelling all orders twice is safe.
 const RATE_WINDOW_MS = parseInt(process.env.ADMIN_RATE_WINDOW_MS || '60000', 10);
-const _rateLimitMap = new Map(); // ip -> lastAllowedMs
+const _cancelRateLimitMap = new Map(); // ip -> lastAllowedMs
 
 function checkRateLimit(req) {
   const ip = req.headers.get('x-forwarded-for')?.split(',')[0].trim()
     || req.headers.get('cf-connecting-ip')
     || 'unknown';
   const now = Date.now();
-  const last = _rateLimitMap.get(ip) ?? 0;
+  // Evict stale entries to prevent unbounded memory growth
+  for (const [k, v] of _cancelRateLimitMap) {
+    if (now - v >= RATE_WINDOW_MS) _cancelRateLimitMap.delete(k);
+  }
+  const last = _cancelRateLimitMap.get(ip) ?? 0;
   if (now - last < RATE_WINDOW_MS) {
     const retryAfter = Math.ceil((RATE_WINDOW_MS - (now - last)) / 1000);
     return retryAfter; // seconds to wait
   }
-  _rateLimitMap.set(ip, now);
+  _cancelRateLimitMap.set(ip, now);
   return 0; // allowed
 }
 
@@ -645,9 +651,10 @@ async function getOrphanedOrders(client) {
 
   // external_id is the client-assigned order ID — matches clientorderid in DB.
   // Include partial fills: an order being filled right now must never be treated as orphaned.
+  // Canonical values from market-maker-orchestrator.js statusMap: 'new','partial_fill','cancelling','pending_new'
   const tracked = await db.query(`
     SELECT clientorderid FROM orders
-    WHERE status IN ('new','pending','cancelling','partial_fill','1','PARTIALLY_FILLED')
+    WHERE status IN ('new','pending_new','cancelling','partial_fill')
   `);
   const trackedIds = new Set(tracked.rows.map(r => r.clientorderid).filter(Boolean));
 
@@ -706,8 +713,7 @@ async function handleCancelOrphanedOrders(req) {
 
 async function handleEmergencyStop(req) {
   if (!requireAdminToken(req)) return jsonError('Unauthorized', 401);
-  const wait = checkRateLimit(req);
-  if (wait > 0) return jsonError(`Rate limited — retry after ${wait}s`, 429);
+  // No rate limit — kill-switch must always fire immediately
 
   try {
     const client = await makeTrueXClient();

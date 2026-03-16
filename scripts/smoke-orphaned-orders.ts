@@ -247,20 +247,22 @@ if (!LIVE_CANCEL && orphanedOrders.length > 0) {
 
 // ---------------------------------------------------------------------------
 // Scenario 7 — Rate limiter rejects rapid repeated cancel calls
+// Safe in both dry-run and live mode: first call cancels orphans (or finds 0),
+// second call is blocked before hitting the exchange. No extra side effects.
 // ---------------------------------------------------------------------------
 
 section('Scenario 7: Rate limiter blocks second cancel within window');
 
 {
-  // First call — should be allowed (resets the window)
+  // First call — resets the window (may cancel orphans if LIVE_CANCEL=1, already covered by Scenario 5)
   await post('/api/v1/cancel-orphaned-orders', ADMIN_TOKEN);
-  // Second call immediately — should be rate limited
+  // Second call immediately — must be rate limited before any exchange call
   const { status, body } = await post('/api/v1/cancel-orphaned-orders', ADMIN_TOKEN);
   if (status === 429) {
     ok('POST /api/v1/cancel-orphaned-orders (rapid 2nd call) → 429 rate limited');
     const msg: string = body?.error ?? '';
     if (msg.includes('retry after')) {
-      ok(`rate limit message includes retry-after: "${msg}"`);
+      ok(`rate limit response includes retry-after hint: "${msg}"`);
     } else {
       fail('rate limit response missing retry-after detail', msg);
     }
