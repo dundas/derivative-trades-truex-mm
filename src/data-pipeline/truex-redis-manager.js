@@ -200,18 +200,18 @@ export class TrueXRedisManager {
   async tryReserveExecId(execID, ttlSeconds = 86400) {
     try {
       const key = `${this.dedupKeyPrefix}:exec:${execID}`;
-      if (typeof this.redisClient.set === 'function') {
-        // Upstash/node-redis style: set(key, value, { NX: true, EX: ttl }) returns 'OK' or null
-        const res = await this.redisClient.set(key, '1', { NX: true, EX: ttlSeconds });
-        return !!res; // truthy on success
-      }
       if (typeof this.redisClient.setnx === 'function') {
-        // Legacy style: setnx returns 1 on success, 0 on exists
+        // ioredis style: setnx returns 1 on success, 0 if key exists
         const res = await this.redisClient.setnx(key, '1');
         if (res === 1 && typeof this.redisClient.expire === 'function') {
           await this.redisClient.expire(key, ttlSeconds);
         }
         return res === 1;
+      }
+      if (typeof this.redisClient.set === 'function') {
+        // Upstash/node-redis style: set(key, value, { NX: true, EX: ttl }) returns 'OK' or null
+        const res = await this.redisClient.set(key, '1', { NX: true, EX: ttlSeconds });
+        return !!res;
       }
       // If no NX support, cannot guarantee cross-instance dedup
       return true; // allow write to proceed rather than block

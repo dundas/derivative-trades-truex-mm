@@ -84,6 +84,23 @@ describe('FIXConnection', () => {
   });
   
   describe('connect()', () => {
+    // Bug 1: stale heartbeat timestamps must be cleared on every connect attempt
+    it('should reset lastHeartbeatReceived and lastHeartbeatSent to null at start of connect', async () => {
+      // Simulate stale timestamps from a previous session
+      connection.lastHeartbeatReceived = Date.now() - 674000;
+      connection.lastHeartbeatSent = Date.now() - 700000;
+
+      // Begin connecting — we just need connect() to have started
+      const connectPromise = connection.connect();
+      // Timestamps should be nulled synchronously at the start of connect()
+      expect(connection.lastHeartbeatReceived).toBeNull();
+      expect(connection.lastHeartbeatSent).toBeNull();
+
+      // Clean up: destroy the socket so the promise doesn't hang the suite
+      if (connection.socket) connection.socket.destroy();
+      await connectPromise.catch(() => {});
+    }, 35000);
+
     it('should establish TCP connection and send logon', async () => {
       const connectPromise = connection.connect();
 
@@ -559,30 +576,30 @@ describe('FIXConnection', () => {
   describe('attemptReconnect()', () => {
     it('should schedule reconnection with exponential backoff', () => {
       jest.useFakeTimers();
-      
+
       connection.reconnectAttempts = 0;
       connection.attemptReconnect();
-      
+
       expect(connection.reconnectAttempts).toBe(1);
       expect(connection.reconnectTimer).toBeDefined();
-      
+
       jest.useRealTimers();
     });
-    
+
     it('should not exceed max reconnect attempts', () => {
       connection.reconnectAttempts = 10;
       connection.maxReconnectAttempts = 10;
-      
+
       const maxAttemptsHandler = jest.fn();
       connection.on('max-reconnect-attempts', maxAttemptsHandler);
-      
+
       connection.attemptReconnect();
-      
+
       expect(maxAttemptsHandler).toHaveBeenCalled();
       // reconnectTimer should not be set when max attempts reached
       expect(connection.reconnectTimer).toBeFalsy();
     });
-    
+
     afterEach(() => {
       // Clean up any timers
       if (connection.reconnectTimer) {
@@ -590,25 +607,60 @@ describe('FIXConnection', () => {
         connection.reconnectTimer = null;
       }
     });
-    
+
     it('should use exponential backoff delays', () => {
       connection.initialReconnectDelay = 1000;
       connection.maxReconnectDelay = 30000;
-      
+
       // First attempt: 1000ms
       connection.reconnectAttempts = 0;
+      connection.isReconnecting = false; // simulate fresh state (as if connect() just started)
       connection.attemptReconnect();
       expect(connection.reconnectAttempts).toBe(1);
-      
-      // Second attempt: 2000ms
+
+      // Second attempt: 2000ms — simulate connect() clearing the flag then failing again
       connection.reconnectAttempts = 1;
+      connection.isReconnecting = false;
       connection.attemptReconnect();
       expect(connection.reconnectAttempts).toBe(2);
-      
+
       // Third attempt: 4000ms
       connection.reconnectAttempts = 2;
+      connection.isReconnecting = false;
       connection.attemptReconnect();
       expect(connection.reconnectAttempts).toBe(3);
+    });
+
+    // Bug 2: duplicate reconnect guard
+    it('should not schedule a second reconnect if one is already pending', () => {
+      jest.useFakeTimers();
+
+      connection.reconnectAttempts = 0;
+      connection.attemptReconnect();
+      const firstTimer = connection.reconnectTimer;
+
+      // Call again without the first timer firing — must be a no-op
+      connection.attemptReconnect();
+
+      // reconnectAttempts should still be 1 (second call was a no-op)
+      expect(connection.reconnectAttempts).toBe(1);
+      // timer must be the same object — no new timer scheduled
+      expect(connection.reconnectTimer).toBe(firstTimer);
+
+      jest.useRealTimers();
+    });
+
+    it('should clear isReconnecting flag when max retries reached', () => {
+      // Already at the max — next call should hit the early-return branch
+      connection.reconnectAttempts = 10;
+      connection.maxReconnectAttempts = 10;
+      // Simulate the flag being set from a prior scheduleReconnect call that
+      // somehow arrived after max was already reached
+      connection.isReconnecting = true;
+
+      connection.attemptReconnect();
+
+      expect(connection.isReconnecting).toBe(false);
     });
   });
   

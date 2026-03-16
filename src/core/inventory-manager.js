@@ -70,13 +70,19 @@ export class InventoryManager extends EventEmitter {
       // Note: fee deduction not included — maker fees are 0 bps per TrueX agreement.
       // Any taker fills (rare, from cancel-replace races) cause minor drift corrected by 60s refresh.
       if (this.balancesInitialized) {
-        if (this.baseBalance) this.baseBalance.available += quantity;
+        if (this.baseBalance) {
+          this.baseBalance.available += quantity;
+          this.baseBalance.total += quantity;
+        }
         if (this.quoteBalance) {
-          this.quoteBalance.available -= quantity * price;
+          const quoteDelta = quantity * price;
+          this.quoteBalance.available -= quoteDelta;
+          this.quoteBalance.total -= quoteDelta;
           if (this.quoteBalance.available < 0) {
             this.logger.warn(`[InventoryManager] Quote balance went negative (${this.quoteBalance.available.toFixed(2)}) — clamping to 0. Will correct on next balance refresh.`);
             this.quoteBalance.available = 0;
           }
+          if (this.quoteBalance.total < 0) this.quoteBalance.total = 0;
         }
       }
     } else if (normalizedSide === 'sell') {
@@ -88,12 +94,18 @@ export class InventoryManager extends EventEmitter {
       if (this.balancesInitialized) {
         if (this.baseBalance) {
           this.baseBalance.available -= quantity;
+          this.baseBalance.total -= quantity;
           if (this.baseBalance.available < 0) {
             this.logger.warn(`[InventoryManager] Base balance went negative (${this.baseBalance.available.toFixed(8)}) — clamping to 0. Will correct on next balance refresh.`);
             this.baseBalance.available = 0;
           }
+          if (this.baseBalance.total < 0) this.baseBalance.total = 0;
         }
-        if (this.quoteBalance) this.quoteBalance.available += quantity * price;
+        if (this.quoteBalance) {
+          const quoteDelta = quantity * price;
+          this.quoteBalance.available += quoteDelta;
+          this.quoteBalance.total += quoteDelta;
+        }
       }
     } else {
       this.logger.warn(`[InventoryManager] Unknown side: ${side}`);
@@ -254,9 +266,11 @@ export class InventoryManager extends EventEmitter {
     if (!this.balancesInitialized) return Infinity; // No balance info — don't restrict
 
     if (normalizedSide === 'buy') {
-      return this.quoteBalance ? this.quoteBalance.available : 0;
+      if (!this.quoteBalance) return 0;
+      return this.quoteBalance.total - (this.quoteBalance.transferHold || 0);
     } else if (normalizedSide === 'sell') {
-      return this.baseBalance ? this.baseBalance.available : 0;
+      if (!this.baseBalance) return 0;
+      return this.baseBalance.total - (this.baseBalance.transferHold || 0);
     }
     return 0;
   }

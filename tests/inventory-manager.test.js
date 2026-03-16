@@ -514,8 +514,12 @@ describe('InventoryManager', () => {
         quoteBalance: { available: 3000, held: 500, total: 3500 },
       });
 
-      expect(im.getAvailableForSide('sell')).toBe(0.044);  // BTC available
-      expect(im.getAvailableForSide('buy')).toBe(3000);     // PYUSD available
+      // Sell side: returns total - transferHold. No transferHold present → total (0.054).
+      // askCommittedBase in the quote engine handles the order_hold deduction.
+      expect(im.getAvailableForSide('sell')).toBe(0.054);
+      // Buy side: returns total - transferHold. No transferHold present → total (3500).
+      // bidCommittedQuote in the quote engine handles the order_hold deduction.
+      expect(im.getAvailableForSide('buy')).toBe(3500);
     });
 
     it('should return Infinity when balances not initialized', () => {
