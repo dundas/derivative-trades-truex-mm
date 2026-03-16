@@ -628,7 +628,7 @@ async function getOrphanedOrders(client) {
   const tracked = await db.query(`SELECT clientorderid FROM orders WHERE status IN ('new','pending','cancelling')`);
   const trackedIds = new Set(tracked.rows.map(r => r.clientorderid).filter(Boolean));
 
-  const orphaned = liveOrders.filter(o => !trackedIds.has(o.external_id));
+  const orphaned = liveOrders.filter(o => o.external_id && !trackedIds.has(o.external_id));
   return { liveOrders, orphaned };
 }
 
