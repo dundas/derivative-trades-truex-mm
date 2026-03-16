@@ -541,6 +541,7 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('uncaughtException', (err) => {
   logger.error(`Uncaught exception: ${err.message}`);
   logger.error(err.stack);
+  if (isShuttingDown) return;
   sendAlert('crash', 'critical', `Uncaught exception: ${err.message}`, { stack: err.stack })
     .catch(() => {})
     .finally(() => shutdown('UNCAUGHT_EXCEPTION', 1));
@@ -548,6 +549,7 @@ process.on('uncaughtException', (err) => {
 process.on('unhandledRejection', (reason) => {
   const msg = reason instanceof Error ? reason.message : String(reason);
   logger.error(`Unhandled rejection: ${msg}`);
+  if (isShuttingDown) return;
   sendAlert('crash', 'critical', `Unhandled rejection: ${msg}`)
     .catch(() => {})
     .finally(() => shutdown('UNHANDLED_REJECTION', 1));
