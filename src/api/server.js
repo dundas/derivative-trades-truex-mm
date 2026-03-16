@@ -646,6 +646,26 @@ function checkCancelRateLimit(req) {
 // Orphaned Orders
 // ---------------------------------------------------------------------------
 
+// Returns the most recently started session that has not ended, or null.
+// Used to guard orphan cancellation while the MM is actively placing orders:
+// the data pipeline flushes to PostgreSQL every ~5 minutes, so orders placed
+// during an active session may not yet appear in the DB and would be
+// misclassified as orphaned.
+async function getActiveSession() {
+  // No time-bound: a session that never set endedat (e.g. MM crashed) blocks the cancel
+  // regardless of age. The 409 message includes startedat so operators can assess whether
+  // the session is genuine or a stale zombie — use ?force=true to override in either case.
+  // startedat is BIGINT (epoch ms) — select raw, convert to JS in callers.
+  const r = await db.query(`
+    SELECT sessionid, startedat
+    FROM sessions
+    WHERE endedat IS NULL
+    ORDER BY startedat DESC
+    LIMIT 1
+  `);
+  return r.rows[0] || null;
+}
+
 async function getOrphanedOrders(client) {
   const liveOrders = await client.getActiveOrders();
 
@@ -676,13 +696,76 @@ async function handleGetOrphanedOrders(req) {
     qty:             o.order_info.qty,
   }));
 
-  return jsonOk({ live_count: liveOrders.length, orphaned_count: orphaned.length, orphaned: listed });
+  // warning is always present in the response (null when no active session) for a stable schema.
+  const result = { live_count: liveOrders.length, orphaned_count: orphaned.length, orphaned: listed, warning: null };
+  // getOrphanedOrders() above already ran a db.query, so the DB is reachable here.
+  // The catch is a belt-and-suspenders guard for transient per-query errors; the
+  // orphan list is still served if it occurs.
+  const activeSession = await getActiveSession().catch(err => {
+    console.error('[API] getActiveSession failed (warning suppressed):', err.message);
+    return null;
+  });
+  if (activeSession) {
+    // sessionid and startedat (BIGINT epoch-ms → ISO string) intentionally surfaced — admin-only.
+    const startedStr = new Date(Number(activeSession.startedat)).toISOString();
+    result.warning = `Active session detected (${activeSession.sessionid}, started ${startedStr}). PostgreSQL may be up to 5 minutes behind — live MM orders could appear as orphaned. Pass ?force=true to POST /api/v1/cancel-orphaned-orders to override (also use if MM crashed without a clean shutdown).`;
+  }
+  return jsonOk(result);
 }
 
 async function handleCancelOrphanedOrders(req) {
   if (!requireAdminToken(req)) return jsonError('Unauthorized', 401);
+
+  const url = new URL(req.url);
+  const force = url.searchParams.get('force') === 'true';
+
+  // Active-session guard runs BEFORE rate-limit so rejected requests don't consume
+  // the window — an operator retrying after stopping the MM shouldn't face a lockout.
+  if (!force) {
+    // Fail-safe: if we can't confirm the session state, block the cancel (503).
+    // The guard and the orphan query use the same DB connection pool; a transient error
+    // that affects one is likely to affect both, but we don't assume that.
+    let activeSession;
+    try {
+      activeSession = await getActiveSession();
+    } catch (err) {
+      console.error('[API] getActiveSession failed (cancel blocked):', err.message);
+      return jsonError('Unable to verify active session state — cancel blocked. Try again or pass ?force=true.', 503);
+    }
+    if (activeSession) {
+      // sessionid and startedat intentionally surfaced — admin-only endpoint, aids ops debugging.
+      // startedat is BIGINT epoch-ms from PostgreSQL.
+      const ageMs = Date.now() - Number(activeSession.startedat);
+      const startedStr = new Date(Number(activeSession.startedat)).toISOString();
+      const staleHint = ageMs > 3_600_000
+        ? ` This session started ${Math.floor(ageMs / 3_600_000)}h ago — it may be a zombie from a crash; use ?force=true if so.`
+        : '';
+      // Audit log: record blocked attempts so both rejections and bypasses are traceable.
+      console.info(`[cancel-orphaned] blocked: active session ${activeSession.sessionid} started ${startedStr}`);
+      return jsonError(
+        `Active session detected (${activeSession.sessionid}, started ${startedStr}). PostgreSQL may be up to 5 minutes behind — cancelling now risks killing live MM orders. Stop the MM first, or pass ?force=true to override.${staleHint}`,
+        409
+      );
+    }
+  }
+
+  // Rate limit is charged only when the request passes the active-session guard.
   const wait = checkCancelRateLimit(req);
   if (wait > 0) return jsonError(`Rate limited — retry after ${wait}s`, 429);
+
+  if (force) {
+    // Audit log fires AFTER rate-limit so it only records requests that actually proceed
+    // to cancellation — prevents false positives from rate-limited bypass attempts.
+    // Use > 8 to avoid revealing most chars of short tokens.
+    const token = req.headers.get('x-api-token') || req.headers.get('authorization')?.replace('Bearer ', '') || '';
+    const maskedToken = token.length > 8 ? `***${token.slice(-4)}` : '***';
+    let bypassedSession = null;
+    try { bypassedSession = await getActiveSession(); } catch (_) { /* best-effort */ }
+    const sessionInfo = bypassedSession
+      ? `session=${bypassedSession.sessionid} started=${new Date(Number(bypassedSession.startedat)).toISOString()}`
+      : 'no active session detected';
+    console.warn(`[cancel-orphaned] ?force=true proceeding. token=${maskedToken} ${sessionInfo}`);
+  }
 
   const client = await makeTrueXClient();
   const { orphaned } = await getOrphanedOrders(client);

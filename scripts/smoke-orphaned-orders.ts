@@ -64,10 +64,12 @@ async function get(path: string, token?: string) {
   return { status: res.status, body };
 }
 
-async function post(path: string, token?: string) {
+async function post(path: string, token?: string, query?: Record<string, string>) {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (token) headers['x-api-token'] = token;
-  const res = await fetch(`${API_URL}${path}`, { method: 'POST', headers });
+  const url = new URL(`${API_URL}${path}`);
+  if (query) Object.entries(query).forEach(([k, v]) => url.searchParams.set(k, v));
+  const res = await fetch(url.toString(), { method: 'POST', headers });
   const body = await res.json().catch(() => ({}));
   return { status: res.status, body };
 }
@@ -154,6 +156,10 @@ let liveCount = 0;
       ok(`live orders on exchange: ${liveCount}`);
       ok(`orphaned (not in DB): ${orphanedOrders.length}`);
 
+      if (body.data.warning) {
+        console.log(`     ⚠️  active session warning: ${body.data.warning}`);
+      }
+
       if (orphanedOrders.length > 0) {
         const first = orphanedOrders[0];
         assertShape(
@@ -207,8 +213,34 @@ if (!LIVE_CANCEL && orphanedOrders.length > 0) {
 } else {
   const { status, body } = await post('/api/v1/cancel-orphaned-orders', ADMIN_TOKEN);
 
-  if (status !== 200) {
-    fail(`POST /api/v1/cancel-orphaned-orders → expected 200, got ${status}`, JSON.stringify(body));
+  if (status === 409) {
+    ok('POST /api/v1/cancel-orphaned-orders (no force) → 409 active session guard');
+    const msg: string = body?.error ?? '';
+    if (msg.includes('force=true')) {
+      ok('409 response includes force=true hint');
+    } else {
+      fail('409 response missing force=true hint', msg);
+    }
+
+    // Only probe ?force=true when there are no detected orphan candidates.
+    // If orphanedOrders is non-empty and an active session is running, those "orphans"
+    // might be live MM positions not yet flushed to the DB — force-cancelling them would
+    // be the exact hazard the 409 guard exists to prevent.
+    if (orphanedOrders.length === 0) {
+      const { status: fs, body: fb } = await post('/api/v1/cancel-orphaned-orders', ADMIN_TOKEN, { force: 'true' });
+      if (fs === 200) {
+        ok('POST /api/v1/cancel-orphaned-orders?force=true → 200 (guard bypassed, 0 orphans safe)');
+        assertShape('force response has cancelled, failed, total', fb.data, ['cancelled', 'failed', 'total']);
+      } else {
+        fail(`POST /api/v1/cancel-orphaned-orders?force=true → expected 200, got ${fs}`, JSON.stringify(fb));
+      }
+    } else {
+      // Known gap: ?force=true not exercised when orphan candidates exist and session is active
+      // — cancelling them as a smoke test side-effect is unsafe. Bypass verified in dry-run with 0 orphans.
+      skip('?force=true with orphan candidates', `${orphanedOrders.length} potential orphan(s) + active session — skipping force bypass to avoid cancelling live MM orders`);
+    }
+  } else if (status !== 200) {
+    fail(`POST /api/v1/cancel-orphaned-orders → expected 200 or 409, got ${status}`, JSON.stringify(body));
   } else {
     ok('POST /api/v1/cancel-orphaned-orders → 200');
     assertShape('response has cancelled, failed, total', body.data, ['cancelled', 'failed', 'total']);
@@ -254,20 +286,36 @@ if (!LIVE_CANCEL && orphanedOrders.length > 0) {
 section('Scenario 7: Rate limiter blocks second cancel within window');
 
 {
-  // First call — resets the window (may cancel orphans if LIVE_CANCEL=1, already covered by Scenario 5)
-  await post('/api/v1/cancel-orphaned-orders', ADMIN_TOKEN);
-  // Second call immediately — must be rate limited before any exchange call
-  const { status, body } = await post('/api/v1/cancel-orphaned-orders', ADMIN_TOKEN);
-  if (status === 429) {
-    ok('POST /api/v1/cancel-orphaned-orders (rapid 2nd call) → 429 rate limited');
-    const msg: string = body?.error ?? '';
-    if (msg.includes('retry after')) {
-      ok(`rate limit response includes retry-after hint: "${msg}"`);
-    } else {
-      fail('rate limit response missing retry-after detail', msg);
-    }
+  // Rate-limit test uses ?force=true so the active-session guard (409) doesn't shadow
+  // the rate-limit (429) — the guard runs before the rate-limit, so without force=true
+  // an active session causes both calls to 409 and the rate-limiter never fires.
+  //
+  // Safety: if LIVE_CANCEL=1 and orphans exist, force=true on the first call can cancel
+  // them. In that case we skip rather than risk destructive side-effects.
+  // Skip when ANY orphans are present: the server has no concept of LIVE_CANCEL, so
+  // ?force=true sends real cancel requests to TrueX regardless of this local env var.
+  if (orphanedOrders.length > 0) {
+    skip(
+      'rate limiter test',
+      `${orphanedOrders.length} orphan candidate(s) — skipping to avoid ?force=true cancelling them as a test side-effect`
+    );
   } else {
-    fail(`rapid 2nd cancel → expected 429, got ${status} (rate limiter not working)`);
+    const forceQuery = { force: 'true' };
+    // First call — resets the window. No orphans exist so this is a safe no-op cancel.
+    await post('/api/v1/cancel-orphaned-orders', ADMIN_TOKEN, forceQuery);
+    // Second call immediately — must be rate limited before any exchange call
+    const { status, body } = await post('/api/v1/cancel-orphaned-orders', ADMIN_TOKEN, forceQuery);
+    if (status === 429) {
+      ok('POST /api/v1/cancel-orphaned-orders (rapid 2nd call) → 429 rate limited');
+      const msg: string = body?.error ?? '';
+      if (msg.includes('retry after')) {
+        ok(`rate limit response includes retry-after hint: "${msg}"`);
+      } else {
+        fail('rate limit response missing retry-after detail', msg);
+      }
+    } else {
+      fail(`rapid 2nd cancel → expected 429, got ${status} (rate limiter not working)`);
+    }
   }
 }
 
