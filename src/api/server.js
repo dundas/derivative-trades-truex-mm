@@ -656,7 +656,7 @@ async function handleCancelOrphanedOrders(req) {
   const { orphaned } = await getOrphanedOrders(client);
 
   if (orphaned.length === 0) {
-    return jsonOk({ cancelled: 0, failed: 0, message: 'No orphaned orders found' });
+    return jsonOk({ cancelled: 0, failed: 0, total: 0, message: 'No orphaned orders found' });
   }
 
   let cancelled = 0;
