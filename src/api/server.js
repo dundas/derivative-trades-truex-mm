@@ -767,7 +767,7 @@ Bun.serve({
       let m;
 
       // Logs (admin-only — contain operational/internal data)
-      if (path === '/api/v1/logs/tail' || path === '/api/v1/logs/archives' || path.startsWith('/api/v1/logs/')) {
+      if (path.startsWith('/api/v1/logs/')) {
         if (!requireAdminToken(req)) return jsonError('Unauthorized', 401);
       }
       if (path === '/api/v1/logs/tail')     return handleLogsTail(params);
