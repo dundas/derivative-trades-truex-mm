@@ -656,11 +656,15 @@ async function getActiveSession() {
   // regardless of age. The 409 message includes startedat so operators can assess whether
   // the session is genuine or a stale zombie — use ?force=true to override in either case.
   // startedat is BIGINT (epoch ms) — select raw, convert to JS in callers.
+  // NULLS LAST: PostgreSQL DESC ordering puts NULLs first by default.
+  // A zombie session with startedat IS NULL would otherwise shadow real active sessions.
+  // startedat IS NOT NULL: exclude malformed rows that can never be meaningful.
   const r = await db.query(`
     SELECT sessionid, startedat
     FROM sessions
     WHERE endedat IS NULL
-    ORDER BY startedat DESC
+      AND startedat IS NOT NULL
+    ORDER BY startedat DESC NULLS LAST
     LIMIT 1
   `);
   return r.rows[0] || null;
