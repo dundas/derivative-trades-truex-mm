@@ -749,9 +749,13 @@ async function handleCancelOrphanedOrders(req) {
     }
   }
 
+  // Rate limit is charged only when the request passes the active-session guard.
+  const wait = checkCancelRateLimit(req);
+  if (wait > 0) return jsonError(`Rate limited — retry after ${wait}s`, 429);
+
   if (force) {
-    // Audit log: operator explicitly used ?force=true — always log, with or without an
-    // active session, so there is always a record of intentional guard bypasses.
+    // Audit log fires AFTER rate-limit so it only records requests that actually proceed
+    // to cancellation — prevents false positives from rate-limited bypass attempts.
     // Use > 8 to avoid revealing most chars of short tokens.
     const token = req.headers.get('x-api-token') || req.headers.get('authorization')?.replace('Bearer ', '') || '';
     const maskedToken = token.length > 8 ? `***${token.slice(-4)}` : '***';
@@ -760,12 +764,8 @@ async function handleCancelOrphanedOrders(req) {
     const sessionInfo = bypassedSession
       ? `session=${bypassedSession.sessionid} started=${new Date(Number(bypassedSession.startedat)).toISOString()}`
       : 'no active session detected';
-    console.warn(`[cancel-orphaned] ?force=true used. token=${maskedToken} ${sessionInfo}`);
+    console.warn(`[cancel-orphaned] ?force=true proceeding. token=${maskedToken} ${sessionInfo}`);
   }
-
-  // Rate limit is charged only when the request passes the active-session guard.
-  const wait = checkCancelRateLimit(req);
-  if (wait > 0) return jsonError(`Rate limited — retry after ${wait}s`, 429);
 
   const client = await makeTrueXClient();
   const { orphaned } = await getOrphanedOrders(client);
