@@ -715,8 +715,8 @@ describe('FIXConnection', () => {
     it('should load msgSeqNum and expectedSeqNum from Redis on connect', async () => {
       const mockRedis = {
         get: jest.fn().mockImplementation((key) => {
-          if (key === 'fix:seq:CLI_CLIENT:out') return Promise.resolve('42');
-          if (key === 'fix:seq:CLI_CLIENT:in') return Promise.resolve('37');
+          if (key === 'fix:seq:CLI_CLIENT:TRUEX_UAT_OE:out') return Promise.resolve('42');
+          if (key === 'fix:seq:CLI_CLIENT:TRUEX_UAT_OE:in') return Promise.resolve('37');
           return Promise.resolve(null);
         }),
         set: jest.fn().mockResolvedValue('OK'),
@@ -760,7 +760,7 @@ describe('FIXConnection', () => {
       expect(conn.expectedSeqNum).toBe(1);
     });
 
-    it('should use correct Redis key format fix:seq:<senderCompID>:out and :in', async () => {
+    it('should use correct Redis key format fix:seq:<senderCompID>:<targetCompID>:out and :in', async () => {
       const mockRedis = {
         get: jest.fn().mockResolvedValue(null),
         set: jest.fn().mockResolvedValue('OK'),
@@ -778,8 +778,8 @@ describe('FIXConnection', () => {
 
       await conn.loadSequenceNumbers();
 
-      expect(mockRedis.get).toHaveBeenCalledWith('fix:seq:TRUEX_PROD_OE:out');
-      expect(mockRedis.get).toHaveBeenCalledWith('fix:seq:TRUEX_PROD_OE:in');
+      expect(mockRedis.get).toHaveBeenCalledWith('fix:seq:TRUEX_PROD_OE:EXCHANGE:out');
+      expect(mockRedis.get).toHaveBeenCalledWith('fix:seq:TRUEX_PROD_OE:EXCHANGE:in');
     });
   });
 
@@ -808,7 +808,7 @@ describe('FIXConnection', () => {
       await conn.sendMessage({ '35': '0', '49': 'CLI_CLIENT', '56': 'TRUEX_UAT_OE', '34': '1', '52': '20251007-13:40:00.000' });
 
       // After sendMessage, msgSeqNum is incremented to 2
-      expect(mockRedis.set).toHaveBeenCalledWith('fix:seq:CLI_CLIENT:out', 2);
+      expect(mockRedis.set).toHaveBeenCalledWith('fix:seq:CLI_CLIENT:TRUEX_UAT_OE:out', 2);
     });
 
     it('should not call Redis set when redisClient is null (backward compat)', async () => {
@@ -855,7 +855,7 @@ describe('FIXConnection', () => {
 
       expect(result).toBe('OK');
       // expectedSeqNum incremented to 2
-      expect(mockRedis.set).toHaveBeenCalledWith('fix:seq:CLI_CLIENT:in', 2);
+      expect(mockRedis.set).toHaveBeenCalledWith('fix:seq:CLI_CLIENT:TRUEX_UAT_OE:in', 2);
     });
 
     it('should NOT call Redis set on duplicate or gap detection', () => {

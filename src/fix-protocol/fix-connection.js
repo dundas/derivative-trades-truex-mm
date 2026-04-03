@@ -45,8 +45,9 @@ export class FIXConnection extends EventEmitter {
 
     // Optional Redis client for sequence number persistence
     this.redisClient = options.redisClient || null;
-    this._seqKeyOut = `fix:seq:${this.senderCompID}:out`;
-    this._seqKeyIn = `fix:seq:${this.senderCompID}:in`;
+    // Include targetCompID to distinguish OE vs MD sessions sharing the same senderCompID
+    this._seqKeyOut = `fix:seq:${this.senderCompID}:${this.targetCompID}:out`;
+    this._seqKeyIn = `fix:seq:${this.senderCompID}:${this.targetCompID}:in`;
 
     // Track whether this is the first ever connect (vs reconnect)
     this.hasConnectedBefore = false;
@@ -198,9 +199,10 @@ export class FIXConnection extends EventEmitter {
    * Connect to FIX server
    */
   async connect() {
-    // Load persisted sequence numbers from Redis before sending logon
-    // (only when redisClient is configured; preserves synchronous socket setup for no-Redis case)
-    if (this.redisClient) {
+    // Load persisted sequence numbers from Redis only on reconnects.
+    // On first connect, let the reset-to-1 logic in the socket callback handle initialization.
+    // On reconnects, hasConnectedBefore is true and seqnums must not be reset to 1.
+    if (this.redisClient && this.hasConnectedBefore) {
       await this.loadSequenceNumbers();
     }
 
@@ -497,7 +499,10 @@ export class FIXConnection extends EventEmitter {
     this.msgSeqNum++;
 
     // Fire-and-forget: persist outbound sequence number to Redis (must not block)
-    this.redisClient?.set(this._seqKeyOut, this.msgSeqNum);
+    if (this.redisClient) {
+      void this.redisClient.set(this._seqKeyOut, this.msgSeqNum)
+        .catch(err => this.logger.warn(`[FIXConnection] Failed to persist outbound seqnum: ${err.message}`));
+    }
 
     // Emit sent event with redacted sensitive fields
     const redactedFields = { ...fields };
@@ -636,7 +641,10 @@ export class FIXConnection extends EventEmitter {
     } else {
       this.expectedSeqNum++;
       // Fire-and-forget: persist inbound expected sequence number to Redis (must not block)
-      this.redisClient?.set(this._seqKeyIn, this.expectedSeqNum);
+      if (this.redisClient) {
+        void this.redisClient.set(this._seqKeyIn, this.expectedSeqNum)
+          .catch(err => this.logger.warn(`[FIXConnection] Failed to persist inbound seqnum: ${err.message}`));
+      }
       return 'OK';
     }
   }
