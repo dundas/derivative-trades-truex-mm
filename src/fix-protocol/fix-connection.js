@@ -42,6 +42,14 @@ export class FIXConnection extends EventEmitter {
     // Message sequence numbers
     this.msgSeqNum = 1;
     this.expectedSeqNum = 1;
+
+    // Optional Redis client for sequence number persistence
+    this.redisClient = options.redisClient || null;
+    this._seqKeyOut = `fix:seq:${this.senderCompID}:out`;
+    this._seqKeyIn = `fix:seq:${this.senderCompID}:in`;
+
+    // Track whether this is the first ever connect (vs reconnect)
+    this.hasConnectedBefore = false;
     
     // Heartbeat management
     this.heartbeatTimer = null;
@@ -173,15 +181,31 @@ export class FIXConnection extends EventEmitter {
   }
   
   /**
+   * Load persisted sequence numbers from Redis.
+   * Defaults to 1 when the key is missing.
+   */
+  async loadSequenceNumbers() {
+    if (!this.redisClient) return;
+    const [outVal, inVal] = await Promise.all([
+      this.redisClient.get(this._seqKeyOut),
+      this.redisClient.get(this._seqKeyIn),
+    ]);
+    this.msgSeqNum = outVal ? parseInt(outVal, 10) : 1;
+    this.expectedSeqNum = inVal ? parseInt(inVal, 10) : 1;
+  }
+
+  /**
    * Connect to FIX server
    */
   async connect() {
+    // Load persisted sequence numbers from Redis before sending logon
+    // (only when redisClient is configured; preserves synchronous socket setup for no-Redis case)
+    if (this.redisClient) {
+      await this.loadSequenceNumbers();
+    }
+
     return new Promise((resolve, reject) => {
       this.logger.info(`[FIXConnection] Connecting to ${this.targetCompID} at ${this.host}:${this.port}`);
-      
-      // Reset sequence numbers for new session (we use ResetSeqNumFlag=Y in logon)
-      this.msgSeqNum = 1;
-      this.expectedSeqNum = 1;
 
       // Reset heartbeat timestamps so stale values from a previous session cannot
       // trigger an immediate disconnect the moment startHeartbeat() fires.
@@ -237,13 +261,21 @@ export class FIXConnection extends EventEmitter {
         clearTimeout(timeout);
         this.logger.info(`[FIXConnection] TCP connection established to ${this.targetCompID}`);
         this.isConnected = true;
-        
+
+        // Only reset sequence numbers on the very first connect; on reconnects,
+        // preserve them so the exchange can do normal sequence recovery.
+        const isReconnect = this.hasConnectedBefore;
+        if (!isReconnect) {
+          this.msgSeqNum = 1;
+          this.expectedSeqNum = 1;
+        }
+
         // Wait for proxy to establish connection to TrueX (if using proxy)
         // This delay is critical when connecting through a proxy server
         this.logger.info(`[FIXConnection] Waiting for connection setup...`);
         setTimeout(() => {
           // Send logon message
-          this.sendLogon()
+          this.sendLogon(isReconnect)
             .then(() => {
               this.logger.info(`[FIXConnection] Logon message sent to ${this.targetCompID}`);
               
@@ -260,7 +292,39 @@ export class FIXConnection extends EventEmitter {
               if (message.fields['35'] === 'A') { // Logon message
                 if (logonTimeout) clearTimeout(logonTimeout);
                 this.removeListener('message', logonHandler);
+
+                // Check SessionStatus (1409) — non-zero means the exchange
+                // accepted the TCP logon but flagged a session-level problem.
+                // 9 = MsgSeqNum too low (seqnum mismatch on reconnect).
+                // 5 = Invalid API key/signature. 6 = Account locked.
+                const sessionStatus = message.fields['1409'];
+                if (sessionStatus && sessionStatus !== '0') {
+                  const statusMessages = {
+                    '5': 'Invalid API key or signature',
+                    '6': 'Account locked',
+                    '7': 'Logins not allowed at this time',
+                    '9': 'MsgSeqNum too low — seqnum mismatch, will reset on next reconnect',
+                  };
+                  const statusText = statusMessages[sessionStatus] || `SessionStatus=${sessionStatus}`;
+                  this.logger.error(`[FIXConnection] Logon to ${this.targetCompID} has session problem: ${statusText}`);
+
+                  // For seqnum mismatch (9): force a full reset on next reconnect
+                  // by clearing hasConnectedBefore so 141=Y is sent with seqnum=1.
+                  if (sessionStatus === '9') {
+                    this.hasConnectedBefore = false;
+                    this.msgSeqNum = 1;
+                    this.expectedSeqNum = 1;
+                  }
+
+                  if (!settled) {
+                    settled = true;
+                    reject(new Error(`Logon session problem: ${statusText}`));
+                  }
+                  return;
+                }
+
                 this.isLoggedOn = true;
+                this.hasConnectedBefore = true;
                 this.reconnectAttempts = 0;
                 this.startHeartbeat();
                 this.startCleanupTimer(); // Start periodic message cleanup
@@ -291,12 +355,13 @@ export class FIXConnection extends EventEmitter {
   
   /**
    * Send FIX Logon message with HMAC-SHA256 authentication
+   * @param {boolean} isReconnect - true when reconnecting to preserve seqnums
    */
-  async sendLogon() {
+  async sendLogon(isReconnect = false) {
     const sendingTime = this.getUTCTimestamp();
     const msgType = 'A';
     const msgSeqNum = this.msgSeqNum.toString();
-    
+
     // Build signature payload using TrueX specification:
     // sending_time + msg_type + msg_seq_num + sender_comp_id + target_comp_id + username
     const signaturePayload = sendingTime + msgType + msgSeqNum + this.senderCompID + this.targetCompID + this.apiKey;
@@ -304,7 +369,7 @@ export class FIXConnection extends EventEmitter {
       .createHmac('sha256', this.apiSecret)
       .update(signaturePayload)
       .digest('base64');  // TrueX uses base64, not hex
-    
+
     const fields = {
       '8': this.beginString,           // BeginString
       '35': msgType,                    // MsgType = Logon
@@ -312,14 +377,20 @@ export class FIXConnection extends EventEmitter {
       '56': this.targetCompID,          // TargetCompID
       '34': msgSeqNum,                  // MsgSeqNum
       '52': sendingTime,                // SendingTime
+      '58': 'CancelOnDisconnect=Y',     // Cancel open orders on disconnect
       '98': '0',                        // EncryptMethod = None
       '108': this.heartbeatInterval.toString(), // HeartBtInt
-      '141': 'Y',                       // ResetSeqNumFlag = Yes (reset sequence numbers)
       '553': this.apiKey,               // Username
       '554': signature,                 // Password = HMAC signature (base64)
       '1137': this.defaultApplVerID     // DefaultApplVerID
     };
-    
+
+    // Only reset sequence numbers on initial logon, not reconnects.
+    // On reconnect, preserve seqnums so the exchange can do normal gap recovery.
+    if (!isReconnect) {
+      fields['141'] = 'Y'; // ResetSeqNumFlag
+    }
+
     await this.sendMessage(fields);
   }
   
@@ -424,7 +495,10 @@ export class FIXConnection extends EventEmitter {
     
     // Increment sequence number
     this.msgSeqNum++;
-    
+
+    // Fire-and-forget: persist outbound sequence number to Redis (must not block)
+    this.redisClient?.set(this._seqKeyOut, this.msgSeqNum);
+
     // Emit sent event with redacted sensitive fields
     const redactedFields = { ...fields };
     if (redactedFields['553']) redactedFields['553'] = '[REDACTED]';
@@ -561,6 +635,8 @@ export class FIXConnection extends EventEmitter {
       return 'GAP';
     } else {
       this.expectedSeqNum++;
+      // Fire-and-forget: persist inbound expected sequence number to Redis (must not block)
+      this.redisClient?.set(this._seqKeyIn, this.expectedSeqNum);
       return 'OK';
     }
   }
@@ -661,15 +737,31 @@ export class FIXConnection extends EventEmitter {
           // Note: OrigSendingTime (field 122) would hold the original time
           // but TrueX rejects messages with field 122, so we omit it
           
-          // Rebuild FIX message from stored fields
-          let body = '';
+          // Rebuild FIX message from stored fields with correct header ordering.
+          // NOTE: Object.entries() sorts integer keys numerically (7,16,34,35,...),
+          // which puts body fields before MsgType (35). We must explicitly order
+          // header fields first to comply with FIX spec.
           const bodyFields = { ...clonedFields };
           delete bodyFields['8'];  // BeginString
           delete bodyFields['9'];  // BodyLength
           delete bodyFields['10']; // CheckSum
-          
+
+          const headerFieldOrder = ['35', '49', '56', '34', '52'];
+          let body = '';
+
+          // 1. Header fields in required order
+          for (const tag of headerFieldOrder) {
+            if (bodyFields[tag] !== undefined) {
+              body += `${tag}=${bodyFields[tag]}${this.SOH}`;
+            }
+          }
+
+          // 2. Remaining fields (excluding header tags already written)
+          const processedTags = new Set(headerFieldOrder);
           for (const [tag, value] of Object.entries(bodyFields)) {
-            body += `${tag}=${value}${this.SOH}`;
+            if (!processedTags.has(tag) && value !== undefined) {
+              body += `${tag}=${value}${this.SOH}`;
+            }
           }
           
           // Calculate body length
