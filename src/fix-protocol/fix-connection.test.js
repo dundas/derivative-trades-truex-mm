@@ -214,8 +214,8 @@ describe('FIXConnection', () => {
       // TrueX spec: payload = sendingTime + msgType + msgSeqNum + senderCompID + targetCompID + username
       const sendingTime = fields['52'];
       const signaturePayload = sendingTime + fields['35'] + fields['34'] + fields['49'] + fields['56'] + fields['553'];
-      const testSecret = 'test-api-secret'; // nosemgrep: hardcoded-hmac-key — test fixture, not a real credential
-      const expectedSignature = crypto
+      const testSecret = 'test-api-secret';
+      const expectedSignature = crypto // nosemgrep: hardcoded-hmac-key — test fixture
         .createHmac('sha256', testSecret)
         .update(signaturePayload)
         .digest('base64');
