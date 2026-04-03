@@ -23,7 +23,7 @@ This project uses the agentbootup self-improvement system for continuous learnin
 | File | Purpose |
 |------|---------|
 | `memory/MEMORY.md` | Core operational knowledge |
-| `memory/daily/<today>.md` | Today's session log (if it exists) |
+| `memory/daily/<today>.md` | Today's session log |
 | `.ai/protocols/STANDARD_DEV_WORKFLOW.md` | 7-step code change pipeline |
 | `.ai/protocols/AUTONOMOUS_OPERATION.md` | Decision authority, communication style |
 
@@ -107,10 +107,8 @@ Execute continuously without being asked:
 11. **(SO-6)** Run `/pre-push-review` before every `git push` — including fix commits mid-review-loop
 12. **(SO-7)** `pr-review-loop` Phase 0 delegates to `/pre-push-review` (not an inline semgrep/roborev block)
 13. **(SO-8)** Smoke test runs after `/pre-push-review` passes, before push. Skip requires explicit category + reason in PR description. Valid skip categories: `DOCS_ONLY`, `CONFIG_ONLY`, `NO_SERVER_SURFACE`, `SMOKE_MISSING (must name follow-up PR)`
-14. **(SO-9)** `/adversarial-reviewer` must be invoked via the Skill tool (not inline) at gate 4c
-15. **(SO-11)** Never commit directly to `main` — always use a feature branch
-16. **(SO-13)** `/docs-generator` mandatory after PRs touching `scripts/`, `docs/`, or content pipeline files
-17. **(SO-14)** If no review comments after 5 min on a PR, tag `@coderabbitai review`. Never merge on CI-only.
+14. **(SO-13)** `/docs-generator` mandatory after PRs touching `scripts/`, `docs/`, or content pipeline files
+15. **(SO-14)** If no review comments after 5 min on a PR, tag `@coderabbitai review`. Never merge on CI-only.
 
 ## Development Protocol (mandatory for ALL code changes)
 
