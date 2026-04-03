@@ -1,14 +1,31 @@
 # true_markets_mm
 
+## Primary Goal: Production Readiness
+
+Every session should move the system closer to production-ready. The full checklist lives in `memory/production-readiness.md`. Priority order:
+
+1. **Security** — API auth, input validation, CORS lockdown, rate limiting
+2. **Reliability** — Graceful shutdown, process supervision, connection resilience
+3. **Observability** — Structured logging, metrics, health monitoring, alerting
+4. **Testing** — E2E API tests, integration tests, load tests, chaos tests
+5. **Operations** — Production Docker, DB migrations, backup, deployment runbook
+
+When starting a session, check `memory/production-readiness.md` for the next unchecked item and propose working on it. When finishing work, update the checklist.
+
 ## Autonomous Memory System
 
 This project uses the agentbootup self-improvement system for continuous learning and autonomous operation.
 
 ### Memory Files (Always Consult)
 
-**At session start, read**:
-1. `memory/MEMORY.md` - Core operational knowledge and protocols
-2. `memory/daily/<today>.md` - Today's session log (if exists)
+**At session start, read these files:**
+
+| File | Purpose |
+|------|---------|
+| `memory/MEMORY.md` | Core operational knowledge |
+| `memory/daily/<today>.md` | Today's session log (if it exists) |
+| `.ai/protocols/STANDARD_DEV_WORKFLOW.md` | 7-step code change pipeline |
+| `.ai/protocols/AUTONOMOUS_OPERATION.md` | Decision authority, communication style |
 
 **At session end, update**:
 1. `memory/daily/<today>.md` - Session summary, decisions, learnings
@@ -87,3 +104,33 @@ Execute continuously without being asked:
 8. Ask before destructive actions
 9. Document decisions in daily logs
 10. Fix issues immediately
+11. **(SO-6)** Run `/pre-push-review` before every `git push` — including fix commits mid-review-loop
+12. **(SO-7)** `pr-review-loop` Phase 0 delegates to `/pre-push-review` (not an inline semgrep/roborev block)
+13. **(SO-8)** Smoke test runs after `/pre-push-review` passes, before push. Skip requires explicit category + reason in PR description. Valid skip categories: `DOCS_ONLY`, `CONFIG_ONLY`, `NO_SERVER_SURFACE`, `SMOKE_MISSING (must name follow-up PR)`
+14. **(SO-9)** `/adversarial-reviewer` must be invoked via the Skill tool (not inline) at gate 4c
+15. **(SO-11)** Never commit directly to `main` — always use a feature branch
+16. **(SO-13)** `/docs-generator` mandatory after PRs touching `scripts/`, `docs/`, or content pipeline files
+17. **(SO-14)** If no review comments after 5 min on a PR, tag `@coderabbitai review`. Never merge on CI-only.
+
+## Development Protocol (mandatory for ALL code changes)
+
+**Canonical source: `.ai/protocols/STANDARD_DEV_WORKFLOW.md`**
+
+Every code change follows this 7-step pipeline. No shortcuts.
+
+1. **Skill-first** — enumerate skills before coding
+2. **Dialectical coder** — `/dialectical-autocoder` for non-trivial changes (>3 files)
+3. **Feature branch** — never commit to `main` directly (SO-11)
+4. **Gate chain** (in order):
+   - `4a` `/pre-push-review` — semgrep + roborev (SO-6)
+   - `4b` Smoke test (SO-8). Skip categories: `DOCS_ONLY`, `CONFIG_ONLY`, `NO_SERVER_SURFACE`, `SMOKE_MISSING`
+   - `4c` `/adversarial-reviewer` — must invoke via Skill tool (SO-9)
+   - `4d` `/pr-review-loop` — tag `@coderabbitai review` if no comments after 5 min (SO-14)
+5. **`/docs-generator`** — mandatory after PRs touching `scripts/`, `docs/`, or content pipeline (SO-13)
+6. **Docs PR review** — `/pr-review-loop` on the docs PR
+7. **Test locally after merge** — pull main, verify end-to-end
+
+**Never merge on CI-only.** At least one code review (automated or human) must complete.
+
+- **Auto-merge criteria**: 0 blocking issues + CI green — formal APPROVED not required
+- **Agent PRs**: Include `@coderabbitai ignore` in PR body at creation to suppress bot noise

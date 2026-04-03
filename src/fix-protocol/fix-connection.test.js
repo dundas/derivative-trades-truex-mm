@@ -214,8 +214,9 @@ describe('FIXConnection', () => {
       // TrueX spec: payload = sendingTime + msgType + msgSeqNum + senderCompID + targetCompID + username
       const sendingTime = fields['52'];
       const signaturePayload = sendingTime + fields['35'] + fields['34'] + fields['49'] + fields['56'] + fields['553'];
-      const expectedSignature = crypto
-        .createHmac('sha256', 'test-api-secret')
+      const testSecret = 'test-api-secret';
+      const expectedSignature = crypto // nosemgrep: hardcoded-hmac-key — test fixture
+        .createHmac('sha256', testSecret)
         .update(signaturePayload)
         .digest('base64');
       
@@ -702,8 +703,184 @@ describe('FIXConnection', () => {
       const message2 = '8=FIXT.1.1\x019=50\x0135=8\x0149=TRUEX\x0156=CLIENT\x0134=2\x0152=20251007-13:40:01.000\x0110=124\x01';
       
       connection.handleIncomingData(Buffer.from(message1 + message2));
-      
+
       expect(messageHandler).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Task 1.1 — Redis sequence number loading on connect
+  // -----------------------------------------------------------------------
+  describe('Redis sequence persistence — loadSequenceNumbers()', () => {
+    it('should load msgSeqNum and expectedSeqNum from Redis on connect', async () => {
+      const mockRedis = {
+        get: jest.fn().mockImplementation((key) => {
+          if (key === 'fix:seq:CLI_CLIENT:TRUEX_UAT_OE:out') return Promise.resolve('42');
+          if (key === 'fix:seq:CLI_CLIENT:TRUEX_UAT_OE:in') return Promise.resolve('37');
+          return Promise.resolve(null);
+        }),
+        set: jest.fn().mockResolvedValue('OK'),
+      };
+      const conn = new FIXConnection({
+        host: 'test.host',
+        port: 1234,
+        senderCompID: 'CLI_CLIENT',
+        targetCompID: 'TRUEX_UAT_OE',
+        apiKey: 'k',
+        apiSecret: 's',
+        redisClient: mockRedis,
+        logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
+      });
+
+      await conn.loadSequenceNumbers();
+
+      expect(conn.msgSeqNum).toBe(42);
+      expect(conn.expectedSeqNum).toBe(37);
+    });
+
+    it('should default to 1 when Redis keys are missing', async () => {
+      const mockRedis = {
+        get: jest.fn().mockResolvedValue(null),
+        set: jest.fn().mockResolvedValue('OK'),
+      };
+      const conn = new FIXConnection({
+        host: 'test.host',
+        port: 1234,
+        senderCompID: 'CLI_CLIENT',
+        targetCompID: 'TRUEX_UAT_OE',
+        apiKey: 'k',
+        apiSecret: 's',
+        redisClient: mockRedis,
+        logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
+      });
+
+      await conn.loadSequenceNumbers();
+
+      expect(conn.msgSeqNum).toBe(1);
+      expect(conn.expectedSeqNum).toBe(1);
+    });
+
+    it('should use correct Redis key format fix:seq:<senderCompID>:<targetCompID>:out and :in', async () => {
+      const mockRedis = {
+        get: jest.fn().mockResolvedValue(null),
+        set: jest.fn().mockResolvedValue('OK'),
+      };
+      const conn = new FIXConnection({
+        host: 'test.host',
+        port: 1234,
+        senderCompID: 'TRUEX_PROD_OE',
+        targetCompID: 'EXCHANGE',
+        apiKey: 'k',
+        apiSecret: 's',
+        redisClient: mockRedis,
+        logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
+      });
+
+      await conn.loadSequenceNumbers();
+
+      expect(mockRedis.get).toHaveBeenCalledWith('fix:seq:TRUEX_PROD_OE:EXCHANGE:out');
+      expect(mockRedis.get).toHaveBeenCalledWith('fix:seq:TRUEX_PROD_OE:EXCHANGE:in');
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Task 1.2 — Persist outbound sequence number on send (fire-and-forget)
+  // -----------------------------------------------------------------------
+  describe('Redis sequence persistence — outbound seqnum on send', () => {
+    it('should call Redis set after sending a message', async () => {
+      const mockRedis = {
+        get: jest.fn().mockResolvedValue(null),
+        set: jest.fn().mockResolvedValue('OK'),
+      };
+      const conn = new FIXConnection({
+        host: 'test.host',
+        port: 1234,
+        senderCompID: 'CLI_CLIENT',
+        targetCompID: 'TRUEX_UAT_OE',
+        apiKey: 'k',
+        apiSecret: 's',
+        redisClient: mockRedis,
+        logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
+      });
+      conn.socket = new MockSocket();
+      conn.socket.write = jest.fn().mockReturnValue(true);
+
+      await conn.sendMessage({ '35': '0', '49': 'CLI_CLIENT', '56': 'TRUEX_UAT_OE', '34': '1', '52': '20251007-13:40:00.000' });
+
+      // After sendMessage, msgSeqNum is incremented to 2
+      expect(mockRedis.set).toHaveBeenCalledWith('fix:seq:CLI_CLIENT:TRUEX_UAT_OE:out', 2);
+    });
+
+    it('should not call Redis set when redisClient is null (backward compat)', async () => {
+      const conn = new FIXConnection({
+        host: 'test.host',
+        port: 1234,
+        senderCompID: 'CLI_CLIENT',
+        targetCompID: 'TRUEX_UAT_OE',
+        apiKey: 'k',
+        apiSecret: 's',
+        logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
+      });
+      conn.socket = new MockSocket();
+      conn.socket.write = jest.fn().mockReturnValue(true);
+
+      // Should resolve successfully without throwing
+      const result = await conn.sendMessage({ '35': '0', '49': 'CLI_CLIENT', '56': 'TRUEX_UAT_OE', '34': '1', '52': '20251007-13:40:00.000' });
+      expect(result).toBeDefined();
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Task 1.3 — Persist inbound expected seqnum after sequence advance
+  // -----------------------------------------------------------------------
+  describe('Redis sequence persistence — inbound seqnum on receive', () => {
+    it('should call Redis set after a valid sequence advance', () => {
+      const mockRedis = {
+        get: jest.fn().mockResolvedValue(null),
+        set: jest.fn().mockResolvedValue('OK'),
+      };
+      const conn = new FIXConnection({
+        host: 'test.host',
+        port: 1234,
+        senderCompID: 'CLI_CLIENT',
+        targetCompID: 'TRUEX_UAT_OE',
+        apiKey: 'k',
+        apiSecret: 's',
+        redisClient: mockRedis,
+        logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
+      });
+      conn.expectedSeqNum = 1;
+
+      const result = conn.validateSequence(1);
+
+      expect(result).toBe('OK');
+      // expectedSeqNum incremented to 2
+      expect(mockRedis.set).toHaveBeenCalledWith('fix:seq:CLI_CLIENT:TRUEX_UAT_OE:in', 2);
+    });
+
+    it('should NOT call Redis set on duplicate or gap detection', () => {
+      const mockRedis = {
+        get: jest.fn().mockResolvedValue(null),
+        set: jest.fn().mockResolvedValue('OK'),
+      };
+      const conn = new FIXConnection({
+        host: 'test.host',
+        port: 1234,
+        senderCompID: 'CLI_CLIENT',
+        targetCompID: 'TRUEX_UAT_OE',
+        apiKey: 'k',
+        apiSecret: 's',
+        redisClient: mockRedis,
+        logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
+      });
+      conn.expectedSeqNum = 5;
+
+      const dupResult = conn.validateSequence(3);  // duplicate
+      const gapResult = conn.validateSequence(10); // gap
+
+      expect(dupResult).toBe('DUPLICATE');
+      expect(gapResult).toBe('GAP');
+      expect(mockRedis.set).not.toHaveBeenCalled();
     });
   });
 });

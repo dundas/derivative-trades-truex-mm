@@ -28,6 +28,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this.sessionId = options.sessionId || `mm-${Date.now()}`;
     this.symbol = options.symbol || 'BTC-PYUSD';
 
+    // Redis client (optional) — used for sequence number persistence and other caching
+    this.redis = options.redisClient || null;
+
     // --- Core components (accept injected or create from config) ---
 
     this.fixOE = options.fixConnection || new FIXConnection({
@@ -39,6 +42,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       apiSecret: options.apiSecret,
       heartbeatInterval: options.heartbeatInterval || 30,
       logger: this.logger,
+      redisClient: this.redis,
     });
 
     this.inventoryManager = options.inventoryManager || new InventoryManager({
@@ -195,6 +199,11 @@ export class MarketMakerOrchestrator extends EventEmitter {
 
     // 8. Start REST reconciliation timer (if REST client configured)
     if (this.restClient) {
+      // Run immediately at startup to cancel any orphaned orders from previous session
+      this._restReconcile().catch(err =>
+        this.logger.warn(`[Orchestrator] Startup reconciliation failed (non-fatal): ${err.message}`)
+      );
+
       this._reconcileTimer = setInterval(() => this._restReconcile(), this.reconcileIntervalMs);
       this.logger.info(`[Orchestrator] REST reconciliation enabled (every ${this.reconcileIntervalMs / 1000}s)`);
 
