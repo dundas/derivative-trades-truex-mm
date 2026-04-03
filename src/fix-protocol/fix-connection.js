@@ -199,10 +199,12 @@ export class FIXConnection extends EventEmitter {
    * Connect to FIX server
    */
   async connect() {
-    // Load persisted sequence numbers from Redis only on reconnects.
-    // On first connect, let the reset-to-1 logic in the socket callback handle initialization.
-    // On reconnects, hasConnectedBefore is true and seqnums must not be reset to 1.
-    if (this.redisClient && this.hasConnectedBefore) {
+    // Load persisted sequence numbers from Redis before connecting.
+    // This handles both crash-recovery (first connect after restart) and mid-process reconnects.
+    // loadSequenceNumbers() defaults to 1 when keys are absent, so no separate reset is needed
+    // when Redis is available. The reset-to-1 in the socket callback is skipped when Redis is
+    // configured (see below) to avoid overwriting the loaded values.
+    if (this.redisClient) {
       await this.loadSequenceNumbers();
     }
 
@@ -264,10 +266,11 @@ export class FIXConnection extends EventEmitter {
         this.logger.info(`[FIXConnection] TCP connection established to ${this.targetCompID}`);
         this.isConnected = true;
 
-        // Only reset sequence numbers on the very first connect; on reconnects,
-        // preserve them so the exchange can do normal sequence recovery.
+        // Reset sequence numbers to 1 only on first connect when Redis is not configured.
+        // When Redis is available, loadSequenceNumbers() already set the correct values
+        // (defaulting to 1 when no keys exist), so resetting here would overwrite them.
         const isReconnect = this.hasConnectedBefore;
-        if (!isReconnect) {
+        if (!isReconnect && !this.redisClient) {
           this.msgSeqNum = 1;
           this.expectedSeqNum = 1;
         }
