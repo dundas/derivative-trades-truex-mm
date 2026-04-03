@@ -205,7 +205,11 @@ export class FIXConnection extends EventEmitter {
     // when Redis is available. The reset-to-1 in the socket callback is skipped when Redis is
     // configured (see below) to avoid overwriting the loaded values.
     if (this.redisClient) {
-      await this.loadSequenceNumbers();
+      try {
+        await this.loadSequenceNumbers();
+      } catch (err) {
+        this.logger.warn(`[FIXConnection] Redis seqnum load failed, starting from 1: ${err.message}`);
+      }
     }
 
     return new Promise((resolve, reject) => {
