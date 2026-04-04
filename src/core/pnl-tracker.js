@@ -71,6 +71,10 @@ export class PnLTracker extends EventEmitter {
    */
   onFill({ side, quantity, price, venue = 'truex', isMaker = false, execID, timestamp }) {
     if (!quantity || quantity <= 0) return;
+    if (side !== 'buy' && side !== 'sell') {
+      this.logger?.warn?.(`[PnLTracker] Ignoring fill with invalid side: ${side}`);
+      return;
+    }
 
     this.numTrades++;
 

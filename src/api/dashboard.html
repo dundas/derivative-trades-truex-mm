@@ -143,7 +143,7 @@
       oeEl.textContent = connText(d.oeConnected);
       const mdEl = document.getElementById('md-conn');
       // mdConnected may be null if feed doesn't expose isLoggedOn — infer from freshness
-      const mdConn = d.mdConnected !== null ? d.mdConnected : (d.lastMdAge !== null && d.lastMdAge < 10000);
+      const mdConn = d.mdConnected == null ? (d.lastMdAge !== null && d.lastMdAge < 10000) : d.mdConnected;
       mdEl.className = connClass(mdConn);
       mdEl.textContent = connText(mdConn);
       document.getElementById('last-md').textContent = d.lastMdAge !== null ? fmt(d.lastMdAge) + ' ago' : '—';
