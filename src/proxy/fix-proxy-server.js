@@ -2,7 +2,7 @@ const net = require('net');
 const crypto = require('crypto');
 require('dotenv').config({ path: '.env' });
 
-const FIX_PROXY_PORT = 3004;
+const FIX_PROXY_PORT = parseInt(process.env.FIX_PROXY_PORT || '3004');
 const TRUEX_FIX_HOST = process.env.TRUEX_UPSTREAM_HOST || '38.32.101.229';
 const TRUEX_FIX_PORT = parseInt(process.env.TRUEX_UPSTREAM_PORT || '19484');
 

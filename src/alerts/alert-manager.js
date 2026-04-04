@@ -76,33 +76,30 @@ export class AlertManager {
 
   async _sendEmail(subject, body) {
     if (!this.alertEmail) return;
-    // Dynamic import to avoid crashing when nodemailer not installed
-    let nodemailer;
-    try {
-      nodemailer = (await import('nodemailer')).default;
-    } catch {
-      this.logger.warn('[AlertManager] nodemailer not installed — email skipped');
-      return;
-    }
 
-    const gmailUser = process.env.GMAIL_USER;
-    const gmailPass = process.env.GMAIL_USER_PASS;
-    if (!gmailUser || !gmailPass) {
-      this.logger.warn('[AlertManager] GMAIL_USER/GMAIL_USER_PASS not set — email skipped');
+    const apiKey = process.env.CIRCLEINBOX_API_KEY;
+    const fromEmail = process.env.ALERT_FROM_EMAIL || 'alerts@derivative.email';
+
+    if (!apiKey) {
+      this.logger.warn('[AlertManager] CIRCLEINBOX_API_KEY not set — email skipped');
       return;
     }
 
     try {
-      const transporter = nodemailer.createTransport({
-        service: 'gmail',
-        auth: { user: gmailUser, pass: gmailPass },
+      const resp = await fetch('https://api.circleinbox.com/api/v1/send', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          from: { email: fromEmail, name: 'True Markets Alerts' },
+          to: this.alertEmail,
+          subject,
+          text: body,
+        }),
       });
-      await transporter.sendMail({
-        from: gmailUser,
-        to: this.alertEmail,
-        subject,
-        text: body,
-      });
+      if (!resp.ok) this.logger.warn(`[AlertManager] CircleInbox email failed: ${resp.status}`);
     } catch (err) {
       this.logger.warn(`[AlertManager] Email send error: ${err.message}`);
     }
