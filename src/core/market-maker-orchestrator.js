@@ -8,6 +8,7 @@ import { QuoteEngine } from './quote-engine.js';
 import { HedgeExecutor } from './hedge-executor.js';
 import { TrueXMarketDataFeed } from './truex-market-data.js';
 import { TrueXRESTClient } from '../exchanges/truex/TrueXRESTClient.js';
+import { AlertManager } from '../alerts/alert-manager.js';
 
 /**
  * MarketMakerOrchestrator - Wires all components and manages lifecycle.
@@ -135,6 +136,17 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this._mdStaleThresholdMs = parseInt(process.env.MD_STALE_THRESHOLD_MS || '10000', 10);
     this._quotingIdleThresholdMs = parseInt(process.env.QUOTING_IDLE_THRESHOLD_MS || '120000', 10);
     this._quotingGateEnabled = true; // false when MD stale or session down
+    this._wasQuotingHalted = false;
+
+    // Alert manager (injectable for testing; defaults to env-driven config)
+    this.alertManager = options.alertManager || new AlertManager({
+      slackWebhookUrl: process.env.DEFAULT_SLACK_WEBHOOK_URL || null,
+      alertEmail: process.env.ALERT_EMAIL || null,
+      alertPhone: process.env.ALERT_PHONE || null,
+      telnyxApiKey: process.env.TELNYX_API_KEY || null,
+      telnyxFromNumber: process.env.TELNYX_FROM_NUMBER || null,
+      logger: this.logger,
+    });
 
     // Timers
     this.drainQueueTimer = null;
@@ -723,6 +735,15 @@ export class MarketMakerOrchestrator extends EventEmitter {
     const now = Date.now();
     const issues = [];
 
+    // Detect quoting resume (recovery alert) — check BEFORE building issues list
+    const isQuotingNow = this.isRunning && this._lastRepriceTime > 0 &&
+      (now - this._lastRepriceTime) < this._quotingIdleThresholdMs;
+    if (this._wasQuotingHalted && isQuotingNow) {
+      this._wasQuotingHalted = false;
+      this.alertManager.sendRecovery({ reason: 'quoting resumed' })
+        .catch(err => this.logger.error(`[WATCHDOG] Recovery alert failed: ${err.message}`));
+    }
+
     // Check OE FIX
     if (!this.fixOE.isLoggedOn) {
       issues.push('OE FIX not logged on');
@@ -742,12 +763,12 @@ export class MarketMakerOrchestrator extends EventEmitter {
     const repriceAge = this._lastRepriceTime > 0 ? now - this._lastRepriceTime : null;
     if (repriceAge !== null && repriceAge > this._quotingIdleThresholdMs) {
       const position = this.inventoryManager.getPositionSummary();
-      const balances = position.baseBalance || position.quoteBalance;
       const baseTotal = position.baseBalance?.total ?? 0;
       const quoteTotal = position.quoteBalance?.total ?? 0;
       const hasBalance = baseTotal > 0 || quoteTotal > 0;
       if (hasBalance) {
         issues.push(`Quoting idle for ${Math.round(repriceAge / 1000)}s`);
+        this._wasQuotingHalted = true;
       }
     }
 
@@ -755,6 +776,14 @@ export class MarketMakerOrchestrator extends EventEmitter {
       const msg = `[WATCHDOG] Health check failed: ${issues.join('; ')}`;
       this.logger.error(msg);
       this.emit('watchdog-alert', { issues, timestamp: now });
+
+      // Fire alerts (deduplication handled by AlertManager)
+      const position = this.inventoryManager.getPositionSummary();
+      this.alertManager.sendAlert({
+        reason: issues.join('; '),
+        level: 'error',
+        details: { position, issues },
+      }).catch(err => this.logger.error(`[WATCHDOG] Alert send failed: ${err.message}`));
 
       // Cancel all orders via REST (safety net)
       if (this.restClient) {

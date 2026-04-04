@@ -491,3 +491,69 @@ describe('getHealthStatus', () => {
     expect(status.position).toBeDefined();
   });
 });
+
+// -----------------------------------------------------------------------
+// Task 4.3 — AlertManager wired into Orchestrator
+// -----------------------------------------------------------------------
+describe('AlertManager integration in Orchestrator', () => {
+  function makeAlertManager() {
+    return {
+      sendAlert: jest.fn().mockResolvedValue({ sent: true }),
+      sendRecovery: jest.fn().mockResolvedValue(undefined),
+    };
+  }
+
+  it('calls alertManager.sendAlert when watchdog detects a failure', async () => {
+    const mockAlertManager = makeAlertManager();
+    const orch = makeOrch({ alertManager: mockAlertManager });
+    orch.isRunning = true;
+    orch._intentionalStop = false;
+    orch.fixOE.isLoggedOn = false; // triggers OE issue
+
+    orch._runWatchdog();
+    await Promise.resolve(); // flush fire-and-forget
+
+    expect(mockAlertManager.sendAlert).toHaveBeenCalledTimes(1);
+    const [arg] = mockAlertManager.sendAlert.mock.calls[0];
+    expect(arg.reason).toContain('OE FIX not logged on');
+    expect(arg.level).toBe('error');
+  });
+
+  it('calls alertManager.sendRecovery when quoting resumes after halt', async () => {
+    const mockAlertManager = makeAlertManager();
+    const orch = makeOrch({ alertManager: mockAlertManager });
+    orch.isRunning = true;
+    orch._intentionalStop = false;
+    orch.fixOE.isLoggedOn = true;
+    orch._wasQuotingHalted = true; // simulate previous halt
+    orch._lastRepriceTime = Date.now() - 1000; // actively quoting
+    orch._quotingIdleThresholdMs = 120000;
+
+    orch._runWatchdog();
+    await Promise.resolve();
+
+    expect(mockAlertManager.sendRecovery).toHaveBeenCalledTimes(1);
+    const [arg] = mockAlertManager.sendRecovery.mock.calls[0];
+    expect(arg.reason).toBe('quoting resumed');
+    expect(orch._wasQuotingHalted).toBe(false);
+  });
+
+  it('does not call sendAlert when zero balances suppress the quoting-idle issue', async () => {
+    const mockAlertManager = makeAlertManager();
+    const orch = makeOrch({ alertManager: mockAlertManager });
+    orch.isRunning = true;
+    orch._intentionalStop = false;
+    orch.fixOE.isLoggedOn = true; // OE fine — no OE issue
+
+    // Quoting idle with ZERO balances — should NOT push the idle issue
+    orch._lastRepriceTime = Date.now() - 200000; // 200s ago, well over 120s threshold
+    orch._quotingIdleThresholdMs = 120000;
+    // inventoryManager.getPositionSummary already returns baseBalance: null, quoteBalance: null
+    // which means baseTotal=0, quoteTotal=0, hasBalance=false
+
+    orch._runWatchdog();
+    await Promise.resolve();
+
+    expect(mockAlertManager.sendAlert).not.toHaveBeenCalled();
+  });
+});
