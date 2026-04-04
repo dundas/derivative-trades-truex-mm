@@ -1,5 +1,5 @@
 # TrueX Market Maker (true_markets_mm)
-# Generated: 2026-04-04
+# Generated: 2026-04-04 (rev2)
 # Audience: AI agents operating or debugging this system
 
 > Automated BTC-PYUSD market maker on TrueX exchange using FIX protocol,
@@ -198,13 +198,26 @@ Steps: fetch active orders → cancelAllOrders() → verify none remain.
 
 ## Deployment
 
-Network: Mac → Hetzner proxy (178.156.230.110) → WireGuard → TrueX (10.20.1.11).
-Proxy ports: 3004=FIX OE, 3006=REST. Docker: oven/bun:1.1-alpine, non-root user.
-Services: redis (7-alpine), fix-proxy, market-maker. `docker compose up -d`.
+All production components run on Hetzner (Docker, network_mode: host).
+Servers:
+  truex-mm-prod     178.156.230.110  — fix-proxy, md-proxy, market-maker, redis, log-exporter
+  truex-pg-analytics 178.156.247.87  — PostgreSQL (db=truex_analytics, user=truex_mm)
 
-Env required: TRUEX_API_KEY (or TRUEX_PROD_API_KEY), TRUEX_SECRET_KEY.
-Optional: TRUEX_FIX_HOST/PORT, TRUEX_CLIENT_ID, TRUEX_REST_URL, DATABASE_URL,
-REDIS_URL, LOG_LEVEL, TRUEX_MAKER_FEE_BPS, TRUEX_TAKER_FEE_BPS.
+Network (inside Hetzner):
+  FIX OE: 127.0.0.1:3004 (fix-proxy) → WireGuard → 10.20.1.11:19484
+  REST:   direct http://10.20.1.11:9742 (WireGuard, no proxy needed)
+  Redis:  127.0.0.1:6379 (local, 256MB, appendonly)
+  PG:     178.156.247.87:5432/truex_analytics
+
+Log exporter: ships new log lines to Mech Storage every 5 min (cursor-tracked JSONL).
+Logs: Docker volume mm-logs → /app/logs/market-maker.log (daily gzip rotation).
+
+Deploy: `ssh root@178.156.230.110 "cd /root/true_markets_mm && docker compose -f docker-compose.prod.yml up -d --build market-maker"`
+Kill switch: `bun scripts/kill-switch.js --prod` (REST-only, no FIX needed)
+
+Required env (prod): TRUEX_PROD_API_KEY, TRUEX_PROD_SECRET_KEY, TRUEX_CLIENT_ID,
+  TRUEX_FIX_HOST, TRUEX_FIX_PORT, TRUEX_REST_URL.
+Optional: DATABASE_URL, REDIS_URL, LOG_LEVEL, TRUEX_MAKER_FEE_BPS, TRUEX_TAKER_FEE_BPS.
 
 UAT: FIX 38.32.101.229:19484, REST http://38.32.101.229:9742.
 SenderCompID: DAVID1|DAVID2, TargetCompID: TRUEX_UAT_OE.

@@ -1,6 +1,6 @@
 # TrueX Market Maker - Architecture
 
-> Generated from source code on 2026-04-04. Source is the single source of truth.
+> Generated from source code on 2026-04-04 (rev2). Source is the single source of truth.
 
 ## Overview
 
@@ -110,49 +110,50 @@ QuoteEngine.onPriceUpdate(aggregatedPrice)
 ## Deployment Topology
 
 ```
-+---------------------------+
-|  Mac (local machine)      |
-|                           |
-|  bun scripts/run-prod.js  |
-|                           |
-|  +---------------------+  |        +---------------------------+
-|  | MarketMaker process |  |        |  Hetzner VPS              |
-|  |                     |  |        |  178.156.230.110           |
-|  |  FIX OE ---------->+--+------->|  :3004 (FIX proxy Docker)  |
-|  |  (TCP)              |  |        |    network_mode: host      |
-|  |                     |  |        |    socat/node fwd          |---WireGuard VPN--->
-|  |  REST  ----------->+--+------->|  :3006 (REST socat proxy)  |                   |
-|  |  (HTTP)             |  |        +---------------------------+                    |
-|  |                     |  |                                                         |
-|  |  Coinbase WS -------+--+---> wss://ws-feed.exchange.coinbase.com (direct)       |
-|  |  (WebSocket)        |  |                                                         v
-|  +---------------------+  |                                              +----------+---------+
-|                           |                                              |  TrueX Production   |
-+---------------------------+                                              |  10.20.1.11          |
-         |                                                                 |  FIX OE: port 19484 |
-         |  DATABASE_URL                                                   |  REST: /api/v1       |
-         v                                                                 +--------------------+
-+---------------------------+
-|  DigitalOcean Managed PG  |
-|  (PostgreSQL)             |
-+---------------------------+
-
-+---------------------------+
-|  Redis (optional)         |
-|  Local Docker or remote   |
-|  Auto-fallback to         |
-|  direct Memory->PG flush  |
-+---------------------------+
++---------------------------------------------+
+|  Hetzner: truex-mm-prod (178.156.230.110)   |
+|  Docker containers (network_mode: host)      |
+|                                              |
+|  +------------------+  +-----------------+  |
+|  | truex-fix-proxy  |  | truex-md-proxy  |  |
+|  | :3004 → WG →     |  | :3005 → WG →    |  |
+|  | 10.20.1.11:19484 |  | 10.20.1.11:20484|  |
+|  +------------------+  +-----------------+  |
+|                                              |
+|  +------------------+                        |
+|  | truex-market-    |                        |
+|  | maker            |  FIX → 127.0.0.1:3004 |
+|  |                  |  REST → 10.20.1.11:9742| ---WireGuard VPN---> TrueX Production
+|  |  Coinbase WS ----+---> coinbase.com       |                     (10.20.1.11)
+|  +--------+---------+                        |
+|           |  logs                            |
+|  +--------+---------+  +----------------+   |
+|  | truex-log-       |  | truex-redis    |   |
+|  | exporter         |  | 127.0.0.1:6379 |   |
+|  | → Mech Storage   |  | 256MB AOF      |   |
+|  +------------------+  +----------------+   |
++---------------------------------------------+
+          |
+          | DATABASE_URL (postgresql://truex_mm@...)
+          v
++---------------------------------------------+
+|  Hetzner: truex-pg-analytics (178.156.247.87)|
+|  PostgreSQL 14 — db: truex_analytics         |
+|  tables: sessions, orders, fills, ohlc       |
+|  access: whitelisted from 178.156.230.110    |
++---------------------------------------------+
 ```
 
 ### Key Deployment Notes
 
-- The market maker process runs **locally on Mac** via `bun scripts/run-prod.js`
-- FIX traffic goes through a **Hetzner proxy** (Docker container with `network_mode: host`) at `178.156.230.110:3004`, which forwards over **WireGuard VPN** to TrueX production at `10.20.1.11`
-- REST traffic goes through a **Hetzner socat proxy** at `178.156.230.110:3006`, also forwarding over WireGuard VPN
-- Coinbase WebSocket connects **directly** (no VPN needed)
-- PostgreSQL is hosted on **DigitalOcean managed database**, connected via `DATABASE_URL`
-- Redis is **optional** -- when unavailable, the data pipeline automatically falls back to direct Memory-to-PostgreSQL flush every 5 seconds
+- All production components run **on Hetzner** in Docker (`network_mode: host`)
+- The market maker connects to TrueX FIX via `truex-fix-proxy` at `127.0.0.1:3004`, which forwards over **WireGuard VPN** to `10.20.1.11:19484`
+- REST calls go **direct over WireGuard** to `http://10.20.1.11:9742` — no REST proxy needed from inside Hetzner
+- Coinbase WebSocket connects **directly** from the market maker container
+- Redis runs **locally** on `truex-mm-prod` at `127.0.0.1:6379` (not externally accessible)
+- PostgreSQL runs on a **dedicated Hetzner server** `truex-pg-analytics` at `178.156.247.87:5432/truex_analytics`
+- `truex-log-exporter` reads the log file via shared Docker volume and ships new lines to Mech Storage every 5 minutes
+- Redis is **required** in production; pipeline falls back to direct PG flush every 5s if Redis is unavailable
 
 ---
 
@@ -315,6 +316,10 @@ FIX 5.0 SP2 over FIXT.1.1 transport layer.
 
 **Memory cleanup:** Old completed orders evicted every 30 minutes.
 
+**Storage targets (production):**
+- Redis: `127.0.0.1:6379` (local to `truex-mm-prod`)
+- PostgreSQL: `178.156.247.87:5432/truex_analytics` (Hetzner `truex-pg-analytics` server)
+
 ### TrueXRESTClient (`src/exchanges/truex/TrueXRESTClient.ts`)
 
 REST API client for TrueX with HMAC-SHA256 authentication.
@@ -350,6 +355,21 @@ REST API client for TrueX with HMAC-SHA256 authentication.
 - TimeInForce: GTC (`59=1`), IOC (`59=3`). No GTD/TTL.
 - Execution instruction: ALO (Add Liquidity Only / post-only)
 - Self-trade protection: NONE, CANCEL_AGGRESSIVE, CANCEL_BOTH
+
+### LogExporter (`scripts/log-exporter.js`)
+
+Ships market-maker log lines to Mech Storage on a rolling cadence.
+
+- Reads `LOG_FILE` (default `/app/logs/market-maker.log`) from shared Docker volume
+- Tracks byte position via cursor file (`market-maker.log.cursor`) — never re-uploads
+- Uploads new lines every `EXPORT_INTERVAL_MS` (default 5 minutes)
+- Filename: `truex-mm-YYYY-MM-DD-HHmm.log` per export chunk
+- Final flush on SIGTERM before exit
+
+**Required env:** `MECH_APP_ID`, `MECH_API_KEY`
+**Optional:** `MECH_STORAGE_URL` (default: `https://storage.mechdna.net`), `EXPORT_INTERVAL_MS`
+
+---
 
 ### Analytics API (`src/api/server.js`)
 
@@ -465,16 +485,21 @@ PostgreSQL-backed analytics server using `Bun.serve()` on port 3100.
 - Production dependencies only (`bun install --production`)
 - Health check: `bun --version` every 30s
 
-### Docker Compose (`docker-compose.yml`)
+### Docker Compose — Production (`docker-compose.prod.yml`)
 
-| Service | Image | Port | Purpose |
-|---------|-------|------|---------|
-| `redis` | `redis:7-alpine` | 6379 | Pipeline Layer 2 (optional) |
-| `fix-proxy` | Custom (Dockerfile) | 3004 | FIX proxy to TrueX UAT `38.32.101.229:19484` |
-| `market-maker` | Custom (Dockerfile) | -- | Market maker process |
-| `test-runner` | Custom (Dockerfile) | -- | Integration tests (profile: `test`) |
+| Service | Container | Port | Purpose |
+|---------|-----------|------|---------|
+| `redis` | `truex-redis` | 127.0.0.1:6379 | Pipeline Layer 2 — AOF persistence, 256MB |
+| `fix-proxy` | `truex-fix-proxy` | 3004 | FIX OE proxy → WireGuard → 10.20.1.11:19484 |
+| `md-proxy` | `truex-md-proxy` | 3005 | FIX MD proxy → WireGuard → 10.20.1.11:20484 |
+| `market-maker` | `truex-market-maker` | 3100 (API) | Market maker + analytics API |
+| `log-exporter` | `truex-log-exporter` | -- | Ships logs to Mech Storage every 5 min |
 
-Note: The docker-compose.yml targets UAT (`38.32.101.229:19484`). Production uses the Hetzner VPS proxy topology described above.
+All services use `network_mode: host` for direct WireGuard access.
+
+### Docker Compose — UAT/Dev (`docker-compose.yml`)
+
+Targets UAT (`38.32.101.229:19484`). For local development only.
 
 ---
 
