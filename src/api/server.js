@@ -863,6 +863,27 @@ async function handleEmergencyStop(req) {
 }
 
 // ---------------------------------------------------------------------------
+// Status dashboard handlers
+// ---------------------------------------------------------------------------
+
+async function handleApiStatus() {
+  const orchHealth = orchestratorRef?.getHealthStatus() ?? null;
+  if (!orchHealth) {
+    return jsonOk({ status: 'unknown', message: 'Orchestrator not connected' });
+  }
+  return jsonOk(orchHealth);
+}
+
+function handleDashboard() {
+  try {
+    const file = Bun.file('./src/api/dashboard.html');
+    return new Response(file, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+  } catch {
+    return jsonError('Dashboard not found', 404);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
@@ -924,6 +945,9 @@ Bun.serve({
       if (path === '/api/v1/sessions') return await handleGetSessions(params);
       if (path === '/api/v1/orders')   return await handleGetOrders(params);
       if (path === '/api/v1/fills')    return await handleGetFills(params);
+
+      if (path === '/api/status') return handleApiStatus();
+      if (path === '/' || path === '/dashboard') return handleDashboard();
 
       return jsonError('Not found', 404);
     } catch (err) {
