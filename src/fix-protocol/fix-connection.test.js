@@ -1038,7 +1038,7 @@ describe('FIXConnection', () => {
         // reconnectAttempts should NOT have reset yet (timer hasn't fired)
         expect(connection.reconnectAttempts).toBe(5);
 
-        // Wait for the real callback (now 0ms delay) to fire
+        // Wait for the real callback (now 0ms delay) to fire.\n        // Note: Bun 1.3.3 does not support jest.advanceTimersByTime/runAllTimers,\n        // so we patch global.setTimeout to 0ms delay and use a 100ms sentinel.
         await new Promise(resolve => originalSetTimeout(resolve, 20));
 
         // Real callback reset reconnectAttempts to 0
