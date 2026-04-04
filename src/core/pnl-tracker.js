@@ -212,6 +212,11 @@ export class PnLTracker extends EventEmitter {
     }
   }
 
+  /**
+   * Get current PnL summary.
+   * realizedPnL = FIFO spread on matched round-trips.
+   * netCashFlow = sellProceeds - buyCost (use for sell-heavy accounts).
+   */
   getSummary() {
     const totalPnL = this.realizedPnL + this.unrealizedPnL - this.totalFees;
     const avgSpreadCapture = this.totalMatchedQuantity > 0
@@ -248,6 +253,7 @@ export class PnLTracker extends EventEmitter {
     };
   }
 
+  /** Generate a detailed session report string for logging. */
   getSessionReport() {
     const s = this.getSummary();
     const elapsedMin = ((Date.now() - this.sessionStartTime) / 60000).toFixed(1);
@@ -279,6 +285,7 @@ export class PnLTracker extends EventEmitter {
     return lines.join('\n');
   }
 
+  /** Start periodic PnL summary logging. */
   startPeriodicLogging() {
     if (this._logTimer) return;
     this._logTimer = setInterval(() => {
@@ -288,6 +295,7 @@ export class PnLTracker extends EventEmitter {
     }, this.logIntervalMs);
   }
 
+  /** Stop periodic logging. */
   stopPeriodicLogging() {
     if (this._logTimer) {
       clearInterval(this._logTimer);
@@ -295,6 +303,7 @@ export class PnLTracker extends EventEmitter {
     }
   }
 
+  /** Reset all PnL state. */
   reset() {
     this.buyFills = [];
     this.sellFills = [];
