@@ -31,6 +31,21 @@ const MECH_API_KEY = process.env.MECH_API_KEY;
 const STORAGE_URL  = process.env.MECH_STORAGE_URL || 'https://storage.mechdna.net';
 
 // ---------------------------------------------------------------------------
+// Orchestrator reference (injected at runtime for live health data)
+// ---------------------------------------------------------------------------
+
+/** @type {import('../core/market-maker-orchestrator.js').MarketMakerOrchestrator | null} */
+let orchestratorRef = null;
+
+/**
+ * Attach a live orchestrator instance so health endpoints can reflect real-time state.
+ * Call this after constructing the orchestrator, before or after starting the API server.
+ */
+export function setOrchestrator(orch) {
+  orchestratorRef = orch;
+}
+
+// ---------------------------------------------------------------------------
 // Database
 // ---------------------------------------------------------------------------
 
@@ -116,13 +131,41 @@ function addTimeFilter(conditions, values, idx, col, from, to) {
 
 async function handleHealth() {
   const start = Date.now();
+  const orchHealth = orchestratorRef?.getHealthStatus() ?? null;
+  const buildBody = (dbInfo) => {
+    const status = orchHealth?.status ?? (dbInfo.connected ? 'healthy' : 'degraded');
+    return {
+      status,
+      // Orchestrator health fields at top level (per FR-2.4)
+      quoting: orchHealth?.quoting ?? null,
+      lastRepriceAge: orchHealth?.lastRepriceAge ?? null,
+      oeConnected: orchHealth?.oeConnected ?? null,
+      mdConnected: orchHealth?.mdConnected ?? null,
+      lastMdAge: orchHealth?.lastMdAge ?? null,
+      // Other fields
+      database: dbInfo,
+      uptime: process.uptime(),
+      timestamp: Date.now(),
+    };
+  };
   try {
     await db.query('SELECT 1');
     const latencyMs = Date.now() - start;
     const pool = db.getStats ? db.getStats() : null;
-    return jsonOk({ status: 'healthy', database: { connected: true, latencyMs, pool }, uptime: process.uptime(), timestamp: Date.now() });
+    const body = buildBody({ connected: true, latencyMs, pool });
+    if (body.status === 'unhealthy') {
+      return new Response(JSON.stringify({ success: true, data: body, meta: {} }), {
+        status: 503,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders() },
+      });
+    }
+    return jsonOk(body);
   } catch (err) {
-    return jsonOk({ status: 'unhealthy', database: { connected: false, error: err.message }, uptime: process.uptime(), timestamp: Date.now() });
+    const body = buildBody({ connected: false, error: err.message });
+    return new Response(JSON.stringify({ success: true, data: body, meta: {} }), {
+      status: 503,
+      headers: { 'Content-Type': 'application/json', ...corsHeaders() },
+    });
   }
 }
 
