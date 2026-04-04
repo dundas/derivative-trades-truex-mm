@@ -1,0 +1,121 @@
+# TrueX Proxies + Market Maker - Host Network Mode (direct WireGuard access)
+# Usage: docker compose -f docker-compose.prod.yml up -d
+
+services:
+  # Redis - local to Hetzner, no external dependency
+  redis:
+    image: redis:7-alpine
+    container_name: truex-redis
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru --bind 127.0.0.1
+    healthcheck:
+      test: ["CMD", "redis-cli", "-h", "127.0.0.1", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  # FIX OE Proxy - forwards to TrueX prod via WireGuard
+  fix-proxy:
+    build: .
+    container_name: truex-fix-proxy
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - NODE_ENV=production
+      - FIX_PROXY_PORT=3004
+      - TRUEX_UPSTREAM_HOST=10.20.1.11
+      - TRUEX_UPSTREAM_PORT=19484
+    command: ["bun", "src/proxy/fix-proxy-server.js"]
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  # FIX MD Proxy - market data feed
+  md-proxy:
+    build: .
+    container_name: truex-md-proxy
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - NODE_ENV=production
+      - FIX_PROXY_PORT=3005
+      - TRUEX_UPSTREAM_HOST=10.20.1.11
+      - TRUEX_UPSTREAM_PORT=20484
+    command: ["bun", "src/proxy/fix-proxy-server.js"]
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  # Market Maker - FIX via local proxy, REST direct via WireGuard
+  market-maker:
+    build: .
+    container_name: truex-market-maker
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      redis:
+        condition: service_healthy
+      fix-proxy:
+        condition: service_started
+    env_file: .env
+    environment:
+      - NODE_ENV=production
+      - TRUEX_FIX_HOST=127.0.0.1
+      - TRUEX_FIX_PORT=3004
+      - TRUEX_REST_URL=http://10.20.1.11:9742
+      - REDIS_URL=redis://127.0.0.1:6379
+      - LOG_LEVEL=info
+      - LOG_FILE=/app/logs/market-maker.log
+    volumes:
+      - mm-logs:/app/logs
+    command: ["bun", "scripts/run-prod.js"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3100/api/v1/health | grep -q '\"status\":\"healthy\"' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+        max-file: "5"
+
+  # Log Exporter - ships logs to mech-storage every 5 minutes
+  log-exporter:
+    build: .
+    container_name: truex-log-exporter
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      - market-maker
+    env_file: .env
+    environment:
+      - LOG_FILE=/app/logs/market-maker.log
+      - EXPORT_INTERVAL_MS=300000
+    volumes:
+      - mm-logs:/app/logs
+    command: ["bun", "scripts/log-exporter.js"]
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  redis-data:
+    driver: local
+  mm-logs:
+    driver: local
