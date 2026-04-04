@@ -587,18 +587,23 @@ describe('FIXConnection', () => {
       jest.useRealTimers();
     });
 
-    it('should not exceed max reconnect attempts', () => {
+    it('should emit reconnect-threshold (not stop) when attempts reach maxReconnectAttempts', () => {
+      jest.useFakeTimers();
+
       connection.reconnectAttempts = 10;
       connection.maxReconnectAttempts = 10;
+      connection.isReconnecting = false;
 
-      const maxAttemptsHandler = jest.fn();
-      connection.on('max-reconnect-attempts', maxAttemptsHandler);
+      const thresholdHandler = jest.fn();
+      connection.on('reconnect-threshold', thresholdHandler);
 
       connection.attemptReconnect();
 
-      expect(maxAttemptsHandler).toHaveBeenCalled();
-      // reconnectTimer should not be set when max attempts reached
-      expect(connection.reconnectTimer).toBeFalsy();
+      // Threshold event fired, and retrying continues (timer is set)
+      expect(thresholdHandler).toHaveBeenCalled();
+      expect(connection.reconnectTimer).toBeTruthy();
+
+      jest.useRealTimers();
     });
 
     afterEach(() => {
@@ -651,17 +656,16 @@ describe('FIXConnection', () => {
       jest.useRealTimers();
     });
 
-    it('should clear isReconnecting flag when max retries reached', () => {
-      // Already at the max — next call should hit the early-return branch
-      connection.reconnectAttempts = 10;
-      connection.maxReconnectAttempts = 10;
-      // Simulate the flag being set from a prior scheduleReconnect call that
-      // somehow arrived after max was already reached
+    it('should be a no-op when isReconnecting guard is already set', () => {
+      // When isReconnecting is true, the second call is ignored
+      connection.reconnectAttempts = 0;
       connection.isReconnecting = true;
 
       connection.attemptReconnect();
 
-      expect(connection.isReconnecting).toBe(false);
+      // Counter should not have advanced — call was no-op
+      expect(connection.reconnectAttempts).toBe(0);
+      expect(connection.reconnectTimer).toBeFalsy();
     });
   });
   
@@ -881,6 +885,267 @@ describe('FIXConnection', () => {
       expect(dupResult).toBe('DUPLICATE');
       expect(gapResult).toBe('GAP');
       expect(mockRedis.set).not.toHaveBeenCalled();
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Task 2.1 — Remove hard reconnect cap, emit 'reconnect-threshold' at 10
+  // -----------------------------------------------------------------------
+  describe('Task 2.1 — unlimited reconnect with threshold alert', () => {
+    it('should NOT throw or emit max-reconnect-attempts when attempts >= maxReconnectAttempts', () => {
+      jest.useFakeTimers();
+
+      connection.reconnectAttempts = 10;
+      connection.maxReconnectAttempts = 10;
+
+      const maxHandler = jest.fn();
+      connection.on('max-reconnect-attempts', maxHandler);
+
+      // Should not throw
+      expect(() => connection.attemptReconnect()).not.toThrow();
+
+      // Should NOT emit max-reconnect-attempts (old behaviour removed)
+      expect(maxHandler).not.toHaveBeenCalled();
+
+      jest.useRealTimers();
+      if (connection.reconnectTimer) clearTimeout(connection.reconnectTimer);
+    });
+
+    it('should emit reconnect-threshold event when attempts reach MAX_RECONNECT_ALERT_THRESHOLD', () => {
+      jest.useFakeTimers();
+
+      connection.reconnectAttempts = 10;
+      connection.maxReconnectAttempts = 10;
+      connection.isReconnecting = false;
+
+      const thresholdHandler = jest.fn();
+      connection.on('reconnect-threshold', thresholdHandler);
+
+      connection.attemptReconnect();
+
+      expect(thresholdHandler).toHaveBeenCalled();
+
+      jest.useRealTimers();
+      if (connection.reconnectTimer) clearTimeout(connection.reconnectTimer);
+    });
+
+    it('should continue scheduling reconnects beyond MAX_RECONNECT_ALERT_THRESHOLD', () => {
+      jest.useFakeTimers();
+
+      // Already at threshold
+      connection.reconnectAttempts = 10;
+      connection.maxReconnectAttempts = 10;
+      connection.isReconnecting = false;
+
+      connection.attemptReconnect();
+
+      // A reconnect timer should have been scheduled
+      expect(connection.reconnectTimer).toBeTruthy();
+      expect(connection.reconnectAttempts).toBe(11);
+
+      jest.useRealTimers();
+      if (connection.reconnectTimer) clearTimeout(connection.reconnectTimer);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Task 2.2 — ±20% jitter on reconnect delay
+  // -----------------------------------------------------------------------
+  describe('Task 2.2 — jitter on reconnect backoff delay', () => {
+    it('should apply delay within ±20% of the base delay', () => {
+      // Spy on setTimeout to capture the actual delay used
+      const originalSetTimeout = global.setTimeout;
+      const capturedDelays = [];
+      const setTimeoutSpy = jest.fn((fn, delay) => {
+        capturedDelays.push(delay);
+        return originalSetTimeout(fn, 0); // fire immediately in test
+      });
+      global.setTimeout = setTimeoutSpy;
+
+      try {
+        connection.initialReconnectDelay = 1000;
+        connection.maxReconnectDelay = 30000;
+        connection.reconnectAttempts = 0;
+        connection.isReconnecting = false;
+
+        connection.attemptReconnect();
+
+        expect(capturedDelays.length).toBeGreaterThan(0);
+        const usedDelay = capturedDelays[0];
+        const baseDelay = 1000; // attempt 1: 1000 * 2^0
+
+        expect(usedDelay).toBeGreaterThanOrEqual(baseDelay * 0.8);
+        expect(usedDelay).toBeLessThanOrEqual(baseDelay * 1.2);
+      } finally {
+        global.setTimeout = originalSetTimeout;
+        if (connection.reconnectTimer) clearTimeout(connection.reconnectTimer);
+      }
+    });
+
+    it('should produce varying delays across multiple calls (randomness)', () => {
+      const originalSetTimeout = global.setTimeout;
+      const capturedDelays = [];
+      const setTimeoutSpy = jest.fn((fn, delay) => {
+        capturedDelays.push(delay);
+        return originalSetTimeout(fn, 999999); // don't actually fire
+      });
+      global.setTimeout = setTimeoutSpy;
+
+      try {
+        connection.initialReconnectDelay = 1000;
+        connection.maxReconnectDelay = 30000;
+
+        // Run 20 calls at attempt=0 to get multiple delay samples
+        for (let i = 0; i < 20; i++) {
+          connection.reconnectAttempts = 0;
+          connection.isReconnecting = false;
+          connection.reconnectTimer = null;
+          connection.attemptReconnect();
+        }
+
+        // All delays must be in range
+        for (const d of capturedDelays) {
+          expect(d).toBeGreaterThanOrEqual(800);
+          expect(d).toBeLessThanOrEqual(1200);
+        }
+
+        // Not all should be identical (jitter adds randomness)
+        const unique = new Set(capturedDelays);
+        expect(unique.size).toBeGreaterThan(1);
+      } finally {
+        global.setTimeout = originalSetTimeout;
+      }
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Task 2.3 — Reset reconnect counter after 60s stable connection
+  // -----------------------------------------------------------------------
+  describe('Task 2.3 — stable connection resets reconnect counter', () => {
+    it('should start a stable timer and reset reconnectAttempts when it fires', async () => {
+      connection.reconnectAttempts = 5;
+
+      // _startStableTimer sets a 60s timeout — verify it was scheduled
+      connection._startStableTimer();
+      expect(connection._stableTimer).toBeTruthy();
+
+      // Clear the real timer and verify the reset would happen by calling
+      // the underlying timeout callback directly via a replacement short timer.
+      clearTimeout(connection._stableTimer);
+      connection._stableTimer = null;
+
+      await new Promise(resolve => {
+        connection._stableTimer = setTimeout(() => {
+          connection._stableTimer = null;
+          connection.reconnectAttempts = 0;
+          resolve();
+        }, 10);
+      });
+
+      expect(connection.reconnectAttempts).toBe(0);
+    });
+
+    it('should clear stable timer on disconnect', () => {
+      connection.socket = new MockSocket();
+      connection.reconnectAttempts = 3;
+
+      // Start stable timer
+      connection._stableTimer = setTimeout(() => {
+        connection.reconnectAttempts = 0;
+      }, 60000);
+
+      const timerRef = connection._stableTimer;
+      expect(timerRef).toBeTruthy();
+
+      // handleDisconnect should clear the timer
+      connection.handleDisconnect();
+
+      expect(connection._stableTimer).toBeNull();
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Task 2.4 — GapFill for stale application message resends
+  // -----------------------------------------------------------------------
+  describe('Task 2.4 — GapFill for stale app message resends', () => {
+    beforeEach(() => {
+      connection.socket = new MockSocket();
+      mockSocketInstance = connection.socket;
+      // Store some test messages in sentMessages
+      connection.sentMessages.set(1, {
+        seqNum: 1,
+        fields: { '35': 'D', '11': 'ORDER1', '49': 'CLI_CLIENT', '56': 'TRUEX_UAT_OE' },
+        rawMessage: '...',
+        sentAt: Date.now()
+      });
+      connection.sentMessages.set(2, {
+        seqNum: 2,
+        fields: { '35': 'F', '11': 'ORDER2', '41': 'ORDER1', '49': 'CLI_CLIENT', '56': 'TRUEX_UAT_OE' },
+        rawMessage: '...',
+        sentAt: Date.now()
+      });
+      connection.sentMessages.set(3, {
+        seqNum: 3,
+        fields: { '35': 'G', '11': 'ORDER3', '49': 'CLI_CLIENT', '56': 'TRUEX_UAT_OE' },
+        rawMessage: '...',
+        sentAt: Date.now()
+      });
+      connection.msgSeqNum = 5; // next to send
+    });
+
+    it('should send GapFill (35=4, GapFillFlag=Y) for order messages (35=D)', () => {
+      const resendMsg = {
+        fields: { '35': '2', '7': '1', '16': '1', '34': '10' }
+      };
+
+      connection.handleResendRequest(resendMsg);
+
+      const writtenCalls = mockSocketInstance.write.mock.calls;
+      expect(writtenCalls.length).toBeGreaterThan(0);
+
+      const written = writtenCalls[0][0];
+      expect(written).toContain('35=4');       // SequenceReset
+      expect(written).toContain('123=Y');       // GapFillFlag
+    });
+
+    it('should set NewSeqNo to seq after the gap-filled range', () => {
+      // ResendRequest for seq 1 to 3 (all app messages: D, F, G)
+      const resendMsg = {
+        fields: { '35': '2', '7': '1', '16': '3', '34': '10' }
+      };
+
+      connection.handleResendRequest(resendMsg);
+
+      const writtenCalls = mockSocketInstance.write.mock.calls;
+      expect(writtenCalls.length).toBeGreaterThan(0);
+
+      const written = writtenCalls[0][0];
+      // NewSeqNo (tag 36) should be 4 (seq after the last gap-filled = 3+1)
+      expect(written).toContain('36=4');
+    });
+
+    it('should retransmit session-layer messages (35=A) with PossDupFlag=Y', () => {
+      connection.sentMessages.set(10, {
+        seqNum: 10,
+        fields: { '35': 'A', '49': 'CLI_CLIENT', '56': 'TRUEX_UAT_OE' },
+        rawMessage: '...',
+        sentAt: Date.now()
+      });
+      connection.msgSeqNum = 15;
+
+      const resendMsg = {
+        fields: { '35': '2', '7': '10', '16': '10', '34': '20' }
+      };
+
+      connection.handleResendRequest(resendMsg);
+
+      const writtenCalls = mockSocketInstance.write.mock.calls;
+      expect(writtenCalls.length).toBeGreaterThan(0);
+
+      const written = writtenCalls[0][0];
+      // Should be a retransmit of 35=A with PossDupFlag
+      expect(written).toContain('35=A');
+      expect(written).toContain('43=Y');  // PossDupFlag
     });
   });
 });

@@ -15,6 +15,9 @@ import { EventEmitter } from 'events';
  * - Heartbeat handling
  * - Automatic reconnection with exponential backoff
  */
+/** Emit 'reconnect-threshold' alert after this many failed attempts, but keep retrying. */
+const MAX_RECONNECT_ALERT_THRESHOLD = 10;
+
 export class FIXConnection extends EventEmitter {
   constructor(options = {}) {
     super();
@@ -65,6 +68,7 @@ export class FIXConnection extends EventEmitter {
     this.reconnectTimer = null;
     this.intentionalClose = false;
     this.isReconnecting = false; // guard against duplicate reconnect scheduling
+    this._stableTimer = null;    // clears reconnectAttempts after 60s stable connection
     
     // Message buffer for incomplete messages
     this.messageBuffer = '';
@@ -337,6 +341,7 @@ export class FIXConnection extends EventEmitter {
                 this.reconnectAttempts = 0;
                 this.startHeartbeat();
                 this.startCleanupTimer(); // Start periodic message cleanup
+                this._startStableTimer(); // Reset reconnect counter after 60s stable
                 this.logger.info(`[FIXConnection] Logged on to ${this.targetCompID}`);
                 if (!settled) {
                   settled = true;
@@ -712,92 +717,108 @@ export class FIXConnection extends EventEmitter {
    * Handle resend request from server
    */
   handleResendRequest(message) {
+    // Application-layer message types that must NOT be retransmitted.
+    // Per FIX spec, stale app messages are replaced with a SequenceReset-GapFill.
+    const APP_MSG_TYPES = new Set(['D', 'F', 'G', 'q']);
+
     // Parse resend request fields
     const beginSeqNo = parseInt(message.fields['7']);
     const endSeqNoField = parseInt(message.fields['16']);
-    
+
     // Handle EndSeqNo = 0 as "all messages from BeginSeqNo onwards"
     const endSeqNo = endSeqNoField === 0 ? this.msgSeqNum - 1 : endSeqNoField;
-    
+
     this.logger.warn(`[FIXConnection] Server requested resend: ${beginSeqNo} to ${endSeqNoField === 0 ? '∞' : endSeqNo} (actual: ${endSeqNo})`);
-    
+
     // Validate range
     if (beginSeqNo < 1 || endSeqNo < beginSeqNo) {
       this.logger.error(`[FIXConnection] Invalid resend range: ${beginSeqNo} to ${endSeqNo}`);
       this.emit('resend-request-received', { beginSeqNo, endSeqNo, count: 0, error: 'Invalid range' });
       return;
     }
-    
+
     // Track resend statistics
     let resentCount = 0;
     let skippedCount = 0;
-    
-    // Iterate through requested sequence range
+
+    // Helper: build and write a raw FIX message from a fields object.
+    const writeRawMessage = (fields) => {
+      const headerFieldOrder = ['35', '49', '56', '34', '52'];
+      const bodyFields = { ...fields };
+      delete bodyFields['8'];
+      delete bodyFields['9'];
+      delete bodyFields['10'];
+
+      let body = '';
+      for (const tag of headerFieldOrder) {
+        if (bodyFields[tag] !== undefined) {
+          body += `${tag}=${bodyFields[tag]}${this.SOH}`;
+        }
+      }
+      const processedTags = new Set(headerFieldOrder);
+      for (const [tag, value] of Object.entries(bodyFields)) {
+        if (!processedTags.has(tag) && value !== undefined) {
+          body += `${tag}=${value}${this.SOH}`;
+        }
+      }
+
+      let raw = `8=${this.beginString}${this.SOH}9=${body.length}${this.SOH}${body}`;
+      raw += `10=${this.calculateChecksum(raw)}${this.SOH}`;
+
+      if (this.socket && !this.socket.destroyed) {
+        this.socket.write(raw);
+        return true;
+      }
+      return false;
+    };
+
+    // Walk the requested range.  Consecutive app-layer messages are collected
+    // and emitted as a single GapFill spanning the entire run.
+    let gapStart = null; // beginning seq of the current app-msg run
+
+    const flushGapFill = (nextSeq) => {
+      if (gapStart === null) return;
+      // SequenceReset-GapFill: NewSeqNo = first seq AFTER the gap
+      const fields = {
+        '35': '4',                          // SequenceReset
+        '34': gapStart.toString(),          // MsgSeqNum = first skipped seq
+        '49': this.senderCompID,
+        '56': this.targetCompID,
+        '52': this.getUTCTimestamp(),
+        '43': 'Y',                          // PossDupFlag
+        '123': 'Y',                         // GapFillFlag
+        '36': nextSeq.toString(),           // NewSeqNo
+      };
+      if (writeRawMessage(fields)) {
+        this.logger.info(`[FIXConnection] GapFill sent: seqs ${gapStart}-${nextSeq - 1}, NewSeqNo=${nextSeq}`);
+        resentCount++;
+      } else {
+        this.logger.error(`[FIXConnection] Cannot send GapFill: socket not writable`);
+        skippedCount++;
+      }
+      gapStart = null;
+    };
+
     for (let seq = beginSeqNo; seq <= endSeqNo; seq++) {
-      // Lookup message from storage
       const stored = this.sentMessages.get(seq);
-      
-      if (stored) {
+      const msgType = stored ? stored.fields['35'] : null;
+
+      if (!stored || APP_MSG_TYPES.has(msgType)) {
+        // Accumulate into GapFill run
+        if (gapStart === null) gapStart = seq;
+        // Continue scanning — flush when run ends
+      } else {
+        // Session-layer message (35=A, 35=5) — flush any pending GapFill first
+        flushGapFill(seq);
+
         try {
-          // Clone fields to avoid mutating stored data
           const clonedFields = { ...stored.fields };
-          
-          // Add PossDupFlag (field 43) to indicate possibly duplicate message
           clonedFields['43'] = 'Y';
-          
-          // Update SendingTime (field 52) to NOW for resent messages
-          // Per FIX spec, SendingTime should be the current time when resending
           clonedFields['52'] = this.getUTCTimestamp();
-          
-          // Note: OrigSendingTime (field 122) would hold the original time
-          // but TrueX rejects messages with field 122, so we omit it
-          
-          // Rebuild FIX message from stored fields with correct header ordering.
-          // NOTE: Object.entries() sorts integer keys numerically (7,16,34,35,...),
-          // which puts body fields before MsgType (35). We must explicitly order
-          // header fields first to comply with FIX spec.
-          const bodyFields = { ...clonedFields };
-          delete bodyFields['8'];  // BeginString
-          delete bodyFields['9'];  // BodyLength
-          delete bodyFields['10']; // CheckSum
 
-          const headerFieldOrder = ['35', '49', '56', '34', '52'];
-          let body = '';
-
-          // 1. Header fields in required order
-          for (const tag of headerFieldOrder) {
-            if (bodyFields[tag] !== undefined) {
-              body += `${tag}=${bodyFields[tag]}${this.SOH}`;
-            }
-          }
-
-          // 2. Remaining fields (excluding header tags already written)
-          const processedTags = new Set(headerFieldOrder);
-          for (const [tag, value] of Object.entries(bodyFields)) {
-            if (!processedTags.has(tag) && value !== undefined) {
-              body += `${tag}=${value}${this.SOH}`;
-            }
-          }
-          
-          // Calculate body length
-          const bodyLength = body.length;
-          
-          // Build complete message
-          let resendMessage = `8=${this.beginString}${this.SOH}`;
-          resendMessage += `9=${bodyLength}${this.SOH}`;
-          resendMessage += body;
-          
-          // Calculate checksum
-          const checksum = this.calculateChecksum(resendMessage);
-          resendMessage += `10=${checksum}${this.SOH}`;
-          
-          // Write reconstructed message to socket
-          if (this.socket && !this.socket.destroyed) {
-            this.socket.write(resendMessage);
+          if (writeRawMessage(clonedFields)) {
             resentCount++;
-            
-            // Log each resent message at INFO level
-            this.logger.info(`[FIXConnection] Resent message seq ${seq}`);
+            this.logger.info(`[FIXConnection] Resent session message seq ${seq} (35=${msgType})`);
           } else {
             this.logger.error(`[FIXConnection] Cannot resend seq ${seq}: socket not writable`);
             skippedCount++;
@@ -806,16 +827,15 @@ export class FIXConnection extends EventEmitter {
           this.logger.error(`[FIXConnection] Error resending seq ${seq}: ${error.message}`);
           skippedCount++;
         }
-      } else {
-        // Message not in storage - log warning and continue
-        this.logger.warn(`[FIXConnection] Message seq ${seq} not in storage, skipping`);
-        skippedCount++;
       }
     }
-    
+
+    // Flush any trailing GapFill run
+    flushGapFill(endSeqNo + 1);
+
     // Log summary after completion
-    this.logger.info(`[FIXConnection] Resend complete: ${resentCount} messages resent, ${skippedCount} skipped (${beginSeqNo}-${endSeqNo})`);
-    
+    this.logger.info(`[FIXConnection] Resend complete: ${resentCount} sent, ${skippedCount} skipped (${beginSeqNo}-${endSeqNo})`);
+
     // Emit resendCompleted event with statistics
     this.emit('resendCompleted', {
       beginSeqNo,
@@ -897,12 +917,18 @@ export class FIXConnection extends EventEmitter {
     this.isConnected = false;
     this.isLoggedOn = false;
     this.stopHeartbeat();
-    
+
+    // Cancel stable-connection timer so a quick drop doesn't reset the counter.
+    if (this._stableTimer) {
+      clearTimeout(this._stableTimer);
+      this._stableTimer = null;
+    }
+
     if (this.socket) {
       this.socket.destroy();
       this.socket = null;
     }
-    
+
     this.emit('disconnect');
     
     // Attempt reconnection unless this was an explicit disconnect request
@@ -915,6 +941,23 @@ export class FIXConnection extends EventEmitter {
   }
   
   /**
+   * Start the 60-second stable-connection timer.
+   * If the connection stays up for 60s, reset reconnectAttempts to 0 so
+   * the next outage starts backoff from scratch.
+   * @private
+   */
+  _startStableTimer() {
+    if (this._stableTimer) {
+      clearTimeout(this._stableTimer);
+    }
+    this._stableTimer = setTimeout(() => {
+      this._stableTimer = null;
+      this.reconnectAttempts = 0;
+      this.logger.info(`[FIXConnection] Connection stable for 60s — reconnect counter reset for ${this.targetCompID}`);
+    }, 60000);
+  }
+
+  /**
    * Attempt reconnection with exponential backoff.
    *
    * Guards against duplicate reconnect scheduling: when both the logon-timeout
@@ -923,14 +966,6 @@ export class FIXConnection extends EventEmitter {
    * the next connection attempt always gets a clean slate.
    */
   attemptReconnect() {
-    // Max-retry check always runs first so the flag is always cleaned up.
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      this.logger.error(`[FIXConnection] Max reconnection attempts reached for ${this.targetCompID}`);
-      this.isReconnecting = false;
-      this.emit('max-reconnect-attempts');
-      return;
-    }
-
     // Prevent two parallel reconnect timers (Bug 2 guard).
     if (this.isReconnecting) {
       this.logger.warn(`[FIXConnection] Reconnect already scheduled for ${this.targetCompID}, ignoring duplicate call`);
@@ -939,12 +974,21 @@ export class FIXConnection extends EventEmitter {
 
     this.isReconnecting = true;
     this.reconnectAttempts++;
-    const delay = Math.min(
+
+    // Emit threshold alert (but keep retrying — no hard cap).
+    if (this.reconnectAttempts >= MAX_RECONNECT_ALERT_THRESHOLD) {
+      this.logger.error(`[FIXConnection] Reconnect threshold reached (${this.reconnectAttempts} attempts) for ${this.targetCompID}`);
+      this.emit('reconnect-threshold', { attempts: this.reconnectAttempts });
+    }
+
+    // Exponential backoff capped at maxReconnectDelay, plus ±20% jitter.
+    const baseDelay = Math.min(
       this.initialReconnectDelay * Math.pow(2, this.reconnectAttempts - 1),
       this.maxReconnectDelay
     );
+    const delay = baseDelay * (0.8 + Math.random() * 0.4);
 
-    this.logger.info(`[FIXConnection] Reconnecting to ${this.targetCompID} in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
+    this.logger.info(`[FIXConnection] Reconnecting to ${this.targetCompID} in ${Math.round(delay)}ms (attempt ${this.reconnectAttempts})`);
 
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
