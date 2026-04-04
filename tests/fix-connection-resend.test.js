@@ -157,7 +157,7 @@ describe('FIXConnection - Resend Request Handling', () => {
   });
 
   test('handles resend request for specific range (7=5, 16=10)', async () => {
-    // Arrange - send 10 messages
+    // Arrange - send 10 messages (all app-layer 35=D)
     for (let i = 1; i <= 10; i++) {
       await fixConnection.sendMessage({
         '35': 'D',
@@ -167,7 +167,6 @@ describe('FIXConnection - Resend Request Handling', () => {
       });
     }
 
-    const initialWriteCount = mockSocket.write.mock.calls.length;
     mockSocket.write.mockClear();
 
     // Act - simulate resend request for messages 5-10
@@ -186,12 +185,17 @@ describe('FIXConnection - Resend Request Handling', () => {
     fixConnection.handleResendRequest(resendRequest);
     const result = await resendCompletedPromise;
 
-    // Assert
+    // With GapFill: all 6 app messages collapsed into 1 SequenceReset-GapFill write
     expect(result.beginSeqNo).toBe(5);
     expect(result.endSeqNo).toBe(10);
-    expect(result.count).toBe(6); // 5, 6, 7, 8, 9, 10
+    expect(result.count).toBe(1);   // 1 GapFill covering seqs 5-10
     expect(result.skipped).toBe(0);
-    expect(mockSocket.write).toHaveBeenCalledTimes(6);
+    expect(mockSocket.write).toHaveBeenCalledTimes(1);
+    // GapFill message content
+    const written = mockSocket.write.mock.calls[0][0];
+    expect(written).toContain('35=4');   // SequenceReset
+    expect(written).toContain('123=Y');  // GapFillFlag
+    expect(written).toContain('36=11');  // NewSeqNo = 10+1
   });
 
   test('handles resend request for all messages (16=0)', async () => {
@@ -222,9 +226,11 @@ describe('FIXConnection - Resend Request Handling', () => {
     fixConnection.handleResendRequest(resendRequest);
     const result = await resendCompletedPromise;
 
-    // Assert - should resend messages 2-5 (4 messages)
-    expect(result.count).toBe(4);
-    expect(mockSocket.write).toHaveBeenCalledTimes(4);
+    // Assert - with GapFill, all 4 app messages (35=D) become 1 GapFill
+    expect(result.count).toBe(1);
+    expect(mockSocket.write).toHaveBeenCalledTimes(1);
+    const written = mockSocket.write.mock.calls[0][0];
+    expect(written).toContain('35=4');  // SequenceReset-GapFill
     expect(mockLogger.warn).toHaveBeenCalledWith(
       expect.stringContaining('Server requested resend: 2 to ∞')
     );
@@ -251,12 +257,13 @@ describe('FIXConnection - Resend Request Handling', () => {
     fixConnection.handleResendRequest(resendRequest);
     const result = await resendCompletedPromise;
 
-    // Assert
-    expect(result.count).toBe(2); // Only 1 and 3 resent
-    expect(result.skipped).toBe(1); // Message 2 skipped
-    expect(mockLogger.warn).toHaveBeenCalledWith(
-      expect.stringContaining('Message seq 2 not in storage')
-    );
+    // Assert - with GapFill: seqs 1 and 3 are app msgs (35=D), seq 2 is missing.
+    // Both present and missing seqs within the range are GapFilled together → 1 write.
+    expect(result.count).toBe(1);  // 1 GapFill covering seqs 1-3
+    expect(result.skipped).toBe(0);
+    const written = mockSocket.write.mock.calls[0][0];
+    expect(written).toContain('35=4');   // SequenceReset-GapFill
+    expect(written).toContain('36=4');   // NewSeqNo = 3+1
   });
 
   test('validates invalid resend ranges', () => {
@@ -320,8 +327,8 @@ describe('FIXConnection - PossDupFlag Support', () => {
     
   });
 
-  test('adds PossDupFlag to resent messages', async () => {
-    // Arrange
+  test('GapFill response includes PossDupFlag (43=Y) for app message resends', async () => {
+    // Arrange - 35=D is an app-layer message; it gets GapFilled, not retransmitted
     await fixConnection.sendMessage({
       '35': 'D',
       '49': 'TEST',
@@ -335,20 +342,21 @@ describe('FIXConnection - PossDupFlag Support', () => {
     const resendRequest = { fields: { '35': '2', '7': '1', '16': '1' } };
     fixConnection.handleResendRequest(resendRequest);
 
-    // Assert
+    // Assert - GapFill (35=4) is sent with PossDupFlag=Y
     const resentMessage = mockSocket.write.mock.calls[0][0];
-    expect(resentMessage).toContain('43=Y'); // PossDupFlag
+    expect(resentMessage).toContain('35=4');  // SequenceReset-GapFill
+    expect(resentMessage).toContain('43=Y');  // PossDupFlag on GapFill
   });
 
-  test('preserves OrigSendingTime in resent messages', async () => {
-    // Arrange
+  test('app messages (35=D) respond with GapFill (35=4) not retransmission', async () => {
+    // Per Task 2.4: stale app messages must not be retransmitted; use GapFill instead.
+    // TrueX also rejects tag 122 (OrigSendingTime), so GapFill avoids that entirely.
     const originalSendingTime = '20251009-10:30:00';
     await fixConnection.sendMessage({
       '35': 'D',
       '49': 'TEST',
       '56': 'SERVER',
       '52': originalSendingTime,
-      '122': originalSendingTime // Already has OrigSendingTime
     });
 
     mockSocket.write.mockClear();
@@ -357,9 +365,11 @@ describe('FIXConnection - PossDupFlag Support', () => {
     const resendRequest = { fields: { '35': '2', '7': '1', '16': '1' } };
     fixConnection.handleResendRequest(resendRequest);
 
-    // Assert
+    // Assert - GapFill sent, original order NOT retransmitted, no tag 122
     const resentMessage = mockSocket.write.mock.calls[0][0];
-    expect(resentMessage).toContain(`122=${originalSendingTime}`);
+    expect(resentMessage).toContain('35=4');    // SequenceReset-GapFill
+    expect(resentMessage).not.toContain('35=D'); // Original order NOT in this message
+    expect(resentMessage).not.toContain('122='); // No OrigSendingTime (TrueX rejects it)
   });
 
   test('omits OrigSendingTime if not present (TrueX rejects tag 122)', async () => {
@@ -572,16 +582,16 @@ describe('FIXConnection - Integration Scenarios', () => {
     fixConnection.handleResendRequest(resendRequest);
     const result = await resendCompletedPromise;
 
-    // Assert
-    expect(result.count).toBe(50);
+    // With GapFill: all 50 app messages (35=D) collapsed into 1 SequenceReset-GapFill
+    expect(result.count).toBe(1);
     expect(result.skipped).toBe(0);
-    expect(mockSocket.write).toHaveBeenCalledTimes(50);
-    
-    // Verify all resent messages have PossDupFlag
-    const resentMessages = mockSocket.write.mock.calls.map(call => call[0]);
-    resentMessages.forEach(msg => {
-      expect(msg).toContain('43=Y'); // PossDupFlag
-    });
+    expect(mockSocket.write).toHaveBeenCalledTimes(1);
+
+    const gapFillMsg = mockSocket.write.mock.calls[0][0];
+    expect(gapFillMsg).toContain('35=4');   // SequenceReset-GapFill
+    expect(gapFillMsg).toContain('123=Y');  // GapFillFlag
+    expect(gapFillMsg).toContain('43=Y');   // PossDupFlag
+    expect(gapFillMsg).toContain('36=51');  // NewSeqNo = 50+1
   });
 
   test('emits resendCompleted event with correct statistics', async () => {
@@ -605,11 +615,11 @@ describe('FIXConnection - Integration Scenarios', () => {
 
     const result = await resendCompletedPromise;
 
-    // Assert
+    // Assert - with GapFill: 5 app messages (3-7) collapsed into 1 GapFill write
     expect(result).toEqual({
       beginSeqNo: 3,
       endSeqNo: 7,
-      count: 5,
+      count: 1,    // 1 GapFill write
       skipped: 0,
       requested: 5
     });
