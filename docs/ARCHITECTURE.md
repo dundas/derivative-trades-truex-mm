@@ -406,10 +406,10 @@ PostgreSQL-backed analytics server using `Bun.serve()` on port 3100.
 | `TRUEX_CLIENT_ID` | Yes | `78932725357888855` | Production client ID (FIX PartyID tag 448) |
 | `TRUEX_FIX_HOST` | Yes | `178.156.230.110` | Hetzner FIX proxy host |
 | `TRUEX_FIX_PORT` | Yes | `3004` | Hetzner FIX proxy port |
-| `TRUEX_REST_URL` | Yes | `http://178.156.230.110:3006` | REST URL via Hetzner socat proxy |
+| `TRUEX_REST_URL` | Yes | `http://10.20.1.11:9742` | TrueX REST URL (direct via WireGuard from Hetzner) |
 | `TRUEX_TARGET_COMP_ID` | No | `TRUEX_PROD_OE` | FIX TargetCompID |
 | `TRUEX_SENDER_COMP_ID` | No | `DAVID1` | FIX SenderCompID |
-| `DATABASE_URL` | No | -- | PostgreSQL connection string (DigitalOcean managed) |
+| `DATABASE_URL` | No | -- | PostgreSQL connection string (Hetzner truex-pg-analytics 178.156.247.87:5432/truex_analytics) |
 | `REDIS_URL` | No | -- | Redis connection string (optional, auto-fallback) |
 | `TRUEX_MAKER_FEE_BPS` | No | `0` | TrueX maker fee in basis points |
 | `TRUEX_TAKER_FEE_BPS` | No | `0` | TrueX taker fee in basis points |
@@ -461,9 +461,9 @@ PostgreSQL-backed analytics server using `Bun.serve()` on port 3100.
 
 - All TrueX production traffic tunneled through WireGuard VPN via Hetzner proxy
 - FIX proxy runs in Docker with `network_mode: host`
-- REST proxy uses socat for TCP forwarding
+- REST connects directly to TrueX via WireGuard (no proxy needed inside Hetzner)
 - Coinbase WebSocket uses public WSS endpoint (TLS)
-- PostgreSQL connection via `DATABASE_URL` (TLS to DigitalOcean managed DB)
+- PostgreSQL connection via `DATABASE_URL` (Hetzner truex-pg-analytics, same private network)
 
 ### Operational Safety
 
@@ -549,7 +549,7 @@ Targets UAT (`38.32.101.229:19484`). For local development only.
 | Max orders/sec | 4 | 4 |
 | FIX target | `TRUEX_PROD_OE` | `TRUEX_UAT_OE` |
 | FIX host | `178.156.230.110:3004` (proxy) | `38.32.101.229:19484` (direct) |
-| REST URL | `http://178.156.230.110:3006` (proxy) | `http://38.32.101.229:9742` (direct) |
+| REST URL | `http://10.20.1.11:9742` (direct via WireGuard) | `http://38.32.101.229:9742` (direct) |
 | Client ID | `78932725357888855` | `78972918929686546` (DAVID1) |
 | Env validation | Strict (6 required vars, UAT safety check) | Minimal (2 required vars) |
 | Orphan cancel failure | Fatal (process.exit) | Non-fatal (warning) |
