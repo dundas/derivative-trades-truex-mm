@@ -406,7 +406,7 @@ PostgreSQL-backed analytics server using `Bun.serve()` on port 3100.
 | `TRUEX_CLIENT_ID` | Yes | `78932725357888855` | Production client ID (FIX PartyID tag 448) |
 | `TRUEX_FIX_HOST` | Yes | `178.156.230.110` | Hetzner FIX proxy host |
 | `TRUEX_FIX_PORT` | Yes | `3004` | Hetzner FIX proxy port |
-| `TRUEX_REST_URL` | Yes | `http://10.20.1.11:9742` | TrueX REST URL (direct via WireGuard from Hetzner) |
+| `TRUEX_REST_URL` | Yes | `http://10.20.1.11:9742` | TrueX REST URL — direct via WireGuard. Only reachable inside Hetzner; set to `http://178.156.230.110:3006` if accessing from outside (socat tunnel) |
 | `TRUEX_TARGET_COMP_ID` | No | `TRUEX_PROD_OE` | FIX TargetCompID |
 | `TRUEX_SENDER_COMP_ID` | No | `DAVID1` | FIX SenderCompID |
 | `DATABASE_URL` | No | -- | PostgreSQL connection string (Hetzner truex-pg-analytics 178.156.247.87:5432/truex_analytics) |
