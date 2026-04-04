@@ -31,6 +31,21 @@ const MECH_API_KEY = process.env.MECH_API_KEY;
 const STORAGE_URL  = process.env.MECH_STORAGE_URL || 'https://storage.mechdna.net';
 
 // ---------------------------------------------------------------------------
+// Orchestrator reference (injected at runtime for live health data)
+// ---------------------------------------------------------------------------
+
+/** @type {import('../core/market-maker-orchestrator.js').MarketMakerOrchestrator | null} */
+let orchestratorRef = null;
+
+/**
+ * Attach a live orchestrator instance so health endpoints can reflect real-time state.
+ * Call this after constructing the orchestrator, before or after starting the API server.
+ */
+export function setOrchestrator(orch) {
+  orchestratorRef = orch;
+}
+
+// ---------------------------------------------------------------------------
 // Database
 // ---------------------------------------------------------------------------
 
@@ -116,13 +131,26 @@ function addTimeFilter(conditions, values, idx, col, from, to) {
 
 async function handleHealth() {
   const start = Date.now();
+  const orchestratorHealth = orchestratorRef?.getHealthStatus() ?? null;
   try {
     await db.query('SELECT 1');
     const latencyMs = Date.now() - start;
     const pool = db.getStats ? db.getStats() : null;
-    return jsonOk({ status: 'healthy', database: { connected: true, latencyMs, pool }, uptime: process.uptime(), timestamp: Date.now() });
+    return jsonOk({
+      status: orchestratorHealth?.status ?? 'healthy',
+      database: { connected: true, latencyMs, pool },
+      uptime: process.uptime(),
+      timestamp: Date.now(),
+      orchestrator: orchestratorHealth,
+    });
   } catch (err) {
-    return jsonOk({ status: 'unhealthy', database: { connected: false, error: err.message }, uptime: process.uptime(), timestamp: Date.now() });
+    return jsonOk({
+      status: 'unhealthy',
+      database: { connected: false, error: err.message },
+      uptime: process.uptime(),
+      timestamp: Date.now(),
+      orchestrator: orchestratorHealth,
+    });
   }
 }
 

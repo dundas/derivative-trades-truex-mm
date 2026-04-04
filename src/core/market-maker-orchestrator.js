@@ -127,6 +127,14 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this.isRunning = false;
     this.startedAt = null;
 
+    // Watchdog state
+    this._lastMdUpdateTime = 0;
+    this._lastRepriceTime = 0;
+    this._watchdogTimer = null;
+    this._intentionalStop = false;
+    this._mdStaleThresholdMs = parseInt(process.env.MD_STALE_THRESHOLD_MS || '10000', 10);
+    this._quotingIdleThresholdMs = parseInt(process.env.QUOTING_IDLE_THRESHOLD_MS || '120000', 10);
+
     // Timers
     this.drainQueueTimer = null;
     this.drainQueueIntervalMs = options.drainQueueIntervalMs || 200;
@@ -212,6 +220,10 @@ export class MarketMakerOrchestrator extends EventEmitter {
       this.logger.info(`[Orchestrator] Balance refresh enabled (every ${this.balanceRefreshIntervalMs / 1000}s)`);
     }
 
+    // Start watchdog
+    this._watchdogTimer = setInterval(() => this._runWatchdog(), 30000);
+    this.logger.info('[Orchestrator] Watchdog started (30s interval)');
+
     this.isRunning = true;
     this.startedAt = Date.now();
 
@@ -258,6 +270,11 @@ export class MarketMakerOrchestrator extends EventEmitter {
       clearInterval(this._balanceRefreshTimer);
       this._balanceRefreshTimer = null;
     }
+    if (this._watchdogTimer) {
+      clearInterval(this._watchdogTimer);
+      this._watchdogTimer = null;
+    }
+    this._intentionalStop = true;
     this.pnlTracker.stopPeriodicLogging();
 
     // 4. Stop data pipeline (flush remaining data)
@@ -371,8 +388,18 @@ export class MarketMakerOrchestrator extends EventEmitter {
   _onPriceUpdate(aggregatedPrice) {
     if (!this.isRunning) return;
 
+    // Track when we last received a market data update
+    this._lastMdUpdateTime = Date.now();
+
+    // Dual-session gate: if MD feed is active, OE must also be logged on before quoting
+    if (this.marketDataFeed && !this.fixOE.isLoggedOn) {
+      this.logger.error('[WATCHDOG] Quoting gate closed: OE not logged on');
+      return;
+    }
+
     // Feed price to QuoteEngine
     this.quoteEngine.onPriceUpdate(aggregatedPrice);
+    this._lastRepriceTime = Date.now();
 
     // Update PnL mark-to-market
     if (aggregatedPrice.weightedMidpoint) {
@@ -612,6 +639,144 @@ export class MarketMakerOrchestrator extends EventEmitter {
     );
 
     return { baseBalance, quoteBalance };
+  }
+
+  // --- Watchdog ---
+
+  /**
+   * Check whether the MD feed has gone stale.
+   * Returns true and triggers order cancellation if stale; false otherwise.
+   */
+  _checkMdStaleness() {
+    if (!this.marketDataFeed || this._lastMdUpdateTime === 0) return false;
+    const age = Date.now() - this._lastMdUpdateTime;
+    if (age > this._mdStaleThresholdMs) {
+      this.logger.error(`[WATCHDOG] MD feed stale (${age}ms > ${this._mdStaleThresholdMs}ms) — cancelling all orders`);
+      // Cancel via REST if available
+      if (this.restClient) {
+        this._cancelAllOrdersViaRest('md-stale').catch(err =>
+          this.logger.error(`[WATCHDOG] REST cancel failed: ${err.message}`)
+        );
+      }
+      // Cancel via QuoteEngine (FIX)
+      this.quoteEngine.cancelAllQuotes('md-stale');
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Cancel all active orders via REST client.
+   * Calls cancelAllOrders() if available, otherwise iterates getActiveOrders().
+   */
+  async _cancelAllOrdersViaRest(reason) {
+    this.logger.info(`[WATCHDOG] Cancelling all orders via REST (reason: ${reason})`);
+    if (typeof this.restClient.cancelAllOrders === 'function') {
+      await this.restClient.cancelAllOrders();
+      return;
+    }
+    // Fallback: iterate and cancel individually
+    const orders = await this.restClient.getActiveOrders();
+    for (const raw of orders) {
+      try {
+        await this.restClient.cancelOrder(raw.id);
+      } catch (err) {
+        this.logger.warn(`[WATCHDOG] REST cancel of ${raw.id} failed: ${err.message}`);
+      }
+    }
+  }
+
+  /**
+   * Periodic health check: runs every 30s while the market maker is active.
+   * Emits 'watchdog-alert' with a list of issues if any are found.
+   */
+  _runWatchdog() {
+    if (!this.isRunning || this._intentionalStop) return;
+    const now = Date.now();
+    const issues = [];
+
+    // Check OE FIX
+    if (!this.fixOE.isLoggedOn) {
+      issues.push('OE FIX not logged on');
+    }
+
+    // Check MD FIX
+    if (this.marketDataFeed && !this.marketDataFeed.isLoggedOn) {
+      issues.push('MD FIX not logged on');
+    }
+
+    // Check MD staleness
+    if (this._checkMdStaleness()) {
+      issues.push('MD feed stale');
+    }
+
+    // Check quoting idle (only if we have non-zero balances expected)
+    const repriceAge = this._lastRepriceTime > 0 ? now - this._lastRepriceTime : null;
+    if (repriceAge !== null && repriceAge > this._quotingIdleThresholdMs) {
+      const position = this.inventoryManager.getPositionSummary();
+      const balances = position.baseBalance || position.quoteBalance;
+      const baseTotal = position.baseBalance?.total ?? 0;
+      const quoteTotal = position.quoteBalance?.total ?? 0;
+      const hasBalance = baseTotal > 0 || quoteTotal > 0;
+      if (hasBalance) {
+        issues.push(`Quoting idle for ${Math.round(repriceAge / 1000)}s`);
+      }
+    }
+
+    if (issues.length > 0) {
+      const msg = `[WATCHDOG] Health check failed: ${issues.join('; ')}`;
+      this.logger.error(msg);
+      this.emit('watchdog-alert', { issues, timestamp: now });
+    } else {
+      this.logger.debug('[WATCHDOG] Health check OK');
+    }
+  }
+
+  /**
+   * Return a structured health status snapshot for API consumers.
+   */
+  getHealthStatus() {
+    const now = Date.now();
+    const lastRepriceAge = this._lastRepriceTime > 0 ? now - this._lastRepriceTime : null;
+    const lastMdAge = this._lastMdUpdateTime > 0 ? now - this._lastMdUpdateTime : null;
+    const oeConnected = this.fixOE.isLoggedOn;
+    const mdConnected = this.marketDataFeed ? (this.marketDataFeed.isLoggedOn === true) : null;
+    const uptime = this.startedAt ? now - this.startedAt : 0;
+
+    // Status logic
+    const quotingIdle = lastRepriceAge !== null && lastRepriceAge > this._quotingIdleThresholdMs;
+    const bothConnected = oeConnected && (mdConnected === null || mdConnected === true);
+    const isHealthy = !quotingIdle && bothConnected && this.isRunning;
+    const isUnhealthy = quotingIdle || !oeConnected || mdConnected === false;
+
+    let status;
+    if (isHealthy) {
+      status = 'healthy';
+    } else if (!isUnhealthy && this.isRunning) {
+      status = 'degraded';
+    } else {
+      status = 'unhealthy';
+    }
+
+    return {
+      status,
+      quoting: this.isRunning && !quotingIdle,
+      lastRepriceAge,
+      oeConnected,
+      mdConnected,
+      lastMdAge,
+      activeOrders: this.quoteEngine.activeOrders?.size ?? 0,
+      position: this.inventoryManager.getPositionSummary(),
+      balances: typeof this.inventoryManager.getBalances === 'function'
+        ? this.inventoryManager.getBalances()
+        : null,
+      lastFill: typeof this.pnlTracker.getLastFill === 'function'
+        ? this.pnlTracker.getLastFill()
+        : null,
+      pnl: this.pnlTracker.getSummary(),
+      uptime,
+      sessionId: this.sessionId,
+    };
   }
 
   // --- REST-based Order Reconciliation ---
