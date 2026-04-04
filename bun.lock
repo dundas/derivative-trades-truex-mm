@@ -11,7 +11,6 @@
         "ioredis": "^5.3.2",
         "joi": "^17.11.0",
         "jspurefix": "^4.0.0",
-        "nodemailer": "^8.0.4",
         "pg": "^8.11.3",
         "reflect-metadata": "^0.2.0",
         "winston": "^3.11.0",
@@ -359,8 +358,6 @@
     "negotiator": ["negotiator@1.0.0", "", {}, "sha512-8Ofs/AUQh8MaEcrlq5xOX0CQ9ypTF5dl78mjlMNfOK08fzpgTHQRQPBxcPlEtIw0yRpws+Zo/3r+5WRby7u3Gg=="],
 
     "node-fs-extra": ["node-fs-extra@0.8.2", "", { "dependencies": { "jsonfile": "~1.1.0", "mkdirp": "0.3.x", "ncp": "~0.4.2", "rimraf": "~2.2.0" } }, "sha512-C396wQ2aEpuUIlv9BwQvG8uaDhi2ro4hhv1muBb1nb1d7KWqgBRPn1F64PMVB6hElpbE74JY+67L00IkA9DDkQ=="],
-
-    "nodemailer": ["nodemailer@8.0.4", "", {}, "sha512-k+jf6N8PfQJ0Fe8ZhJlgqU5qJU44Lpvp2yvidH3vp1lPnVQMgi4yEEMPXg5eJS1gFIJTVq1NHBk7Ia9ARdSBdQ=="],
 
     "object-inspect": ["object-inspect@1.13.4", "", {}, "sha512-W67iLl4J2EXEGTbfeHCffrjDfitvLANg0UlX3wFUUSTx92KXRFegMHUVgSqE+wvhAbi4WqjGg9czysTV2Epbew=="],
 

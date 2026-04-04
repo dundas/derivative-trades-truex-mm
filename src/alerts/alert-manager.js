@@ -98,6 +98,7 @@ export class AlertManager {
           subject,
           text: body,
         }),
+        signal: AbortSignal.timeout(5000),
       });
       if (!resp.ok) this.logger.warn(`[AlertManager] CircleInbox email failed: ${resp.status}`);
     } catch (err) {

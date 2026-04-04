@@ -2,9 +2,13 @@ const net = require('net');
 const crypto = require('crypto');
 require('dotenv').config({ path: '.env' });
 
-const FIX_PROXY_PORT = parseInt(process.env.FIX_PROXY_PORT || '3004');
+const FIX_PROXY_PORT = parseInt(process.env.FIX_PROXY_PORT || '3004', 10);
+if (Number.isNaN(FIX_PROXY_PORT) || FIX_PROXY_PORT < 1 || FIX_PROXY_PORT > 65535) {
+  console.error(`Invalid FIX_PROXY_PORT: ${process.env.FIX_PROXY_PORT}`);
+  process.exit(1);
+}
 const TRUEX_FIX_HOST = process.env.TRUEX_UPSTREAM_HOST || '38.32.101.229';
-const TRUEX_FIX_PORT = parseInt(process.env.TRUEX_UPSTREAM_PORT || '19484');
+const TRUEX_FIX_PORT = parseInt(process.env.TRUEX_UPSTREAM_PORT || '19484', 10);
 
 console.log('🔌 Starting FIX Protocol Proxy Server');
 console.log('=====================================');

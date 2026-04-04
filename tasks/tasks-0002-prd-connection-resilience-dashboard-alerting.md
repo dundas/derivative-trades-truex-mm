@@ -220,11 +220,11 @@ New `src/alerts/alert-manager.js` — fire-and-forget alerts to Slack, Gmail SMT
   - **Commit:** `feat(alerts): AlertManager with Slack support and cooldown deduplication`
   - **Agent:** `tdd-developer`
 
-- [ ] **4.2** Add Gmail SMTP email support
+- [ ] **4.2** Add CircleInbox email support
   - **File:** `src/alerts/alert-manager.js` (modify)
-  - **Action:** Add `_sendEmail(subject, body)` using `nodemailer` (already available or add via `bun install nodemailer`). Configure transporter with `GMAIL_USER` / `GMAIL_USER_PASS`. Send to `ALERT_EMAIL` env var. Fall back gracefully if creds missing. When derivative.email is provisioned by circleinbox, swap `ALERT_EMAIL` to that address — no code change needed.
-  - **Test:** `src/alerts/alert-manager.test.js` — 3 assertions: nodemailer sendMail called with correct args, graceful skip when GMAIL_USER missing, subject includes alert reason
-  - **Commit:** `feat(alerts): add Gmail SMTP email alerting`
+  - **Action:** Add `_sendEmail(subject, body)` using CircleInbox HTTP API via `fetch`. POST to `https://api.circleinbox.com/api/v1/send` with `Authorization: Bearer ${CIRCLEINBOX_API_KEY}`. From address: `ALERT_FROM_EMAIL` (default `alerts@derivative.email`). Send to `ALERT_EMAIL` env var. 5s timeout via `AbortSignal.timeout(5000)`. Fall back gracefully if `CIRCLEINBOX_API_KEY` missing. No external dependencies.
+  - **Test:** `src/alerts/alert-manager.test.js` — 3 assertions: fetch called with correct CircleInbox endpoint, graceful skip when CIRCLEINBOX_API_KEY missing, subject included in payload
+  - **Commit:** `feat(alerts): add CircleInbox email alerting`
   - **Agent:** `tdd-developer`
 
 - [ ] **4.3** Add Telnyx SMS support
