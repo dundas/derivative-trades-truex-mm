@@ -1,16 +1,10 @@
 import { EventEmitter } from 'events';
 
 /**
- * PnLTracker - FIFO-based Market Making P&L Tracker
+ * PnLTracker - FIFO-based Profit & Loss Tracker
  *
- * realizedPnL   = FIFO-matched spread (profit from completed round-trips)
- * unrealizedPnL = cost-basis MTM of open net position
- * sellProceeds  = total quote received from all sells (cash-flow, useful for sell-heavy accounts)
- * buyCost       = total quote spent on all buys
- * netCashFlow   = sellProceeds - buyCost (net PYUSD generated from trading)
- *
- * For a sell-heavy account (e.g. liquidating BTC inventory), realizedPnL will be
- * near $0 (no matched round-trips), but netCashFlow shows total PYUSD received.
+ * Tracks realized PnL from matched fills using FIFO queuing,
+ * unrealized PnL via mark-to-market, and per-venue fee accounting.
  *
  * Events emitted:
  * - 'significantChange' { totalPnL, previousPnL, delta }
@@ -33,19 +27,15 @@ export class PnLTracker extends EventEmitter {
     // Logger
     this.logger = options.logger || console;
 
-    // FIFO queues for spread capture matching
+    // FIFO queues for matching
     this.buyFills = [];   // { quantity, price, remainingQty, timestamp, venue }
     this.sellFills = [];  // { quantity, price, remainingQty, timestamp, venue }
 
-    // FIFO PnL state
+    // PnL state
     this.realizedPnL = 0;
     this.unrealizedPnL = 0;
     this.totalMatchedQuantity = 0;
     this.lastMid = null;
-
-    // Cash-flow tracking (accurate for sell-heavy / inventory-liquidation accounts)
-    this.sellProceeds = 0;  // total quote received from all sells
-    this.buyCost = 0;       // total quote spent on all buys
 
     // Fee tracking
     this.totalFees = 0;
@@ -55,8 +45,6 @@ export class PnLTracker extends EventEmitter {
 
     // Trade stats
     this.numTrades = 0;
-    this.buyCount = 0;
-    this.sellCount = 0;
     this.sessionStartTime = Date.now();
 
     // For significant change detection
@@ -85,16 +73,7 @@ export class PnLTracker extends EventEmitter {
       this.takerFees += feeAmount;
     }
 
-    // Cash-flow tracking
-    if (side === 'buy') {
-      this.buyCost += quantity * price;
-      this.buyCount++;
-    } else {
-      this.sellProceeds += quantity * price;
-      this.sellCount++;
-    }
-
-    // FIFO matching for realized spread PnL
+    // Add to FIFO queue
     const entry = {
       quantity,
       price,
@@ -116,29 +95,41 @@ export class PnLTracker extends EventEmitter {
       this.markToMarket(this.lastMid);
     }
 
+    // Check for significant PnL change
     this._checkSignificantChange();
   }
 
   /**
-   * FIFO matching: match opposite queue against the newest fill.
-   * Realized PnL = spread captured on matched round-trips.
+   * FIFO matching: try to match the opposite queue against newest fills.
+   * oppositeQueue is the queue we match from (oldest first).
+   * newQueue is where we just added (the new fill is at the end).
    */
   _matchFIFO(oppositeQueue, newQueue, oppositeSide) {
+    // The new fill is the last entry in newQueue
+    // We match it against entries in oppositeQueue (oldest first)
     const newEntry = newQueue[newQueue.length - 1];
     if (!newEntry || newEntry.remainingQty <= 0) return;
 
     let i = 0;
     while (i < oppositeQueue.length && newEntry.remainingQty > 0) {
       const oppEntry = oppositeQueue[i];
-      if (oppEntry.remainingQty <= 0) { i++; continue; }
+      if (oppEntry.remainingQty <= 0) {
+        i++;
+        continue;
+      }
 
       const matchQty = Math.min(newEntry.remainingQty, oppEntry.remainingQty);
 
+      // Determine buy/sell prices
       let buyPrice, sellPrice;
       if (oppositeSide === 'buy') {
-        buyPrice = oppEntry.price; sellPrice = newEntry.price;
+        // oppositeQueue = buyFills, newQueue = sellFills
+        buyPrice = oppEntry.price;
+        sellPrice = newEntry.price;
       } else {
-        buyPrice = newEntry.price; sellPrice = oppEntry.price;
+        // oppositeQueue = sellFills, newQueue = buyFills
+        buyPrice = newEntry.price;
+        sellPrice = oppEntry.price;
       }
 
       this.realizedPnL += matchQty * (sellPrice - buyPrice);
@@ -146,18 +137,25 @@ export class PnLTracker extends EventEmitter {
 
       newEntry.remainingQty -= matchQty;
       oppEntry.remainingQty -= matchQty;
-      if (oppEntry.remainingQty <= 0) i++;
+
+      if (oppEntry.remainingQty <= 0) {
+        i++;
+      }
     }
 
+    // Remove exhausted entries from the opposite queue
     while (oppositeQueue.length > 0 && oppositeQueue[0].remainingQty <= 0) {
       oppositeQueue.shift();
     }
-    if (newEntry.remainingQty <= 0) newQueue.pop();
+
+    // Remove exhausted entry from new queue if fully matched
+    if (newEntry.remainingQty <= 0) {
+      newQueue.pop();
+    }
   }
 
   /**
    * Recompute unrealized PnL based on current mid price.
-   * Uses cost-basis: unrealized = net position * (mid - avg cost).
    */
   markToMarket(currentMid) {
     this.lastMid = currentMid;
@@ -167,9 +165,11 @@ export class PnLTracker extends EventEmitter {
     const netPosition = longQty - shortQty;
 
     if (netPosition > 0) {
+      // Net long: unrealized = netPosition * (mid - avgCost)
       const avgCost = this._weightedAvg(this.buyFills);
       this.unrealizedPnL = netPosition * (currentMid - avgCost);
     } else if (netPosition < 0) {
+      // Net short: unrealized = |netPosition| * (avgCost - mid)
       const avgCost = this._weightedAvg(this.sellFills);
       this.unrealizedPnL = Math.abs(netPosition) * (avgCost - currentMid);
     } else {
@@ -181,7 +181,8 @@ export class PnLTracker extends EventEmitter {
    * Weighted average price of remaining fills in a queue.
    */
   _weightedAvg(fills) {
-    let totalQty = 0, totalValue = 0;
+    let totalQty = 0;
+    let totalValue = 0;
     for (const f of fills) {
       if (f.remainingQty > 0) {
         totalQty += f.remainingQty;
@@ -191,13 +192,20 @@ export class PnLTracker extends EventEmitter {
     return totalQty > 0 ? totalValue / totalQty : 0;
   }
 
+  /**
+   * Look up fee rate in bps for venue/maker combination.
+   */
   _getFeeBps(venue, isMaker) {
     if (venue === 'truex') {
       return isMaker ? this.truexMakerFeeBps : this.truexTakerFeeBps;
     }
+    // All non-truex venues use hedge fee schedule (kraken, etc.)
     return isMaker ? this.hedgeMakerFeeBps : this.hedgeTakerFeeBps;
   }
 
+  /**
+   * Check if PnL has moved significantly since last report.
+   */
   _checkSignificantChange() {
     const currentTotal = this.realizedPnL + this.unrealizedPnL - this.totalFees;
     const delta = Math.abs(currentTotal - this._lastReportedPnL);
@@ -214,8 +222,6 @@ export class PnLTracker extends EventEmitter {
 
   /**
    * Get current PnL summary.
-   * realizedPnL = FIFO spread on matched round-trips.
-   * netCashFlow = sellProceeds - buyCost (use for sell-heavy accounts).
    */
   getSummary() {
     const totalPnL = this.realizedPnL + this.unrealizedPnL - this.totalFees;
@@ -228,74 +234,70 @@ export class PnLTracker extends EventEmitter {
     const netPosition = longQty - shortQty;
 
     return {
-      // FIFO spread PnL (accurate for round-trip market making)
       realizedPnL: this.realizedPnL,
       unrealizedPnL: this.unrealizedPnL,
       totalPnL,
       totalFees: this.totalFees,
-      // Cash-flow (accurate for sell-heavy / inventory liquidation)
-      sellProceeds: this.sellProceeds,
-      buyCost: this.buyCost,
-      netCashFlow: this.sellProceeds - this.buyCost,
-      // Position
-      netPosition,
-      // Trade stats
       numTrades: this.numTrades,
-      buyCount: this.buyCount,
-      sellCount: this.sellCount,
-      // Efficiency
       avgSpreadCapture,
+      netPosition,
       totalMatchedQuantity: this.totalMatchedQuantity,
-      // Fees
       feesByVenue: { ...this.feesByVenue },
       makerFees: this.makerFees,
-      takerFees: this.takerFees,
+      takerFees: this.takerFees
     };
   }
 
-  /** Generate a detailed session report string for logging. */
+  /**
+   * Generate a detailed session report string for logging.
+   */
   getSessionReport() {
-    const s = this.getSummary();
-    const elapsedMin = ((Date.now() - this.sessionStartTime) / 60000).toFixed(1);
+    const summary = this.getSummary();
+    const elapsed = Date.now() - this.sessionStartTime;
+    const elapsedMin = (elapsed / 60000).toFixed(1);
+
     const lines = [
       '=== PnL Session Report ===',
       `Session Duration: ${elapsedMin} min`,
-      `Trades: ${s.numTrades} (${s.buyCount} buys, ${s.sellCount} sells)`,
-      `Net Position: ${s.netPosition.toFixed(8)}`,
-      `Realized PnL:   $${s.realizedPnL.toFixed(2)} (spread on matched round-trips)`,
-      `Unrealized PnL: $${s.unrealizedPnL.toFixed(2)}`,
-      `Total Fees:     $${s.totalFees.toFixed(2)}`,
-      `Net PnL:        $${s.totalPnL.toFixed(2)}`,
-      `Avg Spread Capture: $${s.avgSpreadCapture.toFixed(4)}/unit`,
-      `Matched Quantity:   ${s.totalMatchedQuantity.toFixed(8)}`,
-      `--- Cash Flow ---`,
-      `Sell Proceeds: $${s.sellProceeds.toFixed(2)}`,
-      `Buy Cost:      $${s.buyCost.toFixed(2)}`,
-      `Net Cash Flow: $${s.netCashFlow.toFixed(2)}`,
-      `Maker Fees: $${s.makerFees.toFixed(2)} | Taker Fees: $${s.takerFees.toFixed(2)}`,
+      `Trades: ${summary.numTrades}`,
+      `Net Position: ${summary.netPosition.toFixed(8)}`,
+      `Realized PnL: $${summary.realizedPnL.toFixed(2)}`,
+      `Unrealized PnL: $${summary.unrealizedPnL.toFixed(2)}`,
+      `Total Fees: $${summary.totalFees.toFixed(2)}`,
+      `Net PnL: $${summary.totalPnL.toFixed(2)}`,
+      `Avg Spread Capture: $${summary.avgSpreadCapture.toFixed(4)}/unit`,
+      `Matched Quantity: ${summary.totalMatchedQuantity.toFixed(8)}`,
+      `Maker Fees: $${summary.makerFees.toFixed(2)}`,
+      `Taker Fees: $${summary.takerFees.toFixed(2)}`,
     ];
-    const venues = Object.keys(s.feesByVenue);
+
+    const venues = Object.keys(summary.feesByVenue);
     if (venues.length > 0) {
       lines.push('Fees by Venue:');
       for (const v of venues) {
-        lines.push(`  ${v}: $${s.feesByVenue[v].toFixed(2)}`);
+        lines.push(`  ${v}: $${summary.feesByVenue[v].toFixed(2)}`);
       }
     }
+
     lines.push('===========================');
     return lines.join('\n');
   }
 
-  /** Start periodic PnL summary logging. */
+  /**
+   * Start periodic PnL summary logging.
+   */
   startPeriodicLogging() {
     if (this._logTimer) return;
     this._logTimer = setInterval(() => {
-      const s = this.getSummary();
-      this.logger.info(`[PnLTracker] realized=$${s.realizedPnL.toFixed(2)} unrealized=$${s.unrealizedPnL.toFixed(2)} fees=$${s.totalFees.toFixed(2)} net=$${s.totalPnL.toFixed(2)} cashFlow=$${s.netCashFlow.toFixed(2)} trades=${s.numTrades}(${s.buyCount}B/${s.sellCount}S)`);
-      this.emit('summary', s);
+      const summary = this.getSummary();
+      this.logger.info(`[PnLTracker] PnL: realized=$${summary.realizedPnL.toFixed(2)} unrealized=$${summary.unrealizedPnL.toFixed(2)} fees=$${summary.totalFees.toFixed(2)} net=$${summary.totalPnL.toFixed(2)} trades=${summary.numTrades}`);
+      this.emit('summary', summary);
     }, this.logIntervalMs);
   }
 
-  /** Stop periodic logging. */
+  /**
+   * Stop periodic logging.
+   */
   stopPeriodicLogging() {
     if (this._logTimer) {
       clearInterval(this._logTimer);
@@ -303,7 +305,9 @@ export class PnLTracker extends EventEmitter {
     }
   }
 
-  /** Reset all PnL state. */
+  /**
+   * Reset all PnL state.
+   */
   reset() {
     this.buyFills = [];
     this.sellFills = [];
@@ -311,15 +315,11 @@ export class PnLTracker extends EventEmitter {
     this.unrealizedPnL = 0;
     this.totalMatchedQuantity = 0;
     this.lastMid = null;
-    this.sellProceeds = 0;
-    this.buyCost = 0;
     this.totalFees = 0;
     this.feesByVenue = {};
     this.makerFees = 0;
     this.takerFees = 0;
     this.numTrades = 0;
-    this.buyCount = 0;
-    this.sellCount = 0;
     this._lastReportedPnL = 0;
     this.sessionStartTime = Date.now();
     this.stopPeriodicLogging();

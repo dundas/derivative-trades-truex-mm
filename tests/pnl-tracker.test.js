@@ -269,36 +269,6 @@ describe('PnLTracker', () => {
     });
   });
 
-  describe('Cash Flow Tracking', () => {
-    it('should track sell proceeds for sell-only account (no matching buys)', () => {
-      tracker.onFill({ side: 'sell', quantity: 0.01, price: 70000, venue: 'truex', isMaker: true, execID: 's1' });
-      tracker.onFill({ side: 'sell', quantity: 0.005, price: 71000, venue: 'truex', isMaker: true, execID: 's2' });
-
-      const summary = tracker.getSummary();
-      // No matching buys → FIFO realizedPnL = 0
-      expect(summary.realizedPnL).toBe(0);
-      expect(summary.totalMatchedQuantity).toBe(0);
-      // But cash-flow shows actual proceeds
-      expect(summary.sellProceeds).toBeCloseTo(0.01 * 70000 + 0.005 * 71000, 4);
-      expect(summary.buyCost).toBe(0);
-      expect(summary.netCashFlow).toBeCloseTo(summary.sellProceeds, 4);
-      expect(summary.sellCount).toBe(2);
-      expect(summary.buyCount).toBe(0);
-    });
-
-    it('should track buy cost and net cash flow for round-trip', () => {
-      tracker.onFill({ side: 'buy', quantity: 1, price: 100, venue: 'truex', isMaker: true, execID: 'e1' });
-      tracker.onFill({ side: 'sell', quantity: 1, price: 105, venue: 'truex', isMaker: true, execID: 'e2' });
-
-      const summary = tracker.getSummary();
-      expect(summary.buyCost).toBe(100);
-      expect(summary.sellProceeds).toBe(105);
-      expect(summary.netCashFlow).toBe(5);
-      expect(summary.buyCount).toBe(1);
-      expect(summary.sellCount).toBe(1);
-    });
-  });
-
   describe('Session Report', () => {
     it('should return a string containing key metrics', () => {
       tracker.onFill({ side: 'buy', quantity: 1, price: 100, venue: 'truex', isMaker: true, execID: 'e1' });
@@ -314,10 +284,6 @@ describe('PnLTracker', () => {
       expect(report).toContain('Net PnL');
       expect(report).toContain('Trades: 2');
       expect(report).toContain('Avg Spread Capture');
-      expect(report).toContain('Cash Flow');
-      expect(report).toContain('Sell Proceeds');
-      expect(report).toContain('Buy Cost');
-      expect(report).toContain('Net Cash Flow');
     });
 
     it('should include venue fee breakdown', () => {
@@ -387,11 +353,6 @@ describe('PnLTracker', () => {
       expect(summary.makerFees).toBe(0);
       expect(summary.takerFees).toBe(0);
       expect(Object.keys(summary.feesByVenue).length).toBe(0);
-      expect(summary.sellProceeds).toBe(0);
-      expect(summary.buyCost).toBe(0);
-      expect(summary.netCashFlow).toBe(0);
-      expect(summary.buyCount).toBe(0);
-      expect(summary.sellCount).toBe(0);
     });
 
     it('should allow fresh tracking after reset', () => {
