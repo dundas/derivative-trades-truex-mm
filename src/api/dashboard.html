@@ -29,6 +29,7 @@
     .conn-off { color: #f85149; }
     .conn-null { color: #8b949e; }
     .footer { margin-top: 20px; color: #8b949e; font-size: 12px; text-align: right; }
+    .section-separator { margin-top: 6px; border-top: 1px solid #21262d; padding-top: 6px; }
     .alert-item { border-left: 3px solid #f85149; padding-left: 8px; margin-bottom: 8px; font-size: 12px; color: #c9d1d9; }
     .alert-time { color: #8b949e; font-size: 11px; }
     #error-banner { display:none; background:#3a1a1a; color:#f85149; border:1px solid #f85149; border-radius:4px; padding:8px 12px; margin-bottom:16px; }
@@ -64,10 +65,13 @@
     </div>
     <div class="card">
       <h2>PnL</h2>
-      <div class="kv"><span class="key">Realized</span><span class="val" id="pnl-realized">—</span></div>
+      <div class="kv"><span class="key">Spread Captured</span><span class="val" id="pnl-realized">—</span></div>
       <div class="kv"><span class="key">Unrealized</span><span class="val" id="pnl-unreal">—</span></div>
       <div class="kv"><span class="key">Fees</span><span class="val" id="pnl-fees">—</span></div>
       <div class="kv"><span class="key">Net</span><span class="val" id="pnl-net">—</span></div>
+      <div class="kv section-separator"><span class="key">Sell Proceeds</span><span class="val" id="pnl-sell-proceeds">—</span></div>
+      <div class="kv"><span class="key">Buy Cost</span><span class="val" id="pnl-buy-cost">—</span></div>
+      <div class="kv"><span class="key">Net Cash Flow</span><span class="val" id="pnl-cashflow">—</span></div>
     </div>
     <div class="card">
       <h2>Last Fill</h2>
@@ -138,24 +142,34 @@
       oeEl.className = connClass(d.oeConnected);
       oeEl.textContent = connText(d.oeConnected);
       const mdEl = document.getElementById('md-conn');
-      mdEl.className = connClass(d.mdConnected);
-      mdEl.textContent = connText(d.mdConnected);
+      // mdConnected may be null if feed doesn't expose isLoggedOn — infer from freshness
+      const mdConn = d.mdConnected !== null ? d.mdConnected : (d.lastMdAge !== null && d.lastMdAge < 10000);
+      mdEl.className = connClass(mdConn);
+      mdEl.textContent = connText(mdConn);
       document.getElementById('last-md').textContent = d.lastMdAge !== null ? fmt(d.lastMdAge) + ' ago' : '—';
 
-      // Position
+      // Position — balances live in position.baseBalance / position.quoteBalance
       const pos = d.position || {};
       document.getElementById('net-pos').textContent = pos.netPosition !== undefined ? fmtNum(pos.netPosition, 6) + ' BTC' : '—';
       const bal = d.balances || {};
-      document.getElementById('btc-avail').textContent = bal.base ? fmtNum(bal.base.available, 6) : '—';
-      document.getElementById('pyusd-avail').textContent = bal.quote ? fmtNum(bal.quote.available, 2) : '—';
+      const baseBal = bal.base || pos.baseBalance || {};
+      const quoteBal = bal.quote || pos.quoteBalance || {};
+      document.getElementById('btc-avail').textContent = baseBal.available !== undefined ? fmtNum(baseBal.available, 6) : '—';
+      document.getElementById('pyusd-avail').textContent = quoteBal.available !== undefined ? fmtNum(quoteBal.available, 2) : '—';
       document.getElementById('active-orders').textContent = d.activeOrders !== undefined ? d.activeOrders : '—';
 
       // PnL
       const pnl = d.pnl || {};
-      document.getElementById('pnl-realized').textContent = pnl.realizedPnl !== undefined ? '$' + fmtNum(pnl.realizedPnl, 2) : '—';
-      document.getElementById('pnl-unreal').textContent = pnl.unrealizedPnl !== undefined ? '$' + fmtNum(pnl.unrealizedPnl, 2) : '—';
+      const realized = pnl.realizedPnL ?? pnl.realizedPnl;
+      const unrealized = pnl.unrealizedPnL ?? pnl.unrealizedPnl;
+      const netPnl = pnl.totalPnL ?? pnl.netPnl;
+      document.getElementById('pnl-realized').textContent = realized !== undefined ? '$' + fmtNum(realized, 2) : '—';
+      document.getElementById('pnl-unreal').textContent = unrealized !== undefined ? '$' + fmtNum(unrealized, 2) : '—';
       document.getElementById('pnl-fees').textContent = pnl.totalFees !== undefined ? '$' + fmtNum(pnl.totalFees, 2) : '—';
-      document.getElementById('pnl-net').textContent = pnl.netPnl !== undefined ? '$' + fmtNum(pnl.netPnl, 2) : '—';
+      document.getElementById('pnl-net').textContent = netPnl !== undefined ? '$' + fmtNum(netPnl, 2) : '—';
+      document.getElementById('pnl-sell-proceeds').textContent = pnl.sellProceeds !== undefined ? '$' + fmtNum(pnl.sellProceeds, 2) : '—';
+      document.getElementById('pnl-buy-cost').textContent = pnl.buyCost !== undefined ? '$' + fmtNum(pnl.buyCost, 2) : '—';
+      document.getElementById('pnl-cashflow').textContent = pnl.netCashFlow !== undefined ? '$' + fmtNum(pnl.netCashFlow, 2) : '—';
 
       // Last fill
       const fill = d.lastFill;
