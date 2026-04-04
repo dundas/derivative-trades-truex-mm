@@ -1,178 +1,134 @@
 # TrueX Market Maker (true_markets_mm)
+# Generated: 2026-04-04
+# Audience: AI agents operating or debugging this system
 
-> Automated BTC-PYUSD market maker on TrueX exchange using FIX protocol for order entry, Coinbase WebSocket for pricing, and balance-aware quoting to prevent unfunded orders.
+> Automated BTC-PYUSD market maker on TrueX exchange using FIX protocol,
+> with Coinbase price feed, balance-aware quoting, and PostgreSQL data pipeline.
 
 ## Architecture
 
 ```
-CoinbaseWS → PriceAggregator → QuoteEngine → FIXConnection (OE) → TrueX
-                                     ↑                ↓
+Coinbase WS → PriceAggregator → QuoteEngine → FIXConnection → TrueX
+                                     ↑               ↓
                               InventoryManager ← ExecReports (35=8, 35=9)
                                      ↓
                                HedgeExecutor → Kraken (optional)
                                      ↓
-                                PnLTracker (FIFO matching)
-
-Orchestrator wires all components. DataPipelineManager (Memory → Redis → PostgreSQL) persists orders/fills.
-REST client handles balance fetching, order reconciliation, and orphan cleanup.
+                                PnLTracker (FIFO + cash-flow)
+                                     ↓
+                          DataPipeline: Memory → Redis → PostgreSQL
 ```
 
-### Key Source Files
-- `src/core/market-maker-orchestrator.js` — Lifecycle, event wiring, REST reconciliation
-- `src/core/quote-engine.js` — Quote computation, order placement/cancel, rate limiting
-- `src/core/inventory-manager.js` — Position tracking, skew, balance-aware gating
-- `src/core/pnl-tracker.js` — FIFO PnL, fee tracking, mark-to-market
+Orchestrator wires all modules. QuoteEngine computes ladder quotes with inventory
+skew. InventoryManager tracks position/balances. PnLTracker: FIFO spread PnL for
+matched round-trips (realizedPnL=$0 for sell-only) + cash-flow tracking
+(netCashFlow=sellProceeds-buyCost, accurate for sell-heavy/inventory-liquidation accounts).
+HedgeExecutor offloads to Kraken. DataPipelineManager: audit JSONL → Redis → PG.
+
+### Key Files
+- `src/core/market-maker-orchestrator.js` — Lifecycle, event wiring, reconciliation
+- `src/core/quote-engine.js` — Quote computation, order placement/cancel
+- `src/core/inventory-manager.js` — Position tracking, skew, balance gating
 - `src/exchanges/truex/TrueXRESTClient.ts` — REST API client with HMAC auth
-- `src/fix-protocol/fix-connection.js` — FIX 5.0 SP2 over FIXT.1.1, reconnection
-- `scripts/run-prod.js` — Production configuration and startup
+- `src/fix-protocol/fix-connection.js` — FIX 5.0 SP2 over FIXT.1.1
+- `scripts/run-prod.js` — Production config and startup
+- `scripts/kill-switch.js` — Emergency order cancellation via REST
 
-## TrueX FIX Protocol
+## FIX Protocol (FIXT.1.1 / FIX.5.0SP2)
 
-**Protocol**: FIX 5.0 SP2 over FIXT.1.1 transport.
+### Authentication
+Logon (35=A) uses HMAC-SHA256: sign `sendingTime + msgType + msgSeqNum +
+senderCompID + targetCompID + username` with apiSecret, digest as **base64**.
+Fields: 553=apiKey (Username), 554=signature (Password), 141=Y (ResetSeqNumFlag).
 
 ### New Order Single (35=D)
-```
-35=D, 11=<clOrdID>, 55=BTC-PYUSD, 54=1|2, 38=<qty>, 44=<price>, 40=2 (Limit), 59=1 (GTC)
-18=6 (ExecInst: Add Liquidity Only / maker-only)
-Party block: 453=1, 448=<clientId>, 452=3
-```
+Tags: 11=clOrdID, 55=BTC-PYUSD, 54=1(buy)|2(sell), 38=qty, 44=price,
+40=2(Limit), 59=1(GTC)|3(IOC), 18=6(ALO/maker-only).
+Party block required: 453=1, 448=clientId, 452=3.
 
-### Cancel Order (35=F) — NOT 35=G
-```
-35=F, 11=<newClOrdID>, 41=<origClOrdID>
-Party block: 453=1, 448=<clientId>, 452=3
-No tag 54 (Side) on cancels.
-```
+### Order Cancel (35=F) — NOT 35=G
+Tags: 11=newClOrdID, 41=origClOrdID. Party block required. NO tag 54 (Side).
 
 ### Execution Reports (35=8)
-- `39=A` — PendingNew (order in flight, do NOT cancel yet)
-- `39=0` — New/Accepted (order live on book)
-- `39=1` — PartialFill
-- `39=2` — Filled (tag 31=lastPx, tag 32=lastQty)
-- `39=4` — Cancelled
-- `39=8` — Rejected (tag 58=reason, tag 103=code)
+OrdStatus (39): A=PendingNew, 0=New, 1=PartialFill, 2=Filled, 4=Cancelled, 8=Rejected.
+Fill data: 31=LastPx, 32=LastQty (never fall back to 38=OrderQty).
 
 ### Cancel Reject (35=9)
-- `102=0` — Too late (order filled/gone, but cancel missed it)
-- `102=1` — Unknown order (already gone from exchange, safe to remove locally)
+CxlRejReason (102): 0=TooLate, 1=UnknownOrder (order gone from exchange).
+If reason=1, remove from local tracking. Otherwise restore to 'active'.
 
 ### Critical Rules
-- **Never cancel 'pending' orders** — TrueX returns "Unknown order" for orders not yet ack'd
-- **Cancel before reprice** — Always cancel old order, then place new. No modify-in-place via FIX.
-- **50 open order limit** per client ID (UAT). Production limit may differ.
-- **BTC size increment**: 0.0001 (sizeDecimalPlaces=4)
-- **Price tick size**: $0.50
-- **Rate limit**: ~10 msg/s on FIX, engine caps at maxOrdersPerSecond
-- **Price band**: +/-2.5% from mid. Orders outside are rejected.
-- **Min notional**: $1.00
+- Never cancel 'pending' orders — TrueX returns "Unknown order"
+- reconcileOrders skips 'pending' AND 'cancelling' status orders
+- minRepriceIntervalMs=5000 prevents cascading cancel/place failures
+- 3+ consecutive rejects trigger 5s backoff (rejectBackoffUntil)
+- cancelToOrigMap tracks cancel clOrdID → original clOrdID for ack matching
+- 50 open order limit per client ID on UAT
+- Rate limit: ~10 msg/sec. maxOrdersPerSecond default=8 with queue overflow
+- TimeInForce: GTC (59=1) and IOC (59=3) ONLY. No GTD/TTL.
+- BTC size increment: 0.0001 (sizeDecimalPlaces=4), tick size: $0.50
 
 ## TrueX REST API
-
-**Base URL**: `{TRUEX_REST_URL}/api/v1`
 
 ### Authentication (HMAC-SHA256 Base64)
 ```
 timestamp = Math.floor(Date.now() / 1000)
-message = "${timestamp}${METHOD}${path}" + body (if present)
-// path already includes /api/v1 prefix (e.g., "/api/v1/balance")
+message = timestamp + METHOD + /api/v1 + path [+ body if present]
 signature = HMAC-SHA256(apiSecret, message) → base64
-
-Headers:
-  x-truex-auth-userid: <clientId>     (NOT apiKey)
-  x-truex-auth-timestamp: <timestamp>
-  x-truex-auth-token: <apiKey>
-  x-truex-auth-signature: <signature>
 ```
-**Important**: Sign path only — do NOT include query string in signature.
+Sign path only — do NOT include query string in signature.
+Headers:
+  x-truex-auth-token: apiKey
+  x-truex-auth-signature: base64 HMAC
+  x-truex-auth-timestamp: unix seconds
+  x-truex-auth-userid: clientId (NOT apiKey)
 
 ### Key Endpoints
-| Method | Path | Purpose |
-|--------|------|---------|
-| GET | `/balance` | Account balances (returns asset_id, not name) |
-| GET | `/asset` | Asset metadata (id → name mapping) |
-| GET | `/order/active` | All active orders |
-| GET | `/order/status/{id}?id_type=client` | Order status by external_id |
-| DELETE | `/order/{id}?id_type=exchange` | Cancel by exchange ID |
-| POST | `/order` | Create order |
-| PATCH | `/order` | Modify order |
-| GET | `/instrument` | Instrument metadata |
-| GET | `/market/quote?instrument_id=X` | EBBO (best bid/offer) |
+- GET /asset → array of `{ id, status, fields: { name } }` — name under `fields`, NOT top-level
+- GET /balance → `[{ balances: [{ asset_id, balance, order_hold, transfer_hold }] }]`
+  Raw fields: balance, order_hold, transfer_hold (NOT available/held/total)
+  getAccountSummary() normalizes: available = balance - order_hold - transfer_hold
+- GET /order/active → array of OrderResponse (external_id = our clOrdID)
+- DELETE /order/:id?id_type=exchange|client → cancel single order
+- POST /order → { external_id, info: { client_id, instrument_id, side, type, qty, price, tif } }
+- GET /instrument → { id, symbol, base_asset_id, quote_asset_id }
+- GET /market/quote?instrument_id=X → { bid_price, ask_price, bid_qty, ask_qty }
 
-### Balance Parsing Gotcha
-REST returns `asset_id` (e.g., `78873627519877134`) not asset names. Must resolve via `/asset` endpoint or hardcoded map:
-```
-78873627519877132 → USD
-78873627519877133 → PYUSD
-78873627519877134 → BTC
-```
-Raw balance fields: `{ balance, order_hold, transfer_hold, unsettled }`.
-Available = balance - order_hold - transfer_hold.
+### Asset ID Mapping (hardcoded fallback)
+78873627519877132=USD, 78873627519877133=PYUSD, 78873627519877134=BTC
 
-## Configuration (Production Defaults)
+### Order Statuses (REST)
+INITIALIZED, NEW_PENDING, REJECTED, ACTIVE, FILLED, CANCEL_PENDING, CANCELED, MODIFY_PENDING.
+Note: API has typo `exeuted_qty` (not `executed_qty`).
 
-```javascript
-// Quote Engine
-levels: 3,                        // Levels per side
-baseSpreadBps: 80,                // 0.8% total spread
-levelSpacingTicks: 2,             // $1.00 between levels
-repriceThresholdTicks: 3,         // Reprice after $1.50 move
-baseSizeBTC: 0.01,                // ~$1,000 per level at $100k
-sizeDecayFactor: 0.8,             // Each level 80% of previous
-maxOrdersPerSecond: 4,            // FIX rate limit
-minRepriceIntervalMs: 5000,       // 5s debounce between reprices
-tickSize: 0.50,                   // TrueX price increment
-minNotional: 1.0,                 // TrueX minimum order value
-priceBandPct: 2.5,                // TrueX +/-2.5% band
-sizeDecimalPlaces: 4,             // BTC quantity precision
+## Configuration Defaults
 
-// Inventory
-maxPositionBTC: 0.05,             // Max net position
-hedgeThresholdBTC: 0.03,          // Trigger hedge signal
-emergencyLimitBTC: 0.06,          // Cancel all + emergency event
-maxSkewTicks: 3,                  // Max quote skew
-skewExponent: 1.5,                // Skew curve aggressiveness
+### Production (run-prod.js)
+levels=3, baseSpreadBps=80, baseSizeBTC=0.01, maxPositionBTC=0.05,
+emergencyLimitBTC=0.06, minRepriceIntervalMs=5000, maxOrdersPerSecond=4,
+tickSize=0.50, priceBandPct=2.5, heartbeatInterval=30s.
+reconcileIntervalMs=300000 (5min), balanceRefreshIntervalMs=60000 (1min).
 
-// Fees
-truexMakerFeeBps: 0,              // Zero maker fees (agreement)
-truexTakerFeeBps: 10,             // 1bp taker
+### UAT (run-uat-paper-trading.js)
+levels=5, baseSpreadBps=50, baseSizeBTC=0.02, maxPositionBTC=0.10,
+emergencyLimitBTC=0.12, sizeDecayFactor=0.8.
 
-// Timers
-reconcileIntervalMs: 300000,      // REST reconciliation every 5min
-balanceRefreshIntervalMs: 60000,  // Balance sync every 1min
-heartbeatInterval: 30,            // FIX heartbeat (seconds)
-```
+### Fee Configuration
+Dynamic via env: TRUEX_MAKER_FEE_BPS, TRUEX_TAKER_FEE_BPS, HEDGE_MAKER_FEE_BPS,
+HEDGE_TAKER_FEE_BPS. parseFee() with NaN guard, range [0,500]. Currently 0/0
+per TrueX agreement.
 
 ## Balance-Aware Quoting
 
-1. **Startup**: Orchestrator fetches balances via REST (`getAccountSummary`). Mandatory — refuses to start without balance data.
-2. **InventoryManager.initializeFromBalances()**: Stores `{ available, held, total }` for base (BTC) and quote (PYUSD). Sets initial `netPosition = baseBalance.total`.
-3. **canQuote(side)**: Returns false if available balance for that side is <= 0. Buy needs PYUSD, sell needs BTC.
-4. **Cumulative size capping in computeDesiredQuotes()**:
-   - Tracks `bidCommittedQuote` (PYUSD) and `askCommittedBase` (BTC) across levels
-   - Starts from amounts already committed in active/pending orders
-   - Each level's size is capped: `_capSizeToBalance(side, size, price, alreadyCommitted)`
-   - Sells: remaining = availableBTC - committedBTC
-   - Buys: remaining = (availablePYUSD - committedPYUSD) / price
-5. **Fill updates**: `onFill()` adjusts tracked balances immediately (buy: +BTC, -PYUSD; sell: -BTC, +PYUSD). Clamps to 0 on negative.
-6. **Periodic refresh**: Every 60s, `refreshBalances()` re-syncs from exchange without resetting netPosition or VWAP. Logs drift.
-
-## Inventory & Skew
-
-**Position tracking**: `netPosition` starts at BTC total balance. Buys increment, sells decrement.
-
-**Skew computation** (`getSkew()`):
-```
-utilizationPct = abs(netPosition) / maxPositionBTC
-rawSkew = utilizationPct^skewExponent * maxSkewTicks
-
-If long:  askSkewTicks = +rawSkew (widen asks), bidSkewTicks = -rawSkew (tighten bids)
-If short: bidSkewTicks = +rawSkew (widen bids), askSkewTicks = -rawSkew (tighten asks)
-```
-Effect: encourages fills that reduce position. Positive skew = widen (less aggressive), negative = tighten (more aggressive).
-
-**Hedge signal**: Emitted when `abs(netPosition) >= hedgeThresholdBTC`. Side is opposite of position.
-
-**Emergency**: When `abs(netPosition) >= emergencyLimitBTC`, cancels all quotes immediately.
+1. At startup: REST getAccountSummary() fetches balances. initializeFromBalances()
+   sets netPosition from base total. Startup FAILS if balance fetch fails.
+2. canQuote(side): returns false if no available balance for that side.
+   No PYUSD = no bids (buy side disabled). No BTC = no asks.
+3. _capSizeToBalance(): each level caps order size to remaining available balance
+   minus already-committed amounts from prior levels. Prevents over-commitment.
+4. On fill: tracked balances update locally (buy: +BTC -PYUSD, sell: -BTC +PYUSD).
+5. Every 60s: refreshBalances() re-syncs from exchange without resetting netPosition/VWAP.
+6. Balance drift logged when tracked vs exchange diverges.
 
 ## Order Lifecycle
 
@@ -191,60 +147,106 @@ CancelReject other → restore to 'active' (cancel failed, order still live)
 ExecReport 39=2 → delete + emit 'fill'   (filled)
 ```
 
-**Reconciliation skips** orders with status `pending` or `cancelling` (in-flight).
+Reconciliation skips orders with status 'pending' or 'cancelling' (in-flight).
+Reject backoff: 3+ consecutive rejects pauses quoting for 5s.
+Price update flow: PriceAggregator 'price' → QuoteEngine.onPriceUpdate() →
+computeDesiredQuotes(mid, skew) → reconcileOrders() → executeActions().
+Priority: cancels first → replacements → new orders. Rate-limited queue.
 
-**Reject backoff**: After 3+ consecutive rejects, pauses quoting for 5 seconds (`rejectBackoffUntil`).
+## Inventory & Skew
+
+Position tracking: netPosition starts at BTC total balance. Buys increment, sells decrement.
+Skew: utilizationPct = abs(netPosition)/maxPositionBTC.
+rawSkew = utilizationPct^skewExponent * maxSkewTicks.
+Long: widen asks (+rawSkew), tighten bids (-rawSkew). Encourages selling.
+Short: widen bids (+rawSkew), tighten asks (-rawSkew). Encourages buying.
+Hedge signal: emitted when abs(netPosition) >= hedgeThresholdBTC.
+Emergency: abs(netPosition) >= emergencyLimitBTC → cancel all quotes.
 
 ## REST Reconciliation (every 5 min)
 
-1. Fetch active orders from exchange via `getActiveOrders()`
-2. Compare against local `activeOrders` map (skip pending/cancelling)
-3. **Orphans** (on exchange, not local): Cancel via REST
-4. **Ghosts** (in local, not on exchange): Remove from `activeOrders`
-5. Logs: `exchange=N local=N matched=N orphans=N ghosts=N`
+1. Fetch active orders from exchange via getActiveOrders()
+2. Compare external_id against local activeOrders map (skip pending/cancelling)
+3. Orphans (on exchange, not local): cancel via REST
+4. Ghosts (local, not on exchange): remove from activeOrders
+5. Logs: exchange=N local=N matched=N orphans=N ghosts=N
 
 ## Startup Sequence
 
-1. Cancel orphaned orders from previous sessions via REST
-2. Initialize DataPipelineManager
-3. Connect Coinbase WS, wait for first price (30s timeout)
-4. Create Orchestrator with all config
-5. `orchestrator.start()`:
+0. Cancel orphaned orders via REST (from previous sessions)
+1. DataPipelineManager.start() — connect Redis/PG
+2. PriceAggregator + CoinbaseWsIngest — wait for first price (30s timeout)
+3. Orchestrator.start():
    a. Wire event handlers
-   b. Fetch and initialize balances (mandatory)
-   c. Connect FIX OE
-   d. Start data pipeline
-   e. Start PnL logging, drain queue timer, reconciliation timer, balance refresh timer
+   b. Fetch balances via REST (mandatory — fails startup if unavailable)
+   c. Connect FIX OE (logon with HMAC-SHA256)
+   d. Connect market data feed (optional)
+   e. Start data pipeline, PnL logging, drain queue timer
+   f. Start REST reconciliation + balance refresh timers
 
 ## Shutdown Sequence
 
-1. Cancel all active quotes via FIX
-2. Hedge remaining position (if > minHedgeSizeBTC)
-3. Stop all timers
-4. Stop data pipeline (flush)
-5. Disconnect market data feed
-6. Disconnect FIX
-7. Log final PnL report
+1. cancelAllQuotes → 2. Hedge remaining position → 3. Stop timers →
+4. DataPipelineManager.stop() (final flush) → 5. Disconnect FIX (35=5 Logout) →
+6. Log final PnL report
 
-## Common Debugging
+## Kill Switch
+`bun scripts/kill-switch.js [--prod|--uat]`
+Cancels all orders via REST API. Works independently of FIX connection.
+Auto-detects environment from TRUEX_PROD_API_KEY presence.
+Steps: fetch active orders → cancelAllOrders() → verify none remain.
 
-### Order Rejections
-- **"Unknown order"** on cancel: Tried to cancel a pending order. Wait for 39=0 ack first.
-- **Price band**: Order price > 2.5% from mid. Check `priceBandPct` and mid price.
-- **Min notional**: Order value < $1.00. Check `minNotional`.
-- **50 order limit**: Too many open orders. Check `activeOrders.size`.
+## Deployment
 
-### Balance Issues
-- **"Balance name resolution failed"**: asset_id → name mapping broken. Check `getAssetMap()` and `KNOWN_ASSETS` fallback.
-- **Negative tracked balance**: Fill arrived before balance refresh corrected drift. Clamped to 0, corrects on next 60s refresh.
-- **One-sided quoting**: No PYUSD = no bids, no BTC = no asks. Check `canQuote()`.
+Network: Mac → Hetzner proxy (178.156.230.110) → WireGuard → TrueX (10.20.1.11).
+Proxy ports: 3004=FIX OE, 3006=REST. Docker: oven/bun:1.1-alpine, non-root user.
+Services: redis (7-alpine), fix-proxy, market-maker. `docker compose up -d`.
 
-### Connection
-- FIX connects via proxy: app → Hetzner proxy (178.156.230.110:3004) → WireGuard → TrueX
-- REST via proxy: app → Hetzner proxy (:3006) → TrueX
-- FIX reconnects with exponential backoff (1s initial, 30s max, 10 attempts)
+Env required: TRUEX_API_KEY (or TRUEX_PROD_API_KEY), TRUEX_SECRET_KEY.
+Optional: TRUEX_FIX_HOST/PORT, TRUEX_CLIENT_ID, TRUEX_REST_URL, DATABASE_URL,
+REDIS_URL, LOG_LEVEL, TRUEX_MAKER_FEE_BPS, TRUEX_TAKER_FEE_BPS.
 
-### Rate Limiting
-- `maxOrdersPerSecond` caps FIX messages. Overflow goes to `actionQueue`, drained every 200ms.
-- `minRepriceIntervalMs=5000` prevents cascading cancel/place storms.
-- `dupGuardMs=500` prevents duplicate cancel sends for same clOrdID.
+UAT: FIX 38.32.101.229:19484, REST http://38.32.101.229:9742.
+SenderCompID: DAVID1|DAVID2, TargetCompID: TRUEX_UAT_OE.
+Client IDs: DAVID1=78972918929686546, DAVID2=78972918929686547.
+
+Data pipeline: AuditLogger (JSONL) → Memory → Redis (1s) → PostgreSQL (5min).
+Auto-failover: Redis fails → direct Memory→PG flush every 5s.
+
+## Debugging Guide
+
+### Orders not posting
+- Check confidence > 0.3 (need active Coinbase feed)
+- Check canQuote() — may have 0 balance for that side
+- Check rejectBackoffUntil — 3+ rejects cause 5s pause
+- Check maxOrdersPerSecond — overflow queued, drained every 200ms
+- Verify clientId is set (Party block required for all FIX messages)
+
+### Fills not tracking
+- LastQty (tag 32) must come from exec report, never fall back to OrderQty (tag 38)
+- cancelToOrigMap resolves cancel ack clOrdIDs to original orders
+
+### Stale orders on exchange
+- REST reconciliation runs every 5min, cancels orphans
+- Kill switch: `bun scripts/kill-switch.js --prod` for emergency
+
+### Balance mismatch
+- refreshBalances() every 60s is authoritative (exchange is source of truth)
+- Fill-based tracking may drift; clamped to 0, corrects on next refresh
+
+### Connection issues
+- FIX auto-reconnects with exponential backoff (max 10 attempts, up to 30s)
+- Heartbeat: 30s, disconnects after 2x missed. Proxy adds 2s logon delay.
+
+### Rate limiting
+- maxOrdersPerSecond caps FIX messages. Overflow queued, drained every 200ms.
+- minRepriceIntervalMs=5000, dupGuardMs=500 prevents cascading storms.
+
+## Running
+
+```sh
+bun scripts/run-prod.js               # Production
+bun scripts/run-uat-paper-trading.js   # UAT paper trading
+bun scripts/kill-switch.js --prod      # Emergency cancel all orders
+bun test                               # Run test suite (712 tests)
+```
