@@ -1025,24 +1025,28 @@ describe('FIXConnection', () => {
     it('should start a stable timer and reset reconnectAttempts when it fires', async () => {
       connection.reconnectAttempts = 5;
 
-      // _startStableTimer sets a 60s timeout — verify it was scheduled
-      connection._startStableTimer();
-      expect(connection._stableTimer).toBeTruthy();
+      // Patch global setTimeout to fire immediately (0ms) so the real
+      // _startStableTimer callback runs without waiting 60 real seconds.
+      const originalSetTimeout = global.setTimeout;
+      global.setTimeout = (fn, _delay, ...args) => originalSetTimeout(fn, 0, ...args);
 
-      // Clear the real timer and verify the reset would happen by calling
-      // the underlying timeout callback directly via a replacement short timer.
-      clearTimeout(connection._stableTimer);
-      connection._stableTimer = null;
+      try {
+        // _startStableTimer sets a 60s timeout — verify it was scheduled
+        connection._startStableTimer();
+        expect(connection._stableTimer).toBeTruthy();
 
-      await new Promise(resolve => {
-        connection._stableTimer = setTimeout(() => {
-          connection._stableTimer = null;
-          connection.reconnectAttempts = 0;
-          resolve();
-        }, 10);
-      });
+        // reconnectAttempts should NOT have reset yet (timer hasn't fired)
+        expect(connection.reconnectAttempts).toBe(5);
 
-      expect(connection.reconnectAttempts).toBe(0);
+        // Wait for the real callback (now 0ms delay) to fire
+        await new Promise(resolve => originalSetTimeout(resolve, 20));
+
+        // Real callback reset reconnectAttempts to 0
+        expect(connection.reconnectAttempts).toBe(0);
+        expect(connection._stableTimer).toBeNull();
+      } finally {
+        global.setTimeout = originalSetTimeout;
+      }
     });
 
     it('should clear stable timer on disconnect', () => {

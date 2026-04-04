@@ -338,7 +338,9 @@ export class FIXConnection extends EventEmitter {
 
                 this.isLoggedOn = true;
                 this.hasConnectedBefore = true;
-                this.reconnectAttempts = 0;
+                // Do NOT reset reconnectAttempts immediately — _startStableTimer will
+                // reset it after 60s of stable uptime, preventing a brief drop from
+                // resetting the counter too eagerly.
                 this.startHeartbeat();
                 this.startCleanupTimer(); // Start periodic message cleanup
                 this._startStableTimer(); // Reset reconnect counter after 60s stable
