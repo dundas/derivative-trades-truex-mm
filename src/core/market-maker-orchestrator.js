@@ -134,6 +134,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this._intentionalStop = false;
     this._mdStaleThresholdMs = parseInt(process.env.MD_STALE_THRESHOLD_MS || '10000', 10);
     this._quotingIdleThresholdMs = parseInt(process.env.QUOTING_IDLE_THRESHOLD_MS || '120000', 10);
+    this._quotingGateEnabled = true; // false when MD stale or session down
 
     // Timers
     this.drainQueueTimer = null;
@@ -388,16 +389,34 @@ export class MarketMakerOrchestrator extends EventEmitter {
   _onPriceUpdate(aggregatedPrice) {
     if (!this.isRunning) return;
 
-    // Track when we last received a market data update
+    // Update MD freshness timestamp FIRST (so we know if data is arriving)
     this._lastMdUpdateTime = Date.now();
 
-    // Dual-session gate: if MD feed is active, OE must also be logged on before quoting
-    if (this.marketDataFeed && !this.fixOE.isLoggedOn) {
-      this.logger.error('[WATCHDOG] Quoting gate closed: OE not logged on');
+    // Re-enable quoting gate if MD data is flowing again (was closed by staleness)
+    if (!this._quotingGateEnabled) {
+      this._quotingGateEnabled = true;
+      this.logger.info('[WATCHDOG] Quoting gate re-enabled: fresh MD update received');
+    }
+
+    // Check dual-session gate: both OE and MD must be logged on
+    if (this.marketDataFeed) {
+      if (!this.fixOE.isLoggedOn) {
+        this.logger.warn('[WATCHDOG] Quoting gate closed: OE not logged on');
+        return;
+      }
+      if (this.marketDataFeed.isLoggedOn === false) {
+        this.logger.warn('[WATCHDOG] Quoting gate closed: MD not logged on');
+        return;
+      }
+    }
+
+    // Check explicit gate (set by MD staleness)
+    if (!this._quotingGateEnabled) {
+      this.logger.warn('[WATCHDOG] Quoting gate closed: gate disabled');
       return;
     }
 
-    // Feed price to QuoteEngine
+    // Feed price to QuoteEngine (gate passed)
     this.quoteEngine.onPriceUpdate(aggregatedPrice);
     this._lastRepriceTime = Date.now();
 
@@ -660,6 +679,15 @@ export class MarketMakerOrchestrator extends EventEmitter {
       }
       // Cancel via QuoteEngine (FIX)
       this.quoteEngine.cancelAllQuotes('md-stale');
+      // Close the quoting gate until fresh MD data arrives
+      this._quotingGateEnabled = false;
+      // Attempt MD reconnect
+      if (this.marketDataFeed && typeof this.marketDataFeed.connect === 'function') {
+        this.logger.info('[WATCHDOG] Attempting MD feed reconnect...');
+        this.marketDataFeed.connect().catch(err =>
+          this.logger.error(`[WATCHDOG] MD reconnect failed: ${err.message}`)
+        );
+      }
       return true;
     }
     return false;
@@ -727,6 +755,27 @@ export class MarketMakerOrchestrator extends EventEmitter {
       const msg = `[WATCHDOG] Health check failed: ${issues.join('; ')}`;
       this.logger.error(msg);
       this.emit('watchdog-alert', { issues, timestamp: now });
+
+      // Cancel all orders via REST (safety net)
+      if (this.restClient) {
+        this._cancelAllOrdersViaRest('watchdog').catch(err =>
+          this.logger.error(`[WATCHDOG] REST cancel on watchdog failed: ${err.message}`)
+        );
+      }
+
+      // Force-reconnect failed sessions (FR-2.2 step 4)
+      if (!this.fixOE.isLoggedOn) {
+        this.logger.info('[WATCHDOG] Force-reconnecting OE FIX session...');
+        this.fixOE.connect().catch(err =>
+          this.logger.error(`[WATCHDOG] OE reconnect failed: ${err.message}`)
+        );
+      }
+      if (this.marketDataFeed && !this.marketDataFeed.isLoggedOn && typeof this.marketDataFeed.connect === 'function') {
+        this.logger.info('[WATCHDOG] Force-reconnecting MD FIX session...');
+        this.marketDataFeed.connect().catch(err =>
+          this.logger.error(`[WATCHDOG] MD reconnect failed: ${err.message}`)
+        );
+      }
     } else {
       this.logger.debug('[WATCHDOG] Health check OK');
     }

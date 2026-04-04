@@ -164,8 +164,8 @@ describe('dual-session gate', () => {
 
     // quoteEngine.onPriceUpdate should NOT be called
     expect(orch.quoteEngine.onPriceUpdate).not.toHaveBeenCalled();
-    // logger.error should mention gate closed
-    expect(orch.logger.error).toHaveBeenCalledWith(
+    // logger.warn should mention gate closed
+    expect(orch.logger.warn).toHaveBeenCalledWith(
       expect.stringContaining('[WATCHDOG] Quoting gate closed')
     );
   });
@@ -194,6 +194,21 @@ describe('dual-session gate', () => {
 
     // No feed → gate is not applied
     expect(orch.quoteEngine.onPriceUpdate).toHaveBeenCalledWith(price);
+  });
+
+  it('blocks quoting when MD is not logged on (OE is up)', () => {
+    const mockMDFeed = new EventEmitter();
+    mockMDFeed.isLoggedOn = false; // MD down
+
+    const orch = makeOrch({ marketDataFeed: mockMDFeed });
+    orch.isRunning = true;
+    orch.fixOE.isLoggedOn = true; // OE up
+
+    const price = { weightedMidpoint: 50000 };
+    orch._onPriceUpdate(price);
+
+    // quoteEngine.onPriceUpdate should NOT be called because MD is not logged on
+    expect(orch.quoteEngine.onPriceUpdate).not.toHaveBeenCalled();
   });
 });
 
@@ -241,6 +256,30 @@ describe('MD staleness', () => {
     const orch = makeOrch(); // no feed
     orch._lastMdUpdateTime = Date.now() - 99999;
     expect(orch._checkMdStaleness()).toBe(false);
+  });
+
+  it('re-enables quoting gate after fresh MD update', () => {
+    const mockMDFeed = new EventEmitter();
+    mockMDFeed.isLoggedOn = true;
+    mockMDFeed.connect = jest.fn().mockResolvedValue(undefined);
+
+    const orch = makeOrch({ marketDataFeed: mockMDFeed });
+    orch.isRunning = true;
+    orch.fixOE.isLoggedOn = true;
+
+    // Force stale condition and close the gate
+    orch._lastMdUpdateTime = Date.now() - 20000;
+    orch._mdStaleThresholdMs = 10000;
+    orch._checkMdStaleness(); // closes gate, sets _quotingGateEnabled = false
+
+    expect(orch._quotingGateEnabled).toBe(false);
+
+    // Now call _onPriceUpdate — it should re-enable the gate and allow quoting
+    const price = { weightedMidpoint: 51000 };
+    orch._onPriceUpdate(price);
+
+    expect(orch._quotingGateEnabled).toBe(true);
+    expect(orch.quoteEngine.onPriceUpdate).toHaveBeenCalledWith(price);
   });
 });
 
@@ -323,6 +362,57 @@ describe('watchdog', () => {
 
     expect(alertEvents).toHaveLength(1);
     expect(alertEvents[0].issues.some(i => i.includes('MD FIX not logged on'))).toBe(true);
+  });
+
+  it('calls _cancelAllOrdersViaRest when issues detected', async () => {
+    const mockRestClient = {
+      cancelAllOrders: jest.fn().mockResolvedValue(undefined),
+      getActiveOrders: jest.fn().mockResolvedValue([]),
+    };
+
+    const orch = makeOrch();
+    orch.isRunning = true;
+    orch._intentionalStop = false;
+    orch.fixOE.isLoggedOn = false; // triggers OE issue
+    orch.restClient = mockRestClient;
+
+    orch._runWatchdog();
+
+    // Allow microtask queue to flush (fire-and-forget .catch path)
+    await Promise.resolve();
+
+    expect(mockRestClient.cancelAllOrders).toHaveBeenCalled();
+  });
+
+  it('calls fixOE.connect when watchdog detects OE not logged on', async () => {
+    const connectMock = jest.fn().mockResolvedValue(undefined);
+    const orch = makeOrch();
+    orch.isRunning = true;
+    orch._intentionalStop = false;
+    orch.fixOE.isLoggedOn = false;
+    orch.fixOE.connect = connectMock;
+
+    orch._runWatchdog();
+    await Promise.resolve();
+
+    expect(connectMock).toHaveBeenCalled();
+  });
+
+  it('calls marketDataFeed.connect when watchdog detects MD not logged on', async () => {
+    const mdConnectMock = jest.fn().mockResolvedValue(undefined);
+    const mockMDFeed = new EventEmitter();
+    mockMDFeed.isLoggedOn = false;
+    mockMDFeed.connect = mdConnectMock;
+
+    const orch = makeOrch({ marketDataFeed: mockMDFeed });
+    orch.isRunning = true;
+    orch._intentionalStop = false;
+    orch.fixOE.isLoggedOn = true; // OE is up, only MD is down
+
+    orch._runWatchdog();
+    await Promise.resolve();
+
+    expect(mdConnectMock).toHaveBeenCalled();
   });
 });
 

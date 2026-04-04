@@ -131,25 +131,40 @@ function addTimeFilter(conditions, values, idx, col, from, to) {
 
 async function handleHealth() {
   const start = Date.now();
-  const orchestratorHealth = orchestratorRef?.getHealthStatus() ?? null;
+  const orchHealth = orchestratorRef?.getHealthStatus() ?? null;
+  const buildBody = (dbInfo) => {
+    const status = orchHealth?.status ?? (dbInfo.connected ? 'healthy' : 'degraded');
+    return {
+      status,
+      // Orchestrator health fields at top level (per FR-2.4)
+      quoting: orchHealth?.quoting ?? null,
+      lastRepriceAge: orchHealth?.lastRepriceAge ?? null,
+      oeConnected: orchHealth?.oeConnected ?? null,
+      mdConnected: orchHealth?.mdConnected ?? null,
+      lastMdAge: orchHealth?.lastMdAge ?? null,
+      // Other fields
+      database: dbInfo,
+      uptime: process.uptime(),
+      timestamp: Date.now(),
+    };
+  };
   try {
     await db.query('SELECT 1');
     const latencyMs = Date.now() - start;
     const pool = db.getStats ? db.getStats() : null;
-    return jsonOk({
-      status: orchestratorHealth?.status ?? 'healthy',
-      database: { connected: true, latencyMs, pool },
-      uptime: process.uptime(),
-      timestamp: Date.now(),
-      orchestrator: orchestratorHealth,
-    });
+    const body = buildBody({ connected: true, latencyMs, pool });
+    if (body.status === 'unhealthy') {
+      return new Response(JSON.stringify({ success: true, data: body, meta: {} }), {
+        status: 503,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders() },
+      });
+    }
+    return jsonOk(body);
   } catch (err) {
-    return jsonOk({
-      status: 'unhealthy',
-      database: { connected: false, error: err.message },
-      uptime: process.uptime(),
-      timestamp: Date.now(),
-      orchestrator: orchestratorHealth,
+    const body = buildBody({ connected: false, error: err.message });
+    return new Response(JSON.stringify({ success: true, data: body, meta: {} }), {
+      status: 503,
+      headers: { 'Content-Type': 'application/json', ...corsHeaders() },
     });
   }
 }
