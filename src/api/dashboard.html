@@ -150,12 +150,12 @@
 
       // Position — balances live in position.baseBalance / position.quoteBalance
       const pos = d.position || {};
-      document.getElementById('net-pos').textContent = pos.netPosition !== undefined ? fmtNum(pos.netPosition, 6) + ' BTC' : '—';
+      document.getElementById('net-pos').textContent = pos.netPosition != null ? fmtNum(pos.netPosition, 6) + ' BTC' : '—';
       const bal = d.balances || {};
-      const baseBal = bal.base || pos.baseBalance || {};
-      const quoteBal = bal.quote || pos.quoteBalance || {};
-      document.getElementById('btc-avail').textContent = baseBal.available !== undefined ? fmtNum(baseBal.available, 6) : '—';
-      document.getElementById('pyusd-avail').textContent = quoteBal.available !== undefined ? fmtNum(quoteBal.available, 2) : '—';
+      const btcAvail = bal.base?.available ?? pos.baseBalance?.available;
+      const pyusdAvail = bal.quote?.available ?? pos.quoteBalance?.available;
+      document.getElementById('btc-avail').textContent = btcAvail != null ? fmtNum(btcAvail, 6) : '—';
+      document.getElementById('pyusd-avail').textContent = pyusdAvail != null ? fmtNum(pyusdAvail, 2) : '—';
       document.getElementById('active-orders').textContent = d.activeOrders !== undefined ? d.activeOrders : '—';
 
       // PnL
@@ -163,13 +163,13 @@
       const realized = pnl.realizedPnL ?? pnl.realizedPnl;
       const unrealized = pnl.unrealizedPnL ?? pnl.unrealizedPnl;
       const netPnl = pnl.totalPnL ?? pnl.netPnl;
-      document.getElementById('pnl-realized').textContent = realized !== undefined ? '$' + fmtNum(realized, 2) : '—';
-      document.getElementById('pnl-unreal').textContent = unrealized !== undefined ? '$' + fmtNum(unrealized, 2) : '—';
-      document.getElementById('pnl-fees').textContent = pnl.totalFees !== undefined ? '$' + fmtNum(pnl.totalFees, 2) : '—';
-      document.getElementById('pnl-net').textContent = netPnl !== undefined ? '$' + fmtNum(netPnl, 2) : '—';
-      document.getElementById('pnl-sell-proceeds').textContent = pnl.sellProceeds !== undefined ? '$' + fmtNum(pnl.sellProceeds, 2) : '—';
-      document.getElementById('pnl-buy-cost').textContent = pnl.buyCost !== undefined ? '$' + fmtNum(pnl.buyCost, 2) : '—';
-      document.getElementById('pnl-cashflow').textContent = pnl.netCashFlow !== undefined ? '$' + fmtNum(pnl.netCashFlow, 2) : '—';
+      document.getElementById('pnl-realized').textContent = realized != null ? '$' + fmtNum(realized, 2) : '—';
+      document.getElementById('pnl-unreal').textContent = unrealized != null ? '$' + fmtNum(unrealized, 2) : '—';
+      document.getElementById('pnl-fees').textContent = pnl.totalFees != null ? '$' + fmtNum(pnl.totalFees, 2) : '—';
+      document.getElementById('pnl-net').textContent = netPnl != null ? '$' + fmtNum(netPnl, 2) : '—';
+      document.getElementById('pnl-sell-proceeds').textContent = pnl.sellProceeds != null ? '$' + fmtNum(pnl.sellProceeds, 2) : '—';
+      document.getElementById('pnl-buy-cost').textContent = pnl.buyCost != null ? '$' + fmtNum(pnl.buyCost, 2) : '—';
+      document.getElementById('pnl-cashflow').textContent = pnl.netCashFlow != null ? '$' + fmtNum(pnl.netCashFlow, 2) : '—';
 
       // Last fill
       const fill = d.lastFill;
