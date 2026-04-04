@@ -148,7 +148,7 @@
       mdEl.textContent = connText(mdConn);
       document.getElementById('last-md').textContent = d.lastMdAge !== null ? fmt(d.lastMdAge) + ' ago' : '—';
 
-      // Position — balances live in position.baseBalance / position.quoteBalance
+      // Position + balances (primary: d.balances; fallback: legacy position.*Balance)
       const pos = d.position || {};
       document.getElementById('net-pos').textContent = pos.netPosition != null ? fmtNum(pos.netPosition, 6) + ' BTC' : '—';
       const bal = d.balances || {};
