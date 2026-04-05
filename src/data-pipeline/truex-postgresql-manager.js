@@ -108,10 +108,36 @@ export class TrueXPostgreSQLManager {
         `);
         
         await this.db.query(`
-          CREATE INDEX IF NOT EXISTS idx_ohlc_timestamp 
+          CREATE INDEX IF NOT EXISTS idx_ohlc_timestamp
           ON ohlc(timestamp)
         `);
-        
+
+        // Create balance_snapshots table if it doesn't exist
+        await this.db.query(`
+          CREATE TABLE IF NOT EXISTS balance_snapshots (
+            id                    SERIAL PRIMARY KEY,
+            session_id            TEXT          NOT NULL,
+            timestamp             BIGINT        NOT NULL,
+            btc_qty               NUMERIC(18,8) NOT NULL,
+            pyusd_qty             NUMERIC(18,4) NOT NULL,
+            btc_mid_price         NUMERIC(18,2),
+            portfolio_value_pyusd NUMERIC(18,4),
+            created_at            TIMESTAMPTZ   DEFAULT NOW(),
+            CONSTRAINT unique_balance_snapshot UNIQUE (session_id, timestamp)
+          )
+        `);
+
+        // Create indexes for balance_snapshots table
+        await this.db.query(`
+          CREATE INDEX IF NOT EXISTS idx_balance_snapshots_session_ts
+          ON balance_snapshots(session_id, timestamp DESC)
+        `);
+
+        await this.db.query(`
+          CREATE INDEX IF NOT EXISTS idx_balance_snapshots_timestamp
+          ON balance_snapshots(timestamp DESC)
+        `);
+
         // Create index on exec_id for fills deduplication
         await this.db.query(`
           CREATE INDEX IF NOT EXISTS idx_fills_execid 
