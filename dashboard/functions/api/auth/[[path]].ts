@@ -1,12 +1,14 @@
 import { createClearAuth, handleClearAuthEdgeRequest } from 'clearauth/edge';
 import type { EmailProvider } from 'clearauth/edge';
 
+const AUTH_SENDER_EMAIL = 'auth@derivative.email';
+
 interface Env {
   AUTH_SECRET: string;
   MECH_APP_ID: string;
   MECH_API_KEY: string;
   BASE_URL: string;
-  CIRCLEINBOX_API_KEY: string;
+  CIRCLEINBOX_API_KEY?: string; // optional — email skipped gracefully if not set
 }
 
 function createCircleInboxProvider(apiKey: string, from: string): EmailProvider {
@@ -51,8 +53,8 @@ export const onRequest: PagesFunction<Env> = async (context) => {
     isProduction: true,
     ...(CIRCLEINBOX_API_KEY && {
       email: {
-        provider: createCircleInboxProvider(CIRCLEINBOX_API_KEY, 'auth@derivative.email'),
-        from: 'auth@derivative.email',
+        provider: createCircleInboxProvider(CIRCLEINBOX_API_KEY, AUTH_SENDER_EMAIL),
+        from: AUTH_SENDER_EMAIL,
       },
     }),
   });
