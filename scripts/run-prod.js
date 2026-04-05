@@ -261,11 +261,13 @@ async function main() {
   });
 
   // 1b. Analytics API (queries PostgreSQL, serves on port 3100)
+  let apiSetOrchestrator = null;
   if (config.pgUrl) {
     const apiPort = process.env.API_PORT || '3100';
     logger.info(`[1b/5] Starting Analytics API on port ${apiPort}...`);
     try {
-      await import('../src/api/server.js');
+      const apiModule = await import('../src/api/server.js');
+      apiSetOrchestrator = apiModule.setOrchestrator;
     } catch (err) {
       logger.warn(`Analytics API failed to start: ${err.message} — continuing without it`);
     }
@@ -387,6 +389,9 @@ async function main() {
   });
 
   wireOrchestratorEvents(orchestrator);
+
+  // Wire orchestrator into API server so /health and /api/status reflect live state
+  apiSetOrchestrator?.(orchestrator);
 
   // 5. Start (connects FIX, fetches balances, begins quoting)
   await orchestrator.start();
