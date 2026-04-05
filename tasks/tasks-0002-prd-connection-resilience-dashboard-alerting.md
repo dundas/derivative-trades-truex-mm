@@ -302,7 +302,7 @@ Update the market-maker Docker healthcheck to probe `/health` and fail on unheal
   - **Action:** Add healthcheck to the `market-maker` service:
     ```yaml
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:3100/api/v1/health | grep -q '\"status\":\"healthy\"' || exit 1"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:3100/api/v1/health | grep -Eq '\"status\"\\s*:\\s*\"healthy\"' || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -316,7 +316,7 @@ Update the market-maker Docker healthcheck to probe `/health` and fail on unheal
 - [ ] **6.2** Document new env vars in .env.example
   - **File:** `.env.example` (modify)
   - **Action:** Add documented entries for all new env vars:
-    ```
+    ```dotenv
     # Alerting
     ALERT_EMAIL=           # Email address for operational alerts
     ALERT_PHONE=           # Phone number for SMS alerts (E.164 format, e.g. +16179536366)

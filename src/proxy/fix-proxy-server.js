@@ -9,6 +9,10 @@ if (Number.isNaN(FIX_PROXY_PORT) || FIX_PROXY_PORT < 1 || FIX_PROXY_PORT > 65535
 }
 const TRUEX_FIX_HOST = process.env.TRUEX_UPSTREAM_HOST || '38.32.101.229';
 const TRUEX_FIX_PORT = parseInt(process.env.TRUEX_UPSTREAM_PORT || '19484', 10);
+if (Number.isNaN(TRUEX_FIX_PORT) || TRUEX_FIX_PORT < 1 || TRUEX_FIX_PORT > 65535) {
+  console.error(`Invalid TRUEX_UPSTREAM_PORT: ${process.env.TRUEX_UPSTREAM_PORT}`);
+  process.exit(1);
+}
 
 console.log('🔌 Starting FIX Protocol Proxy Server');
 console.log('=====================================');
