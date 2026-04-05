@@ -901,6 +901,7 @@ Bun.serve({
 
     // POST endpoints
     if (req.method === 'POST') {
+      if (!requireAdminToken(req)) return jsonError('Unauthorized', 401);
       if (path === '/api/v1/emergency-stop')          return await handleEmergencyStop(req);
       if (path === '/api/v1/cancel-orphaned-orders')  return await handleCancelOrphanedOrders(req);
       return jsonError('Method not allowed', 405);
@@ -911,16 +912,18 @@ Bun.serve({
     }
 
     try {
-      // System
+      // Public — no auth required
       if (path === '/api/v1/health') return await handleHealth();
+
+      // All other routes require admin token
+      if (!requireAdminToken(req)) return jsonError('Unauthorized', 401);
+
+      // System
       if (path === '/api/v1/stats')  return await handleStats();
 
       let m;
 
-      // Logs (admin-only — contain operational/internal data)
-      if (path.startsWith('/api/v1/logs/')) {
-        if (!requireAdminToken(req)) return jsonError('Unauthorized', 401);
-      }
+      // Logs
       if (path === '/api/v1/logs/tail')     return handleLogsTail(params);
       if (path === '/api/v1/logs/archives') return await handleLogsArchiveList(params);
       if ((m = matchRoute(path, '/api/v1/logs/archives/:id'))) return await handleLogsArchiveDownload(m.id);
