@@ -8,14 +8,25 @@ interface Env {
 }
 
 export const onRequest: PagesFunction<Env> = async (context) => {
+  const { AUTH_SECRET, BASE_URL, MECH_APP_ID, MECH_API_KEY } = context.env;
+
+  if (!AUTH_SECRET || !BASE_URL) {
+    console.error('[auth] Missing required env vars: AUTH_SECRET, BASE_URL');
+    return new Response(JSON.stringify({ error: 'Server misconfigured' }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
   const config = createClearAuth({
-    secret: context.env.AUTH_SECRET,
-    baseUrl: context.env.BASE_URL || 'https://truex-dashboard.pages.dev',
+    secret: AUTH_SECRET,
+    baseUrl: BASE_URL,
     database: {
-      appId: context.env.MECH_APP_ID,
-      apiKey: context.env.MECH_API_KEY,
+      appId: MECH_APP_ID,
+      apiKey: MECH_API_KEY,
     },
     isProduction: true,
   });
+
   return handleClearAuthEdgeRequest(context.request, config);
 };

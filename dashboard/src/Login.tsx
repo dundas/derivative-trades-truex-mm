@@ -25,7 +25,16 @@ export default function Login({ onLogin }: { onLogin: (user: User) => void }) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, password }),
       });
-      const data: LoginResponse = await res.json();
+
+      // Parse JSON defensively — body may be empty or non-JSON on some errors
+      let data: LoginResponse = {};
+      try {
+        const text = await res.text();
+        if (text) data = JSON.parse(text) as LoginResponse;
+      } catch {
+        // ignore parse error — fall through to generic error
+      }
+
       if (!res.ok) throw new Error(data.error || 'Login failed');
       if (!data.user) throw new Error('Login failed: no user returned');
       onLogin(data.user);
@@ -53,8 +62,9 @@ export default function Login({ onLogin }: { onLogin: (user: User) => void }) {
         <h1 style={{ color: '#58a6ff', fontSize: 18, marginBottom: 24, fontFamily: 'monospace' }}>TrueX Market Maker</h1>
         <form onSubmit={handleSubmit}>
           <div style={{ marginBottom: 16 }}>
-            <label style={{ color: '#8b949e', fontSize: 12, display: 'block', marginBottom: 4 }}>EMAIL</label>
+            <label htmlFor="email" style={{ color: '#8b949e', fontSize: 12, display: 'block', marginBottom: 4 }}>EMAIL</label>
             <input
+              id="email"
               type="email"
               value={email}
               onChange={e => setEmail(e.target.value)}
@@ -63,8 +73,9 @@ export default function Login({ onLogin }: { onLogin: (user: User) => void }) {
             />
           </div>
           <div style={{ marginBottom: 24 }}>
-            <label style={{ color: '#8b949e', fontSize: 12, display: 'block', marginBottom: 4 }}>PASSWORD</label>
+            <label htmlFor="password" style={{ color: '#8b949e', fontSize: 12, display: 'block', marginBottom: 4 }}>PASSWORD</label>
             <input
+              id="password"
               type="password"
               value={password}
               onChange={e => setPassword(e.target.value)}
