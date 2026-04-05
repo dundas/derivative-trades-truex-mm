@@ -135,7 +135,7 @@ export default function Dashboard({ user, onLogout }: { user: User; onLogout: ()
   }, [fetchAll]);
 
   async function handleLogout() {
-    await fetch('/auth/logout', { method: 'POST' }).catch(() => {});
+    await fetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
     onLogout();
   }
 

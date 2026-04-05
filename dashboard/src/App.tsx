@@ -10,7 +10,7 @@ export default function App() {
   const [user, setUser] = useState<User | null | undefined>(undefined);
 
   useEffect(() => {
-    fetch('/auth/session')
+    fetch('/api/auth/session')
       .then(r => r.json())
       .then((d: { user?: User }) => setUser(d.user ?? null))
       .catch(() => setUser(null));
