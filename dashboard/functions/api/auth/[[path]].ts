@@ -10,8 +10,8 @@ interface Env {
 export const onRequest: PagesFunction<Env> = async (context) => {
   const { AUTH_SECRET, BASE_URL, MECH_APP_ID, MECH_API_KEY } = context.env;
 
-  if (!AUTH_SECRET || !BASE_URL) {
-    console.error('[auth] Missing required env vars: AUTH_SECRET, BASE_URL');
+  if (!AUTH_SECRET || !BASE_URL || !MECH_APP_ID || !MECH_API_KEY) {
+    console.error('[auth] Missing required env vars: AUTH_SECRET, BASE_URL, MECH_APP_ID, MECH_API_KEY');
     return new Response(JSON.stringify({ error: 'Server misconfigured' }), {
       status: 500,
       headers: { 'Content-Type': 'application/json' },
