@@ -126,7 +126,7 @@ export default function Dashboard({ user, onLogout }: { user: User; onLogout: ()
     // Serialized poll loop — waits for each fetch to complete before scheduling next
     const poll = async () => {
       while (!cancelledRef.current) {
-        await fetchAll();
+        try { await fetchAll(); } catch { /* continue polling on unexpected errors */ }
         await new Promise(r => setTimeout(r, 10_000));
       }
     };
@@ -138,14 +138,11 @@ export default function Dashboard({ user, onLogout }: { user: User; onLogout: ()
   async function handleLogout() {
     try {
       const res = await fetch('/api/auth/logout', { method: 'POST' });
-      if (!res.ok) {
-        console.error('[logout] failed:', res.status);
-        return;
-      }
+      if (!res.ok) console.error('[logout] server error:', res.status);
     } catch (err) {
       console.error('[logout] network error:', err);
-      return;
     }
+    // Always clear local session — a failed server-side logout shouldn't trap the user
     onLogout();
   }
 
