@@ -1,0 +1,20 @@
+{
+  "name": "truex-dashboard",
+  "type": "module",
+  "scripts": {
+    "dev": "bun --hot index.html",
+    "build": "bun build index.html --outdir dist --target browser",
+    "deploy": "wrangler pages deploy dist"
+  },
+  "dependencies": {
+    "clearauth": "^0.7.0",
+    "react": "^18.3.0",
+    "react-dom": "^18.3.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.0.0",
+    "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.0",
+    "wrangler": "^4.80.0"
+  }
+}
