@@ -12,14 +12,14 @@ interface Env {
 function createCircleInboxProvider(apiKey: string, from: string): EmailProvider {
   return {
     name: 'circleinbox',
-    async send(to: string, subject: string, _html: string, text: string): Promise<void> {
+    async send(to: string, subject: string, html: string, text: string): Promise<void> {
       const resp = await fetch('https://api.circleinbox.com/api/v1/send', {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${apiKey}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ from: { email: from, name: 'TrueX Dashboard' }, to, subject, text }),
+        body: JSON.stringify({ from: { email: from, name: 'TrueX Dashboard' }, to, subject, html, text }),
         signal: AbortSignal.timeout(5000),
       });
       if (!resp.ok) {
