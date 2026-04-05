@@ -324,7 +324,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       await this._takeBalanceSnapshot();
     }
 
-    // 5. Disconnect market data feed
+    // 5b. Disconnect market data feed
     if (this.marketDataFeed) {
       try {
         await this.marketDataFeed.disconnect();
@@ -718,8 +718,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
         INSERT INTO balance_snapshots (session_id, timestamp, btc_qty, pyusd_qty, btc_mid_price, portfolio_value_pyusd)
         VALUES ($1, $2, $3, $4, $5, $6)
         ON CONFLICT (session_id, timestamp) DO NOTHING
+        RETURNING id
       `;
-      await this.postgresManager.db.query(sql, [
+      const result = await this.postgresManager.db.query(sql, [
         this.sessionId,
         Date.now(),
         btcQty,
@@ -727,6 +728,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
         midPrice,
         portfolioValue,
       ]);
+      if (result.rows.length === 0) {
+        this.logger.warn('[Orchestrator] balance snapshot skipped (timestamp conflict — duplicate within same ms)');
+      }
     } catch (err) {
       this.logger.warn(`[Orchestrator] balance snapshot failed: ${err.message}`);
     }

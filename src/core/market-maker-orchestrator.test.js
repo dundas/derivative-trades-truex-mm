@@ -687,9 +687,12 @@ describe('balance snapshot job', () => {
     const fakeTimer = setInterval(() => {}, 99999);
     orch._snapshotTimer = fakeTimer;
 
-    await orch.stop();
-
-    expect(orch._snapshotTimer).toBeNull();
+    try {
+      await orch.stop();
+      expect(orch._snapshotTimer).toBeNull();
+    } finally {
+      clearInterval(fakeTimer);
+    }
   });
 
   it('stop() calls _takeBalanceSnapshot for a final snapshot', async () => {
