@@ -21,6 +21,7 @@
  */
 import { createPostgreSQLAPIFromEnv } from '../../lib/postgresql-api/index.js';
 import { readFileSync, existsSync } from 'fs';
+import { handleAnalyticsBalanceSnapshots as _handleBalanceSnapshots } from './analytics-balance-snapshots.js';
 
 const PORT         = parseInt(process.env.API_PORT || '3100', 10);
 const CORS_ORIGIN  = process.env.CORS_ORIGIN || '*';
@@ -540,41 +541,8 @@ async function handleAnalyticsInventory(params) {
 }
 
 async function handleAnalyticsBalanceSnapshots(params) {
-  const session = params.get('session');
-  const { from, to } = parseTimeRange(params);
-  const { limit, offset, page } = parsePagination(params);
-
-  const conditions = [];
-  const values = [];
-  let idx = 1;
-  if (session) { conditions.push(`session_id = $${idx++}`); values.push(session); }
-  idx = addTimeFilter(conditions, values, idx, 'timestamp', from, to);
-  const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
-
-  const countValues = [...values];
-  const countR = await db.query(
-    `SELECT COUNT(*)::int AS total FROM balance_snapshots ${where}`,
-    countValues,
-  );
-  const total = countR.rows[0]?.total ?? 0;
-
-  values.push(limit, offset);
-  const r = await db.query(`
-    SELECT
-      id,
-      session_id,
-      timestamp,
-      btc_qty::float,
-      pyusd_qty::float,
-      btc_mid_price::float,
-      portfolio_value_pyusd::float
-    FROM balance_snapshots
-    ${where}
-    ORDER BY timestamp ASC
-    LIMIT $${idx++} OFFSET $${idx++}
-  `, values);
-
-  return jsonOk(r.rows, { total, page, limit, count: r.rows.length });
+  const { rows, meta } = await _handleBalanceSnapshots(params, db);
+  return jsonOk(rows, meta);
 }
 
 async function handleAnalyticsParameters(params) {

@@ -1,91 +1,27 @@
 /**
  * Tests for GET /api/v1/analytics/balance-snapshots
  *
- * Uses a mock db query function injected via the db module to avoid a live
- * PostgreSQL connection. The handler is extracted and tested in isolation.
+ * Imports the real handler from analytics-balance-snapshots.js and
+ * injects a mock db so no live PostgreSQL connection is needed.
  */
 import { describe, it, expect, jest } from 'bun:test';
+import { handleAnalyticsBalanceSnapshots } from './analytics-balance-snapshots.js';
 
 // ---------------------------------------------------------------------------
-// Minimal stubs matching the shapes used by the handler
+// Helpers
 // ---------------------------------------------------------------------------
 
 function makeParams(obj = {}) {
-  const p = new URLSearchParams(obj);
-  return p;
+  return new URLSearchParams(obj);
 }
 
 function makeDb(rows = [], total = rows.length) {
-  let callCount = 0;
   return {
     query: jest.fn(async (sql) => {
-      callCount++;
       if (sql.includes('COUNT(*)')) return { rows: [{ total }] };
       return { rows };
     }),
-    get callCount() { return callCount; },
   };
-}
-
-// ---------------------------------------------------------------------------
-// Inline handler (mirrors server.js logic but with injected db)
-// ---------------------------------------------------------------------------
-
-function parsePagination(params) {
-  const page = Math.max(1, parseInt(params.get('page') || '1', 10));
-  const limit = Math.min(500, Math.max(1, parseInt(params.get('limit') || '50', 10)));
-  const offset = (page - 1) * limit;
-  return { page, limit, offset };
-}
-
-function parseTimeRange(params) {
-  const from = params.get('from') ? parseInt(params.get('from'), 10) : null;
-  const to = params.get('to') ? parseInt(params.get('to'), 10) : null;
-  return { from, to };
-}
-
-function addTimeFilter(conditions, values, idx, col, from, to) {
-  if (from) { conditions.push(`${col} >= $${idx++}`); values.push(from); }
-  if (to)   { conditions.push(`${col} <= $${idx++}`); values.push(to); }
-  return idx;
-}
-
-async function handleAnalyticsBalanceSnapshots(params, db) {
-  const session = params.get('session');
-  const { from, to } = parseTimeRange(params);
-  const { limit, offset, page } = parsePagination(params);
-
-  const conditions = [];
-  const values = [];
-  let idx = 1;
-  if (session) { conditions.push(`session_id = $${idx++}`); values.push(session); }
-  idx = addTimeFilter(conditions, values, idx, 'timestamp', from, to);
-  const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
-
-  const countValues = [...values];
-  const countR = await db.query(
-    `SELECT COUNT(*)::int AS total FROM balance_snapshots ${where}`,
-    countValues,
-  );
-  const total = countR.rows[0]?.total ?? 0;
-
-  values.push(limit, offset);
-  const r = await db.query(`
-    SELECT
-      id,
-      session_id,
-      timestamp,
-      btc_qty::float,
-      pyusd_qty::float,
-      btc_mid_price::float,
-      portfolio_value_pyusd::float
-    FROM balance_snapshots
-    ${where}
-    ORDER BY timestamp ASC
-    LIMIT $${idx++} OFFSET $${idx++}
-  `, values);
-
-  return { rows: r.rows, meta: { total, page, limit, count: r.rows.length } };
 }
 
 // ---------------------------------------------------------------------------
@@ -141,7 +77,7 @@ describe('GET /api/v1/analytics/balance-snapshots', () => {
     const db = makeDb([], 25);
     await handleAnalyticsBalanceSnapshots(makeParams({ page: '2', limit: '10' }), db);
     const [selectSql, selectVals] = db.query.mock.calls[1];
-    // LIMIT and OFFSET appear as the last two values
+    // LIMIT and OFFSET are the last two values
     const [limitVal, offsetVal] = selectVals.slice(-2);
     expect(limitVal).toBe(10);
     expect(offsetVal).toBe(10); // (page-1)*limit = 10
