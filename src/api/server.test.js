@@ -132,6 +132,14 @@ describe('GET /api/v1/analytics/balance-snapshots', () => {
     expect(offsetVal).toBe(0); // page 1, offset 0
   });
 
+  it('ignores non-numeric from/to params (does not send NaN to SQL)', async () => {
+    const db = makeDb([], 0);
+    await handleAnalyticsBalanceSnapshots(makeParams({ from: 'abc', to: 'xyz' }), db);
+    const [countSql] = db.query.mock.calls[0];
+    expect(countSql).not.toContain('timestamp >=');
+    expect(countSql).not.toContain('timestamp <=');
+  });
+
   it('treats epoch 0 as a valid time bound (not filtered out as falsy)', async () => {
     const db = makeDb([], 0);
     await handleAnalyticsBalanceSnapshots(makeParams({ from: '0' }), db);

@@ -17,12 +17,14 @@ function parsePaginationLocal(params) {
   return { page, limit, offset };
 }
 
+function parseTimestamp(raw) {
+  if (raw === null) return null;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) ? n : null;
+}
+
 function parseTimeRangeLocal(params) {
-  const rawFrom = params.get('from');
-  const rawTo   = params.get('to');
-  const from = rawFrom !== null ? parseInt(rawFrom, 10) : null;
-  const to   = rawTo   !== null ? parseInt(rawTo,   10) : null;
-  return { from, to };
+  return { from: parseTimestamp(params.get('from')), to: parseTimestamp(params.get('to')) };
 }
 
 function addTimeFilterLocal(conditions, values, idx, col, from, to) {
