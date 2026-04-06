@@ -899,6 +899,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       status = 'unhealthy';
     }
 
+    const position = this.inventoryManager.getPositionSummary();
     return {
       status,
       quoting: this.isRunning && !quotingIdle,
@@ -907,8 +908,8 @@ export class MarketMakerOrchestrator extends EventEmitter {
       mdConnected,
       lastMdAge,
       activeOrders: this.quoteEngine.activeOrders?.size ?? 0,
-      position: this.inventoryManager.getPositionSummary(),
-      balances: null, // balances exposed via position.baseBalance / position.quoteBalance above
+      position,
+      balances: { base: position.baseBalance, quote: position.quoteBalance },
       lastFill: typeof this.pnlTracker.getLastFill === 'function'
         ? this.pnlTracker.getLastFill()
         : null,

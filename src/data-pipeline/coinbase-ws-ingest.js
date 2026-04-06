@@ -117,8 +117,10 @@ export class CoinbaseWsIngest {
         openHandler = () => {
           clearTimeout(timeout);
           if (gen !== this._generation) {
-            // Stale connection opened while a newer one already exists — resolve without
-            // touching shared state; the post-await gen bail-out will clean up.
+            // Stale connection opened while a newer one already exists — close the socket
+            // to release the TCP connection, then resolve so _connect() can reach the
+            // post-await gen bail-out and clean up remaining listeners.
+            setTimeout(() => { try { localWs.close(); } catch (_) {} }, 0);
             resolve();
             return;
           }
@@ -211,7 +213,7 @@ export class CoinbaseWsIngest {
     // Cap attempt counter at the point where delay saturates (2^6 * 1000ms = 64s > 60s max)
     this._reconnectAttempt = Math.min(this._reconnectAttempt + 1, 7);
     const base = Math.min(RECONNECT_BASE_MS * 2 ** (this._reconnectAttempt - 1), RECONNECT_MAX_MS);
-    const delay = Math.floor(base * (0.5 + Math.random())); // ±50% jitter (0.5..1.5×base)
+    const delay = Math.min(Math.floor(base * (0.5 + Math.random())), RECONNECT_MAX_MS); // ±50% jitter, hard-capped
     this.logger.warn(`Coinbase WS reconnecting in ${delay}ms (attempt ${this._reconnectAttempt})`);
     this._reconnectTimer = setTimeout(async () => {
       this._reconnectTimer = null;
