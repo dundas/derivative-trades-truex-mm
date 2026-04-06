@@ -9,7 +9,7 @@
  *   System:    GET /api/v1/health, /api/v1/stats
  *   Data:      GET /api/v1/sessions, /orders, /fills (with pagination & filtering)
  *   Analytics: GET /api/v1/analytics/pnl, /fill-rate, /spread-capture,
- *              /adverse-selection, /inventory, /parameters
+ *              /adverse-selection, /inventory, /parameters, /balance-snapshots
  *
  * Environment:
  *   API_PORT      - Listen port (default: 3100)
@@ -539,6 +539,44 @@ async function handleAnalyticsInventory(params) {
   return jsonOk({ series: r.rows, summary: bySession }, { count: r.rows.length });
 }
 
+async function handleAnalyticsBalanceSnapshots(params) {
+  const session = params.get('session');
+  const { from, to } = parseTimeRange(params);
+  const { limit, offset, page } = parsePagination(params);
+
+  const conditions = [];
+  const values = [];
+  let idx = 1;
+  if (session) { conditions.push(`session_id = $${idx++}`); values.push(session); }
+  idx = addTimeFilter(conditions, values, idx, 'timestamp', from, to);
+  const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
+
+  const countValues = [...values];
+  const countR = await db.query(
+    `SELECT COUNT(*)::int AS total FROM balance_snapshots ${where}`,
+    countValues,
+  );
+  const total = countR.rows[0]?.total ?? 0;
+
+  values.push(limit, offset);
+  const r = await db.query(`
+    SELECT
+      id,
+      session_id,
+      timestamp,
+      btc_qty::float,
+      pyusd_qty::float,
+      btc_mid_price::float,
+      portfolio_value_pyusd::float
+    FROM balance_snapshots
+    ${where}
+    ORDER BY timestamp ASC
+    LIMIT $${idx++} OFFSET $${idx++}
+  `, values);
+
+  return jsonOk(r.rows, { total, page, limit, count: r.rows.length });
+}
+
 async function handleAnalyticsParameters(params) {
   const symbol = params.get('symbol');
   const { from, to } = parseTimeRange(params);
@@ -929,12 +967,13 @@ Bun.serve({
       if ((m = matchRoute(path, '/api/v1/logs/archives/:id'))) return await handleLogsArchiveDownload(m.id);
 
       // Analytics
-      if (path === '/api/v1/analytics/pnl')              return await handleAnalyticsPnl(params);
-      if (path === '/api/v1/analytics/fill-rate')         return await handleAnalyticsFillRate(params);
-      if (path === '/api/v1/analytics/spread-capture')    return await handleAnalyticsSpreadCapture(params);
-      if (path === '/api/v1/analytics/adverse-selection') return await handleAnalyticsAdverseSelection(params);
-      if (path === '/api/v1/analytics/inventory')         return await handleAnalyticsInventory(params);
-      if (path === '/api/v1/analytics/parameters')        return await handleAnalyticsParameters(params);
+      if (path === '/api/v1/analytics/pnl')                return await handleAnalyticsPnl(params);
+      if (path === '/api/v1/analytics/fill-rate')           return await handleAnalyticsFillRate(params);
+      if (path === '/api/v1/analytics/spread-capture')      return await handleAnalyticsSpreadCapture(params);
+      if (path === '/api/v1/analytics/adverse-selection')   return await handleAnalyticsAdverseSelection(params);
+      if (path === '/api/v1/analytics/inventory')           return await handleAnalyticsInventory(params);
+      if (path === '/api/v1/analytics/parameters')          return await handleAnalyticsParameters(params);
+      if (path === '/api/v1/analytics/balance-snapshots')   return await handleAnalyticsBalanceSnapshots(params);
 
       // Parameterized routes (order matters — more specific first)
       if ((m = matchRoute(path, '/api/v1/sessions/:id/orders'))) return await handleGetSessionOrders(m.id, params);
