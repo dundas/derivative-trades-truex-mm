@@ -70,8 +70,10 @@ export class CoinbaseWsIngest {
     try {
       await this._connect();
     } catch (err) {
-      // Initial connect failed — enter reconnect loop rather than dying silently,
-      // but only if this start() still owns the current generation slot.
+      // Initial connect failed. By design, start() does NOT re-throw — it enters the
+      // reconnect loop instead. Callers (e.g. l2-ohlc-orchestrator) await start() as a
+      // non-blocking "arm the feed" call, not a "wait until connected" barrier.
+      // Data delivery begins when the reconnect succeeds and onSnapshot/onTicker fire.
       this.logger.error(`Coinbase WS initial connect failed: ${err.message}`);
       if (!this._stopped && this._generation === genAtStart + 1) this._scheduleReconnect();
     }
@@ -85,15 +87,17 @@ export class CoinbaseWsIngest {
     this._generation += 1;
     const gen = this._generation;
 
-    // Evict message/error handlers from the previous active connection immediately.
-    // This prevents duplicate delivery during the overlap window where both the old
-    // and new sockets are briefly live before the old one closes.
+    // Evict message/error handlers from the previous active connection and close it
+    // immediately. This prevents duplicate delivery and terminates the old upstream
+    // Coinbase subscription, releasing the server-side connection slot.
     if (this._activeMsgWs) {
       if (this._activeMsgHandler) this._activeMsgWs.removeListener('message', this._activeMsgHandler);
       if (this._activeErrHandler) this._activeMsgWs.removeListener('error', this._activeErrHandler);
+      const prevWs = this._activeMsgWs;
       this._activeMsgWs = null;
       this._activeMsgHandler = null;
       this._activeErrHandler = null;
+      try { prevWs.close(); } catch (_) {}
     }
 
     this.ws = new WS(url);
