@@ -208,6 +208,33 @@ describe('CoinbaseWsIngest reconnect logic', () => {
     expect(spy).toHaveBeenCalledTimes(1);
   });
 
+  it('stale open fires deferred close() to release the TCP connection', async () => {
+    ({ ingest, getWs } = makeIngest({ _connectTimeoutMs: 99999 }));
+
+    // Start first connect but don't emit open
+    const p1 = ingest.start();
+    const ws1 = getWs();
+
+    // Second start supersedes the first
+    const p2 = ingest.start();
+    const ws2 = getWs();
+    ws2.emit('open');
+    await p2;
+
+    // Spy on ws1.close BEFORE emitting open on the stale socket
+    const closeSpy = jest.spyOn(ws1, 'close');
+
+    // Stale ws1 opens — should schedule a deferred close()
+    ws1.emit('open');
+    await p1; // stale openHandler resolves, _connect() bails out
+
+    // Flush the deferred macrotask so the scheduled close() fires
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(closeSpy).toHaveBeenCalledTimes(1);
+    expect(ingest.connected).toBe(true); // ws2 remains connected
+  });
+
   it('stale pre-open close does not corrupt connected=true when newer connection is live', async () => {
     // Use a very long timeout so p1 never times out during this test
     ({ ingest, getWs } = makeIngest({ _connectTimeoutMs: 99999 }));

@@ -909,7 +909,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
       lastMdAge,
       activeOrders: this.quoteEngine.activeOrders?.size ?? 0,
       position,
-      balances: { base: position.baseBalance, quote: position.quoteBalance },
+      balances: position.balancesInitialized
+        ? { base: position.baseBalance, quote: position.quoteBalance }
+        : null,
       lastFill: typeof this.pnlTracker.getLastFill === 'function'
         ? this.pnlTracker.getLastFill()
         : null,
