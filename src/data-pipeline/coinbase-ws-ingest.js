@@ -84,6 +84,7 @@ export class CoinbaseWsIngest {
 
     const localWs = this.ws; // capture reference for stale-handler cleanup
     let opened = false;
+    let openHandler;
     let handshakeErrHandler;
     let closeHandler; // tracked to allow targeted removeListener on stale bail-out
     let msgHandler; // set after promise resolves; referenced in stale close branch
@@ -97,14 +98,15 @@ export class CoinbaseWsIngest {
           reject(new Error('Coinbase WS connect timeout'));
           setTimeout(() => { try { localWs.close(); } catch (_) {} }, 0);
         }, this._connectTimeoutMs);
-        this.ws.on('open', () => {
+        openHandler = () => {
           clearTimeout(timeout);
           opened = true;
           this.connected = true;
           this._reconnectAttempt = 0;
           this.logger.info('Coinbase WS connected', { url, productIds });
           resolve();
-        });
+        };
+        this.ws.on('open', openHandler);
         handshakeErrHandler = (err) => {
           clearTimeout(timeout);
           reject(err);
@@ -126,8 +128,10 @@ export class CoinbaseWsIngest {
               resolve();
             }
           } else if (gen === this._generation) {
-            // Authoritative close for the current connection
+            // Authoritative close for the current connection — evict per-connection handlers
             this.connected = false;
+            if (msgHandler) localWs.removeListener('message', msgHandler);
+            if (postConnErrHandler) localWs.removeListener('error', postConnErrHandler);
             if (!this._stopped) this._scheduleReconnect();
           } else {
             // Stale connection superseded by a newer one — evict all per-connection handlers
@@ -140,8 +144,10 @@ export class CoinbaseWsIngest {
       });
     } finally {
       // Always clean up handshake listeners regardless of resolve/reject path.
+      // openHandler and handshakeErrHandler are one-shot; remove unconditionally.
       // If the connection never opened (pre-open failure or timeout), also remove
       // the close handler since the socket will produce no meaningful future events.
+      if (openHandler) localWs.removeListener('open', openHandler);
       if (handshakeErrHandler) localWs.removeListener('error', handshakeErrHandler);
       if (!opened && closeHandler) localWs.removeListener('close', closeHandler);
     }
@@ -174,6 +180,7 @@ export class CoinbaseWsIngest {
   }
 
   _scheduleReconnect() {
+    if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null; }
     // Cap attempt counter at the point where delay saturates (2^6 * 1000ms = 64s > 60s max)
     this._reconnectAttempt = Math.min(this._reconnectAttempt + 1, 7);
     const base = Math.min(RECONNECT_BASE_MS * 2 ** (this._reconnectAttempt - 1), RECONNECT_MAX_MS);

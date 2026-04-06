@@ -257,6 +257,19 @@ describe('CoinbaseWsIngest reconnect logic', () => {
     expect(connectSpy).not.toHaveBeenCalled();
   });
 
+  it('does NOT schedule reconnect when stop() is called before open fires (pre-open stop)', async () => {
+    ({ ingest, getWs } = makeIngest({ _connectTimeoutMs: 99999 }));
+    const spy = jest.spyOn(ingest, '_scheduleReconnect');
+
+    const p = ingest.start();
+    // Don't emit 'open' — handshake is in-flight
+    ingest.stop(); // closes the socket mid-handshake, triggers close event before open
+
+    await p; // start() resolves (stop set _stopped=true, close handler bails)
+    expect(spy).not.toHaveBeenCalled();
+    expect(ingest._stopped).toBe(true);
+  });
+
   it('stale message handler is evicted when old connection closes', async () => {
     const received = [];
     ({ ingest, getWs } = makeIngest({
