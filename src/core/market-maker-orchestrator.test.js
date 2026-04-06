@@ -29,7 +29,7 @@ function makeOrch(overrides = {}) {
 
   const mockInventoryManager = new EventEmitter();
   mockInventoryManager.getPositionSummary = jest.fn().mockReturnValue({
-    netPosition: 0, side: 'flat', baseBalance: null, quoteBalance: null,
+    netPosition: 0, side: 'flat', baseBalance: null, quoteBalance: null, balancesInitialized: false,
   });
   mockInventoryManager.getSkew = jest.fn().mockReturnValue({ bidSkewTicks: 0, askSkewTicks: 0 });
   mockInventoryManager.canQuote = jest.fn().mockReturnValue(true);
@@ -576,6 +576,7 @@ describe('balance snapshot job', () => {
       netPosition: 0, side: 'flat',
       baseBalance: { available: base, held: 0, total: base },
       quoteBalance: { available: quote, held: 0, total: quote },
+      balancesInitialized: true,
     });
     inv.getSkew = jest.fn().mockReturnValue({ bidSkewTicks: 0, askSkewTicks: 0 });
     inv.canQuote = jest.fn().mockReturnValue(true);

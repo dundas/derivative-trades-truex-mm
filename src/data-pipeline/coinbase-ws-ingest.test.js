@@ -224,12 +224,11 @@ describe('CoinbaseWsIngest reconnect logic', () => {
     // Spy on ws1.close BEFORE emitting open on the stale socket
     const closeSpy = jest.spyOn(ws1, 'close');
 
-    // Stale ws1 opens — should schedule a deferred close()
+    // Stale ws1 opens — should schedule a deferred close() via queueMicrotask
     ws1.emit('open');
     await p1; // stale openHandler resolves, _connect() bails out
-
-    // Flush the deferred macrotask so the scheduled close() fires
-    await new Promise((r) => setTimeout(r, 10));
+    // queueMicrotask fires after the microtask queue drains; an extra await flushes it
+    await Promise.resolve();
 
     expect(closeSpy).toHaveBeenCalledTimes(1);
     expect(ingest.connected).toBe(true); // ws2 remains connected

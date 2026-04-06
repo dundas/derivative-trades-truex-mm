@@ -120,7 +120,9 @@ export class CoinbaseWsIngest {
             // Stale connection opened while a newer one already exists — close the socket
             // to release the TCP connection, then resolve so _connect() can reach the
             // post-await gen bail-out and clean up remaining listeners.
-            setTimeout(() => { try { localWs.close(); } catch (_) {} }, 0);
+            // queueMicrotask ensures close() runs after this tick, after the close handler
+            // has been removed by the finally/bail-out path, avoiding double-close.
+            queueMicrotask(() => { try { localWs.close(); } catch (_) {} });
             resolve();
             return;
           }
