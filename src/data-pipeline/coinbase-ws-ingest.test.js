@@ -226,8 +226,10 @@ describe('CoinbaseWsIngest reconnect logic', () => {
 
     // Stale ws1 opens — should schedule a deferred close() via queueMicrotask
     ws1.emit('open');
-    await p1; // stale openHandler resolves, _connect() bails out
-    // queueMicrotask fires after the microtask queue drains; an extra await flushes it
+    // queueMicrotask fires before _connect() resumes (enqueued before resolve()),
+    // so closeSpy is already called by the time await p1 returns; the extra
+    // await Promise.resolve() is a safety no-op to guard against future ordering changes.
+    await p1;
     await Promise.resolve();
 
     expect(closeSpy).toHaveBeenCalledTimes(1);
