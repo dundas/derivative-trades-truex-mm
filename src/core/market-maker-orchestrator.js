@@ -111,6 +111,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this.dataManager = options.dataManager || null;
     this.auditLogger = options.auditLogger || null;
 
+    // PostgreSQL manager (optional) — used for balance snapshots
+    this.postgresManager = options.postgresManager || null;
+
     // REST client for order reconciliation (optional)
     this.restClient = null;
     if (options.restUrl) {
@@ -132,6 +135,11 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this._lastMdUpdateTime = 0;
     this._lastRepriceTime = 0;
     this._watchdogTimer = null;
+
+    // Balance snapshot state
+    this._lastMidPrice = null;
+    this._snapshotTimer = null;
+    this._snapshotIntervalMs = parseInt(process.env.BALANCE_SNAPSHOT_INTERVAL_MS ?? '900000', 10);
     this._intentionalStop = false;
     this._mdStaleThresholdMs = parseInt(process.env.MD_STALE_THRESHOLD_MS || '10000', 10);
     this._quotingIdleThresholdMs = parseInt(process.env.QUOTING_IDLE_THRESHOLD_MS || '120000', 10);
@@ -237,6 +245,13 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this._watchdogTimer = setInterval(() => this._runWatchdog(), 30000);
     this.logger.info('[Orchestrator] Watchdog started (30s interval)');
 
+    // 10. Take immediate balance snapshot and start periodic timer (if postgres available)
+    if (this.postgresManager) {
+      await this._takeBalanceSnapshot();
+      this._snapshotTimer = setInterval(() => this._takeBalanceSnapshot(), this._snapshotIntervalMs);
+      this.logger.info(`[Orchestrator] Balance snapshot timer started (every ${this._snapshotIntervalMs / 1000}s)`);
+    }
+
     this.isRunning = true;
     this.startedAt = Date.now();
 
@@ -287,6 +302,10 @@ export class MarketMakerOrchestrator extends EventEmitter {
       clearInterval(this._watchdogTimer);
       this._watchdogTimer = null;
     }
+    if (this._snapshotTimer) {
+      clearInterval(this._snapshotTimer);
+      this._snapshotTimer = null;
+    }
     this._intentionalStop = true;
     this.pnlTracker.stopPeriodicLogging();
 
@@ -300,7 +319,12 @@ export class MarketMakerOrchestrator extends EventEmitter {
       }
     }
 
-    // 5. Disconnect market data feed
+    // 5a. Take final balance snapshot (FR-2.4)
+    if (this.postgresManager) {
+      await this._takeBalanceSnapshot();
+    }
+
+    // 5b. Disconnect market data feed
     if (this.marketDataFeed) {
       try {
         await this.marketDataFeed.disconnect();
@@ -432,8 +456,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this.quoteEngine.onPriceUpdate(aggregatedPrice);
     this._lastRepriceTime = Date.now();
 
-    // Update PnL mark-to-market
+    // Update PnL mark-to-market and track last mid price for snapshots
     if (aggregatedPrice.weightedMidpoint) {
+      this._lastMidPrice = aggregatedPrice.weightedMidpoint;
       this.pnlTracker.markToMarket(aggregatedPrice.weightedMidpoint);
     }
   }
@@ -672,6 +697,44 @@ export class MarketMakerOrchestrator extends EventEmitter {
     return { baseBalance, quoteBalance };
   }
 
+  // --- Balance Snapshots ---
+
+  /**
+   * Take a single balance snapshot and persist it to the balance_snapshots table.
+   * Errors are caught and logged as warnings — this method NEVER throws.
+   */
+  async _takeBalanceSnapshot() {
+    if (!this.postgresManager) return;
+
+    try {
+      const position = this.inventoryManager.getPositionSummary();
+      const btcQty = position.baseBalance?.available ?? 0;
+      const pyusdQty = position.quoteBalance?.available ?? 0;
+      const midPrice = this._lastMidPrice;
+      const portfolioValue = midPrice !== null ? btcQty * midPrice + pyusdQty : null;
+
+      const sql = `
+        INSERT INTO balance_snapshots (session_id, timestamp, btc_qty, pyusd_qty, btc_mid_price, portfolio_value_pyusd)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (session_id, timestamp) DO NOTHING
+        RETURNING id
+      `;
+      const result = await this.postgresManager.db.query(sql, [
+        this.sessionId,
+        Date.now(),
+        btcQty,
+        pyusdQty,
+        midPrice,
+        portfolioValue,
+      ]);
+      if (result.rows.length === 0) {
+        this.logger.warn('[Orchestrator] balance snapshot skipped (timestamp conflict — duplicate within same ms)');
+      }
+    } catch (err) {
+      this.logger.warn(`[Orchestrator] balance snapshot failed: ${err.message}`);
+    }
+  }
+
   // --- Watchdog ---
 
   /**
@@ -836,6 +899,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       status = 'unhealthy';
     }
 
+    const position = this.inventoryManager.getPositionSummary();
     return {
       status,
       quoting: this.isRunning && !quotingIdle,
@@ -844,9 +908,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
       mdConnected,
       lastMdAge,
       activeOrders: this.quoteEngine.activeOrders?.size ?? 0,
-      position: this.inventoryManager.getPositionSummary(),
-      balances: typeof this.inventoryManager.getBalances === 'function'
-        ? this.inventoryManager.getBalances()
+      position,
+      balances: position.balancesInitialized
+        ? { base: position.baseBalance, quote: position.quoteBalance }
         : null,
       lastFill: typeof this.pnlTracker.getLastFill === 'function'
         ? this.pnlTracker.getLastFill()

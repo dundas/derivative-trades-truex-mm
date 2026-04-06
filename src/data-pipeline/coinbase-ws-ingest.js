@@ -29,8 +29,11 @@ export function mapFromCoinbaseProductId(productId) {
   return productId.replace('-', '/');
 }
 
+const RECONNECT_BASE_MS = 1000;
+const RECONNECT_MAX_MS = 60000;
+
 export class CoinbaseWsIngest {
-  constructor({ symbols, onSnapshot, onL2Update, onTrade, onTicker, logger } = {}) {
+  constructor({ symbols, onSnapshot, onL2Update, onTrade, onTicker, logger, _wsFactory, _connectTimeoutMs } = {}) {
     this.symbols = symbols && symbols.length > 0 ? symbols : ['BTC-PYUSD'];
     this.onSnapshot = onSnapshot;
     this.onL2Update = onL2Update;
@@ -39,28 +42,163 @@ export class CoinbaseWsIngest {
     this.logger = logger || console;
     this.ws = null;
     this.connected = false;
+    this._stopped = false;
+    this._reconnectAttempt = 0;
+    this._reconnectTimer = null;
+    this._generation = 0; // incremented per _connect() to detect stale close handlers
+    this._wsFactory = _wsFactory || null; // injectable WS constructor class for testing
+    this._connectTimeoutMs = _connectTimeoutMs ?? 10000;
+    // Track active per-connection handlers so they can be evicted immediately when a new
+    // connection supersedes the old one, preventing duplicate delivery during the overlap window.
+    this._activeMsgWs = null;
+    this._activeMsgHandler = null;
+    this._activeErrHandler = null;
+    this._activeCloseHandler = null;
   }
 
   async start() {
-    const WS = await getWebSocketImpl();
+    this._stopped = false;
+    this._reconnectAttempt = 0;
+    // Clear any pending reconnect timer to avoid concurrent connections
+    if (this._reconnectTimer) {
+      clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = null;
+    }
+    // Capture generation before _connect() increments it. If this start() is
+    // superseded by a second start() call before _connect() resolves, genAtStart+1
+    // won't match this._generation and we skip the reconnect to avoid a spurious cycle.
+    const genAtStart = this._generation;
+    try {
+      await this._connect();
+    } catch (err) {
+      // Initial connect failed. By design, start() does NOT re-throw — it enters the
+      // reconnect loop instead. Callers (e.g. l2-ohlc-orchestrator) await start() as a
+      // non-blocking "arm the feed" call, not a "wait until connected" barrier.
+      // Data delivery begins when the reconnect succeeds and onSnapshot/onTicker fire.
+      this.logger.error(`Coinbase WS initial connect failed: ${err.message}`);
+      if (!this._stopped && this._generation === genAtStart + 1) this._scheduleReconnect();
+    }
+  }
+
+  async _connect() {
+    const WS = this._wsFactory || await getWebSocketImpl();
     const url = 'wss://ws-feed.exchange.coinbase.com';
     const productIds = this.symbols.map((s) => mapToCoinbaseProductId(s));
 
+    this._generation += 1;
+    const gen = this._generation;
+
+    // Evict all per-connection handlers from the previous active connection and close it
+    // immediately. This prevents duplicate delivery and terminates the old upstream
+    // Coinbase subscription, releasing the server-side connection slot.
+    if (this._activeMsgWs) {
+      if (this._activeMsgHandler) this._activeMsgWs.removeListener('message', this._activeMsgHandler);
+      if (this._activeErrHandler) this._activeMsgWs.removeListener('error', this._activeErrHandler);
+      if (this._activeCloseHandler) this._activeMsgWs.removeListener('close', this._activeCloseHandler);
+      const prevWs = this._activeMsgWs;
+      this._activeMsgWs = null;
+      this._activeMsgHandler = null;
+      this._activeErrHandler = null;
+      this._activeCloseHandler = null;
+      try { prevWs.close(); } catch (_) {}
+    }
+
     this.ws = new WS(url);
 
-    await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('Coinbase WS connect timeout')), 10000);
-      this.ws.on('open', () => {
-        clearTimeout(timeout);
-        this.connected = true;
-        this.logger.info('Coinbase WS connected', { url, productIds });
-        resolve();
+    const localWs = this.ws; // capture reference for stale-handler cleanup
+    let opened = false;
+    let openHandler;
+    let handshakeErrHandler;
+    let closeHandler; // tracked to allow targeted removeListener on stale bail-out
+    let msgHandler; // set after promise resolves; referenced in stale close branch
+    let postConnErrHandler; // post-connection error logger; evicted on stale close
+    try {
+      await new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          // Reject first so timeout is always the canonical failure reason,
+          // then close the dead socket asynchronously. The generation guard in
+          // the close handler prevents any state corruption.
+          reject(new Error('Coinbase WS connect timeout'));
+          setTimeout(() => { try { localWs.close(); } catch (_) {} }, 0);
+        }, this._connectTimeoutMs);
+        openHandler = () => {
+          clearTimeout(timeout);
+          if (gen !== this._generation) {
+            // Stale connection opened while a newer one already exists — close the socket
+            // to release the TCP connection, then resolve so _connect() can reach the
+            // post-await gen bail-out and clean up remaining listeners.
+            // queueMicrotask defers close() so it runs outside the current call frame.
+            // In production, real WebSocket 'close' events are always async, so closeHandler
+            // will have been cleaned up long before any 'close' event arrives.
+            queueMicrotask(() => { try { localWs.close(); } catch (_) {} });
+            resolve();
+            return;
+          }
+          opened = true;
+          this.connected = true;
+          this._reconnectAttempt = 0;
+          this.logger.info('Coinbase WS connected', { url, productIds });
+          resolve();
+        };
+        this.ws.on('open', openHandler);
+        handshakeErrHandler = (err) => {
+          clearTimeout(timeout);
+          reject(err);
+        };
+        this.ws.on('error', handshakeErrHandler);
+        // Register close handler before open fires — no window for undetected disconnects.
+        // Capture reference for targeted removeListener on stale bail-out.
+        closeHandler = (code, reason) => {
+          clearTimeout(timeout);
+          this.logger.info(`Coinbase WS closed: ${code} ${reason?.toString() || ''}`);
+          if (!opened) {
+            if (gen === this._generation) {
+              // Authoritative pre-open close — fail with error so start() schedules reconnect
+              this.connected = false;
+              reject(new Error(`Coinbase WS closed before open: ${code}`));
+            } else {
+              // Stale pre-open close — resolve silently;
+              // post-await generation guard will bail out setup without taking action
+              resolve();
+            }
+          } else if (gen === this._generation) {
+            // Authoritative close for the current connection — evict per-connection handlers
+            this.connected = false;
+            if (msgHandler) localWs.removeListener('message', msgHandler);
+            if (postConnErrHandler) localWs.removeListener('error', postConnErrHandler);
+            if (!this._stopped) this._scheduleReconnect();
+          } else {
+            // Stale connection superseded by a newer one — evict all per-connection handlers
+            // to prevent duplicate data delivery and listener leaks
+            if (msgHandler) localWs.removeListener('message', msgHandler);
+            if (postConnErrHandler) localWs.removeListener('error', postConnErrHandler);
+          }
+        };
+        this.ws.on('close', closeHandler);
       });
-      this.ws.on('error', (err) => {
-        clearTimeout(timeout);
-        reject(err);
-      });
-    });
+    } finally {
+      // Always clean up handshake listeners regardless of resolve/reject path.
+      // openHandler and handshakeErrHandler are one-shot; remove unconditionally.
+      // If the connection never opened (pre-open failure or timeout), also remove
+      // the close handler since the socket will produce no meaningful future events.
+      if (openHandler) localWs.removeListener('open', openHandler);
+      if (handshakeErrHandler) localWs.removeListener('error', handshakeErrHandler);
+      if (!opened && closeHandler) localWs.removeListener('close', closeHandler);
+    }
+
+    // Bail out if this connection was superseded while we were connecting.
+    // Remove only the tracked close handler to avoid clobbering external listeners.
+    if (gen !== this._generation) {
+      if (closeHandler) localWs.removeListener('close', closeHandler);
+      return;
+    }
+
+    // Replace with a post-connection error handler that logs without silently dropping.
+    // Track the reference so the stale-close branch can evict it alongside msgHandler.
+    postConnErrHandler = (err) => {
+      this.logger.error(`Coinbase WS error: ${err.message}`);
+    };
+    localWs.on('error', postConnErrHandler);
 
     // Subscribe
     const subscribeMessage = {
@@ -68,18 +206,44 @@ export class CoinbaseWsIngest {
       product_ids: productIds,
       channels: ['level2', 'matches', 'ticker'],
     };
-    this.ws.send(JSON.stringify(subscribeMessage));
+    localWs.send(JSON.stringify(subscribeMessage));
     this.logger.info('Coinbase WS subscribe sent', { channels: subscribeMessage.channels, productIds });
 
-    // Bind handlers
-    this.ws.on('message', (data) => this.handleMessage(data));
-    this.ws.on('close', (code, reason) => {
-      this.connected = false;
-      this.logger.info(`Coinbase WS closed: ${code} ${reason || ''}`);
-    });
+    msgHandler = (data) => this.handleMessage(data);
+    localWs.on('message', msgHandler);
+
+    // Record active handlers so the next _connect() can evict them immediately on supersession.
+    this._activeMsgWs = localWs;
+    this._activeMsgHandler = msgHandler;
+    this._activeErrHandler = postConnErrHandler;
+    this._activeCloseHandler = closeHandler;
+  }
+
+  _scheduleReconnect() {
+    if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null; }
+    // Cap attempt counter at the point where delay saturates (2^6 * 1000ms = 64s > 60s max)
+    this._reconnectAttempt = Math.min(this._reconnectAttempt + 1, 7);
+    const base = Math.min(RECONNECT_BASE_MS * 2 ** (this._reconnectAttempt - 1), RECONNECT_MAX_MS);
+    const delay = Math.min(Math.floor(base * (0.5 + Math.random())), RECONNECT_MAX_MS); // ±50% jitter, hard-capped
+    this.logger.warn(`Coinbase WS reconnecting in ${delay}ms (attempt ${this._reconnectAttempt})`);
+    this._reconnectTimer = setTimeout(async () => {
+      this._reconnectTimer = null;
+      if (this._stopped) return;
+      try {
+        await this._connect();
+      } catch (err) {
+        this.logger.error(`Coinbase WS reconnect failed: ${err.message}`);
+        if (!this._stopped) this._scheduleReconnect();
+      }
+    }, delay);
   }
 
   stop() {
+    this._stopped = true;
+    if (this._reconnectTimer) {
+      clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = null;
+    }
     try {
       if (this.ws) this.ws.close();
     } catch (_) {
@@ -87,6 +251,10 @@ export class CoinbaseWsIngest {
     } finally {
       this.ws = null;
       this.connected = false;
+      this._activeMsgWs = null;
+      this._activeMsgHandler = null;
+      this._activeErrHandler = null;
+      this._activeCloseHandler = null;
     }
   }
 

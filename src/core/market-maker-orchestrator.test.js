@@ -29,7 +29,7 @@ function makeOrch(overrides = {}) {
 
   const mockInventoryManager = new EventEmitter();
   mockInventoryManager.getPositionSummary = jest.fn().mockReturnValue({
-    netPosition: 0, side: 'flat', baseBalance: null, quoteBalance: null,
+    netPosition: 0, side: 'flat', baseBalance: null, quoteBalance: null, balancesInitialized: false,
   });
   mockInventoryManager.getSkew = jest.fn().mockReturnValue({ bidSkewTicks: 0, askSkewTicks: 0 });
   mockInventoryManager.canQuote = jest.fn().mockReturnValue(true);
@@ -555,5 +555,213 @@ describe('AlertManager integration in Orchestrator', () => {
     await Promise.resolve();
 
     expect(mockAlertManager.sendAlert).not.toHaveBeenCalled();
+  });
+});
+
+// -----------------------------------------------------------------------
+// Task 2.0 — Balance snapshot job (FR-2)
+// -----------------------------------------------------------------------
+describe('balance snapshot job', () => {
+  function makePostgresManager({ queryFn } = {}) {
+    return {
+      db: {
+        query: queryFn || jest.fn().mockResolvedValue({ rows: [] }),
+      },
+    };
+  }
+
+  function makeInventoryWithBalances(base = 0.044, quote = 100) {
+    const inv = new EventEmitter();
+    inv.getPositionSummary = jest.fn().mockReturnValue({
+      netPosition: 0, side: 'flat',
+      baseBalance: { available: base, held: 0, total: base },
+      quoteBalance: { available: quote, held: 0, total: quote },
+      balancesInitialized: true,
+    });
+    inv.getSkew = jest.fn().mockReturnValue({ bidSkewTicks: 0, askSkewTicks: 0 });
+    inv.canQuote = jest.fn().mockReturnValue(true);
+    inv.shouldHedge = jest.fn().mockReturnValue({ shouldHedge: false });
+    inv.balancesInitialized = false;
+    return inv;
+  }
+
+  it('stores _lastMidPrice when _onPriceUpdate fires with weightedMidpoint', () => {
+    const orch = makeOrch();
+    orch.isRunning = true;
+    orch.fixOE.isLoggedOn = true;
+
+    orch._onPriceUpdate({ weightedMidpoint: 83000 });
+
+    expect(orch._lastMidPrice).toBe(83000);
+  });
+
+  it('_lastMidPrice starts as null before any price update', () => {
+    const orch = makeOrch();
+    expect(orch._lastMidPrice).toBeNull();
+  });
+
+  it('_takeBalanceSnapshot inserts a row with correct values', async () => {
+    const querySpy = jest.fn().mockResolvedValue({ rows: [] });
+    const pgm = makePostgresManager({ queryFn: querySpy });
+    const inv = makeInventoryWithBalances(0.044, 200);
+
+    const orch = makeOrch({ postgresManager: pgm, inventoryManager: inv });
+    orch._lastMidPrice = 83000;
+    orch.sessionId = 'test-session-1';
+
+    await orch._takeBalanceSnapshot();
+
+    expect(querySpy).toHaveBeenCalledTimes(1);
+    const [sql, params] = querySpy.mock.calls[0];
+    expect(sql).toContain('INSERT INTO balance_snapshots');
+    expect(sql).toContain('ON CONFLICT');            // FR-1.2 deduplication guard
+    expect(params[0]).toBe('test-session-1');     // session_id
+    expect(typeof params[1]).toBe('number');        // timestamp (unix ms)
+    expect(params[2]).toBeCloseTo(0.044, 8);        // btc_qty
+    expect(params[3]).toBeCloseTo(200, 4);          // pyusd_qty
+    expect(params[4]).toBe(83000);                  // btc_mid_price
+    // portfolio_value_pyusd = 0.044 * 83000 + 200 = 3652 + 200 = 3852
+    expect(params[5]).toBeCloseTo(3852, 2);
+  });
+
+  it('_takeBalanceSnapshot stores null portfolio_value when _lastMidPrice is null', async () => {
+    const querySpy = jest.fn().mockResolvedValue({ rows: [] });
+    const pgm = makePostgresManager({ queryFn: querySpy });
+    const inv = makeInventoryWithBalances(0.044, 200);
+
+    const orch = makeOrch({ postgresManager: pgm, inventoryManager: inv });
+    orch._lastMidPrice = null;
+
+    await orch._takeBalanceSnapshot();
+
+    const [, params] = querySpy.mock.calls[0];
+    expect(params[4]).toBeNull();  // btc_mid_price null
+    expect(params[5]).toBeNull();  // portfolio_value_pyusd null
+  });
+
+  it('_takeBalanceSnapshot does NOT throw when postgres query fails', async () => {
+    const querySpy = jest.fn().mockRejectedValue(new Error('DB down'));
+    const pgm = makePostgresManager({ queryFn: querySpy });
+    const inv = makeInventoryWithBalances();
+
+    const orch = makeOrch({ postgresManager: pgm, inventoryManager: inv });
+
+    // Must not throw
+    await expect(orch._takeBalanceSnapshot()).resolves.toBeUndefined();
+    expect(orch.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('balance snapshot failed')
+    );
+  });
+
+  it('_takeBalanceSnapshot is a no-op when postgresManager is absent', async () => {
+    const orch = makeOrch(); // no postgresManager
+    // Must not throw
+    await expect(orch._takeBalanceSnapshot()).resolves.toBeUndefined();
+  });
+
+  it('_takeBalanceSnapshot writes zero balances when getPositionSummary returns null balances', async () => {
+    const querySpy = jest.fn().mockResolvedValue({ rows: [{ id: 1 }] });
+    const pgm = makePostgresManager({ queryFn: querySpy });
+
+    const orch = makeOrch({ postgresManager: pgm });
+    // default mockInventoryManager returns null baseBalance/quoteBalance → 0 balances inserted
+    await expect(orch._takeBalanceSnapshot()).resolves.toBeUndefined();
+    expect(querySpy).toHaveBeenCalledTimes(1);
+    const [, params] = querySpy.mock.calls[0];
+    expect(params[2]).toBe(0); // btcQty
+    expect(params[3]).toBe(0); // pyusdQty
+  });
+
+  it('_snapshotTimer is null before start()', () => {
+    const orch = makeOrch();
+    expect(orch._snapshotTimer).toBeNull();
+  });
+
+  it('stop() clears _snapshotTimer when set', async () => {
+    const querySpy = jest.fn().mockResolvedValue({ rows: [] });
+    const pgm = makePostgresManager({ queryFn: querySpy });
+    const inv = makeInventoryWithBalances();
+
+    const orch = makeOrch({ postgresManager: pgm, inventoryManager: inv });
+    orch.isRunning = true;
+    orch.startedAt = Date.now();
+    // Manually plant a fake timer to verify clearInterval is called
+    const fakeTimer = setInterval(() => {}, 99999);
+    orch._snapshotTimer = fakeTimer;
+
+    try {
+      await orch.stop();
+      expect(orch._snapshotTimer).toBeNull();
+    } finally {
+      clearInterval(fakeTimer);
+    }
+  });
+
+  it('stop() calls _takeBalanceSnapshot for a final snapshot', async () => {
+    const querySpy = jest.fn().mockResolvedValue({ rows: [] });
+    const pgm = makePostgresManager({ queryFn: querySpy });
+    const inv = makeInventoryWithBalances();
+
+    const orch = makeOrch({ postgresManager: pgm, inventoryManager: inv });
+    orch.isRunning = true;
+    orch.startedAt = Date.now();
+    orch._lastMidPrice = 83000;
+
+    await orch.stop();
+
+    // At least one INSERT should have been fired during stop()
+    expect(querySpy).toHaveBeenCalled();
+  });
+
+  it('start() sets _snapshotTimer when postgresManager is present (FR-2.2)', async () => {
+    const querySpy = jest.fn().mockResolvedValue({ rows: [] });
+    const pgm = makePostgresManager({ queryFn: querySpy });
+    const inv = makeInventoryWithBalances();
+
+    // quoteEngine needs drainQueue for start() to work
+    const orch = makeOrch({ postgresManager: pgm, inventoryManager: inv });
+    orch.quoteEngine.drainQueue = jest.fn();
+
+    await orch.start();
+
+    try {
+      expect(orch._snapshotTimer).not.toBeNull();
+    } finally {
+      // Clean up all timers started by start()
+      clearInterval(orch._snapshotTimer);
+      clearInterval(orch._watchdogTimer);
+      clearInterval(orch.drainQueueTimer);
+      orch._snapshotTimer = null;
+      orch._watchdogTimer = null;
+      orch.drainQueueTimer = null;
+      orch.isRunning = false;
+    }
+  });
+
+  it('start() fires an immediate balance snapshot (FR-2.1)', async () => {
+    const querySpy = jest.fn().mockResolvedValue({ rows: [] });
+    const pgm = makePostgresManager({ queryFn: querySpy });
+    const inv = makeInventoryWithBalances(0.044, 100);
+
+    const orch = makeOrch({ postgresManager: pgm, inventoryManager: inv });
+    orch.quoteEngine.drainQueue = jest.fn();
+    orch._lastMidPrice = 83000;
+
+    await orch.start();
+
+    try {
+      // The startup snapshot must have fired at least once with balance_snapshots SQL
+      expect(querySpy).toHaveBeenCalled();
+      const sqlCalls = querySpy.mock.calls.map(([sql]) => sql);
+      expect(sqlCalls.some(sql => sql.includes('balance_snapshots'))).toBe(true);
+    } finally {
+      clearInterval(orch._snapshotTimer);
+      clearInterval(orch._watchdogTimer);
+      clearInterval(orch.drainQueueTimer);
+      orch._snapshotTimer = null;
+      orch._watchdogTimer = null;
+      orch.drainQueueTimer = null;
+      orch.isRunning = false;
+    }
   });
 });
