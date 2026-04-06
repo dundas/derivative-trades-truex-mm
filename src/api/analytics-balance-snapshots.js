@@ -5,22 +5,29 @@
  * tested without importing the full server (which has top-level await).
  */
 
+function parsePosInt(raw, fallback) {
+  const n = parseInt(raw ?? '', 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
 function parsePaginationLocal(params) {
-  const page = Math.max(1, parseInt(params.get('page') || '1', 10));
-  const limit = Math.min(500, Math.max(1, parseInt(params.get('limit') || '50', 10)));
+  const page = parsePosInt(params.get('page'), 1);
+  const limit = Math.min(500, parsePosInt(params.get('limit'), 50));
   const offset = (page - 1) * limit;
   return { page, limit, offset };
 }
 
 function parseTimeRangeLocal(params) {
-  const from = params.get('from') ? parseInt(params.get('from'), 10) : null;
-  const to = params.get('to') ? parseInt(params.get('to'), 10) : null;
+  const rawFrom = params.get('from');
+  const rawTo   = params.get('to');
+  const from = rawFrom !== null ? parseInt(rawFrom, 10) : null;
+  const to   = rawTo   !== null ? parseInt(rawTo,   10) : null;
   return { from, to };
 }
 
 function addTimeFilterLocal(conditions, values, idx, col, from, to) {
-  if (from) { conditions.push(`${col} >= $${idx++}`); values.push(from); }
-  if (to)   { conditions.push(`${col} <= $${idx++}`); values.push(to); }
+  if (from !== null) { conditions.push(`${col} >= $${idx++}`); values.push(from); }
+  if (to   !== null) { conditions.push(`${col} <= $${idx++}`); values.push(to); }
   return idx;
 }
 

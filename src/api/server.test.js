@@ -122,4 +122,21 @@ describe('GET /api/v1/analytics/balance-snapshots', () => {
     await handleAnalyticsBalanceSnapshots(makeParams(), db);
     expect(db.query).toHaveBeenCalledTimes(2);
   });
+
+  it('uses default page=1, limit=50 when page/limit params are non-numeric', async () => {
+    const db = makeDb([], 0);
+    await handleAnalyticsBalanceSnapshots(makeParams({ page: 'abc', limit: 'xyz' }), db);
+    const [, selectVals] = db.query.mock.calls[1];
+    const [limitVal, offsetVal] = selectVals.slice(-2);
+    expect(limitVal).toBe(50);
+    expect(offsetVal).toBe(0); // page 1, offset 0
+  });
+
+  it('treats epoch 0 as a valid time bound (not filtered out as falsy)', async () => {
+    const db = makeDb([], 0);
+    await handleAnalyticsBalanceSnapshots(makeParams({ from: '0' }), db);
+    const [countSql, countVals] = db.query.mock.calls[0];
+    expect(countSql).toContain('timestamp >= $1');
+    expect(countVals).toContain(0);
+  });
 });
