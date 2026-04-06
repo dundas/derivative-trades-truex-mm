@@ -48,6 +48,11 @@ export class CoinbaseWsIngest {
     this._generation = 0; // incremented per _connect() to detect stale close handlers
     this._wsFactory = _wsFactory || null; // injectable WS constructor class for testing
     this._connectTimeoutMs = _connectTimeoutMs ?? 10000;
+    // Track active per-connection handlers so they can be evicted immediately when a new
+    // connection supersedes the old one, preventing duplicate delivery during the overlap window.
+    this._activeMsgWs = null;
+    this._activeMsgHandler = null;
+    this._activeErrHandler = null;
   }
 
   async start() {
@@ -80,6 +85,17 @@ export class CoinbaseWsIngest {
     this._generation += 1;
     const gen = this._generation;
 
+    // Evict message/error handlers from the previous active connection immediately.
+    // This prevents duplicate delivery during the overlap window where both the old
+    // and new sockets are briefly live before the old one closes.
+    if (this._activeMsgWs) {
+      if (this._activeMsgHandler) this._activeMsgWs.removeListener('message', this._activeMsgHandler);
+      if (this._activeErrHandler) this._activeMsgWs.removeListener('error', this._activeErrHandler);
+      this._activeMsgWs = null;
+      this._activeMsgHandler = null;
+      this._activeErrHandler = null;
+    }
+
     this.ws = new WS(url);
 
     const localWs = this.ws; // capture reference for stale-handler cleanup
@@ -100,6 +116,12 @@ export class CoinbaseWsIngest {
         }, this._connectTimeoutMs);
         openHandler = () => {
           clearTimeout(timeout);
+          if (gen !== this._generation) {
+            // Stale connection opened while a newer one already exists — resolve without
+            // touching shared state; the post-await gen bail-out will clean up.
+            resolve();
+            return;
+          }
           opened = true;
           this.connected = true;
           this._reconnectAttempt = 0;
@@ -177,6 +199,11 @@ export class CoinbaseWsIngest {
 
     msgHandler = (data) => this.handleMessage(data);
     localWs.on('message', msgHandler);
+
+    // Record active handlers so the next _connect() can evict them immediately on supersession.
+    this._activeMsgWs = localWs;
+    this._activeMsgHandler = msgHandler;
+    this._activeErrHandler = postConnErrHandler;
   }
 
   _scheduleReconnect() {
@@ -184,7 +211,7 @@ export class CoinbaseWsIngest {
     // Cap attempt counter at the point where delay saturates (2^6 * 1000ms = 64s > 60s max)
     this._reconnectAttempt = Math.min(this._reconnectAttempt + 1, 7);
     const base = Math.min(RECONNECT_BASE_MS * 2 ** (this._reconnectAttempt - 1), RECONNECT_MAX_MS);
-    const delay = Math.floor(base * (0.5 + Math.random() * 0.5));
+    const delay = Math.floor(base * (0.5 + Math.random())); // ±50% jitter (0.5..1.5×base)
     this.logger.warn(`Coinbase WS reconnecting in ${delay}ms (attempt ${this._reconnectAttempt})`);
     this._reconnectTimer = setTimeout(async () => {
       this._reconnectTimer = null;
@@ -211,6 +238,9 @@ export class CoinbaseWsIngest {
     } finally {
       this.ws = null;
       this.connected = false;
+      this._activeMsgWs = null;
+      this._activeMsgHandler = null;
+      this._activeErrHandler = null;
     }
   }
 

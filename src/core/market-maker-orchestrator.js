@@ -705,12 +705,11 @@ export class MarketMakerOrchestrator extends EventEmitter {
    */
   async _takeBalanceSnapshot() {
     if (!this.postgresManager) return;
-    if (typeof this.inventoryManager.getBalances !== 'function') return;
 
     try {
-      const balances = this.inventoryManager.getBalances();
-      const btcQty = balances?.base?.available ?? 0;
-      const pyusdQty = balances?.quote?.available ?? 0;
+      const position = this.inventoryManager.getPositionSummary();
+      const btcQty = position.baseBalance?.available ?? 0;
+      const pyusdQty = position.quoteBalance?.available ?? 0;
       const midPrice = this._lastMidPrice;
       const portfolioValue = midPrice !== null ? btcQty * midPrice + pyusdQty : null;
 
@@ -909,9 +908,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       lastMdAge,
       activeOrders: this.quoteEngine.activeOrders?.size ?? 0,
       position: this.inventoryManager.getPositionSummary(),
-      balances: typeof this.inventoryManager.getBalances === 'function'
-        ? this.inventoryManager.getBalances()
-        : null,
+      balances: null, // balances exposed via position.baseBalance / position.quoteBalance above
       lastFill: typeof this.pnlTracker.getLastFill === 'function'
         ? this.pnlTracker.getLastFill()
         : null,

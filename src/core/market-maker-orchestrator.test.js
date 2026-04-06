@@ -573,16 +573,14 @@ describe('balance snapshot job', () => {
   function makeInventoryWithBalances(base = 0.044, quote = 100) {
     const inv = new EventEmitter();
     inv.getPositionSummary = jest.fn().mockReturnValue({
-      netPosition: 0, side: 'flat', baseBalance: null, quoteBalance: null,
+      netPosition: 0, side: 'flat',
+      baseBalance: { available: base, held: 0, total: base },
+      quoteBalance: { available: quote, held: 0, total: quote },
     });
     inv.getSkew = jest.fn().mockReturnValue({ bidSkewTicks: 0, askSkewTicks: 0 });
     inv.canQuote = jest.fn().mockReturnValue(true);
     inv.shouldHedge = jest.fn().mockReturnValue({ shouldHedge: false });
     inv.balancesInitialized = false;
-    inv.getBalances = jest.fn().mockReturnValue({
-      base: { available: base },
-      quote: { available: quote },
-    });
     return inv;
   }
 
@@ -660,14 +658,17 @@ describe('balance snapshot job', () => {
     await expect(orch._takeBalanceSnapshot()).resolves.toBeUndefined();
   });
 
-  it('_takeBalanceSnapshot is a no-op when inventoryManager lacks getBalances', async () => {
-    const querySpy = jest.fn().mockResolvedValue({ rows: [] });
+  it('_takeBalanceSnapshot writes zero balances when getPositionSummary returns null balances', async () => {
+    const querySpy = jest.fn().mockResolvedValue({ rows: [{ id: 1 }] });
     const pgm = makePostgresManager({ queryFn: querySpy });
 
     const orch = makeOrch({ postgresManager: pgm });
-    // default mockInventoryManager has no getBalances — do nothing
+    // default mockInventoryManager returns null baseBalance/quoteBalance → 0 balances inserted
     await expect(orch._takeBalanceSnapshot()).resolves.toBeUndefined();
-    expect(querySpy).not.toHaveBeenCalled();
+    expect(querySpy).toHaveBeenCalledTimes(1);
+    const [, params] = querySpy.mock.calls[0];
+    expect(params[2]).toBe(0); // btcQty
+    expect(params[3]).toBe(0); // pyusdQty
   });
 
   it('_snapshotTimer is null before start()', () => {

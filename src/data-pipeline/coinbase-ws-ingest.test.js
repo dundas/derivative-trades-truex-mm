@@ -288,13 +288,16 @@ describe('CoinbaseWsIngest reconnect logic', () => {
     ws2.emit('open');
     await p2;
 
-    // Old WS closes (stale) — should evict its message handler
-    ws1.emit('close', 1001, '');
-
-    // Ticker message from old WS should NOT arrive (handler evicted)
+    // Overlap window: ws1 is still open but ws2 is now authoritative.
+    // Messages from the superseded-but-still-open ws1 must NOT be delivered.
     const tickerMsg = JSON.stringify({ type: 'ticker', product_id: 'BTC-USD', best_bid: '70000', best_ask: '70010', price: '70005', time: new Date().toISOString() });
     ws1.emit('message', tickerMsg);
-    expect(received).toHaveLength(0);
+    expect(received).toHaveLength(0); // overlap window: stale ws1 messages are ignored
+
+    // Now close old WS (stale) — still should not deliver and handler is evicted
+    ws1.emit('close', 1001, '');
+    ws1.emit('message', tickerMsg);
+    expect(received).toHaveLength(0); // handler evicted on close
 
     // Ticker from new WS SHOULD arrive
     ws2.emit('message', tickerMsg);
