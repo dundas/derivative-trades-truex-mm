@@ -53,6 +53,7 @@ export class CoinbaseWsIngest {
     this._activeMsgWs = null;
     this._activeMsgHandler = null;
     this._activeErrHandler = null;
+    this._activeCloseHandler = null;
   }
 
   async start() {
@@ -87,16 +88,18 @@ export class CoinbaseWsIngest {
     this._generation += 1;
     const gen = this._generation;
 
-    // Evict message/error handlers from the previous active connection and close it
+    // Evict all per-connection handlers from the previous active connection and close it
     // immediately. This prevents duplicate delivery and terminates the old upstream
     // Coinbase subscription, releasing the server-side connection slot.
     if (this._activeMsgWs) {
       if (this._activeMsgHandler) this._activeMsgWs.removeListener('message', this._activeMsgHandler);
       if (this._activeErrHandler) this._activeMsgWs.removeListener('error', this._activeErrHandler);
+      if (this._activeCloseHandler) this._activeMsgWs.removeListener('close', this._activeCloseHandler);
       const prevWs = this._activeMsgWs;
       this._activeMsgWs = null;
       this._activeMsgHandler = null;
       this._activeErrHandler = null;
+      this._activeCloseHandler = null;
       try { prevWs.close(); } catch (_) {}
     }
 
@@ -213,6 +216,7 @@ export class CoinbaseWsIngest {
     this._activeMsgWs = localWs;
     this._activeMsgHandler = msgHandler;
     this._activeErrHandler = postConnErrHandler;
+    this._activeCloseHandler = closeHandler;
   }
 
   _scheduleReconnect() {
@@ -250,6 +254,7 @@ export class CoinbaseWsIngest {
       this._activeMsgWs = null;
       this._activeMsgHandler = null;
       this._activeErrHandler = null;
+      this._activeCloseHandler = null;
     }
   }
 

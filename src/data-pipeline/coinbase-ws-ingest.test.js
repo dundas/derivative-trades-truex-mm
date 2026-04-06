@@ -182,6 +182,27 @@ describe('CoinbaseWsIngest reconnect logic', () => {
     expect(spy).toHaveBeenCalledTimes(1);
   });
 
+  it('superseded socket is closed when second start() connects', async () => {
+    ({ ingest, getWs } = makeIngest());
+
+    // First connect
+    const p1 = ingest.start();
+    const ws1 = getWs();
+    ws1.emit('open');
+    await p1;
+
+    // Spy BEFORE second start() so we capture the eviction close
+    const closeSpy = jest.spyOn(ws1, 'close');
+
+    // Second start() should immediately close ws1 and connect ws2
+    const p2 = ingest.start();
+    expect(closeSpy).toHaveBeenCalledTimes(1); // eviction fires synchronously at start of _connect()
+    const ws2 = getWs();
+    ws2.emit('open');
+    await p2;
+    expect(ingest.connected).toBe(true);
+  });
+
   it('stale close handler does not trigger reconnect when a newer connection exists', async () => {
     ({ ingest, getWs } = makeIngest());
 
