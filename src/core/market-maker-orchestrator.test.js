@@ -519,13 +519,13 @@ describe('AlertManager integration in Orchestrator', () => {
     expect(arg.level).toBe('error');
   });
 
-  it('calls alertManager.sendRecovery when quoting resumes after halt', async () => {
+  it('calls alertManager.sendRecovery when a watchdog issue clears', async () => {
     const mockAlertManager = makeAlertManager();
     const orch = makeOrch({ alertManager: mockAlertManager });
     orch.isRunning = true;
     orch._intentionalStop = false;
     orch.fixOE.isLoggedOn = true;
-    orch._wasQuotingHalted = true; // simulate previous halt
+    orch._activeWatchdogIssues = new Set(['Quoting idle']);
     orch._lastRepriceTime = Date.now() - 1000; // actively quoting
     orch._quotingIdleThresholdMs = 120000;
 
@@ -534,8 +534,8 @@ describe('AlertManager integration in Orchestrator', () => {
 
     expect(mockAlertManager.sendRecovery).toHaveBeenCalledTimes(1);
     const [arg] = mockAlertManager.sendRecovery.mock.calls[0];
-    expect(arg.reason).toBe('quoting resumed');
-    expect(orch._wasQuotingHalted).toBe(false);
+    expect(arg.reason).toBe('Quoting idle');
+    expect(orch._activeWatchdogIssues.has('Quoting idle')).toBe(false);
   });
 
   it('does not call sendAlert when zero balances suppress the quoting-idle issue', async () => {

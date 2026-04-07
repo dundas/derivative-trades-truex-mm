@@ -8,7 +8,7 @@ import { QuoteEngine } from './quote-engine.js';
 import { HedgeExecutor } from './hedge-executor.js';
 import { TrueXMarketDataFeed } from './truex-market-data.js';
 import { TrueXRESTClient } from '../exchanges/truex/TrueXRESTClient.js';
-import { AlertManager } from '../alerts/alert-manager.js';
+import { AlertManager, normalizeAlertReason } from '../alerts/alert-manager.js';
 
 /**
  * MarketMakerOrchestrator - Wires all components and manages lifecycle.
@@ -144,7 +144,8 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this._mdStaleThresholdMs = parseInt(process.env.MD_STALE_THRESHOLD_MS || '10000', 10);
     this._quotingIdleThresholdMs = parseInt(process.env.QUOTING_IDLE_THRESHOLD_MS || '120000', 10);
     this._quotingGateEnabled = true; // false when MD stale or session down
-    this._wasQuotingHalted = false;
+    /** Normalized watchdog issue keys that were present on the last tick (for recovery diffing) */
+    this._activeWatchdogIssues = new Set();
 
     // Alert manager (injectable for testing; defaults to env-driven config)
     this.alertManager = options.alertManager || new AlertManager({
@@ -798,15 +799,6 @@ export class MarketMakerOrchestrator extends EventEmitter {
     const now = Date.now();
     const issues = [];
 
-    // Detect quoting resume (recovery alert) — check BEFORE building issues list
-    const isQuotingNow = this.isRunning && this._lastRepriceTime > 0 &&
-      (now - this._lastRepriceTime) < this._quotingIdleThresholdMs;
-    if (this._wasQuotingHalted && isQuotingNow) {
-      this._wasQuotingHalted = false;
-      this.alertManager.sendRecovery({ reason: 'quoting resumed' })
-        .catch(err => this.logger.error(`[WATCHDOG] Recovery alert failed: ${err.message}`));
-    }
-
     // Check OE FIX
     if (!this.fixOE.isLoggedOn) {
       issues.push('OE FIX not logged on');
@@ -831,9 +823,17 @@ export class MarketMakerOrchestrator extends EventEmitter {
       const hasBalance = baseTotal > 0 || quoteTotal > 0;
       if (hasBalance) {
         issues.push(`Quoting idle for ${Math.round(repriceAge / 1000)}s`);
-        this._wasQuotingHalted = true;
       }
     }
+
+    const currentKeys = new Set(issues.map((i) => normalizeAlertReason(i)));
+    for (const prev of this._activeWatchdogIssues) {
+      if (!currentKeys.has(prev)) {
+        this.alertManager.sendRecovery({ reason: prev })
+          .catch(err => this.logger.error(`[WATCHDOG] Recovery alert failed: ${err.message}`));
+      }
+    }
+    this._activeWatchdogIssues = currentKeys;
 
     if (issues.length > 0) {
       const msg = `[WATCHDOG] Health check failed: ${issues.join('; ')}`;

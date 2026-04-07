@@ -1,3 +1,16 @@
+/**
+ * Normalize watchdog/alert reason strings for deduplication keys so variable
+ * fragments (e.g. ` for 5135s`) do not defeat the cooldown.
+ */
+export function normalizeAlertReason(reason) {
+  let s = String(reason ?? '');
+  s = s.replace(/ for \d+s/gi, '');
+  s = s.replace(/ \(\d+ orders?\)/gi, '');
+  s = s.replace(/\$[\d,]+\.?\d*/g, '');
+  s = s.replace(/\b\d+\.\d+\s*BTC\b/gi, '');
+  return s.trim();
+}
+
 export class AlertManager {
   constructor(options = {}) {
     this.slackWebhookUrl = options.slackWebhookUrl || null;
@@ -11,7 +24,7 @@ export class AlertManager {
   }
 
   async sendAlert({ reason, level = 'error', details = {} }) {
-    const key = reason;
+    const key = normalizeAlertReason(reason);
     const now = Date.now();
 
     // Deduplication cooldown
@@ -33,8 +46,8 @@ export class AlertManager {
   }
 
   async sendRecovery({ reason, details = {} }) {
-    // Clear cooldown so next alert fires immediately
-    delete this._lastAlertTime[reason];
+    // Clear cooldown so next alert fires immediately (same key shape as sendAlert)
+    delete this._lastAlertTime[normalizeAlertReason(reason)];
 
     const message = this._buildRecoveryMessage({ reason, details });
     await Promise.allSettled([
