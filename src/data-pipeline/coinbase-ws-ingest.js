@@ -259,6 +259,12 @@ export class CoinbaseWsIngest {
     this.stop();
     this._stopped = false;
     await this.start();
+    // start() resets _successfulOpenCount — organic onReconnect from open() won't fire; notify here too
+    try {
+      this.onReconnect?.({ via: 'restart' });
+    } catch (err) {
+      this.logger.error(`Coinbase onReconnect (restart) failed: ${err.message}`);
+    }
   }
 
   stop() {

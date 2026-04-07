@@ -257,6 +257,13 @@ tail_logs() {
     fi
 
     SERVICE="${2:-market-maker}"
+    case "$SERVICE" in
+        market-maker|fix-proxy|redis|log-exporter|md-proxy) ;;
+        *)
+            log_error "Unknown service: $SERVICE (use: market-maker|fix-proxy|redis|log-exporter|md-proxy)"
+            exit 1
+            ;;
+    esac
     log_info "Tailing logs for $SERVICE (Ctrl+C to exit)..."
     ssh root@"$SERVER_IP" "docker logs -f --tail=100 truex-${SERVICE}"
 }

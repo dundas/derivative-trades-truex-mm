@@ -228,6 +228,19 @@ describe('CoinbaseWsIngest reconnect logic', () => {
     expect(ingest.connected).toBe(true);
   });
 
+  it('restart() invokes onReconnect after successful recycle', async () => {
+    const onReconnect = jest.fn();
+    ({ ingest, getWs } = makeIngest({ onReconnect }));
+    const p1 = ingest.start();
+    getWs().emit('open');
+    await p1;
+    const pr = ingest.restart();
+    await Promise.resolve();
+    getWs().emit('open');
+    await pr;
+    expect(onReconnect).toHaveBeenCalledWith(expect.objectContaining({ via: 'restart' }));
+  });
+
   it('stale close handler does not trigger reconnect when a newer connection exists', async () => {
     ({ ingest, getWs } = makeIngest());
 
