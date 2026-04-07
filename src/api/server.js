@@ -9,7 +9,7 @@
  *   System:    GET /api/v1/health, /api/v1/stats
  *   Data:      GET /api/v1/sessions, /orders, /fills (with pagination & filtering)
  *   Analytics: GET /api/v1/analytics/pnl, /fill-rate, /spread-capture,
- *              /adverse-selection, /inventory, /parameters
+ *              /adverse-selection, /inventory, /parameters, /balance-snapshots
  *
  * Environment:
  *   API_PORT      - Listen port (default: 3100)
@@ -21,6 +21,7 @@
  */
 import { createPostgreSQLAPIFromEnv } from '../../lib/postgresql-api/index.js';
 import { readFileSync, existsSync } from 'fs';
+import { handleAnalyticsBalanceSnapshots as _handleBalanceSnapshots } from './analytics-balance-snapshots.js';
 
 const PORT         = parseInt(process.env.API_PORT || '3100', 10);
 const CORS_ORIGIN  = process.env.CORS_ORIGIN || '*';
@@ -539,6 +540,11 @@ async function handleAnalyticsInventory(params) {
   return jsonOk({ series: r.rows, summary: bySession }, { count: r.rows.length });
 }
 
+async function handleAnalyticsBalanceSnapshots(params) {
+  const { rows, meta } = await _handleBalanceSnapshots(params, db);
+  return jsonOk(rows, meta);
+}
+
 async function handleAnalyticsParameters(params) {
   const symbol = params.get('symbol');
   const { from, to } = parseTimeRange(params);
@@ -929,12 +935,13 @@ Bun.serve({
       if ((m = matchRoute(path, '/api/v1/logs/archives/:id'))) return await handleLogsArchiveDownload(m.id);
 
       // Analytics
-      if (path === '/api/v1/analytics/pnl')              return await handleAnalyticsPnl(params);
-      if (path === '/api/v1/analytics/fill-rate')         return await handleAnalyticsFillRate(params);
-      if (path === '/api/v1/analytics/spread-capture')    return await handleAnalyticsSpreadCapture(params);
-      if (path === '/api/v1/analytics/adverse-selection') return await handleAnalyticsAdverseSelection(params);
-      if (path === '/api/v1/analytics/inventory')         return await handleAnalyticsInventory(params);
-      if (path === '/api/v1/analytics/parameters')        return await handleAnalyticsParameters(params);
+      if (path === '/api/v1/analytics/pnl')                return await handleAnalyticsPnl(params);
+      if (path === '/api/v1/analytics/fill-rate')           return await handleAnalyticsFillRate(params);
+      if (path === '/api/v1/analytics/spread-capture')      return await handleAnalyticsSpreadCapture(params);
+      if (path === '/api/v1/analytics/adverse-selection')   return await handleAnalyticsAdverseSelection(params);
+      if (path === '/api/v1/analytics/inventory')           return await handleAnalyticsInventory(params);
+      if (path === '/api/v1/analytics/parameters')          return await handleAnalyticsParameters(params);
+      if (path === '/api/v1/analytics/balance-snapshots')   return await handleAnalyticsBalanceSnapshots(params);
 
       // Parameterized routes (order matters — more specific first)
       if ((m = matchRoute(path, '/api/v1/sessions/:id/orders'))) return await handleGetSessionOrders(m.id, params);

@@ -33,12 +33,14 @@ const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 60000;
 
 export class CoinbaseWsIngest {
-  constructor({ symbols, onSnapshot, onL2Update, onTrade, onTicker, logger, _wsFactory, _connectTimeoutMs } = {}) {
+  constructor({ symbols, onSnapshot, onL2Update, onTrade, onTicker, onReconnect, logger, _wsFactory, _connectTimeoutMs } = {}) {
     this.symbols = symbols && symbols.length > 0 ? symbols : ['BTC-PYUSD'];
     this.onSnapshot = onSnapshot;
     this.onL2Update = onL2Update;
     this.onTrade = onTrade;
     this.onTicker = onTicker;
+    /** Called after a successful WS connection that follows a prior connection (reconnect path). Not called on the first open after start(). */
+    this.onReconnect = onReconnect || null;
     this.logger = logger || console;
     this.ws = null;
     this.connected = false;
@@ -54,10 +56,13 @@ export class CoinbaseWsIngest {
     this._activeMsgHandler = null;
     this._activeErrHandler = null;
     this._activeCloseHandler = null;
+    /** Counts successful WS opens in the current process; reset in start(). Used to skip onReconnect on first open. */
+    this._successfulOpenCount = 0;
   }
 
   async start() {
     this._stopped = false;
+    this._successfulOpenCount = 0;
     this._reconnectAttempt = 0;
     // Clear any pending reconnect timer to avoid concurrent connections
     if (this._reconnectTimer) {
@@ -137,6 +142,14 @@ export class CoinbaseWsIngest {
           opened = true;
           this.connected = true;
           this._reconnectAttempt = 0;
+          this._successfulOpenCount += 1;
+          if (this._successfulOpenCount > 1) {
+            try {
+              this.onReconnect?.({ successfulOpenCount: this._successfulOpenCount });
+            } catch (err) {
+              this.logger.error(`Coinbase onReconnect callback failed: ${err.message}`);
+            }
+          }
           this.logger.info('Coinbase WS connected', { url, productIds });
           resolve();
         };
@@ -236,6 +249,22 @@ export class CoinbaseWsIngest {
         if (!this._stopped) this._scheduleReconnect();
       }
     }, delay);
+  }
+
+  /**
+   * Hard recycle: close the socket and run start() again (used when automatic reconnect is insufficient).
+   */
+  async restart() {
+    this.logger.warn('Coinbase WS restart() — recycling connection');
+    this.stop();
+    this._stopped = false;
+    await this.start();
+    // start() resets _successfulOpenCount — organic onReconnect from open() won't fire; notify here too
+    try {
+      this.onReconnect?.({ via: 'restart' });
+    } catch (err) {
+      this.logger.error(`Coinbase onReconnect (restart) failed: ${err.message}`);
+    }
   }
 
   stop() {

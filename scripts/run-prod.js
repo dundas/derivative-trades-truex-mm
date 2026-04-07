@@ -390,6 +390,27 @@ async function main() {
 
   wireOrchestratorEvents(orchestrator);
 
+  coinbaseIngest.onReconnect = () => {
+    orchestrator.alertManager.sendRecovery({ reason: 'Coinbase WS disconnected' })
+      .catch((err) => logger.error(`[Coinbase] Recovery notification failed: ${err.message}`));
+  };
+
+  let lastCoinbaseRestartAt = 0;
+  const COINBASE_RESTART_COOLDOWN_MS = 5 * 60 * 1000;
+  orchestrator.on('watchdog-alert', async ({ issues }) => {
+    const quotingIdle = issues.some((i) => i.includes('Quoting idle'));
+    if (!quotingIdle || coinbaseIngest.connected) return;
+    const t = Date.now();
+    if (t - lastCoinbaseRestartAt < COINBASE_RESTART_COOLDOWN_MS) return;
+    lastCoinbaseRestartAt = t;
+    logger.warn('[Recovery] Coinbase WS down during quoting-idle watchdog — restarting feed');
+    try {
+      await coinbaseIngest.restart();
+    } catch (err) {
+      logger.error(`[Recovery] Coinbase restart failed: ${err.message}`);
+    }
+  });
+
   // Wire orchestrator into API server so /health and /api/status reflect live state
   apiSetOrchestrator?.(orchestrator);
 

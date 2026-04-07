@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, mock, afterEach } from 'bun:test';
-import { AlertManager } from './alert-manager.js';
+import { AlertManager, normalizeAlertReason } from './alert-manager.js';
 
 // Capture the real fetch so we can restore it
 const originalFetch = global.fetch;
@@ -70,6 +70,25 @@ describe('AlertManager — Slack', () => {
     expect(slackCalls).toHaveLength(1);
   });
 
+  it('suppresses second sendAlert when only the idle duration suffix differs', async () => {
+    const fetchMock = makeFetchMock();
+    global.fetch = fetchMock;
+
+    const am = new AlertManager({
+      slackWebhookUrl: 'https://hooks.slack.com/test',
+      logger: makeLogger(),
+      cooldownMs: 600000,
+    });
+
+    await am.sendAlert({ reason: 'Quoting idle for 100s' });
+    await am.sendAlert({ reason: 'Quoting idle for 99999s' });
+
+    const slackCalls = fetchMock.mock.calls.filter(([url]) =>
+      url === 'https://hooks.slack.com/test'
+    );
+    expect(slackCalls).toHaveLength(1);
+  });
+
   it('fires both alerts when reasons differ (no cross-deduplication)', async () => {
     const fetchMock = makeFetchMock();
     global.fetch = fetchMock;
@@ -116,6 +135,44 @@ describe('AlertManager — Slack', () => {
       url === 'https://hooks.slack.com/test'
     );
     expect(slackCalls).toHaveLength(3);
+  });
+
+  it('sendRecovery clears cooldown for duration-variant alert keys', async () => {
+    const fetchMock = makeFetchMock();
+    global.fetch = fetchMock;
+
+    const am = new AlertManager({
+      slackWebhookUrl: 'https://hooks.slack.com/test',
+      logger: makeLogger(),
+      cooldownMs: 600000,
+    });
+
+    await am.sendAlert({ reason: 'Quoting idle for 500s' });
+    expect(am._lastAlertTime[normalizeAlertReason('Quoting idle for 500s')]).toBeDefined();
+
+    await am.sendRecovery({ reason: 'Quoting idle' });
+    expect(am._lastAlertTime['Quoting idle']).toBeUndefined();
+
+    const r = await am.sendAlert({ reason: 'Quoting idle for 1s' });
+    expect(r.sent).toBe(true);
+  });
+
+  it('sendRecovery with duration-suffixed reason clears the same normalized cooldown key', async () => {
+    const fetchMock = makeFetchMock();
+    global.fetch = fetchMock;
+
+    const am = new AlertManager({
+      slackWebhookUrl: 'https://hooks.slack.com/test',
+      logger: makeLogger(),
+      cooldownMs: 600000,
+    });
+
+    await am.sendAlert({ reason: 'Quoting idle for 500s' });
+    await am.sendRecovery({ reason: 'Quoting idle for 999s' });
+    expect(am._lastAlertTime[normalizeAlertReason('Quoting idle for 500s')]).toBeUndefined();
+
+    const r = await am.sendAlert({ reason: 'Quoting idle for 3s' });
+    expect(r.sent).toBe(true);
   });
 
   it('recovery message uses recovery icon_emoji', async () => {
