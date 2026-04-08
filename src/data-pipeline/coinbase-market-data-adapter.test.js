@@ -69,13 +69,13 @@ describe('CoinbaseMarketDataAdapter', () => {
     expect(ingest.start).not.toHaveBeenCalled();
   });
 
-  it('connect() starts ingest when the socket is not connected', async () => {
+  it('connect() hard-recycles ingest when the socket is not connected', async () => {
     const { ingest, priceAggregator } = baseMocks();
     ingest.connected = false;
     const adapter = new CoinbaseMarketDataAdapter({ ingest, priceAggregator });
     await adapter.connect();
-    expect(ingest.start).toHaveBeenCalledTimes(1);
-    expect(ingest.restart).not.toHaveBeenCalled();
+    expect(ingest.restart).toHaveBeenCalledTimes(1);
+    expect(ingest.start).not.toHaveBeenCalled();
   });
 
   it('connect() does not start or restart when already healthy', async () => {
@@ -117,6 +117,23 @@ describe('CoinbaseMarketDataAdapter', () => {
 
     expect(ingest.restart).toHaveBeenCalledTimes(1);
     expect(ingest.start).not.toHaveBeenCalled();
+  });
+
+  it('restart() reuses the same hard-recycle promise when connect() is already in flight', async () => {
+    const { ingest, priceAggregator } = baseMocks();
+    let resolveRestart;
+    ingest.connected = false;
+    ingest.restart.mockReturnValue(new Promise((resolve) => {
+      resolveRestart = resolve;
+    }));
+    const adapter = new CoinbaseMarketDataAdapter({ ingest, priceAggregator });
+
+    const connectPromise = adapter.connect();
+    const restartPromise = adapter.restart();
+
+    expect(ingest.restart).toHaveBeenCalledTimes(1);
+    resolveRestart();
+    await Promise.all([connectPromise, restartPromise]);
   });
 
   it('disconnect() stops the ingest', () => {

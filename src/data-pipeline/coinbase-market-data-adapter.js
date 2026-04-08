@@ -30,28 +30,7 @@ export class CoinbaseMarketDataAdapter {
 
   async connect() {
     if (this.isLoggedOn) return;
-    if (!this.ingest) throw new Error('Coinbase ingest is not configured');
-    if (this._connectPromise) return this._connectPromise;
-
-    const connectPromise = (async () => {
-      if (this.isLoggedOn) return;
-
-      if (this.ingest.connected) {
-        await this.ingest.restart();
-        return;
-      }
-
-      await this.ingest.start();
-    })();
-
-    this._connectPromise = connectPromise;
-    try {
-      await connectPromise;
-    } finally {
-      if (this._connectPromise === connectPromise) {
-        this._connectPromise = null;
-      }
-    }
+    await this.restart();
   }
 
   async restart() {
