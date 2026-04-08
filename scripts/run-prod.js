@@ -418,7 +418,7 @@ async function main() {
     lastCoinbaseRestartAt = t;
     logger.warn('[Recovery] Coinbase MD unhealthy during quoting-idle watchdog — restarting feed');
     try {
-      await coinbaseIngest.restart();
+      await orchestrator.marketDataFeed?.connect?.();
     } catch (err) {
       logger.error(`[Recovery] Coinbase restart failed: ${err.message}`);
     }

@@ -86,6 +86,28 @@ describe('CoinbaseMarketDataAdapter', () => {
     expect(ingest.restart).not.toHaveBeenCalled();
   });
 
+  it('connect() coalesces concurrent recovery calls into one restart', async () => {
+    const { ingest, priceAggregator } = baseMocks();
+    let resolveRestart;
+    ingest.restart.mockReturnValue(new Promise((resolve) => {
+      resolveRestart = resolve;
+    }));
+    priceAggregator.getStatus.mockReturnValue({
+      feeds: {
+        coinbase: { isStale: true, lastUpdate: 0, hasData: true },
+      },
+    });
+    const adapter = new CoinbaseMarketDataAdapter({ ingest, priceAggregator });
+
+    const p1 = adapter.connect();
+    const p2 = adapter.connect();
+
+    expect(ingest.restart).toHaveBeenCalledTimes(1);
+    resolveRestart();
+    await Promise.all([p1, p2]);
+    expect(adapter._connectPromise).toBeNull();
+  });
+
   it('disconnect() stops the ingest', () => {
     const { ingest, priceAggregator } = baseMocks();
     const adapter = new CoinbaseMarketDataAdapter({ ingest, priceAggregator });

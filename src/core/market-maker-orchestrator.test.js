@@ -414,6 +414,25 @@ describe('watchdog', () => {
 
     expect(mdConnectMock).toHaveBeenCalled();
   });
+
+  it('calls marketDataFeed.connect only once per watchdog tick when MD is stale', async () => {
+    const mdConnectMock = jest.fn().mockResolvedValue(undefined);
+    const mockMDFeed = new EventEmitter();
+    mockMDFeed.isLoggedOn = false;
+    mockMDFeed.connect = mdConnectMock;
+
+    const orch = makeOrch({ marketDataFeed: mockMDFeed });
+    orch.isRunning = true;
+    orch._intentionalStop = false;
+    orch.fixOE.isLoggedOn = true;
+    orch._lastMdUpdateTime = Date.now() - 130000;
+    orch._mdStaleThresholdMs = 120000;
+
+    orch._runWatchdog();
+    await Promise.resolve();
+
+    expect(mdConnectMock).toHaveBeenCalledTimes(1);
+  });
 });
 
 // -----------------------------------------------------------------------

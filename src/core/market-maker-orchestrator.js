@@ -810,7 +810,8 @@ export class MarketMakerOrchestrator extends EventEmitter {
     }
 
     // Check MD staleness
-    if (this._checkMdStaleness()) {
+    const mdStale = this._checkMdStaleness();
+    if (mdStale) {
       issues.push('MD feed stale');
     }
 
@@ -862,7 +863,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
           this.logger.error(`[WATCHDOG] OE reconnect failed: ${err.message}`)
         );
       }
-      if (this.marketDataFeed && !this.marketDataFeed.isLoggedOn && typeof this.marketDataFeed.connect === 'function') {
+      if (this.marketDataFeed && !mdStale && !this.marketDataFeed.isLoggedOn && typeof this.marketDataFeed.connect === 'function') {
         this.logger.info('[WATCHDOG] Force-reconnecting market data feed...');
         this.marketDataFeed.connect().catch(err =>
           this.logger.error(`[WATCHDOG] MD reconnect failed: ${err.message}`)
