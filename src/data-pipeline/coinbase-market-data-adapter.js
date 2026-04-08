@@ -53,6 +53,7 @@ export class CoinbaseMarketDataAdapter {
   async connect() {
     if (this.isLoggedOn) return;
     if (!this.ingest) throw new Error('Coinbase ingest is not configured');
+    if (this._connectPromise) return this._connectPromise;
 
     if (!this.ingest.connected && !this._hasAttemptedConnect) {
       this._hasAttemptedConnect = true;

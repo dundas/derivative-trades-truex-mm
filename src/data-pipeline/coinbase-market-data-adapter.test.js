@@ -119,6 +119,25 @@ describe('CoinbaseMarketDataAdapter', () => {
     expect(adapter._connectPromise).toBeNull();
   });
 
+  it('connect() coalesces concurrent cold-start calls without forcing restart', async () => {
+    const { ingest, priceAggregator } = baseMocks();
+    let resolveStart;
+    ingest.connected = false;
+    ingest.start.mockReturnValue(new Promise((resolve) => {
+      resolveStart = resolve;
+    }));
+    const adapter = new CoinbaseMarketDataAdapter({ ingest, priceAggregator });
+
+    const p1 = adapter.connect();
+    const p2 = adapter.connect();
+
+    expect(ingest.start).toHaveBeenCalledTimes(1);
+    expect(ingest.restart).not.toHaveBeenCalled();
+
+    resolveStart();
+    await Promise.all([p1, p2]);
+  });
+
   it('restart() hard-recycles even when the socket is disconnected', async () => {
     const { ingest, priceAggregator } = baseMocks();
     ingest.connected = false;
