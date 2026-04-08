@@ -108,6 +108,17 @@ describe('CoinbaseMarketDataAdapter', () => {
     expect(adapter._connectPromise).toBeNull();
   });
 
+  it('restart() hard-recycles even when the socket is disconnected', async () => {
+    const { ingest, priceAggregator } = baseMocks();
+    ingest.connected = false;
+    const adapter = new CoinbaseMarketDataAdapter({ ingest, priceAggregator });
+
+    await adapter.restart();
+
+    expect(ingest.restart).toHaveBeenCalledTimes(1);
+    expect(ingest.start).not.toHaveBeenCalled();
+  });
+
   it('disconnect() stops the ingest', () => {
     const { ingest, priceAggregator } = baseMocks();
     const adapter = new CoinbaseMarketDataAdapter({ ingest, priceAggregator });

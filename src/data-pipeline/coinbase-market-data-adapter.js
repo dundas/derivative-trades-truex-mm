@@ -54,6 +54,30 @@ export class CoinbaseMarketDataAdapter {
     }
   }
 
+  async restart() {
+    if (!this.ingest) throw new Error('Coinbase ingest is not configured');
+    if (this._connectPromise) return this._connectPromise;
+
+    const restartPromise = (async () => {
+      if (typeof this.ingest.restart === 'function') {
+        await this.ingest.restart();
+        return;
+      }
+
+      this.ingest.stop?.();
+      await this.ingest.start?.();
+    })();
+
+    this._connectPromise = restartPromise;
+    try {
+      await restartPromise;
+    } finally {
+      if (this._connectPromise === restartPromise) {
+        this._connectPromise = null;
+      }
+    }
+  }
+
   async subscribe() {
     // No-op: CoinbaseWsIngest subscribes during start()/restart().
   }
