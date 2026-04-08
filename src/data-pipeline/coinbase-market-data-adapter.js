@@ -4,6 +4,7 @@ export class CoinbaseMarketDataAdapter {
     this.priceAggregator = priceAggregator;
     this.exchange = exchange;
     this._connectPromise = null;
+    this._hasAttemptedConnect = false;
   }
 
   _feedStatus() {
@@ -46,8 +47,8 @@ export class CoinbaseMarketDataAdapter {
     if (this.isLoggedOn) return;
     if (!this.ingest) throw new Error('Coinbase ingest is not configured');
 
-    const hadPriorSuccessfulConnection = (this.ingest._successfulOpenCount ?? 0) > 0;
-    if (!this.ingest.connected && !hadPriorSuccessfulConnection) {
+    if (!this.ingest.connected && !this._hasAttemptedConnect) {
+      this._hasAttemptedConnect = true;
       await this._runExclusive(async () => {
         if (this.isLoggedOn) return;
         await this.ingest.start();
@@ -55,11 +56,13 @@ export class CoinbaseMarketDataAdapter {
       return;
     }
 
+    this._hasAttemptedConnect = true;
     await this.restart();
   }
 
   async restart() {
     if (!this.ingest) throw new Error('Coinbase ingest is not configured');
+    this._hasAttemptedConnect = true;
     await this._runExclusive(async () => {
       if (typeof this.ingest.restart === 'function') {
         await this.ingest.restart();
