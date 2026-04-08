@@ -28,16 +28,39 @@ export class CoinbaseMarketDataAdapter {
     return this.priceAggregator?.getAggregatedPrice?.()?.spread ?? null;
   }
 
+  async _runExclusive(task) {
+    if (this._connectPromise) return this._connectPromise;
+
+    const promise = task();
+    this._connectPromise = promise;
+    try {
+      await promise;
+    } finally {
+      if (this._connectPromise === promise) {
+        this._connectPromise = null;
+      }
+    }
+  }
+
   async connect() {
     if (this.isLoggedOn) return;
+    if (!this.ingest) throw new Error('Coinbase ingest is not configured');
+
+    const hadPriorSuccessfulConnection = (this.ingest._successfulOpenCount ?? 0) > 0;
+    if (!this.ingest.connected && !hadPriorSuccessfulConnection) {
+      await this._runExclusive(async () => {
+        if (this.isLoggedOn) return;
+        await this.ingest.start();
+      });
+      return;
+    }
+
     await this.restart();
   }
 
   async restart() {
     if (!this.ingest) throw new Error('Coinbase ingest is not configured');
-    if (this._connectPromise) return this._connectPromise;
-
-    const restartPromise = (async () => {
+    await this._runExclusive(async () => {
       if (typeof this.ingest.restart === 'function') {
         await this.ingest.restart();
         return;
@@ -45,16 +68,7 @@ export class CoinbaseMarketDataAdapter {
 
       this.ingest.stop?.();
       await this.ingest.start?.();
-    })();
-
-    this._connectPromise = restartPromise;
-    try {
-      await restartPromise;
-    } finally {
-      if (this._connectPromise === restartPromise) {
-        this._connectPromise = null;
-      }
-    }
+    });
   }
 
   async subscribe() {

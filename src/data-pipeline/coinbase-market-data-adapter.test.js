@@ -5,6 +5,7 @@ describe('CoinbaseMarketDataAdapter', () => {
   function baseMocks() {
     const ingest = {
       connected: true,
+      _successfulOpenCount: 0,
       start: jest.fn().mockResolvedValue(undefined),
       restart: jest.fn().mockResolvedValue(undefined),
       stop: jest.fn(),
@@ -69,9 +70,20 @@ describe('CoinbaseMarketDataAdapter', () => {
     expect(ingest.start).not.toHaveBeenCalled();
   });
 
-  it('connect() hard-recycles ingest when the socket is not connected', async () => {
+  it('connect() starts ingest on the first disconnected connect', async () => {
     const { ingest, priceAggregator } = baseMocks();
     ingest.connected = false;
+    ingest._successfulOpenCount = 0;
+    const adapter = new CoinbaseMarketDataAdapter({ ingest, priceAggregator });
+    await adapter.connect();
+    expect(ingest.start).toHaveBeenCalledTimes(1);
+    expect(ingest.restart).not.toHaveBeenCalled();
+  });
+
+  it('connect() hard-recycles a disconnected feed after a prior successful connection', async () => {
+    const { ingest, priceAggregator } = baseMocks();
+    ingest.connected = false;
+    ingest._successfulOpenCount = 1;
     const adapter = new CoinbaseMarketDataAdapter({ ingest, priceAggregator });
     await adapter.connect();
     expect(ingest.restart).toHaveBeenCalledTimes(1);
@@ -123,6 +135,7 @@ describe('CoinbaseMarketDataAdapter', () => {
     const { ingest, priceAggregator } = baseMocks();
     let resolveRestart;
     ingest.connected = false;
+    ingest._successfulOpenCount = 1;
     ingest.restart.mockReturnValue(new Promise((resolve) => {
       resolveRestart = resolve;
     }));
