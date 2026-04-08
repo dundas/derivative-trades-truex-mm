@@ -197,13 +197,13 @@ export class MarketMakerOrchestrator extends EventEmitter {
     await this.fixOE.connect();
     this.logger.info('[Orchestrator] FIX OE connected');
 
-    // 4. Connect market data feed (optional, non-blocking)
+    // 4. Connect market data feed (optional, non-blocking) — TrueX MD FIX or e.g. Coinbase adapter
     if (this.marketDataFeed) {
       try {
-        this.logger.info('[Orchestrator] Connecting TrueX market data feed...');
+        this.logger.info('[Orchestrator] Connecting market data feed...');
         await this.marketDataFeed.connect();
         await this.marketDataFeed.subscribe(this.symbol);
-        this.logger.info('[Orchestrator] TrueX market data feed connected');
+        this.logger.info('[Orchestrator] Market data feed connect/subscribe completed');
       } catch (err) {
         this.logger.warn(`[Orchestrator] Market data feed failed (non-fatal): ${err.message}`);
       }
@@ -804,9 +804,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
       issues.push('OE FIX not logged on');
     }
 
-    // Check MD FIX
+    // Check market data readiness
     if (this.marketDataFeed && !this.marketDataFeed.isLoggedOn) {
-      issues.push('MD FIX not logged on');
+      issues.push('MD feed not ready');
     }
 
     // Check MD staleness
@@ -863,7 +863,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
         );
       }
       if (this.marketDataFeed && !this.marketDataFeed.isLoggedOn && typeof this.marketDataFeed.connect === 'function') {
-        this.logger.info('[WATCHDOG] Force-reconnecting MD FIX session...');
+        this.logger.info('[WATCHDOG] Force-reconnecting market data feed...');
         this.marketDataFeed.connect().catch(err =>
           this.logger.error(`[WATCHDOG] MD reconnect failed: ${err.message}`)
         );
