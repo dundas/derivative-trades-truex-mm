@@ -4,6 +4,7 @@ export class CoinbaseMarketDataAdapter {
     this.priceAggregator = priceAggregator;
     this.exchange = exchange;
     this._connectPromise = null;
+    this._connectOp = null;
     this._hasAttemptedConnect = false;
   }
 
@@ -29,16 +30,22 @@ export class CoinbaseMarketDataAdapter {
     return this.priceAggregator?.getAggregatedPrice?.()?.spread ?? null;
   }
 
-  async _runExclusive(task) {
-    if (this._connectPromise) return this._connectPromise;
+  async _runExclusive(task, op, { upgradeFromStart = false } = {}) {
+    if (this._connectPromise) {
+      if (!upgradeFromStart || this._connectOp !== 'start') {
+        return this._connectPromise;
+      }
+    }
 
     const promise = task();
     this._connectPromise = promise;
+    this._connectOp = op;
     try {
       await promise;
     } finally {
       if (this._connectPromise === promise) {
         this._connectPromise = null;
+        this._connectOp = null;
       }
     }
   }
@@ -52,7 +59,7 @@ export class CoinbaseMarketDataAdapter {
       await this._runExclusive(async () => {
         if (this.isLoggedOn) return;
         await this.ingest.start();
-      });
+      }, 'start');
       return;
     }
 
@@ -71,7 +78,7 @@ export class CoinbaseMarketDataAdapter {
 
       this.ingest.stop?.();
       await this.ingest.start?.();
-    });
+    }, 'restart', { upgradeFromStart: true });
   }
 
   async subscribe() {

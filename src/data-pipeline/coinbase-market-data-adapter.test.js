@@ -148,17 +148,41 @@ describe('CoinbaseMarketDataAdapter', () => {
     await Promise.all([connectPromise, restartPromise]);
   });
 
-  it('connect() hard-recycles after an initial start attempt failed', async () => {
+  it('connect() hard-recycles after an initial start attempt resolved without a live connection', async () => {
     const { ingest, priceAggregator } = baseMocks();
     ingest.connected = false;
-    ingest.start.mockRejectedValueOnce(new Error('initial start failed'));
+    ingest.start.mockResolvedValueOnce(undefined);
     const adapter = new CoinbaseMarketDataAdapter({ ingest, priceAggregator });
 
-    await expect(adapter.connect()).rejects.toThrow('initial start failed');
+    await adapter.connect();
     expect(adapter._hasAttemptedConnect).toBe(true);
 
     await adapter.connect();
     expect(ingest.restart).toHaveBeenCalledTimes(1);
+  });
+
+  it('restart() upgrades an in-flight cold start to a hard recycle', async () => {
+    const { ingest, priceAggregator } = baseMocks();
+    let resolveStart;
+    let resolveRestart;
+    ingest.connected = false;
+    ingest.start.mockReturnValue(new Promise((resolve) => {
+      resolveStart = resolve;
+    }));
+    ingest.restart.mockReturnValue(new Promise((resolve) => {
+      resolveRestart = resolve;
+    }));
+    const adapter = new CoinbaseMarketDataAdapter({ ingest, priceAggregator });
+
+    const connectPromise = adapter.connect();
+    const restartPromise = adapter.restart();
+
+    expect(ingest.start).toHaveBeenCalledTimes(1);
+    expect(ingest.restart).toHaveBeenCalledTimes(1);
+
+    resolveRestart();
+    resolveStart();
+    await Promise.all([connectPromise, restartPromise]);
   });
 
   it('disconnect() stops the ingest', () => {
