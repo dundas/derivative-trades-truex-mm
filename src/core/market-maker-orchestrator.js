@@ -758,9 +758,12 @@ export class MarketMakerOrchestrator extends EventEmitter {
       // Close the quoting gate until fresh MD data arrives
       this._quotingGateEnabled = false;
       // Attempt MD reconnect
-      if (this.marketDataFeed && typeof this.marketDataFeed.connect === 'function') {
+      if (this.marketDataFeed && (typeof this.marketDataFeed.restart === 'function' || typeof this.marketDataFeed.connect === 'function')) {
         this.logger.info('[WATCHDOG] Attempting MD feed reconnect...');
-        this.marketDataFeed.connect().catch(err =>
+        const reconnect = typeof this.marketDataFeed.restart === 'function'
+          ? this.marketDataFeed.restart.bind(this.marketDataFeed)
+          : this.marketDataFeed.connect.bind(this.marketDataFeed);
+        reconnect().catch(err =>
           this.logger.error(`[WATCHDOG] MD reconnect failed: ${err.message}`)
         );
       }
@@ -863,9 +866,13 @@ export class MarketMakerOrchestrator extends EventEmitter {
           this.logger.error(`[WATCHDOG] OE reconnect failed: ${err.message}`)
         );
       }
-      if (this.marketDataFeed && !mdStale && !this.marketDataFeed.isLoggedOn && typeof this.marketDataFeed.connect === 'function') {
+      if (this.marketDataFeed && !mdStale && !this.marketDataFeed.isLoggedOn &&
+        (typeof this.marketDataFeed.restart === 'function' || typeof this.marketDataFeed.connect === 'function')) {
         this.logger.info('[WATCHDOG] Force-reconnecting market data feed...');
-        this.marketDataFeed.connect().catch(err =>
+        const reconnect = typeof this.marketDataFeed.restart === 'function'
+          ? this.marketDataFeed.restart.bind(this.marketDataFeed)
+          : this.marketDataFeed.connect.bind(this.marketDataFeed);
+        reconnect().catch(err =>
           this.logger.error(`[WATCHDOG] MD reconnect failed: ${err.message}`)
         );
       }
