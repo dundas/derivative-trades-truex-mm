@@ -71,10 +71,10 @@ const config = {
   heartbeatInterval: 30,
 
   // Quote Engine — CONSERVATIVE production sizing
-  //   3 levels per side (tight ladder)
+  //   2 levels per side (TrueX requested; matches available BTC inventory)
   //   Base size 0.01 BTC (~$1,000 at $100k)
-  //   Total per side: ~0.0244 BTC (0.01 + 0.008 + 0.0064)
-  levels: 3,
+  //   Total per side: ~0.018 BTC (0.01 + 0.008)
+  levels: 2,
   baseSpreadBps: 80,           // 0.8% spread — wider for safety in production
   levelSpacingTicks: 2,
   randomLevelSpacingBpsMin: 0.8,
