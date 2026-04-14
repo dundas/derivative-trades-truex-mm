@@ -190,7 +190,7 @@ Central coordinator that wires all components and manages the system lifecycle.
 Computes bid/ask ladder quotes with inventory skew, manages order lifecycle through FIX, and enforces rate limits.
 
 **Quote computation:**
-- N levels per side (configurable, default 5 for UAT, 3 for prod)
+- N levels per side (configurable, default 5 for UAT, 2 for prod — per TrueX exchange request)
 - Half-spread from mid: `(baseSpreadBps / 10000) * mid / 2`
 - Level offset: either tick-based (`level * levelSpacingTicks * tickSize`) or randomized bps ladder
 - Inventory skew applied from InventoryManager: widens the accumulating side, tightens the reducing side

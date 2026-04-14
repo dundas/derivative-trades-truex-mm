@@ -104,7 +104,7 @@ Note: API has typo `exeuted_qty` (not `executed_qty`).
 ## Configuration Defaults
 
 ### Production (run-prod.js)
-levels=3, baseSpreadBps=80, baseSizeBTC=0.01, maxPositionBTC=0.05,
+levels=2, baseSpreadBps=80, baseSizeBTC=0.01, maxPositionBTC=0.05,
 emergencyLimitBTC=0.06, minRepriceIntervalMs=5000, maxOrdersPerSecond=4,
 tickSize=0.50, priceBandPct=2.5, heartbeatInterval=30s.
 reconcileIntervalMs=300000 (5min), balanceRefreshIntervalMs=60000 (1min).
