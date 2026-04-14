@@ -89,3 +89,50 @@ describe('QuoteEngine._capSizeToBalance — floor rounding', () => {
     expect(result).toBe(0.0039);
   });
 });
+
+// ---------------------------------------------------------------------------
+// executeActions — replacement ordering (place-before-cancel)
+// ---------------------------------------------------------------------------
+
+describe('QuoteEngine.executeActions — replacement ordering', () => {
+  it('dispatches place before cancel for a replacement action', () => {
+    const callLog = [];
+    const fixConnection = {
+      sendMessage: jest.fn((fields) => {
+        callLog.push(fields['35']);
+        return Promise.resolve(true);
+      }),
+    };
+
+    const engine = new QuoteEngine({
+      inventoryManager: makeInventoryManager(),
+      fixConnection,
+      sizeDecimalPlaces: 4,
+      baseSizeBTC: 0.01,
+      levels: 3,
+      baseSpreadBps: 80,
+      tickSize: 0.5,
+      minNotional: 1.0,
+      sizeDecayFactor: 1.0,
+      levelSpacingTicks: 1,
+    });
+
+    engine.executeActions({
+      toCancel: [],
+      toPlace: [],
+      toReplace: [
+        {
+          cancel: 'old-id',
+          cancelOrder: { side: 'buy', price: 100, size: 0.01, level: 0, status: 'new', placedAt: Date.now() },
+          place: { side: 'buy', price: 101, size: 0.01, level: 0 },
+        },
+      ],
+    });
+
+    // Must have sent exactly 2 FIX messages
+    expect(callLog.length).toBe(2);
+    // place (35=D) must come before cancel (35=F)
+    expect(callLog[0]).toBe('D');
+    expect(callLog[1]).toBe('F');
+  });
+});

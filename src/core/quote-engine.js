@@ -286,7 +286,8 @@ export class QuoteEngine extends EventEmitter {
 
   /**
    * Execute actions through rate limiter.
-   * Priority: cancels first, then replacements, then new orders.
+   * Priority: pure cancels first, then replacements (place first, cancel second),
+   * then new places.
    */
   executeActions(actions) {
     // Reset rate counter if a second has passed
@@ -296,7 +297,11 @@ export class QuoteEngine extends EventEmitter {
       this.lastActionReset = now;
     }
 
-    // Build ordered action list: cancels first, then replaces, then places
+    // Build ordered action list.
+    // For replacements: place the new order FIRST, then cancel the old one.
+    // This ensures continuous market presence — the new quote is live before
+    // the old one disappears, eliminating single-sided market gaps on reprice.
+    // Pure cancels (no replacement) still go first to free up position headroom.
     const orderedActions = [];
 
     for (const c of actions.toCancel) {
@@ -304,8 +309,8 @@ export class QuoteEngine extends EventEmitter {
     }
 
     for (const r of actions.toReplace) {
-      orderedActions.push({ type: 'cancel', clOrdID: r.cancel, order: r.cancelOrder });
       orderedActions.push({ type: 'place', quote: r.place });
+      orderedActions.push({ type: 'cancel', clOrdID: r.cancel, order: r.cancelOrder });
     }
 
     for (const p of actions.toPlace) {

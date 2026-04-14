@@ -346,7 +346,7 @@ describe('watchdog', () => {
     expect(alertEvents).toHaveLength(0);
   });
 
-  it('reports MD FIX not logged on when marketDataFeed present but disconnected', () => {
+  it('reports MD feed not ready when marketDataFeed present but unhealthy', () => {
     const mockMDFeed = new EventEmitter();
     mockMDFeed.isLoggedOn = false;
 
@@ -361,7 +361,7 @@ describe('watchdog', () => {
     orch._runWatchdog();
 
     expect(alertEvents).toHaveLength(1);
-    expect(alertEvents[0].issues.some(i => i.includes('MD FIX not logged on'))).toBe(true);
+    expect(alertEvents[0].issues.some(i => i.includes('MD feed not ready'))).toBe(true);
   });
 
   it('calls _cancelAllOrdersViaRest when issues detected', async () => {
@@ -413,6 +413,67 @@ describe('watchdog', () => {
     await Promise.resolve();
 
     expect(mdConnectMock).toHaveBeenCalled();
+  });
+
+  it('prefers marketDataFeed.restart when watchdog detects MD not logged on', async () => {
+    const mdConnectMock = jest.fn().mockResolvedValue(undefined);
+    const mdRestartMock = jest.fn().mockResolvedValue(undefined);
+    const mockMDFeed = new EventEmitter();
+    mockMDFeed.isLoggedOn = false;
+    mockMDFeed.connect = mdConnectMock;
+    mockMDFeed.restart = mdRestartMock;
+
+    const orch = makeOrch({ marketDataFeed: mockMDFeed });
+    orch.isRunning = true;
+    orch._intentionalStop = false;
+    orch.fixOE.isLoggedOn = true;
+
+    orch._runWatchdog();
+    await Promise.resolve();
+
+    expect(mdRestartMock).toHaveBeenCalledTimes(1);
+    expect(mdConnectMock).not.toHaveBeenCalled();
+  });
+
+  it('calls marketDataFeed.connect only once per watchdog tick when MD is stale', async () => {
+    const mdConnectMock = jest.fn().mockResolvedValue(undefined);
+    const mockMDFeed = new EventEmitter();
+    mockMDFeed.isLoggedOn = false;
+    mockMDFeed.connect = mdConnectMock;
+
+    const orch = makeOrch({ marketDataFeed: mockMDFeed });
+    orch.isRunning = true;
+    orch._intentionalStop = false;
+    orch.fixOE.isLoggedOn = true;
+    orch._lastMdUpdateTime = Date.now() - 130000;
+    orch._mdStaleThresholdMs = 120000;
+
+    orch._runWatchdog();
+    await Promise.resolve();
+
+    expect(mdConnectMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('prefers marketDataFeed.restart when MD is stale', async () => {
+    const mdConnectMock = jest.fn().mockResolvedValue(undefined);
+    const mdRestartMock = jest.fn().mockResolvedValue(undefined);
+    const mockMDFeed = new EventEmitter();
+    mockMDFeed.isLoggedOn = false;
+    mockMDFeed.connect = mdConnectMock;
+    mockMDFeed.restart = mdRestartMock;
+
+    const orch = makeOrch({ marketDataFeed: mockMDFeed });
+    orch.isRunning = true;
+    orch._intentionalStop = false;
+    orch.fixOE.isLoggedOn = true;
+    orch._lastMdUpdateTime = Date.now() - 130000;
+    orch._mdStaleThresholdMs = 120000;
+
+    orch._runWatchdog();
+    await Promise.resolve();
+
+    expect(mdRestartMock).toHaveBeenCalledTimes(1);
+    expect(mdConnectMock).not.toHaveBeenCalled();
   });
 });
 
@@ -489,6 +550,38 @@ describe('getHealthStatus', () => {
     expect(status.uptime).toBeGreaterThan(0);
     expect(status.pnl).toBeDefined();
     expect(status.position).toBeDefined();
+  });
+
+  it('sets mdConnected true when marketDataFeed reports logged on (e.g. Coinbase adapter)', () => {
+    const mockMDFeed = new EventEmitter();
+    mockMDFeed.isLoggedOn = true;
+
+    const orch = makeOrch({ marketDataFeed: mockMDFeed });
+    orch.isRunning = true;
+    orch.startedAt = Date.now() - 5000;
+    orch.fixOE.isLoggedOn = true;
+    orch._lastRepriceTime = Date.now() - 1000;
+
+    const status = orch.getHealthStatus();
+
+    expect(status.mdConnected).toBe(true);
+    expect(status.status).toBe('healthy');
+  });
+
+  it('sets mdConnected false when marketDataFeed is not ready (e.g. stale Coinbase)', () => {
+    const mockMDFeed = new EventEmitter();
+    mockMDFeed.isLoggedOn = false;
+
+    const orch = makeOrch({ marketDataFeed: mockMDFeed });
+    orch.isRunning = true;
+    orch.startedAt = Date.now() - 5000;
+    orch.fixOE.isLoggedOn = true;
+    orch._lastRepriceTime = Date.now() - 1000;
+
+    const status = orch.getHealthStatus();
+
+    expect(status.mdConnected).toBe(false);
+    expect(status.status).toBe('unhealthy');
   });
 });
 

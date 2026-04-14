@@ -34,6 +34,7 @@ import { MarketMakerOrchestrator } from '../src/core/market-maker-orchestrator.j
 import { DataPipelineManager } from '../src/data-pipeline/data-pipeline-manager.js';
 import { PriceAggregator } from '../src/connectors/aggregator/PriceAggregator.ts';
 import { CoinbaseWsIngest } from '../src/data-pipeline/coinbase-ws-ingest.js';
+import { CoinbaseMarketDataAdapter } from '../src/data-pipeline/coinbase-market-data-adapter.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -70,10 +71,10 @@ const config = {
   heartbeatInterval: 30,
 
   // Quote Engine — CONSERVATIVE production sizing
-  //   3 levels per side (tight ladder)
+  //   2 levels per side (TrueX requested; matches available BTC inventory)
   //   Base size 0.01 BTC (~$1,000 at $100k)
-  //   Total per side: ~0.0244 BTC (0.01 + 0.008 + 0.0064)
-  levels: 3,
+  //   Total per side: ~0.018 BTC (0.01 + 0.008)
+  levels: 2,
   baseSpreadBps: 80,           // 0.8% spread — wider for safety in production
   levelSpacingTicks: 2,
   randomLevelSpacingBpsMin: 0.8,
@@ -194,6 +195,7 @@ function validateEnv() {
 
 let orchestrator = null;
 let coinbaseIngest = null;
+let coinbaseMdAdapter = null;
 let priceAggregator = null;
 let dataPipeline = null;
 let isShuttingDown = false;
@@ -312,6 +314,12 @@ async function main() {
     logger,
   });
 
+  coinbaseMdAdapter = new CoinbaseMarketDataAdapter({
+    ingest: coinbaseIngest,
+    priceAggregator,
+    exchange: 'coinbase',
+  });
+
   // 3. Start Coinbase feed (need prices before FIX connect)
   logger.info('[3/5] Connecting to Coinbase WebSocket...');
   await coinbaseIngest.start();
@@ -344,6 +352,7 @@ async function main() {
 
     // Price feed
     priceAggregator,
+    marketDataFeed: coinbaseMdAdapter,
 
     // Quote engine
     levels: config.levels,
@@ -399,13 +408,17 @@ async function main() {
   const COINBASE_RESTART_COOLDOWN_MS = 5 * 60 * 1000;
   orchestrator.on('watchdog-alert', async ({ issues }) => {
     const quotingIdle = issues.some((i) => i.includes('Quoting idle'));
-    if (!quotingIdle || coinbaseIngest.connected) return;
+    if (!quotingIdle) return;
+    // Recycle Coinbase when the MD path is unhealthy: hard disconnect or half-open/stale feed
+    // (adapter isLoggedOn requires socket connected + fresh non-stale ticker data)
+    const mdHealthy = orchestrator.marketDataFeed?.isLoggedOn === true;
+    if (mdHealthy) return;
     const t = Date.now();
     if (t - lastCoinbaseRestartAt < COINBASE_RESTART_COOLDOWN_MS) return;
     lastCoinbaseRestartAt = t;
-    logger.warn('[Recovery] Coinbase WS down during quoting-idle watchdog — restarting feed');
+    logger.warn('[Recovery] Coinbase MD unhealthy during quoting-idle watchdog — restarting feed');
     try {
-      await coinbaseIngest.restart();
+      await orchestrator.marketDataFeed?.restart?.();
     } catch (err) {
       logger.error(`[Recovery] Coinbase restart failed: ${err.message}`);
     }
