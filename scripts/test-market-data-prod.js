@@ -2,8 +2,8 @@
  * Quick test: listen to BTC-PYUSD orderbook on prod via SSH tunnel
  *
  * Prerequisites:
- *   SSH tunnel must be active:
- *   ssh -f -N -L 20484:10.20.6.11:20484 root@178.156.230.110
+ *   SSH tunnel must be active (substitute current TRUEX_PROD_HOST):
+ *   ssh -f -N -L 20484:${TRUEX_PROD_HOST}:20484 root@178.156.230.110
  *
  * Run: bun scripts/test-market-data-prod.js
  */
@@ -48,7 +48,7 @@ md.on('update', (data) => {
   console.log('Update:', JSON.stringify(data));
 });
 
-console.log('Connecting to 127.0.0.1:20484 (tunneled → 10.20.6.11:20484)');
+console.log('Connecting to 127.0.0.1:20484 (tunneled to TrueX prod via WireGuard)');
 console.log(`SenderCompID: ${process.env.TRUEX_SENDER_COMP_ID || 'DAVID1'}, TargetCompID: TRUEX_PROD_MD`);
 console.log('Ctrl+C to stop\n');
 

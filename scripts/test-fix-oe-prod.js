@@ -15,6 +15,11 @@ const TARGET = 'TRUEX_PROD_OE';
 const API_KEY = process.env.TRUEX_PROD_API_KEY || process.env.TRUEX_API_KEY;
 const API_SECRET = process.env.TRUEX_PROD_SECRET_KEY || process.env.TRUEX_SECRET_KEY;
 
+if (!API_KEY || !API_SECRET) {
+  console.error('ERROR: TRUEX_PROD_API_KEY and TRUEX_PROD_SECRET_KEY (or the TRUEX_API_KEY/TRUEX_SECRET_KEY fallbacks) must be set.');
+  process.exit(1);
+}
+
 function ts() {
   const n = new Date();
   const pad = (v, l = 2) => String(v).padStart(l, '0');
@@ -44,7 +49,7 @@ const logon = buildFIX({
   1137: 'FIX.5.0SP2',
 });
 
-console.log(`Connecting to ${HOST}:${PORT} (tunneled → 10.20.6.11:19484)`);
+console.log(`Connecting to ${HOST}:${PORT} (tunneled to TrueX prod via WireGuard)`);
 console.log(`SenderCompID: ${SENDER}, TargetCompID: ${TARGET}`);
 console.log(`API Key: ${API_KEY}\n`);
 
