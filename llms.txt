@@ -204,8 +204,8 @@ Servers:
   truex-pg-analytics 178.156.247.87  — PostgreSQL (db=truex_analytics, user=truex_mm)
 
 Network (inside Hetzner):
-  FIX OE: 127.0.0.1:3004 (fix-proxy) → WireGuard → 10.20.1.11:19484
-  REST:   direct http://10.20.1.11:9742 (WireGuard, no proxy needed)
+  FIX OE: 127.0.0.1:3004 (fix-proxy) → WireGuard → 10.20.6.11:19484
+  REST:   direct http://10.20.6.11:9742 (WireGuard, no proxy needed)
   Redis:  127.0.0.1:6379 (local, 256MB, appendonly)
   PG:     178.156.247.87:5432/truex_analytics
 
