@@ -38,7 +38,11 @@ function buildFIX(fields) {
 }
 
 function prettyFIX(raw) {
-  return raw.replace(/\x01/g, ' | ');
+  // Redact sensitive auth tags before logging — 553 = API key, 554 = HMAC signature.
+  return raw
+    .replace(/553=[^\x01]*/g, '553=***')
+    .replace(/554=[^\x01]*/g, '554=***')
+    .replace(/\x01/g, ' | ');
 }
 
 const sending = ts();
