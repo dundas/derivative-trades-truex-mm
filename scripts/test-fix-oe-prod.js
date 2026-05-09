@@ -27,7 +27,10 @@ function ts() {
 }
 
 function buildFIX(fields) {
-  const body = Object.entries(fields).map(([k, v]) => `${k}=${v}${SOH}`).join('');
+  // Accept ordered array of [tag, value] pairs — preserves FIX header/body
+  // order (Object.entries reorders integer-like keys numerically, which
+  // would put tag 34 before 35 and break logon).
+  const body = fields.map(([k, v]) => `${k}=${v}${SOH}`).join('');
   const len = Buffer.byteLength(body, 'utf8');
   const raw = `8=FIXT.1.1${SOH}9=${len}${SOH}` + body;
   const sum = [...Buffer.from(raw, 'utf8')].reduce((a, b) => a + b, 0) % 256;
@@ -43,15 +46,24 @@ const sig = crypto.createHmac('sha256', API_SECRET)
   .update(`${sending}A1${SENDER}${TARGET}${API_KEY}`)
   .digest('base64');
 
-const logon = buildFIX({
-  35: 'A', 49: SENDER, 56: TARGET, 34: '1', 52: sending,
-  98: '0', 108: '30', 141: 'Y', 553: API_KEY, 554: sig,
-  1137: 'FIX.5.0SP2',
-});
+const logon = buildFIX([
+  ['35', 'A'],
+  ['49', SENDER],
+  ['56', TARGET],
+  ['34', '1'],
+  ['52', sending],
+  ['98', '0'],
+  ['108', '30'],
+  ['141', 'Y'],
+  ['553', API_KEY],
+  ['554', sig],
+  ['1137', 'FIX.5.0SP2'],
+]);
 
+const maskedKey = API_KEY.length > 8 ? `${API_KEY.slice(0, 4)}***${API_KEY.slice(-4)}` : '***';
 console.log(`Connecting to ${HOST}:${PORT} (tunneled to TrueX prod via WireGuard)`);
 console.log(`SenderCompID: ${SENDER}, TargetCompID: ${TARGET}`);
-console.log(`API Key: ${API_KEY}\n`);
+console.log(`API Key: ${maskedKey}\n`);
 
 const socket = new net.Socket();
 socket.connect(PORT, HOST, () => {

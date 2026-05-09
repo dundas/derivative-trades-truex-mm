@@ -10,13 +10,21 @@
 
 import { TrueXMarketDataFeed } from '../src/core/truex-market-data.js';
 
+const apiKey = process.env.TRUEX_PROD_API_KEY || process.env.TRUEX_API_KEY;
+const apiSecret = process.env.TRUEX_PROD_SECRET_KEY || process.env.TRUEX_SECRET_KEY;
+
+if (!apiKey || !apiSecret) {
+  console.error('ERROR: TRUEX_PROD_API_KEY and TRUEX_PROD_SECRET_KEY (or the TRUEX_API_KEY/TRUEX_SECRET_KEY fallbacks) must be set.');
+  process.exit(1);
+}
+
 const md = new TrueXMarketDataFeed({
   host: '127.0.0.1',
   port: 20484,
   senderCompID: process.env.TRUEX_SENDER_COMP_ID || 'DAVID1',
   targetCompID: 'TRUEX_PROD_MD',
-  apiKey: process.env.TRUEX_PROD_API_KEY || process.env.TRUEX_API_KEY,
-  apiSecret: process.env.TRUEX_PROD_SECRET_KEY || process.env.TRUEX_SECRET_KEY,
+  apiKey,
+  apiSecret,
 });
 
 // Log all raw incoming FIX messages before anything else processes them
