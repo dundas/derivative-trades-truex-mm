@@ -87,6 +87,9 @@ socket.on('data', (data) => {
   setTimeout(() => socket.destroy(), 1000);
 });
 
+const safetyTimer = setTimeout(() => socket.destroy(), 10000);
 socket.on('error', (e) => console.error('Error:', e.message));
-socket.on('close', () => console.log('\nConnection closed.'));
-setTimeout(() => socket.destroy(), 10000);
+socket.on('close', () => {
+  clearTimeout(safetyTimer);
+  console.log('\nConnection closed.');
+});
