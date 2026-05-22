@@ -610,9 +610,7 @@ export class FIXConnection extends EventEmitter {
     if (this.logger.debug) {
       this.logger.debug(`[FIXConnection] Stored message seq ${currentSeqNum} (total: ${this.sentMessages.size})`);
     }
-    
-    this.logger.info(`[FIXConnection] Stored message seq ${currentSeqNum} (total: ${this.sentMessages.size})`);
-    
+
     // Debug: Log raw message being sent
     if (process.env.TRUEX_DEBUG_MODE === 'true') {
       const preview = message.replace(/\x01/g, '|').substring(0, 300);
@@ -738,6 +736,30 @@ export class FIXConnection extends EventEmitter {
       });
     }
     
+    // SequenceReset-GapFill can legitimately advance over a gap. Handle it
+    // before normal gap validation to avoid requesting the range it is filling.
+    if (msgType === '4' && message.fields['123'] === 'Y') {
+      const newSeqNo = parseInt(message.fields['36'], 10);
+      if (!Number.isFinite(msgSeqNum) || !Number.isFinite(newSeqNo)) {
+        this.logger.warn(
+          `[FIXConnection] Ignoring invalid SequenceReset-GapFill: ` +
+          `seq=${msgSeqNum}, newSeqNo=${message.fields['36']}, expected=${this.expectedSeqNum}`
+        );
+        return;
+      }
+      if (msgSeqNum === this.expectedSeqNum) {
+        if (newSeqNo <= this.expectedSeqNum || newSeqNo <= msgSeqNum) {
+          this.logger.warn(
+            `[FIXConnection] Ignoring stale/non-advancing SequenceReset-GapFill: ` +
+            `seq=${msgSeqNum}, newSeqNo=${message.fields['36']}, expected=${this.expectedSeqNum}`
+          );
+          return;
+        }
+        this.handleSequenceReset(message);
+        return;
+      }
+    }
+
     // Validate sequence number
     const seqStatus = this.validateSequence(msgSeqNum);
     if (seqStatus === 'DUPLICATE') {
@@ -851,7 +873,6 @@ export class FIXConnection extends EventEmitter {
       '52': this.getUTCTimestamp(),
       '7': beginSeqNo.toString(),       // BeginSeqNo
       '16': endSeqNo.toString(),        // EndSeqNo
-      '1137': this.defaultApplVerID
     };
     
     await this.sendMessage(fields);
@@ -882,7 +903,6 @@ export class FIXConnection extends EventEmitter {
       '34': this.msgSeqNum.toString(),
       '52': this.getUTCTimestamp(),
       '112': testReqID,                 // TestReqID
-      '1137': this.defaultApplVerID
     };
     
     await this.sendMessage(fields);
@@ -1066,7 +1086,6 @@ export class FIXConnection extends EventEmitter {
         '56': this.targetCompID,
         '34': this.msgSeqNum.toString(),
         '52': this.getUTCTimestamp(),
-        '1137': this.defaultApplVerID
       };
       
       await this.sendMessage(fields);
@@ -1199,7 +1218,6 @@ export class FIXConnection extends EventEmitter {
         '56': this.targetCompID,
         '34': this.msgSeqNum.toString(),
         '52': this.getUTCTimestamp(),
-        '1137': this.defaultApplVerID
       };
       
       await this.sendMessage(fields);

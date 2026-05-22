@@ -398,6 +398,7 @@ describe('FIXConnection', () => {
       expect(sentMessage).toContain('35=2'); // MsgType = Resend Request
       expect(sentMessage).toContain('7=5'); // BeginSeqNo
       expect(sentMessage).toContain('16=10'); // EndSeqNo
+      expect(sentMessage).not.toContain('1137=');
     });
     
     it('should emit resend-request event', async () => {
@@ -437,6 +438,7 @@ describe('FIXConnection', () => {
       
       expect(sentMessage).toContain('35=0'); // MsgType = Heartbeat
       expect(sentMessage).toContain('112=TEST123'); // TestReqID
+      expect(sentMessage).not.toContain('1137=');
     });
   });
   
@@ -494,6 +496,7 @@ describe('FIXConnection', () => {
       expect(mockSocketInstance.write).toHaveBeenCalled();
       const sentMessage = mockSocketInstance.write.mock.calls[0][0];
       expect(sentMessage).toContain('35=0'); // Heartbeat
+      expect(sentMessage).not.toContain('1137=');
 
       connection.stopHeartbeat();
     });
@@ -539,6 +542,7 @@ describe('FIXConnection', () => {
       // Verify logout message sent
       const sentMessage = mockSocketInstance.write.mock.calls[0][0];
       expect(sentMessage).toContain('35=5'); // MsgType = Logout
+      expect(sentMessage).not.toContain('1137=');
       
       // Verify socket destroyed
       expect(mockSocketInstance.destroy).toHaveBeenCalled();

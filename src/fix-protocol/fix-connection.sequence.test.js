@@ -53,6 +53,88 @@ describe('FIXConnection sequence handling (7.4)', () => {
     expect(connection.expectedSeqNum).toBe(3);
   });
 
+  it('requests resend for gap-fill SequenceReset received above expected sequence', () => {
+    const messageHandler = jest.fn();
+    const resetHandler = jest.fn();
+    jest.spyOn(connection, 'requestResend').mockImplementation(() => {});
+    connection.on('message', messageHandler);
+    connection.on('sequence-reset', resetHandler);
+    connection.expectedSeqNum = 10;
+
+    const message = {
+      fields: {
+        '35': '4',
+        '34': '15',
+        '123': 'Y',
+        '36': '20',
+      }
+    };
+    connection.handleMessage(message);
+
+    expect(connection.requestResend).toHaveBeenCalledWith(10, 14);
+    expect(messageHandler).not.toHaveBeenCalled();
+    expect(connection.expectedSeqNum).toBe(10);
+    expect(resetHandler).not.toHaveBeenCalled();
+  });
+
+  it('ignores stale gap-fill SequenceReset without moving expected sequence backward', () => {
+    const resetHandler = jest.fn();
+    connection.on('sequence-reset', resetHandler);
+    connection.expectedSeqNum = 20;
+
+    connection.handleMessage({
+      fields: {
+        '35': '4',
+        '34': '15',
+        '123': 'Y',
+        '36': '18',
+      }
+    });
+
+    expect(connection.expectedSeqNum).toBe(20);
+    expect(resetHandler).not.toHaveBeenCalled();
+  });
+
+  it('requests resend for non-advancing gap-fill SequenceReset above expected sequence', () => {
+    const resetHandler = jest.fn();
+    jest.spyOn(connection, 'requestResend').mockImplementation(() => {});
+    connection.on('sequence-reset', resetHandler);
+    connection.expectedSeqNum = 10;
+
+    connection.handleMessage({
+      fields: {
+        '35': '4',
+        '34': '15',
+        '123': 'Y',
+        '36': '15',
+      }
+    });
+
+    expect(connection.requestResend).toHaveBeenCalledWith(10, 14);
+    expect(connection.expectedSeqNum).toBe(10);
+    expect(resetHandler).not.toHaveBeenCalled();
+  });
+
+  it('ignores exact-sequence gap-fill SequenceReset when NewSeqNo does not advance', () => {
+    const resetHandler = jest.fn();
+    jest.spyOn(connection, 'requestResend').mockImplementation(() => {});
+    connection.on('sequence-reset', resetHandler);
+    connection.expectedSeqNum = 10;
+
+    connection.handleMessage({
+      fields: {
+        '35': '4',
+        '34': '10',
+        '123': 'Y',
+        '36': '10',
+      }
+    });
+
+    expect(connection.requestResend).not.toHaveBeenCalled();
+    expect(connection.expectedSeqNum).toBe(10);
+    expect(resetHandler).not.toHaveBeenCalled();
+  });
+
   it('emits resend-failed-reset and forces session reset after MAX_RESEND_ATTEMPTS', async () => {
     const resetHandler = jest.fn();
     jest.spyOn(connection, 'requestResend').mockImplementation(() => {});
