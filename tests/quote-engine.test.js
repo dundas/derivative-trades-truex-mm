@@ -433,6 +433,18 @@ describe('QuoteEngine', () => {
       expect(fixMock.sendMessage).toHaveBeenCalledTimes(2);
     });
 
+    it('should not treat provider books without timestamps as fresh marketability data', () => {
+      const fixMock = createMockFix();
+      const engine = createEngine({
+        fixConnection: fixMock,
+        marketDataProvider: () => ({ bestBid: 99, bestAsk: 100 }),
+      });
+
+      expect(engine._sendNewOrder({ side: 'buy', price: 100, size: 0.1, level: 1 })).not.toBeNull();
+      expect(fixMock.sendMessage).toHaveBeenCalledTimes(1);
+      expect(engine.getQuoteStatus().lastMarketableAloSkip).toBeNull();
+    });
+
     it('should recheck queued ALO orders before final send', () => {
       const fixMock = createMockFix();
       const engine = createEngine({ fixConnection: fixMock, maxOrdersPerSecond: 1 });
@@ -474,6 +486,33 @@ describe('QuoteEngine', () => {
 
       expect(fixMock.sendMessage).toHaveBeenCalledTimes(1);
       expect(engine.getQuoteStatus().lastMarketableAloSkip.reason).toBe('marketable-post-only');
+    });
+
+    it('should expire pending replacements even when cancel ack never arrives', () => {
+      const fixMock = createMockFix();
+      const engine = createEngine({
+        fixConnection: fixMock,
+        maxOrdersPerSecond: 100,
+        levels: 1,
+        pendingReplacementTimeoutMs: 1,
+      });
+      const oldClOrdID = 'OLD001';
+      const oldOrder = { side: 'sell', price: 101, size: 0.1, level: 1, status: 'active', placedAt: Date.now() };
+      engine.activeOrders.set(oldClOrdID, oldOrder);
+
+      engine.executeActions({
+        toCancel: [],
+        toPlace: [],
+        toReplace: [{ cancel: oldClOrdID, cancelOrder: oldOrder, place: { side: 'sell', price: 102, size: 0.1, level: 1 } }],
+      });
+
+      const pending = engine.pendingReplacements.get(oldClOrdID);
+      pending.createdAt = Date.now() - 100;
+      engine.drainQueue();
+
+      expect(engine.pendingReplacements.has(oldClOrdID)).toBe(false);
+      expect(engine.activeOrders.get(oldClOrdID).status).toBe('active');
+      expect(engine.getQuoteStatus().suppressed.at(-1).reason).toBe('pending-replacement-expired');
     });
 
     it('should omit ALO only for taker orders that pass post-fee edge threshold', () => {

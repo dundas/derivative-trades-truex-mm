@@ -133,6 +133,31 @@ describe('FIXConnection', () => {
       expect(connection.isLoggedOn).toBe(true);
     }, 10000);
 
+    it('should remove temporary logon reject handler after successful logon', async () => {
+      const connectPromise = connection.connect();
+      mockSocketInstance = connection.socket;
+      const connectCallback = mockSocketInstance.connect.mock.calls[0][2];
+      connectCallback();
+
+      await new Promise(resolve => {
+        const check = setInterval(() => {
+          if (mockSocketInstance.write.mock.calls.length > 0) {
+            clearInterval(check);
+            const logonResponse = '8=FIXT.1.1\x019=50\x0135=A\x0149=TRUEX_UAT_OE\x0156=CLI_CLIENT\x0134=1\x0152=20251007-13:40:00.000\x0110=123\x01';
+            mockSocketInstance.emit('data', Buffer.from(logonResponse));
+            resolve();
+          }
+        }, 20);
+      });
+
+      await connectPromise;
+      connection.emit('reject', { reason: 'Business reject after logon', message: { fields: { '35': '3' } } });
+
+      expect(mockSocketInstance.destroy).not.toHaveBeenCalled();
+      expect(connection.socket).toBe(mockSocketInstance);
+      expect(connection.reconnectTimer).toBeNull();
+    }, 10000);
+
     it('should reject on connection timeout', async () => {
       // Create a connection with very short timeout for testing
       const shortTimeoutConnection = new FIXConnection({

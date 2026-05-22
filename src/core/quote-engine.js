@@ -99,7 +99,7 @@ export class QuoteEngine extends EventEmitter {
       bestAsk,
       bestBidSize: book.bestBidSize ?? null,
       bestAskSize: book.bestAskSize ?? null,
-      timestamp: book.timestamp || Date.now(),
+      timestamp: book.timestamp ?? null,
     };
   }
 
@@ -108,6 +108,7 @@ export class QuoteEngine extends EventEmitter {
    */
   onPriceUpdate(aggregatedPrice) {
     if (!aggregatedPrice) return;
+    this._expirePendingReplacements();
 
     // Gate on confidence
     if (aggregatedPrice.confidence < this.config.confidenceThreshold) {
@@ -632,6 +633,7 @@ export class QuoteEngine extends EventEmitter {
    * Return a summary of current quoting status.
    */
   getQuoteStatus() {
+    this._expirePendingReplacements();
     let bidLevels = 0;
     let askLevels = 0;
 
@@ -713,6 +715,7 @@ export class QuoteEngine extends EventEmitter {
    * Drain queued actions (call periodically from orchestrator or timer).
    */
   drainQueue() {
+    this._expirePendingReplacements();
     const now = Date.now();
     if (now - this.lastActionReset >= 1000) {
       this.actionsThisSecond = 0;
@@ -868,6 +871,19 @@ export class QuoteEngine extends EventEmitter {
       return;
     }
     this._dispatchAction({ type: 'place', quote: pending.quote });
+  }
+
+  _expirePendingReplacements() {
+    const now = Date.now();
+    for (const [origClOrdID, pending] of this.pendingReplacements.entries()) {
+      if (now - pending.createdAt <= this.config.pendingReplacementTimeoutMs) continue;
+      this.pendingReplacements.delete(origClOrdID);
+      const original = this.activeOrders.get(origClOrdID);
+      if (original?.status === 'cancelling') {
+        original.status = 'active';
+      }
+      this._recordSuppression(pending.quote, 'pending-replacement-expired');
+    }
   }
 
   _buildLevelSpacingBpsLadder() {

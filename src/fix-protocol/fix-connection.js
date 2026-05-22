@@ -416,6 +416,10 @@ export class FIXConnection extends EventEmitter {
                 logonTimeout = null;
                 this.removeListener('message', logonHandler);
                 logonHandler = null;
+                if (rejectHandler) {
+                  this.removeListener('reject', rejectHandler);
+                  rejectHandler = null;
+                }
 
                 // Check SessionStatus (1409) — non-zero means the exchange
                 // accepted the TCP logon but flagged a session-level problem.
