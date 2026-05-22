@@ -52,6 +52,10 @@ export class TrueXMarketDataFeed extends EventEmitter {
     this._onDisconnect = this._handleDisconnect.bind(this);
   }
 
+  get isLoggedOn() {
+    return this.fix.isLoggedOn;
+  }
+
   /**
    * Connect to the TrueX Market Data FIX endpoint
    */

@@ -203,11 +203,27 @@ Computes bid/ask ladder quotes with inventory skew, manages order lifecycle thro
 - Skip orders in `pending` or `cancelling` status (wait for confirmation)
 - Reprice if price difference >= `repriceThresholdTicks`
 - Cancel unmatched active orders (orphans in local state)
-- Rate limited: `maxOrdersPerSecond` (default 4-8), overflow queued
+- Default replacement mode is `passive-safe`: cancel the old quote first, hold the replacement as pending, then release it only after the cancel ack. `replaceMode='place-before-cancel'` is available only as an explicit legacy override.
+- Pending replacements expire after `pendingReplacementTimeoutMs` and are reported in quote status as suppressed levels.
+- Rate limited: `maxOrdersPerSecond` (default 4-8), overflow queued. Queued placements and pending replacement releases are rechecked immediately before FIX send.
+
+**TrueX book and ALO safety:**
+- The orchestrator injects the latest TrueX best bid/ask into QuoteEngine through `marketDataProvider` / `updateTrueXBook()`.
+- `truexBookStaleThresholdMs` controls whether the book is fresh enough for marketability decisions.
+- Post-only quotes use `18=6` and are checked at send time. A buy at or above fresh best ask, or a sell at or below fresh best bid, is suppressed by default with reason `marketable-post-only`.
+- `marketablePostOnlyAction='skip'` is the default. `slide` can move a marketable ALO one tick away from the opposite side, but should be enabled only after venue behavior is confirmed.
+- Missing or stale TrueX book means marketability is unknown; existing maker quoting remains allowed, but intentional taker orders require explicit fair value/execution inputs and remain disabled unless configured.
 
 **FIX messages sent:**
-- New Order Single (`35=D`): tags 11, 18 (ALO), 55, 54, 38, 44, 40=2 (Limit), 59=1 (GTC), Party ID block (453/448/452)
+- New Order Single (`35=D`): tags 11, 18 (ALO, omitted only for intentional taker orders), 55, 54, 38, 44, 40=2 (Limit), 59=1 (GTC), Party ID block (453/448/452)
 - Order Cancel Request (`35=F`): tags 11, 41, Party ID block. No tag 54 (Side).
+
+**Optional taker path:**
+- `allowTakerOrders=false` by default; no aggressive order is sent unless this is explicitly enabled.
+- Taker-intent orders omit tag `18=6` and require explicit `fairValue` and execution price inputs.
+- Post-fee edge is `grossEdgeBps - truexTakerFeeBps - takeSlippageBufferBps - takeHedgeBufferBps`; it must be at least `minTakeEdgeBps`.
+- `maxTakerOrdersPerMinute` and `maxTakerNotionalPerMinute` enforce minute-window taker budgets when set to positive values.
+- Active orders and fills carry `orderIntent`, `liquidityRoleExpected`, and final `isMaker`; orchestrator forwards `isMaker=false` taker fills to PnL and audit/data records.
 
 **Rejection handling:**
 - `consecutiveRejects` counter, backoff for 5 seconds after 3+ consecutive rejects
@@ -299,6 +315,10 @@ FIX 5.0 SP2 over FIXT.1.1 transport layer.
 - Strict FIX field ordering enforced (header fields first, then body fields)
 - Sensitive tags (553/554) redacted in logs
 - 2-second delay after TCP connect for proxy connection establishment
+- Connection attempts are generation-guarded so stale socket callbacks, delayed logon setup, and timeout handlers cannot mutate a newer connection.
+- Duplicate-logon rejects containing `Already authenticated` emit `duplicate-logon`, tear down only the attempted socket, and schedule reconnect through the normal lifecycle.
+- Repeated unresolved sequence gaps force a session reset: local and Redis sequence counters are cleared, next logon uses `141=Y` with `34=1`, and reconnect is scheduled once.
+- Inbound SequenceReset-GapFill (`35=4`, `123=Y`) advances `expectedSeqNum` without emitting application messages or looping resend requests.
 
 ### DataPipelineManager (`src/data-pipeline/data-pipeline-manager.js`)
 

@@ -713,6 +713,32 @@ describe('MarketMakerOrchestrator', () => {
       await orchestrator.stop();
     });
 
+    test('routes intentional taker fills to PnLTracker as taker', async () => {
+      const { orchestrator, mocks } = createOrchestrator();
+      await orchestrator.start();
+
+      mocks.quoteEngine.emit('fill', {
+        side: 'buy',
+        price: 99950,
+        size: 0.1,
+        clOrdID: 'QTAKER',
+        execID: 'exec-taker',
+        orderIntent: 'taker_opportunity',
+        liquidityRoleExpected: 'taker',
+        isMaker: false,
+      });
+
+      const pnlCall = mocks.pnlTracker.onFill.mock.calls[0][0];
+      expect(pnlCall.isMaker).toBe(false);
+      expect(pnlCall.venue).toBe('truex');
+
+      const auditCall = mocks.auditLogger.logFillEvent.mock.calls[0][0];
+      expect(auditCall.orderIntent).toBe('taker_opportunity');
+      expect(auditCall.liquidityRoleExpected).toBe('taker');
+      expect(auditCall.isMaker).toBe(false);
+      await orchestrator.stop();
+    });
+
     test('logs to audit logger when available', async () => {
       const { orchestrator, mocks } = createOrchestrator();
       await orchestrator.start();
@@ -1163,6 +1189,44 @@ describe('MarketMakerOrchestrator', () => {
       await orchestrator.stop();
     });
 
+    test('dedupes dataPipeline fills when QuoteEngine also emits the execution-report fill', async () => {
+      const dataPipeline = createMockDataPipeline();
+      const quoteEngine = createMockQuoteEngine();
+      quoteEngine.onExecutionReport = jest.fn((fields) => {
+        quoteEngine.emit('fill', {
+          side: fields['54'] === '1' ? 'buy' : 'sell',
+          price: Number(fields['31']),
+          size: Number(fields['32']),
+          clOrdID: fields['11'],
+          execID: fields['17'],
+          orderIntent: 'taker_opportunity',
+          liquidityRoleExpected: 'taker',
+          isMaker: false,
+        });
+      });
+      const { orchestrator, mocks } = createOrchestrator({ dataPipeline, dataManager: null, quoteEngine });
+      await orchestrator.start();
+
+      mocks.fixConnection.emit('message', {
+        fields: {
+          '35': '8',
+          '11': 'Q001',
+          '17': 'exec-1',
+          '39': '2',
+          '31': '100000',
+          '32': '0.5',
+          '54': '1',
+        },
+      });
+
+      expect(dataPipeline.addFill).toHaveBeenCalledTimes(1);
+      const fill = dataPipeline.addFill.mock.calls[0][0];
+      expect(fill.fillId).toBe('Q001-exec-1');
+      expect(fill.orderIntent).toBe('taker_opportunity');
+      expect(fill.isMaker).toBe(false);
+      await orchestrator.stop();
+    });
+
     test('logs all FIX messages to dataPipeline.logFIXMessage()', async () => {
       const dataPipeline = createMockDataPipeline();
       const { orchestrator, mocks } = createOrchestrator({ dataPipeline });
@@ -1284,8 +1348,10 @@ describe('MarketMakerOrchestrator', () => {
       const { orchestrator, mocks } = createOrchestrator({ drainQueueIntervalMs: 50 });
       await orchestrator.start();
 
-      // Wait for at least 2 intervals
-      await new Promise(r => setTimeout(r, 130));
+      const deadline = Date.now() + 500;
+      while (mocks.quoteEngine.drainQueue.mock.calls.length < 2 && Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 10));
+      }
 
       expect(mocks.quoteEngine.drainQueue.mock.calls.length).toBeGreaterThanOrEqual(2);
       await orchestrator.stop();

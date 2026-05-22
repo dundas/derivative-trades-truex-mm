@@ -166,6 +166,52 @@ describe('FIXConnection', () => {
 
       await expect(shortTimeoutConnection.connect()).rejects.toThrow('Connection timeout');
     }, 5000);
+
+    it('should emit duplicate-logon and tear down attempted socket on Already authenticated reject', async () => {
+      const duplicateHandler = jest.fn();
+      connection.on('duplicate-logon', duplicateHandler);
+
+      const connectPromise = connection.connect();
+      mockSocketInstance = connection.socket;
+      const connectCallback = mockSocketInstance.connect.mock.calls[0][2];
+      connectCallback();
+
+      await new Promise(resolve => {
+        const check = setInterval(() => {
+          if (mockSocketInstance.write.mock.calls.length > 0) {
+            clearInterval(check);
+            const reject = '8=FIXT.1.1\x019=92\x0135=3\x0149=TRUEX_UAT_OE\x0156=CLI_CLIENT\x0134=1\x0152=20251007-13:40:00.000\x0158=Already authenticated cannot logon again\x0110=123\x01';
+            mockSocketInstance.emit('data', Buffer.from(reject));
+            resolve();
+          }
+        }, 20);
+      });
+
+      await expect(connectPromise).rejects.toThrow('Already authenticated');
+      expect(duplicateHandler).toHaveBeenCalledWith({
+        reason: 'Already authenticated cannot logon again',
+        message: expect.any(Object),
+      });
+      expect(mockSocketInstance.destroy).toHaveBeenCalled();
+      expect(connection.socket).toBeNull();
+      expect(connection.reconnectTimer).not.toBeNull();
+      clearTimeout(connection.reconnectTimer);
+      connection.reconnectTimer = null;
+    }, 10000);
+
+    it('should ignore stale disconnect callbacks after a newer attempt owns the socket', () => {
+      const oldSocket = new MockSocket();
+      const newSocket = new MockSocket();
+      connection.socket = newSocket;
+      connection._connectionGeneration = 2;
+      connection.isConnected = true;
+
+      connection.handleDisconnect(oldSocket, 1);
+
+      expect(connection.socket).toBe(newSocket);
+      expect(connection.isConnected).toBe(true);
+      expect(connection.reconnectTimer).toBeNull();
+    });
   });
   
   describe('sendLogon()', () => {

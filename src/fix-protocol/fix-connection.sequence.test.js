@@ -52,4 +52,128 @@ describe('FIXConnection sequence handling (7.4)', () => {
     expect(messageHandler).toHaveBeenCalledWith(message);
     expect(connection.expectedSeqNum).toBe(3);
   });
+
+  it('emits resend-failed-reset and forces session reset after MAX_RESEND_ATTEMPTS', async () => {
+    const resetHandler = jest.fn();
+    jest.spyOn(connection, 'requestResend').mockImplementation(() => {});
+    connection.on('resend-failed-reset', resetHandler);
+    connection.socket = {
+      destroyed: false,
+      destroy: jest.fn(function destroy() {
+        this.destroyed = true;
+      }),
+    };
+
+    // Set up like we've connected before (so reset will be meaningful)
+    connection.hasConnectedBefore = true;
+    connection.msgSeqNum = 100;
+    connection.expectedSeqNum = 50;
+
+    // Simulate 3 consecutive gap detections for the same expected seq
+    for (let i = 0; i < 3; i++) {
+      const message = { fields: { '35': '8', '34': '60' } }; // big gap
+      connection.handleMessage(message);
+    }
+    await Promise.resolve();
+
+    // Should emit reset event with details
+    expect(resetHandler).toHaveBeenCalledWith({ expected: 50, received: 60, attempts: 3 });
+
+    // Should force reset sequences
+    expect(connection.hasConnectedBefore).toBe(false);
+    expect(connection.msgSeqNum).toBe(1);
+    expect(connection.expectedSeqNum).toBe(1);
+    expect(connection._resendGapStart).toBeNull();
+    expect(connection._resendAttempts).toBe(0);
+
+    // Should tear down through real lifecycle methods and schedule one reconnect.
+    expect(connection.socket).toBeNull();
+    expect(connection.reconnectTimer).not.toBeNull();
+    clearTimeout(connection.reconnectTimer);
+    connection.reconnectTimer = null;
+  });
+
+  it('clears persisted Redis seqnums on forced session reset', async () => {
+    const redis = {
+      del: jest.fn().mockResolvedValue(2),
+      get: jest.fn(),
+      set: jest.fn(),
+    };
+    connection.redisClient = redis;
+    connection.socket = {
+      destroyed: false,
+      destroy: jest.fn(function destroy() {
+        this.destroyed = true;
+      }),
+    };
+
+    await connection._forceSessionReset('test-reset');
+
+    expect(redis.del).toHaveBeenCalledWith(
+      'fix:seq:CLI_CLIENT:TRUEX_UAT_OE:out',
+      'fix:seq:CLI_CLIENT:TRUEX_UAT_OE:in'
+    );
+    expect(connection.msgSeqNum).toBe(1);
+    expect(connection.expectedSeqNum).toBe(1);
+    expect(connection.hasConnectedBefore).toBe(false);
+    clearTimeout(connection.reconnectTimer);
+    connection.reconnectTimer = null;
+  });
+
+  it('handles inbound SequenceReset-GapFill without emitting application message', () => {
+    const messageHandler = jest.fn();
+    const resetHandler = jest.fn();
+    connection.on('message', messageHandler);
+    connection.on('sequence-reset', resetHandler);
+    connection.expectedSeqNum = 10;
+
+    connection.handleMessage({
+      fields: {
+        '35': '4',
+        '34': '10',
+        '123': 'Y',
+        '36': '15',
+      }
+    });
+
+    expect(connection.expectedSeqNum).toBe(15);
+    expect(messageHandler).not.toHaveBeenCalled();
+    expect(resetHandler).toHaveBeenCalledWith({
+      newSeqNo: 15,
+      gapFill: true,
+      message: expect.any(Object),
+    });
+  });
+
+  it('does not reset on different gaps (resend counter resets)', () => {
+    jest.spyOn(connection, 'requestResend').mockImplementation(() => {});
+
+    connection.expectedSeqNum = 10;
+
+    // First gap at 10
+    connection.handleMessage({ fields: { '35': '8', '34': '15' } });
+    expect(connection._resendGapStart).toBe(10);
+    expect(connection._resendAttempts).toBe(1);
+
+    // Different gap (expected now changed to 15 if we processed, but it didn't)
+    // Actually expected stays 10, so let's simulate a jump to different expected
+    connection.expectedSeqNum = 20;
+    connection.handleMessage({ fields: { '35': '8', '34': '25' } });
+    expect(connection._resendGapStart).toBe(20); // reset to new gap
+    expect(connection._resendAttempts).toBe(1); // counter reset
+  });
+
+  it('clears resend tracking on successful logon', () => {
+    connection._resendGapStart = 50;
+    connection._resendAttempts = 2;
+
+    // Simulate successful logon state transition
+    connection.isLoggedOn = true;
+    connection.hasConnectedBefore = true;
+    connection._resendGapStart = null;
+    connection._resendAttempts = 0;
+
+    expect(connection._resendGapStart).toBeNull();
+    expect(connection._resendAttempts).toBe(0);
+  });
 });

@@ -357,6 +357,241 @@ describe('QuoteEngine', () => {
       engine.drainQueue();
       expect(engine.actionQueue.length).toBe(0);
     });
+
+    it('should cancel old order before placing replacement by default on TrueX', () => {
+      // High rate limit so nothing gets deferred
+      const fixMock = createMockFix();
+      const engine = createEngine({ maxOrdersPerSecond: 100, levels: 1, fixConnection: fixMock });
+
+      engine.lastActionReset = Date.now();
+      engine.actionsThisSecond = 0;
+
+      // Simulate one active order that needs repricing
+      const oldClOrdID = 'OLD001';
+      const oldOrder = { side: 'buy', price: 99000, size: 0.1, level: 1, status: 'active', placedAt: Date.now() };
+      engine.activeOrders.set(oldClOrdID, oldOrder);
+
+      const newQuote = { side: 'buy', price: 99500, size: 0.1, level: 1 };
+
+      const actions = {
+        toCancel: [],
+        toPlace: [],
+        toReplace: [{ cancel: oldClOrdID, cancelOrder: oldOrder, place: newQuote }],
+      };
+
+      engine.executeActions(actions);
+
+      expect(fixMock.sendMessage).toHaveBeenCalledTimes(1);
+      expect(fixMock.sendMessage.mock.calls[0][0]['35']).toBe('F');
+      expect(engine.pendingReplacements.has(oldClOrdID)).toBe(true);
+
+      const cancelClOrdID = fixMock.sendMessage.mock.calls[0][0]['11'];
+      engine.onExecutionReport({ '11': cancelClOrdID, '39': '4', '54': '1' });
+
+      expect(fixMock.sendMessage).toHaveBeenCalledTimes(2);
+      expect(fixMock.sendMessage.mock.calls[1][0]['35']).toBe('D');
+      expect(engine.pendingReplacements.has(oldClOrdID)).toBe(false);
+    });
+
+    it('should preserve place-before-cancel only when explicitly configured', () => {
+      const engine = createEngine({ maxOrdersPerSecond: 100, levels: 1, replaceMode: 'place-before-cancel' });
+      const oldClOrdID = 'OLD001';
+      const oldOrder = { side: 'buy', price: 99000, size: 0.1, level: 1, status: 'active', placedAt: Date.now() };
+      const newQuote = { side: 'buy', price: 99500, size: 0.1, level: 1 };
+      const dispatchedTypes = [];
+      engine._dispatchAction = (action) => dispatchedTypes.push(action.type);
+
+      engine.executeActions({
+        toCancel: [],
+        toPlace: [],
+        toReplace: [{ cancel: oldClOrdID, cancelOrder: oldOrder, place: newQuote }],
+      });
+
+      expect(dispatchedTypes).toEqual(['place', 'cancel']);
+    });
+
+    it('should skip marketable ALO buy orders before send', () => {
+      const fixMock = createMockFix();
+      const engine = createEngine({ fixConnection: fixMock });
+      engine.updateTrueXBook({ bestBid: 99, bestAsk: 100, timestamp: Date.now() });
+
+      const result = engine._sendNewOrder({ side: 'buy', price: 100, size: 0.1, level: 1 });
+
+      expect(result).toBeNull();
+      expect(fixMock.sendMessage).not.toHaveBeenCalled();
+      expect(engine.getQuoteStatus().lastMarketableAloSkip.reason).toBe('marketable-post-only');
+    });
+
+    it('should send ALO orders when TrueX book is missing or stale because marketability is unknown', () => {
+      const fixMock = createMockFix();
+      const engine = createEngine({ fixConnection: fixMock, truexBookStaleThresholdMs: 10 });
+
+      expect(engine._sendNewOrder({ side: 'buy', price: 100, size: 0.1, level: 1 })).not.toBeNull();
+
+      engine.updateTrueXBook({ bestBid: 99, bestAsk: 100, timestamp: Date.now() - 1000 });
+      expect(engine._sendNewOrder({ side: 'sell', price: 99, size: 0.1, level: 1 })).not.toBeNull();
+      expect(fixMock.sendMessage).toHaveBeenCalledTimes(2);
+    });
+
+    it('should recheck queued ALO orders before final send', () => {
+      const fixMock = createMockFix();
+      const engine = createEngine({ fixConnection: fixMock, maxOrdersPerSecond: 1 });
+
+      engine.actionsThisSecond = 1;
+      engine.lastActionReset = Date.now();
+      engine.executeActions({
+        toCancel: [],
+        toReplace: [],
+        toPlace: [{ side: 'sell', price: 99, size: 0.1, level: 1 }],
+      });
+
+      expect(engine.actionQueue.length).toBe(1);
+      engine.updateTrueXBook({ bestBid: 100, bestAsk: 101, timestamp: Date.now() });
+      engine.lastActionReset = Date.now() - 1001;
+      engine.drainQueue();
+
+      expect(fixMock.sendMessage).not.toHaveBeenCalled();
+      expect(engine.actionQueue.length).toBe(0);
+    });
+
+    it('should recheck pending replacement against latest book after cancel ack', () => {
+      const fixMock = createMockFix();
+      const engine = createEngine({ fixConnection: fixMock, maxOrdersPerSecond: 100, levels: 1 });
+      const oldClOrdID = 'OLD001';
+      const oldOrder = { side: 'buy', price: 99000, size: 0.1, level: 1, status: 'active', placedAt: Date.now() };
+      engine.activeOrders.set(oldClOrdID, oldOrder);
+
+      engine.executeActions({
+        toCancel: [],
+        toPlace: [],
+        toReplace: [{ cancel: oldClOrdID, cancelOrder: oldOrder, place: { side: 'buy', price: 100, size: 0.1, level: 1 } }],
+      });
+
+      expect(fixMock.sendMessage).toHaveBeenCalledTimes(1);
+      engine.updateTrueXBook({ bestBid: 99, bestAsk: 100, timestamp: Date.now() });
+      const cancelClOrdID = fixMock.sendMessage.mock.calls[0][0]['11'];
+      engine.onExecutionReport({ '11': cancelClOrdID, '39': '4', '54': '1' });
+
+      expect(fixMock.sendMessage).toHaveBeenCalledTimes(1);
+      expect(engine.getQuoteStatus().lastMarketableAloSkip.reason).toBe('marketable-post-only');
+    });
+
+    it('should omit ALO only for taker orders that pass post-fee edge threshold', () => {
+      const fixMock = createMockFix();
+      const engine = createEngine({
+        fixConnection: fixMock,
+        allowTakerOrders: true,
+        truexTakerFeeBps: 10,
+        minTakeEdgeBps: 5,
+        takeSlippageBufferBps: 1,
+        takeHedgeBufferBps: 1,
+      });
+
+      const edge = engine.computeTakeEdgeBps({ side: 'buy', fairValue: 100, executionPrice: 99.8 });
+      expect(edge).toBeCloseTo(8, 6);
+
+      engine._sendNewOrder({
+        side: 'buy',
+        price: 99.8,
+        executionPrice: 99.8,
+        fairValue: 100,
+        size: 0.1,
+        level: 1,
+        postOnly: false,
+      });
+
+      expect(fixMock.sendMessage).toHaveBeenCalledTimes(1);
+      expect(fixMock.sendMessage.mock.calls[0][0]['18']).toBeUndefined();
+    });
+
+    it('should keep taker orders disabled by default even when postOnly is false', () => {
+      const fixMock = createMockFix();
+      const engine = createEngine({ fixConnection: fixMock });
+
+      const result = engine._sendNewOrder({
+        side: 'buy',
+        price: 99,
+        executionPrice: 99,
+        fairValue: 100,
+        size: 0.1,
+        level: 1,
+        postOnly: false,
+      });
+
+      expect(result).toBeNull();
+      expect(fixMock.sendMessage).not.toHaveBeenCalled();
+      expect(engine.getQuoteStatus().suppressed.at(-1).reason).toBe('taker-disabled');
+    });
+
+    it('should not use stale lastMid as implicit fair value for taker orders', () => {
+      const fixMock = createMockFix();
+      const engine = createEngine({ fixConnection: fixMock, allowTakerOrders: true });
+      engine.lastMid = 100;
+
+      const result = engine._sendNewOrder({
+        side: 'buy',
+        price: 99,
+        executionPrice: 99,
+        size: 0.1,
+        level: 1,
+        postOnly: false,
+      });
+
+      expect(result).toBeNull();
+      expect(fixMock.sendMessage).not.toHaveBeenCalled();
+      expect(engine.getQuoteStatus().suppressed.at(-1).reason).toBe('taker-missing-edge-inputs');
+    });
+
+    it('should skip taker orders below post-fee edge threshold', () => {
+      const fixMock = createMockFix();
+      const engine = createEngine({
+        fixConnection: fixMock,
+        allowTakerOrders: true,
+        truexTakerFeeBps: 10,
+        minTakeEdgeBps: 5,
+      });
+
+      const result = engine._sendNewOrder({
+        side: 'buy',
+        price: 99.95,
+        executionPrice: 99.95,
+        fairValue: 100,
+        size: 0.1,
+        level: 1,
+        postOnly: false,
+      });
+
+      expect(result).toBeNull();
+      expect(fixMock.sendMessage).not.toHaveBeenCalled();
+      expect(engine.getQuoteStatus().suppressed.at(-1).reason).toBe('taker-edge-too-low');
+    });
+
+    it('should enforce taker order and notional budgets', () => {
+      const fixMock = createMockFix();
+      const engine = createEngine({
+        fixConnection: fixMock,
+        allowTakerOrders: true,
+        truexTakerFeeBps: 0,
+        minTakeEdgeBps: 1,
+        maxTakerOrdersPerMinute: 1,
+        maxTakerNotionalPerMinute: 20,
+      });
+
+      const quote = {
+        side: 'sell',
+        price: 101,
+        executionPrice: 101,
+        fairValue: 100,
+        size: 0.1,
+        level: 1,
+        postOnly: false,
+      };
+
+      expect(engine._sendNewOrder(quote)).not.toBeNull();
+      expect(engine._sendNewOrder({ ...quote, level: 2 })).toBeNull();
+      expect(fixMock.sendMessage).toHaveBeenCalledTimes(1);
+      expect(engine.getQuoteStatus().suppressed.at(-1).reason).toBe('taker-budget-exhausted');
+    });
   });
 
   describe('confidence gating', () => {
