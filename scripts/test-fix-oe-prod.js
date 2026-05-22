@@ -70,21 +70,42 @@ console.log(`SenderCompID: ${SENDER}, TargetCompID: ${TARGET}`);
 console.log(`API Key: ${maskedKey}\n`);
 
 const socket = new net.Socket();
+let recvBuffer = Buffer.alloc(0);
+let closeScheduled = false;
+
+function scheduleClose() {
+  if (closeScheduled) return;
+  closeScheduled = true;
+  setTimeout(() => socket.destroy(), 1000);
+}
+
 socket.connect(PORT, HOST, () => {
   console.log(`Connected. Sending logon:\n${prettyFIX(logon)}\n`);
   socket.write(logon);
 });
 
 socket.on('data', (data) => {
-  const msg = data.toString();
-  console.log(`\n<<< SERVER:\n${prettyFIX(msg)}`);
-  if (msg.includes('35=A')) {
-    console.log('\n✅ LOGON ACCEPTED — prod order entry authenticated');
-  } else if (msg.includes('35=3')) {
-    const reason = msg.match(/58=([^\x01]+)/)?.[1] || 'unknown';
-    console.log(`\n❌ REJECTED: ${reason}`);
+  recvBuffer = Buffer.concat([recvBuffer, data]);
+
+  while (recvBuffer.length > 0) {
+    const bufferText = recvBuffer.toString('latin1');
+    const checksumMatch = /10=\d{3}\x01/.exec(bufferText);
+    if (!checksumMatch) break;
+
+    const frameEnd = checksumMatch.index + checksumMatch[0].length;
+    const msg = recvBuffer.subarray(0, frameEnd).toString('latin1');
+    recvBuffer = recvBuffer.subarray(frameEnd);
+
+    console.log(`\n<<< SERVER:\n${prettyFIX(msg)}`);
+    if (msg.includes('35=A')) {
+      console.log('\n✅ LOGON ACCEPTED — prod order entry authenticated');
+      scheduleClose();
+    } else if (msg.includes('35=3')) {
+      const reason = msg.match(/58=([^\x01]+)/)?.[1] || 'unknown';
+      console.log(`\n❌ REJECTED: ${reason}`);
+      scheduleClose();
+    }
   }
-  setTimeout(() => socket.destroy(), 1000);
 });
 
 const safetyTimer = setTimeout(() => socket.destroy(), 10000);
