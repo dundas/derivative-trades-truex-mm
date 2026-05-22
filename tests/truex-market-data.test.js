@@ -448,6 +448,7 @@ describe('TrueXMarketDataFeed', () => {
       expect(bba.bestAskSize).toBe(1.0);
       expect(bba.spread).toBe(500);
       expect(bba.mid).toBe(100250);
+      expect(bba.timestamp).toBeGreaterThan(0);
     });
 
     it('should return nulls when book is empty', () => {
@@ -458,6 +459,7 @@ describe('TrueXMarketDataFeed', () => {
       expect(bba.bestAskSize).toBeNull();
       expect(bba.spread).toBeNull();
       expect(bba.mid).toBeNull();
+      expect(bba.timestamp).toBe(0);
     });
 
     it('should handle single-sided book (bids only)', () => {

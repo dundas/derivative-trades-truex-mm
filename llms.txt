@@ -204,10 +204,17 @@ Servers:
   truex-pg-analytics 178.156.247.87  — PostgreSQL (db=truex_analytics, user=truex_mm)
 
 Network (inside Hetzner):
-  FIX OE: 127.0.0.1:3004 (fix-proxy) → WireGuard → 10.20.1.11:19484
-  REST:   direct http://10.20.1.11:9742 (WireGuard, no proxy needed)
+  FIX OE: 127.0.0.1:3004 (fix-proxy) → WireGuard → ${TRUEX_PROD_HOST:-10.20.6.11}:19484
+  FIX MD: 127.0.0.1:3005 (md-proxy)  → WireGuard → ${TRUEX_PROD_HOST:-10.20.6.11}:20484
+  REST:   direct http://${TRUEX_PROD_HOST:-10.20.6.11}:9742 (WireGuard, no proxy needed)
   Redis:  127.0.0.1:6379 (local, 256MB, appendonly)
   PG:     178.156.247.87:5432/truex_analytics
+
+  TRUEX_PROD_HOST is the single source of truth for the prod internal IP
+  (substituted by docker-compose.prod.yml into all three values above).
+  When TrueX migrates the endpoint: update .env, add new /32 to
+  /etc/wireguard/truemarkets.conf AllowedIPs, and add an `ip route add ...
+  dev truemarkets` for the new IP (or wg-quick down/up to reapply).
 
 Log exporter: ships new log lines to Mech Storage every 5 min (cursor-tracked JSONL).
 Logs: Docker volume mm-logs → /app/logs/market-maker.log (daily gzip rotation).
@@ -216,8 +223,10 @@ Deploy: `ssh root@178.156.230.110 "cd /root/true_markets_mm && docker compose -f
 Kill switch: `bun scripts/kill-switch.js --prod` (REST-only, no FIX needed)
 
 Required env (prod): TRUEX_PROD_API_KEY, TRUEX_PROD_SECRET_KEY, TRUEX_CLIENT_ID,
-  TRUEX_FIX_HOST, TRUEX_FIX_PORT, TRUEX_REST_URL.
-Optional: DATABASE_URL, REDIS_URL, LOG_LEVEL, TRUEX_MAKER_FEE_BPS, TRUEX_TAKER_FEE_BPS.
+  TRUEX_FIX_HOST, TRUEX_FIX_PORT.
+Optional: TRUEX_PROD_HOST (default 10.20.6.11; drives FIX/REST upstream),
+  TRUEX_REST_URL (override only for off-Hetzner access via socat tunnel),
+  DATABASE_URL, REDIS_URL, LOG_LEVEL, TRUEX_MAKER_FEE_BPS, TRUEX_TAKER_FEE_BPS.
 
 UAT: FIX 38.32.101.229:19484, REST http://38.32.101.229:9742.
 SenderCompID: DAVID1|DAVID2, TargetCompID: TRUEX_UAT_OE.

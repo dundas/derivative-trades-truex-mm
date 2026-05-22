@@ -86,6 +86,18 @@ export class MarketMakerOrchestrator extends EventEmitter {
       confidenceThreshold: options.confidenceThreshold || 0.3,
       symbol: this.symbol,
       clientId: options.clientId || null,
+      truexBookStaleThresholdMs: options.truexBookStaleThresholdMs || 10000,
+      marketablePostOnlyAction: options.marketablePostOnlyAction || 'skip',
+      replaceMode: options.replaceMode || 'passive-safe',
+      pendingReplacementTimeoutMs: options.pendingReplacementTimeoutMs || 5000,
+      allowTakerOrders: options.allowTakerOrders || false,
+      truexTakerFeeBps: options.truexTakerFeeBps ?? 0,
+      minTakeEdgeBps: options.minTakeEdgeBps ?? 1,
+      takeSlippageBufferBps: options.takeSlippageBufferBps ?? 0,
+      takeHedgeBufferBps: options.takeHedgeBufferBps ?? 0,
+      maxTakerOrdersPerMinute: options.maxTakerOrdersPerMinute ?? 0,
+      maxTakerNotionalPerMinute: options.maxTakerNotionalPerMinute ?? 0,
+      marketDataProvider: () => this.marketDataFeed?.getBestBidAsk?.(),
       logger: this.logger,
     });
 
@@ -135,6 +147,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this._lastMdUpdateTime = 0;
     this._lastRepriceTime = 0;
     this._watchdogTimer = null;
+    this._recordedPipelineFillIds = new Set();
 
     // Balance snapshot state
     this._lastMidPrice = null;
@@ -170,6 +183,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this._onHedgeSignal = this._onHedgeSignal.bind(this);
     this._onHedgeFill = this._onHedgeFill.bind(this);
     this._onEmergency = this._onEmergency.bind(this);
+    this._onOEDisconnect = this._onOEDisconnect.bind(this);
   }
 
   /**
@@ -397,6 +411,10 @@ export class MarketMakerOrchestrator extends EventEmitter {
     // FIX OE messages → execution report handling
     this.fixOE.on('message', this._onFIXMessage);
 
+    // OE disconnect → flush inflight orders so QuoteEngine can resume on reconnect
+    this.fixOE.on('disconnect', this._onOEDisconnect);
+    this.fixOE.on('logout', this._onOEDisconnect);
+
     // QuoteEngine fills → Inventory + PnL
     this.quoteEngine.on('fill', this._onQuoteFill);
 
@@ -415,6 +433,8 @@ export class MarketMakerOrchestrator extends EventEmitter {
       this.priceAggregator.removeListener('price', this._onPriceUpdate);
     }
     this.fixOE.removeListener('message', this._onFIXMessage);
+    this.fixOE.removeListener('disconnect', this._onOEDisconnect);
+    this.fixOE.removeListener('logout', this._onOEDisconnect);
     this.quoteEngine.removeListener('fill', this._onQuoteFill);
     this.inventoryManager.removeListener('hedge-signal', this._onHedgeSignal);
     this.hedgeExecutor.removeListener('hedge-filled', this._onHedgeFill);
@@ -454,6 +474,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
     }
 
     // Feed price to QuoteEngine (gate passed)
+    if (this.marketDataFeed?.getBestBidAsk) {
+      this.quoteEngine.updateTrueXBook(this.marketDataFeed.getBestBidAsk());
+    }
     this.quoteEngine.onPriceUpdate(aggregatedPrice);
     this._lastRepriceTime = Date.now();
 
@@ -532,12 +555,12 @@ export class MarketMakerOrchestrator extends EventEmitter {
           price: lastPx,
           timestamp: Date.now(),
         };
-        pipeline.addFill(fill);
+        this._addPipelineFillOnce(pipeline, fill);
       }
     }
   }
 
-  _onQuoteFill({ side, price, size, clOrdID, execID }) {
+  _onQuoteFill({ side, price, size, clOrdID, execID, orderIntent, liquidityRoleExpected, isMaker = true }) {
     // Route fill to InventoryManager
     this.inventoryManager.onFill({
       side,
@@ -553,7 +576,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       quantity: size,
       price,
       venue: 'truex',
-      isMaker: true, // Our quotes are maker orders
+      isMaker,
       execID,
       timestamp: Date.now(),
     });
@@ -568,15 +591,26 @@ export class MarketMakerOrchestrator extends EventEmitter {
       side,
       quantity: size,
       price,
+      orderIntent: orderIntent || (isMaker ? 'maker_quote' : 'taker_opportunity'),
+      liquidityRoleExpected: liquidityRoleExpected || (isMaker ? 'maker' : 'taker'),
+      isMaker,
       timestamp: Date.now(),
     };
     if (this.dataPipeline) {
-      this.dataPipeline.addFill(fillRecord);
+      this._addPipelineFillOnce(this.dataPipeline, fillRecord);
     } else if (this.auditLogger) {
       this.auditLogger.logFillEvent(fillRecord);
     }
 
-    this.emit('fill', { side, price, size, clOrdID, execID, venue: 'truex' });
+    this.emit('fill', { side, price, size, clOrdID, execID, venue: 'truex', orderIntent, liquidityRoleExpected, isMaker });
+  }
+
+  _addPipelineFillOnce(pipeline, fill) {
+    if (!pipeline?.addFill) return;
+    const fillId = fill.fillId || `${fill.orderId || fill.clOrdID || 'unknown'}-${fill.execID || 'unknown'}`;
+    if (this._recordedPipelineFillIds.has(fillId)) return;
+    this._recordedPipelineFillIds.add(fillId);
+    pipeline.addFill({ ...fill, fillId });
   }
 
   _onHedgeSignal({ shouldHedge, side, size }) {
@@ -619,6 +653,29 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this.quoteEngine.cancelAllQuotes(`emergency: ${reason}`);
 
     this.emit('emergency', { netPosition, reason });
+  }
+
+  /**
+   * Handle OE FIX disconnect or logout.
+   *
+   * Any orders in 'cancelling' or 'pending' state are inflight on a now-dead
+   * FIX session — they will never receive execution reports. Clear them from
+   * local state so reconcileOrders() doesn't block new placements on reconnect.
+   * Active orders are left intact; the reconciler will find them as orphans and
+   * cancel them via REST on the next reconcile cycle.
+   */
+  _onOEDisconnect() {
+    if (!this.isRunning) return;
+    let flushed = 0;
+    for (const [clOrdID, order] of this.quoteEngine.activeOrders) {
+      if (order.status === 'cancelling' || order.status === 'pending') {
+        this.quoteEngine.activeOrders.delete(clOrdID);
+        flushed++;
+      }
+    }
+    if (flushed > 0) {
+      this.logger.warn(`[Orchestrator] OE disconnected — flushed ${flushed} inflight order(s) from local state`);
+    }
   }
 
   // --- Balance Initialization ---

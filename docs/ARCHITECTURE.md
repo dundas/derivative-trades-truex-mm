@@ -117,14 +117,14 @@ QuoteEngine.onPriceUpdate(aggregatedPrice)
 |  +------------------+  +-----------------+  |
 |  | truex-fix-proxy  |  | truex-md-proxy  |  |
 |  | :3004 → WG →     |  | :3005 → WG →    |  |
-|  | 10.20.1.11:19484 |  | 10.20.1.11:20484|  |
+|  | 10.20.6.11:19484 |  | 10.20.6.11:20484|  |
 |  +------------------+  +-----------------+  |
 |                                              |
 |  +------------------+                        |
 |  | truex-market-    |                        |
 |  | maker            |  FIX → 127.0.0.1:3004 |
-|  |                  |  REST → 10.20.1.11:9742| ---WireGuard VPN---> TrueX Production
-|  |  Coinbase WS ----+---> coinbase.com       |                     (10.20.1.11)
+|  |                  |  REST → 10.20.6.11:9742| ---WireGuard VPN---> TrueX Production
+|  |  Coinbase WS ----+---> coinbase.com       |                     (10.20.6.11)
 |  +--------+---------+                        |
 |           |  logs                            |
 |  +--------+---------+  +----------------+   |
@@ -147,8 +147,8 @@ QuoteEngine.onPriceUpdate(aggregatedPrice)
 ### Key Deployment Notes
 
 - All production components run **on Hetzner** in Docker (`network_mode: host`)
-- The market maker connects to TrueX FIX via `truex-fix-proxy` at `127.0.0.1:3004`, which forwards over **WireGuard VPN** to `10.20.1.11:19484`
-- REST calls go **direct over WireGuard** to `http://10.20.1.11:9742` — no REST proxy needed from inside Hetzner
+- The market maker connects to TrueX FIX via `truex-fix-proxy` at `127.0.0.1:3004`, which forwards over **WireGuard VPN** to `10.20.6.11:19484`
+- REST calls go **direct over WireGuard** to `http://10.20.6.11:9742` — no REST proxy needed from inside Hetzner
 - Coinbase WebSocket connects **directly** from the market maker container
 - Redis runs **locally** on `truex-mm-prod` at `127.0.0.1:6379` (not externally accessible)
 - PostgreSQL runs on a **dedicated Hetzner server** `truex-pg-analytics` at `178.156.247.87:5432/truex_analytics`
@@ -203,11 +203,27 @@ Computes bid/ask ladder quotes with inventory skew, manages order lifecycle thro
 - Skip orders in `pending` or `cancelling` status (wait for confirmation)
 - Reprice if price difference >= `repriceThresholdTicks`
 - Cancel unmatched active orders (orphans in local state)
-- Rate limited: `maxOrdersPerSecond` (default 4-8), overflow queued
+- Default replacement mode is `passive-safe`: cancel the old quote first, hold the replacement as pending, then release it only after the cancel ack. `replaceMode='place-before-cancel'` is available only as an explicit legacy override.
+- Pending replacements expire after `pendingReplacementTimeoutMs` and are reported in quote status as suppressed levels.
+- Rate limited: `maxOrdersPerSecond` (default 4-8), overflow queued. Queued placements and pending replacement releases are rechecked immediately before FIX send.
+
+**TrueX book and ALO safety:**
+- The orchestrator injects the latest TrueX best bid/ask into QuoteEngine through `marketDataProvider` / `updateTrueXBook()`.
+- `truexBookStaleThresholdMs` controls whether the book is fresh enough for marketability decisions.
+- Post-only quotes use `18=6` and are checked at send time. A buy at or above fresh best ask, or a sell at or below fresh best bid, is suppressed by default with reason `marketable-post-only`.
+- `marketablePostOnlyAction='skip'` is the default. `slide` can move a marketable ALO one tick away from the opposite side, but should be enabled only after venue behavior is confirmed.
+- Missing or stale TrueX book means marketability is unknown; existing maker quoting remains allowed, but intentional taker orders require explicit fair value/execution inputs and remain disabled unless configured.
 
 **FIX messages sent:**
-- New Order Single (`35=D`): tags 11, 18 (ALO), 55, 54, 38, 44, 40=2 (Limit), 59=1 (GTC), Party ID block (453/448/452)
+- New Order Single (`35=D`): tags 11, 18 (ALO, omitted only for intentional taker orders), 55, 54, 38, 44, 40=2 (Limit), 59=1 (GTC), Party ID block (453/448/452)
 - Order Cancel Request (`35=F`): tags 11, 41, Party ID block. No tag 54 (Side).
+
+**Optional taker path:**
+- `allowTakerOrders=false` by default; no aggressive order is sent unless this is explicitly enabled.
+- Taker-intent orders omit tag `18=6` and require explicit `fairValue` and execution price inputs.
+- Post-fee edge is `grossEdgeBps - truexTakerFeeBps - takeSlippageBufferBps - takeHedgeBufferBps`; it must be at least `minTakeEdgeBps`.
+- `maxTakerOrdersPerMinute` and `maxTakerNotionalPerMinute` enforce minute-window taker budgets when set to positive values.
+- Active orders and fills carry `orderIntent`, `liquidityRoleExpected`, and final `isMaker`; orchestrator forwards `isMaker=false` taker fills to PnL and audit/data records.
 
 **Rejection handling:**
 - `consecutiveRejects` counter, backoff for 5 seconds after 3+ consecutive rejects
@@ -299,6 +315,10 @@ FIX 5.0 SP2 over FIXT.1.1 transport layer.
 - Strict FIX field ordering enforced (header fields first, then body fields)
 - Sensitive tags (553/554) redacted in logs
 - 2-second delay after TCP connect for proxy connection establishment
+- Connection attempts are generation-guarded so stale socket callbacks, delayed logon setup, and timeout handlers cannot mutate a newer connection.
+- Duplicate-logon rejects containing `Already authenticated` emit `duplicate-logon`, tear down only the attempted socket, and schedule reconnect through the normal lifecycle.
+- Repeated unresolved sequence gaps force a session reset: local and Redis sequence counters are cleared, next logon uses `141=Y` with `34=1`, and reconnect is scheduled once.
+- Inbound SequenceReset-GapFill (`35=4`, `123=Y`) advances `expectedSeqNum` without emitting application messages or looping resend requests.
 
 ### DataPipelineManager (`src/data-pipeline/data-pipeline-manager.js`)
 
@@ -406,7 +426,8 @@ PostgreSQL-backed analytics server using `Bun.serve()` on port 3100.
 | `TRUEX_CLIENT_ID` | Yes | `78932725357888855` | Production client ID (FIX PartyID tag 448) |
 | `TRUEX_FIX_HOST` | Yes | `178.156.230.110` | Hetzner FIX proxy host |
 | `TRUEX_FIX_PORT` | Yes | `3004` | Hetzner FIX proxy port |
-| `TRUEX_REST_URL` | Yes | `http://10.20.1.11:9742` | TrueX REST URL — direct via WireGuard. Only reachable inside Hetzner; set to `http://178.156.230.110:3006` if accessing from outside (socat tunnel) |
+| `TRUEX_PROD_HOST` | No | `10.20.6.11` | TrueX production internal IP (reachable via WireGuard tunnel). Substituted into `TRUEX_UPSTREAM_HOST` for both FIX proxies and `TRUEX_REST_URL` in `docker-compose.prod.yml`. WireGuard `AllowedIPs` must include this `/32`. If TrueX migrates the endpoint, update this var **and** add the new `/32` to `/etc/wireguard/truemarkets.conf`. Empty string does not fall back to default — keep populated or unset. |
+| `TRUEX_REST_URL` | No | `http://10.20.6.11:9742` | TrueX REST URL — derived from `TRUEX_PROD_HOST` by `docker-compose.prod.yml`. Override only when accessing from outside Hetzner (e.g. `http://178.156.230.110:3006` socat tunnel for local development). |
 | `TRUEX_TARGET_COMP_ID` | No | `TRUEX_PROD_OE` | FIX TargetCompID |
 | `TRUEX_SENDER_COMP_ID` | No | `DAVID1` | FIX SenderCompID |
 | `DATABASE_URL` | No | -- | PostgreSQL connection string (Hetzner truex-pg-analytics 178.156.247.87:5432/truex_analytics) |
@@ -490,8 +511,8 @@ PostgreSQL-backed analytics server using `Bun.serve()` on port 3100.
 | Service | Container | Port | Purpose |
 |---------|-----------|------|---------|
 | `redis` | `truex-redis` | 127.0.0.1:6379 | Pipeline Layer 2 — AOF persistence, 256MB |
-| `fix-proxy` | `truex-fix-proxy` | 3004 | FIX OE proxy → WireGuard → 10.20.1.11:19484 |
-| `md-proxy` | `truex-md-proxy` | 3005 | FIX MD proxy → WireGuard → 10.20.1.11:20484 |
+| `fix-proxy` | `truex-fix-proxy` | 3004 | FIX OE proxy → WireGuard → 10.20.6.11:19484 |
+| `md-proxy` | `truex-md-proxy` | 3005 | FIX MD proxy → WireGuard → 10.20.6.11:20484 |
 | `market-maker` | `truex-market-maker` | 3100 (API) | Market maker + analytics API |
 | `log-exporter` | `truex-log-exporter` | -- | Ships logs to Mech Storage every 5 min |
 
@@ -549,7 +570,7 @@ Targets UAT (`38.32.101.229:19484`). For local development only.
 | Max orders/sec | 4 | 4 |
 | FIX target | `TRUEX_PROD_OE` | `TRUEX_UAT_OE` |
 | FIX host | `178.156.230.110:3004` (proxy) | `38.32.101.229:19484` (direct) |
-| REST URL | `http://10.20.1.11:9742` (direct via WireGuard) | `http://38.32.101.229:9742` (direct) |
+| REST URL | `http://10.20.6.11:9742` (direct via WireGuard) | `http://38.32.101.229:9742` (direct) |
 | Client ID | `78932725357888855` | `78972918929686546` (DAVID1) |
 | Env validation | Strict (6 required vars, UAT safety check) | Minimal (2 required vars) |
 | Orphan cancel failure | Fatal (process.exit) | Non-fatal (warning) |

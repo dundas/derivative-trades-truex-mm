@@ -44,6 +44,18 @@ export class QuoteEngine extends EventEmitter {
       senderCompID: options.senderCompID || 'CLI_CLIENT',
       targetCompID: options.targetCompID || 'TRUEX_UAT_OE',
       clientId: options.clientId || null, // TrueX PartyID (tag 448) — required for order entry
+      truexBookStaleThresholdMs: options.truexBookStaleThresholdMs || 10000,
+      marketablePostOnlyAction: options.marketablePostOnlyAction || 'skip',
+      replaceMode: options.replaceMode || 'passive-safe',
+      pendingReplacementTimeoutMs: options.pendingReplacementTimeoutMs || 5000,
+      allowTakerOrders: options.allowTakerOrders || false,
+      truexTakerFeeBps: options.truexTakerFeeBps ?? 0,
+      minTakeEdgeBps: options.minTakeEdgeBps ?? 1,
+      takeSlippageBufferBps: options.takeSlippageBufferBps ?? 0,
+      takeHedgeBufferBps: options.takeHedgeBufferBps ?? 0,
+      maxTakerOrdersPerMinute: options.maxTakerOrdersPerMinute ?? 0,
+      maxTakerNotionalPerMinute: options.maxTakerNotionalPerMinute ?? 0,
+      marketDataProvider: options.marketDataProvider || null,
     };
 
     // State
@@ -65,9 +77,30 @@ export class QuoteEngine extends EventEmitter {
 
     // Cancel tracking: newClOrdID → origClOrdID (for matching cancel acks back to activeOrders)
     this.cancelToOrigMap = new Map();
+    this.pendingReplacements = new Map(); // origClOrdID -> { quote, createdAt }
+    this.suppressedLevels = new Map(); // side:level -> { reason, timestamp, quote }
+    this.recentRejectsByReason = new Map();
+    this.lastMarketableAloSkip = null;
+    this.truexBook = null;
+    this.takerWindowStartedAt = Date.now();
+    this.takerOrdersThisWindow = 0;
+    this.takerNotionalThisWindow = 0;
 
     // Optional randomized bps ladder (stable for this engine instance).
     this.levelSpacingBpsByLevel = this._buildLevelSpacingBpsLadder();
+  }
+
+  updateTrueXBook(book) {
+    if (!book) return;
+    const bestBid = book.bestBid ?? null;
+    const bestAsk = book.bestAsk ?? null;
+    this.truexBook = {
+      bestBid,
+      bestAsk,
+      bestBidSize: book.bestBidSize ?? null,
+      bestAskSize: book.bestAskSize ?? null,
+      timestamp: book.timestamp ?? null,
+    };
   }
 
   /**
@@ -75,6 +108,7 @@ export class QuoteEngine extends EventEmitter {
    */
   onPriceUpdate(aggregatedPrice) {
     if (!aggregatedPrice) return;
+    this._expirePendingReplacements();
 
     // Gate on confidence
     if (aggregatedPrice.confidence < this.config.confidenceThreshold) {
@@ -286,8 +320,7 @@ export class QuoteEngine extends EventEmitter {
 
   /**
    * Execute actions through rate limiter.
-   * Priority: pure cancels first, then replacements (place first, cancel second),
-   * then new places.
+   * Priority: pure cancels first, then replacements, then new places.
    */
   executeActions(actions) {
     // Reset rate counter if a second has passed
@@ -297,11 +330,8 @@ export class QuoteEngine extends EventEmitter {
       this.lastActionReset = now;
     }
 
-    // Build ordered action list.
-    // For replacements: place the new order FIRST, then cancel the old one.
-    // This ensures continuous market presence — the new quote is live before
-    // the old one disappears, eliminating single-sided market gaps on reprice.
-    // Pure cancels (no replacement) still go first to free up position headroom.
+    // Build ordered action list. TrueX default is passive-safe because ALO
+    // replacements that cross the book are cancelled/rejected by the venue.
     const orderedActions = [];
 
     for (const c of actions.toCancel) {
@@ -309,8 +339,13 @@ export class QuoteEngine extends EventEmitter {
     }
 
     for (const r of actions.toReplace) {
-      orderedActions.push({ type: 'place', quote: r.place });
-      orderedActions.push({ type: 'cancel', clOrdID: r.cancel, order: r.cancelOrder });
+      if (this.config.replaceMode === 'place-before-cancel') {
+        orderedActions.push({ type: 'place', quote: r.place });
+        orderedActions.push({ type: 'cancel', clOrdID: r.cancel, order: r.cancelOrder });
+      } else {
+        this.pendingReplacements.set(r.cancel, { quote: r.place, createdAt: Date.now() });
+        orderedActions.push({ type: 'cancel', clOrdID: r.cancel, order: r.cancelOrder });
+      }
     }
 
     for (const p of actions.toPlace) {
@@ -351,18 +386,23 @@ export class QuoteEngine extends EventEmitter {
    * Send a FIX New Order Single (35=D).
    */
   _sendNewOrder(quote) {
+    const prepared = this._prepareQuoteForSend(quote);
+    if (!prepared) return null;
+
     const clOrdID = this.generateClOrdID();
     const fields = {
       '35': 'D',
       '11': clOrdID,
-      '18': '6',  // ExecInst: Add Liquidity Only (maker-only)
       '55': this.config.symbol,
-      '54': quote.side === 'buy' ? '1' : '2',
-      '38': quote.size.toString(),
-      '44': quote.price.toFixed(2),
+      '54': prepared.side === 'buy' ? '1' : '2',
+      '38': prepared.size.toString(),
+      '44': prepared.price.toFixed(2),
       '40': '2',  // Limit
       '59': '1',  // GTC
     };
+    if (prepared.postOnly !== false) {
+      fields['18'] = '6';  // ExecInst: Add Liquidity Only (maker-only)
+    }
 
     // TrueX Party ID block — required for order entry
     if (this.config.clientId) {
@@ -373,11 +413,13 @@ export class QuoteEngine extends EventEmitter {
 
     this.activeOrders.set(clOrdID, {
       side: quote.side,
-      price: quote.price,
-      size: quote.size,
-      level: quote.level,
+      price: prepared.price,
+      size: prepared.size,
+      level: prepared.level,
       status: 'pending',
       placedAt: Date.now(),
+      orderIntent: prepared.orderIntent || (prepared.postOnly === false ? 'taker_opportunity' : 'maker_quote'),
+      liquidityRoleExpected: prepared.postOnly === false ? 'taker' : 'maker',
     });
 
     this.lastActionByClOrdID.set(clOrdID, Date.now());
@@ -385,6 +427,10 @@ export class QuoteEngine extends EventEmitter {
     if (this.fixConnection) {
       this.fixConnection.sendMessage(fields);
     }
+    if (prepared.postOnly === false) {
+      this._recordTakerOrder(prepared.size * prepared.price);
+    }
+    return clOrdID;
   }
 
   /**
@@ -448,6 +494,8 @@ export class QuoteEngine extends EventEmitter {
         break;
 
       case '2': // Filled
+        {
+          const tracked = this.activeOrders.get(resolvedClOrdID);
         this.activeOrders.delete(resolvedClOrdID);
         this.cancelToOrigMap.delete(clOrdID);
         this.emit('fill', {
@@ -456,12 +504,17 @@ export class QuoteEngine extends EventEmitter {
           size: lastQty,
           clOrdID: resolvedClOrdID,
           execID,
+          orderIntent: tracked?.orderIntent || 'maker_quote',
+          liquidityRoleExpected: tracked?.liquidityRoleExpected || 'maker',
+          isMaker: (tracked?.liquidityRoleExpected || 'maker') === 'maker',
         });
         break;
+        }
 
       case '4': // Cancelled
         this.activeOrders.delete(resolvedClOrdID);
         this.cancelToOrigMap.delete(clOrdID);
+        this._releasePendingReplacement(resolvedClOrdID);
         break;
 
       case '8': // Rejected
@@ -483,7 +536,11 @@ export class QuoteEngine extends EventEmitter {
           // New order was rejected — remove from tracking (never made it to exchange)
           this.activeOrders.delete(resolvedClOrdID);
         }
-        this.logger.error(`[QuoteEngine] Order rejected: clOrdID=${clOrdID}, reason=${fields['58'] || 'unknown'}, code=${fields['103'] || 'n/a'}`);
+        {
+          const reason = fields['58'] || 'unknown';
+          this.recentRejectsByReason.set(reason, (this.recentRejectsByReason.get(reason) || 0) + 1);
+          this.logger.error(`[QuoteEngine] Order rejected: clOrdID=${clOrdID}, reason=${reason}, code=${fields['103'] || 'n/a'}`);
+        }
         break;
     }
   }
@@ -516,6 +573,7 @@ export class QuoteEngine extends EventEmitter {
         if (origOrder) {
           origOrder.status = 'active';
         }
+        this.pendingReplacements.delete(resolvedOrigClOrdID);
       }
     }
 
@@ -575,6 +633,7 @@ export class QuoteEngine extends EventEmitter {
    * Return a summary of current quoting status.
    */
   getQuoteStatus() {
+    this._expirePendingReplacements();
     let bidLevels = 0;
     let askLevels = 0;
 
@@ -582,6 +641,10 @@ export class QuoteEngine extends EventEmitter {
       if (order.side === 'buy') bidLevels++;
       else askLevels++;
     }
+    const suppressed = Array.from(this.suppressedLevels.entries()).map(([key, value]) => ({
+      key,
+      ...value,
+    }));
 
     return {
       bidLevels,
@@ -590,6 +653,9 @@ export class QuoteEngine extends EventEmitter {
       lastMid: this.lastMid,
       lastRepriceAt: this.lastRepriceAt,
       isQuoting: this.isQuoting,
+      suppressed,
+      lastMarketableAloSkip: this.lastMarketableAloSkip,
+      recentRejectsByReason: Object.fromEntries(this.recentRejectsByReason),
     };
   }
 
@@ -649,6 +715,7 @@ export class QuoteEngine extends EventEmitter {
    * Drain queued actions (call periodically from orchestrator or timer).
    */
   drainQueue() {
+    this._expirePendingReplacements();
     const now = Date.now();
     if (now - this.lastActionReset >= 1000) {
       this.actionsThisSecond = 0;
@@ -659,6 +726,163 @@ export class QuoteEngine extends EventEmitter {
       const action = this.actionQueue.shift();
       this._dispatchAction(action);
       this.actionsThisSecond++;
+    }
+  }
+
+  _getTrueXBook() {
+    if (this.config.marketDataProvider) {
+      const provided = this.config.marketDataProvider();
+      if (provided) this.updateTrueXBook(provided);
+    }
+    return this.truexBook;
+  }
+
+  _isBookFresh(book = this._getTrueXBook()) {
+    return !!(book && book.timestamp && (Date.now() - book.timestamp) <= this.config.truexBookStaleThresholdMs);
+  }
+
+  _isMarketablePostOnly(quote) {
+    const book = this._getTrueXBook();
+    if (!this._isBookFresh(book)) return false;
+    if (quote.side === 'buy' && book.bestAsk !== null && book.bestAsk !== undefined) {
+      return quote.price >= book.bestAsk;
+    }
+    if (quote.side === 'sell' && book.bestBid !== null && book.bestBid !== undefined) {
+      return quote.price <= book.bestBid;
+    }
+    return false;
+  }
+
+  _recordSuppression(quote, reason) {
+    const key = `${quote.side}:${quote.level}`;
+    const value = { reason, timestamp: Date.now(), quote: { ...quote } };
+    this.suppressedLevels.set(key, value);
+    if (reason === 'marketable-post-only') {
+      this.lastMarketableAloSkip = value;
+    }
+    this.logger.warn(`[QuoteEngine] Suppressed ${quote.side} L${quote.level}: ${reason}`);
+  }
+
+  _prepareQuoteForSend(quote) {
+    const prepared = { ...quote };
+    const isPostOnly = prepared.postOnly !== false;
+    if (!isPostOnly) {
+      const takerQuote = this._prepareTakerQuote(prepared);
+      if (!takerQuote) {
+        return null;
+      }
+      return takerQuote;
+    }
+
+    if (!this._isMarketablePostOnly(prepared)) {
+      return prepared;
+    }
+
+    if (this.config.marketablePostOnlyAction === 'slide') {
+      const book = this._getTrueXBook();
+      if (prepared.side === 'buy' && book?.bestAsk !== null && book?.bestAsk !== undefined) {
+        prepared.price = this.snapToTick(book.bestAsk - this.config.tickSize);
+        return prepared;
+      }
+      if (prepared.side === 'sell' && book?.bestBid !== null && book?.bestBid !== undefined) {
+        prepared.price = this.snapToTick(book.bestBid + this.config.tickSize);
+        return prepared;
+      }
+    }
+
+    this._recordSuppression(prepared, 'marketable-post-only');
+    return null;
+  }
+
+  _prepareTakerQuote(quote) {
+    const prepared = { ...quote };
+    if (!this.config.allowTakerOrders) {
+      this._recordSuppression(prepared, 'taker-disabled');
+      return null;
+    }
+
+    const fairValue = Number(prepared.fairValue);
+    const executionPrice = Number(prepared.executionPrice ?? prepared.price);
+    if (!fairValue || !executionPrice || fairValue <= 0 || executionPrice <= 0) {
+      this._recordSuppression(prepared, 'taker-missing-edge-inputs');
+      return null;
+    }
+
+    const edgeBps = this.computeTakeEdgeBps({ side: prepared.side, fairValue, executionPrice });
+    if (edgeBps < this.config.minTakeEdgeBps) {
+      this._recordSuppression({ ...prepared, edgeBps }, 'taker-edge-too-low');
+      return null;
+    }
+
+    const notional = prepared.size * prepared.price;
+    if (!this._hasTakerBudget(notional)) {
+      this._recordSuppression({ ...prepared, edgeBps }, 'taker-budget-exhausted');
+      return null;
+    }
+
+    prepared.edgeBps = edgeBps;
+    return prepared;
+  }
+
+  computeTakeEdgeBps({ side, fairValue, executionPrice }) {
+    const gross = side === 'buy'
+      ? ((fairValue - executionPrice) / fairValue) * 10000
+      : ((executionPrice - fairValue) / fairValue) * 10000;
+    return gross
+      - this.config.truexTakerFeeBps
+      - this.config.takeSlippageBufferBps
+      - this.config.takeHedgeBufferBps;
+  }
+
+  _resetTakerWindowIfNeeded() {
+    const now = Date.now();
+    if (now - this.takerWindowStartedAt >= 60000) {
+      this.takerWindowStartedAt = now;
+      this.takerOrdersThisWindow = 0;
+      this.takerNotionalThisWindow = 0;
+    }
+  }
+
+  _hasTakerBudget(notional) {
+    this._resetTakerWindowIfNeeded();
+    if (this.config.maxTakerOrdersPerMinute > 0 &&
+        this.takerOrdersThisWindow >= this.config.maxTakerOrdersPerMinute) {
+      return false;
+    }
+    if (this.config.maxTakerNotionalPerMinute > 0 &&
+        this.takerNotionalThisWindow + notional > this.config.maxTakerNotionalPerMinute) {
+      return false;
+    }
+    return true;
+  }
+
+  _recordTakerOrder(notional) {
+    this._resetTakerWindowIfNeeded();
+    this.takerOrdersThisWindow++;
+    this.takerNotionalThisWindow += notional;
+  }
+
+  _releasePendingReplacement(origClOrdID) {
+    const pending = this.pendingReplacements.get(origClOrdID);
+    if (!pending) return;
+    this.pendingReplacements.delete(origClOrdID);
+    if (Date.now() - pending.createdAt > this.config.pendingReplacementTimeoutMs) {
+      this._recordSuppression(pending.quote, 'pending-replacement-expired');
+      return;
+    }
+    this._dispatchAction({ type: 'place', quote: pending.quote });
+  }
+
+  _expirePendingReplacements() {
+    const now = Date.now();
+    for (const [origClOrdID, pending] of this.pendingReplacements.entries()) {
+      if (now - pending.createdAt <= this.config.pendingReplacementTimeoutMs) continue;
+      this.pendingReplacements.delete(origClOrdID);
+      const original = this.activeOrders.get(origClOrdID);
+      if (original?.status === 'cancelling') {
+        original.status = 'active';
+      }
+      this._recordSuppression(pending.quote, 'pending-replacement-expired');
     }
   }
 

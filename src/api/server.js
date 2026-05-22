@@ -650,7 +650,7 @@ async function handleLogsArchiveDownload(objectId) {
 
 function makeTrueXClient() {
   return import('../../src/exchanges/truex/TrueXRESTClient.ts').then(({ TrueXRESTClient }) => {
-    const restUrl = process.env.TRUEX_REST_URL || 'http://10.20.1.11:9742';
+    const restUrl = process.env.TRUEX_REST_URL || `http://${process.env.TRUEX_PROD_HOST || '10.20.6.11'}:9742`;
     return new TrueXRESTClient({
       baseURL:   `${restUrl}/api/v1`,
       apiKey:    process.env.TRUEX_PROD_API_KEY,

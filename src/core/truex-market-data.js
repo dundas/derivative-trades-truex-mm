@@ -52,6 +52,10 @@ export class TrueXMarketDataFeed extends EventEmitter {
     this._onDisconnect = this._handleDisconnect.bind(this);
   }
 
+  get isLoggedOn() {
+    return this.fix.isLoggedOn;
+  }
+
   /**
    * Connect to the TrueX Market Data FIX endpoint
    */
@@ -454,7 +458,7 @@ export class TrueXMarketDataFeed extends EventEmitter {
       ? (bestBid + bestAsk) / 2
       : null;
 
-    return { bestBid, bestBidSize, bestAsk, bestAskSize, spread, mid };
+    return { bestBid, bestBidSize, bestAsk, bestAskSize, spread, mid, timestamp: book.timestamp };
   }
 
   /**

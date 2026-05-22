@@ -69,6 +69,8 @@ export class FIXConnection extends EventEmitter {
     this.intentionalClose = false;
     this.isReconnecting = false; // guard against duplicate reconnect scheduling
     this._stableTimer = null;    // clears reconnectAttempts after 60s stable connection
+    this._connectionGeneration = 0; // guards stale socket callbacks/timers
+    this._logonSetupTimer = null;
     
     // Message buffer for incomplete messages
     this.messageBuffer = '';
@@ -77,7 +79,12 @@ export class FIXConnection extends EventEmitter {
     this.sentMessages = new Map(); // seq -> { seqNum, fields, rawMessage, sentAt }
     this.maxStoredMessages = options.maxStoredMessages || 10000;
     this.messageRetentionMs = options.messageRetentionMs || 3600000; // 1 hour default
-    
+
+    // Resend failure tracking for auto-reset
+    this._resendGapStart = null; // Track current gap begin seq
+    this._resendAttempts = 0;    // Consecutive resend attempts for same gap
+    this._maxResendAttempts = options.maxResendAttempts || 3; // Max before forcing reset
+
     // Logger
     this.logger = options.logger || console;
     // Optional audit logger
@@ -200,6 +207,63 @@ export class FIXConnection extends EventEmitter {
   }
 
   /**
+   * Force a clean local sequence reset and clear persisted Redis seqnums.
+   */
+  async resetSequenceNumbers() {
+    this.msgSeqNum = 1;
+    this.expectedSeqNum = 1;
+    this.hasConnectedBefore = false;
+
+    if (!this.redisClient) return;
+    try {
+      if (typeof this.redisClient.del === 'function') {
+        await this.redisClient.del(this._seqKeyOut, this._seqKeyIn);
+      } else {
+        await Promise.all([
+          this.redisClient.set(this._seqKeyOut, 1),
+          this.redisClient.set(this._seqKeyIn, 1),
+        ]);
+      }
+    } catch (err) {
+      this.logger.warn(`[FIXConnection] Failed to reset persisted seqnums: ${err.message}`);
+    }
+  }
+
+  /**
+   * Stop timers that should not survive a failed connection attempt.
+   * @private
+   */
+  _clearLifecycleTimers() {
+    this.stopHeartbeat();
+    this.stopCleanupTimer();
+    if (this._stableTimer) {
+      clearTimeout(this._stableTimer);
+      this._stableTimer = null;
+    }
+    if (this._logonSetupTimer) {
+      clearTimeout(this._logonSetupTimer);
+      this._logonSetupTimer = null;
+    }
+  }
+
+  async _forceSessionReset(reason, details = {}) {
+    this.logger.error(`[FIXConnection] Forcing session reset: ${reason}`);
+    await this.resetSequenceNumbers();
+    this._resendGapStart = null;
+    this._resendAttempts = 0;
+    this.emit('session-reset-forced', { reason, ...details });
+
+    if (this.socket && !this.socket.destroyed) {
+      const socket = this.socket;
+      const generation = this._connectionGeneration;
+      this.socket.destroy();
+      this.handleDisconnect(socket, generation);
+    } else {
+      this.handleDisconnect();
+    }
+  }
+
+  /**
    * Connect to FIX server
    */
   async connect() {
@@ -233,13 +297,47 @@ export class FIXConnection extends EventEmitter {
       // Clear the reconnect guard so a fresh connect attempt is always allowed.
       this.isReconnecting = false;
       
-      this.socket = new net.Socket();
+      const generation = ++this._connectionGeneration;
+      const socket = new net.Socket();
+      this.socket = socket;
       let settled = false;
       let logonTimeout = null;
+      let logonHandler = null;
+      let rejectHandler = null;
+      let setupTimer = null;
+
+      const isCurrentAttempt = () => this.socket === socket && this._connectionGeneration === generation;
+      const cleanupAttempt = (destroySocket = true) => {
+        if (logonTimeout) {
+          clearTimeout(logonTimeout);
+          logonTimeout = null;
+        }
+        clearTimeout(timeout);
+        if (setupTimer) {
+          clearTimeout(setupTimer);
+          if (this._logonSetupTimer === setupTimer) this._logonSetupTimer = null;
+          setupTimer = null;
+        }
+        if (logonHandler) {
+          this.removeListener('message', logonHandler);
+          logonHandler = null;
+        }
+        if (rejectHandler) {
+          this.removeListener('reject', rejectHandler);
+          rejectHandler = null;
+        }
+        if (isCurrentAttempt()) {
+          if (destroySocket && socket && !socket.destroyed) {
+            socket.destroy();
+          }
+          this.handleDisconnect(socket, generation);
+        }
+      };
       
       // Connection timeout
       const timeout = setTimeout(() => {
-        if (this.socket) this.socket.destroy();
+        if (!isCurrentAttempt()) return;
+        cleanupAttempt(true);
         if (!settled) {
           settled = true;
           reject(new Error('Connection timeout'));
@@ -247,21 +345,23 @@ export class FIXConnection extends EventEmitter {
       }, 30000);
       
       // Handle incoming data
-      this.socket.on('data', (data) => {
+      socket.on('data', (data) => {
+        if (!isCurrentAttempt()) return;
         this.handleIncomingData(data);
       });
       
       // Handle connection close
-      this.socket.on('close', () => {
+      socket.on('close', () => {
+        if (!isCurrentAttempt()) return;
         this.logger.warn(`[FIXConnection] Connection closed to ${this.targetCompID}`);
-        this.handleDisconnect();
+        this.handleDisconnect(socket, generation);
       });
       
       // Handle errors
-      this.socket.on('error', (error) => {
+      socket.on('error', (error) => {
+        if (!isCurrentAttempt()) return;
         this.logger.error(`[FIXConnection] Socket error: ${error.message}`);
-        if (logonTimeout) clearTimeout(logonTimeout);
-        clearTimeout(timeout);
+        cleanupAttempt(false);
         if (!settled) {
           settled = true;
           reject(error);
@@ -269,7 +369,8 @@ export class FIXConnection extends EventEmitter {
         this.emit('error', error);
       });
 
-      this.socket.connect(this.port, this.host, () => {
+      socket.connect(this.port, this.host, () => {
+        if (!isCurrentAttempt()) return;
         clearTimeout(timeout);
         this.logger.info(`[FIXConnection] TCP connection established to ${this.targetCompID}`);
         this.isConnected = true;
@@ -286,14 +387,21 @@ export class FIXConnection extends EventEmitter {
         // Wait for proxy to establish connection to TrueX (if using proxy)
         // This delay is critical when connecting through a proxy server
         this.logger.info(`[FIXConnection] Waiting for connection setup...`);
-        setTimeout(() => {
+        setupTimer = setTimeout(() => {
+          if (!isCurrentAttempt()) return;
+          const firedSetupTimer = setupTimer;
+          setupTimer = null;
+          if (this._logonSetupTimer === firedSetupTimer) this._logonSetupTimer = null;
           // Send logon message
           this.sendLogon(isReconnect)
             .then(() => {
+              if (!isCurrentAttempt()) return;
               this.logger.info(`[FIXConnection] Logon message sent to ${this.targetCompID}`);
               
               // Wait for logon response
               logonTimeout = setTimeout(() => {
+                if (!isCurrentAttempt()) return;
+                cleanupAttempt(true);
                 if (!settled) {
                   settled = true;
                   reject(new Error('Logon timeout - no response from server'));
@@ -301,10 +409,17 @@ export class FIXConnection extends EventEmitter {
               }, 10000);
             
             // Listen for logon response
-            const logonHandler = (message) => {
+            logonHandler = async (message) => {
+              if (!isCurrentAttempt()) return;
               if (message.fields['35'] === 'A') { // Logon message
                 if (logonTimeout) clearTimeout(logonTimeout);
+                logonTimeout = null;
                 this.removeListener('message', logonHandler);
+                logonHandler = null;
+                if (rejectHandler) {
+                  this.removeListener('reject', rejectHandler);
+                  rejectHandler = null;
+                }
 
                 // Check SessionStatus (1409) — non-zero means the exchange
                 // accepted the TCP logon but flagged a session-level problem.
@@ -324,11 +439,10 @@ export class FIXConnection extends EventEmitter {
                   // For seqnum mismatch (9): force a full reset on next reconnect
                   // by clearing hasConnectedBefore so 141=Y is sent with seqnum=1.
                   if (sessionStatus === '9') {
-                    this.hasConnectedBefore = false;
-                    this.msgSeqNum = 1;
-                    this.expectedSeqNum = 1;
+                    await this.resetSequenceNumbers();
                   }
 
+                  cleanupAttempt(true);
                   if (!settled) {
                     settled = true;
                     reject(new Error(`Logon session problem: ${statusText}`));
@@ -338,6 +452,9 @@ export class FIXConnection extends EventEmitter {
 
                 this.isLoggedOn = true;
                 this.hasConnectedBefore = true;
+                // Clear resend-failure tracking on successful logon
+                this._resendGapStart = null;
+                this._resendAttempts = 0;
                 // Do NOT reset reconnectAttempts immediately — _startStableTimer will
                 // reset it after 60s of stable uptime, preventing a brief drop from
                 // resetting the counter too eagerly.
@@ -349,21 +466,35 @@ export class FIXConnection extends EventEmitter {
                   settled = true;
                   resolve();
                 }
-              } else if (message.fields['35'] === '3') { // Reject
-                if (logonTimeout) clearTimeout(logonTimeout);
-                this.removeListener('message', logonHandler);
-                const rejectReason = message.fields['58'] || 'Unknown reason';
-                if (!settled) {
-                  settled = true;
-                  reject(new Error(`Logon rejected: ${rejectReason}`));
-                }
               }
             };
             
             this.on('message', logonHandler);
+            rejectHandler = ({ reason, message }) => {
+              if (!isCurrentAttempt()) return;
+              if (logonTimeout) clearTimeout(logonTimeout);
+              logonTimeout = null;
+              if (/already authenticated/i.test(reason)) {
+                this.emit('duplicate-logon', { reason, message });
+              }
+              cleanupAttempt(true);
+              if (!settled) {
+                settled = true;
+                reject(new Error(`Logon rejected: ${reason}`));
+              }
+            };
+            this.on('reject', rejectHandler);
           })
-          .catch(reject);
+          .catch((error) => {
+            if (!isCurrentAttempt()) return;
+            cleanupAttempt(true);
+            if (!settled) {
+              settled = true;
+              reject(error);
+            }
+          });
         }, 2000); // Wait 2 seconds for proxy to establish TrueX connection
+        this._logonSetupTimer = setupTimer;
       });
       
     });
@@ -479,9 +610,7 @@ export class FIXConnection extends EventEmitter {
     if (this.logger.debug) {
       this.logger.debug(`[FIXConnection] Stored message seq ${currentSeqNum} (total: ${this.sentMessages.size})`);
     }
-    
-    this.logger.info(`[FIXConnection] Stored message seq ${currentSeqNum} (total: ${this.sentMessages.size})`);
-    
+
     // Debug: Log raw message being sent
     if (process.env.TRUEX_DEBUG_MODE === 'true') {
       const preview = message.replace(/\x01/g, '|').substring(0, 300);
@@ -607,6 +736,30 @@ export class FIXConnection extends EventEmitter {
       });
     }
     
+    // SequenceReset-GapFill can legitimately advance over a gap. Handle it
+    // before normal gap validation to avoid requesting the range it is filling.
+    if (msgType === '4' && message.fields['123'] === 'Y') {
+      const newSeqNo = parseInt(message.fields['36'], 10);
+      if (!Number.isFinite(msgSeqNum) || !Number.isFinite(newSeqNo)) {
+        this.logger.warn(
+          `[FIXConnection] Ignoring invalid SequenceReset-GapFill: ` +
+          `seq=${msgSeqNum}, newSeqNo=${message.fields['36']}, expected=${this.expectedSeqNum}`
+        );
+        return;
+      }
+      if (msgSeqNum === this.expectedSeqNum) {
+        if (newSeqNo <= this.expectedSeqNum || newSeqNo <= msgSeqNum) {
+          this.logger.warn(
+            `[FIXConnection] Ignoring stale/non-advancing SequenceReset-GapFill: ` +
+            `seq=${msgSeqNum}, newSeqNo=${message.fields['36']}, expected=${this.expectedSeqNum}`
+          );
+          return;
+        }
+        this.handleSequenceReset(message);
+        return;
+      }
+    }
+
     // Validate sequence number
     const seqStatus = this.validateSequence(msgSeqNum);
     if (seqStatus === 'DUPLICATE') {
@@ -617,6 +770,26 @@ export class FIXConnection extends EventEmitter {
       return;
     } else if (seqStatus === 'GAP') {
       this.logger.error(`[FIXConnection] Sequence gap detected: expected ${this.expectedSeqNum}, received ${msgSeqNum}`);
+
+      // Track resend attempts for the same gap; force reset after MAX_RESEND_ATTEMPTS
+      if (this._resendGapStart !== this.expectedSeqNum) {
+        this._resendGapStart = this.expectedSeqNum;
+        this._resendAttempts = 1;
+      } else {
+        this._resendAttempts++;
+      }
+
+      if (this._resendAttempts >= this._maxResendAttempts) {
+        this.logger.error(`[FIXConnection] Resend failed ${this._resendAttempts} times for gap ${this.expectedSeqNum}-${msgSeqNum - 1}. Forcing session reset.`);
+        this.emit('resend-failed-reset', { expected: this.expectedSeqNum, received: msgSeqNum, attempts: this._resendAttempts });
+        void this._forceSessionReset('resend-failed', {
+          expected: this.expectedSeqNum,
+          received: msgSeqNum,
+          attempts: this._resendAttempts,
+        });
+        return;
+      }
+
       this.requestResend(this.expectedSeqNum, msgSeqNum - 1);
       return;
     }
@@ -635,6 +808,9 @@ export class FIXConnection extends EventEmitter {
       case '3': // Reject
         this.handleReject(message);
         break;
+      case '4': // SequenceReset
+        this.handleSequenceReset(message);
+        break;
       case '5': // Logout
         this.handleLogout(message);
         break;
@@ -642,6 +818,25 @@ export class FIXConnection extends EventEmitter {
         // Emit message for application handling
         this.emit('message', message);
     }
+  }
+
+  handleSequenceReset(message) {
+    const newSeqNo = parseInt(message.fields['36'], 10);
+    const gapFill = message.fields['123'] === 'Y';
+    if (!Number.isFinite(newSeqNo) || newSeqNo < 1) {
+      this.logger.error(`[FIXConnection] Invalid SequenceReset NewSeqNo: ${message.fields['36']}`);
+      return;
+    }
+
+    this.expectedSeqNum = newSeqNo;
+    if (this.redisClient) {
+      void this.redisClient.set(this._seqKeyIn, this.expectedSeqNum)
+        .catch(err => this.logger.warn(`[FIXConnection] Failed to persist inbound seqnum after SequenceReset: ${err.message}`));
+    }
+    this._resendGapStart = null;
+    this._resendAttempts = 0;
+    this.logger.warn(`[FIXConnection] SequenceReset received (${gapFill ? 'GapFill' : 'Reset'}): expectedSeqNum=${newSeqNo}`);
+    this.emit('sequence-reset', { newSeqNo, gapFill, message });
   }
   
   /**
@@ -678,7 +873,6 @@ export class FIXConnection extends EventEmitter {
       '52': this.getUTCTimestamp(),
       '7': beginSeqNo.toString(),       // BeginSeqNo
       '16': endSeqNo.toString(),        // EndSeqNo
-      '1137': this.defaultApplVerID
     };
     
     await this.sendMessage(fields);
@@ -709,7 +903,6 @@ export class FIXConnection extends EventEmitter {
       '34': this.msgSeqNum.toString(),
       '52': this.getUTCTimestamp(),
       '112': testReqID,                 // TestReqID
-      '1137': this.defaultApplVerID
     };
     
     await this.sendMessage(fields);
@@ -893,7 +1086,6 @@ export class FIXConnection extends EventEmitter {
         '56': this.targetCompID,
         '34': this.msgSeqNum.toString(),
         '52': this.getUTCTimestamp(),
-        '1137': this.defaultApplVerID
       };
       
       await this.sendMessage(fields);
@@ -915,10 +1107,13 @@ export class FIXConnection extends EventEmitter {
   /**
    * Handle disconnection
    */
-  handleDisconnect() {
+  handleDisconnect(socket = this.socket, generation = this._connectionGeneration) {
+    if (socket && socket !== this.socket) return;
+    if (generation !== this._connectionGeneration) return;
+
     this.isConnected = false;
     this.isLoggedOn = false;
-    this.stopHeartbeat();
+    this._clearLifecycleTimers();
 
     // Cancel stable-connection timer so a quick drop doesn't reset the counter.
     if (this._stableTimer) {
@@ -1023,7 +1218,6 @@ export class FIXConnection extends EventEmitter {
         '56': this.targetCompID,
         '34': this.msgSeqNum.toString(),
         '52': this.getUTCTimestamp(),
-        '1137': this.defaultApplVerID
       };
       
       await this.sendMessage(fields);

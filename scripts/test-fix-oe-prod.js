@@ -1,0 +1,116 @@
+/**
+ * Prod FIX Order Entry test — logon only, no orders placed
+ * Verifies TRUEX_PROD_OE authentication works before live trading.
+ *
+ * Run: bun scripts/test-fix-oe-prod.js
+ */
+import net from 'net';
+import crypto from 'crypto';
+
+const SOH = '\x01';
+const HOST = '127.0.0.1';
+const PORT = 19484;
+const SENDER = process.env.TRUEX_SENDER_COMP_ID || 'DAVID1';
+const TARGET = 'TRUEX_PROD_OE';
+const API_KEY = process.env.TRUEX_PROD_API_KEY || process.env.TRUEX_API_KEY;
+const API_SECRET = process.env.TRUEX_PROD_SECRET_KEY || process.env.TRUEX_SECRET_KEY;
+
+if (!API_KEY || !API_SECRET) {
+  console.error('ERROR: TRUEX_PROD_API_KEY and TRUEX_PROD_SECRET_KEY (or the TRUEX_API_KEY/TRUEX_SECRET_KEY fallbacks) must be set.');
+  process.exit(1);
+}
+
+function ts() {
+  const n = new Date();
+  const pad = (v, l = 2) => String(v).padStart(l, '0');
+  return `${n.getUTCFullYear()}${pad(n.getUTCMonth()+1)}${pad(n.getUTCDate())}-${pad(n.getUTCHours())}:${pad(n.getUTCMinutes())}:${pad(n.getUTCSeconds())}.${pad(n.getUTCMilliseconds(), 3)}`;
+}
+
+function buildFIX(fields) {
+  // Accept ordered array of [tag, value] pairs — preserves FIX header/body
+  // order (Object.entries reorders integer-like keys numerically, which
+  // would put tag 34 before 35 and break logon).
+  const body = fields.map(([k, v]) => `${k}=${v}${SOH}`).join('');
+  const len = Buffer.byteLength(body, 'utf8');
+  const raw = `8=FIXT.1.1${SOH}9=${len}${SOH}` + body;
+  const sum = [...Buffer.from(raw, 'utf8')].reduce((a, b) => a + b, 0) % 256;
+  return raw + `10=${String(sum).padStart(3, '0')}${SOH}`;
+}
+
+function prettyFIX(raw) {
+  // Redact sensitive auth tags before logging — 553 = API key, 554 = HMAC signature.
+  return raw
+    .replace(/553=[^\x01]*/g, '553=***')
+    .replace(/554=[^\x01]*/g, '554=***')
+    .replace(/\x01/g, ' | ');
+}
+
+const sending = ts();
+const sig = crypto.createHmac('sha256', API_SECRET)
+  .update(`${sending}A1${SENDER}${TARGET}${API_KEY}`)
+  .digest('base64');
+
+const logon = buildFIX([
+  ['35', 'A'],
+  ['49', SENDER],
+  ['56', TARGET],
+  ['34', '1'],
+  ['52', sending],
+  ['98', '0'],
+  ['108', '30'],
+  ['141', 'Y'],
+  ['553', API_KEY],
+  ['554', sig],
+  ['1137', 'FIX.5.0SP2'],
+]);
+
+const maskedKey = API_KEY.length > 8 ? `${API_KEY.slice(0, 4)}***${API_KEY.slice(-4)}` : '***';
+console.log(`Connecting to ${HOST}:${PORT} (tunneled to TrueX prod via WireGuard)`);
+console.log(`SenderCompID: ${SENDER}, TargetCompID: ${TARGET}`);
+console.log(`API Key: ${maskedKey}\n`);
+
+const socket = new net.Socket();
+let recvBuffer = Buffer.alloc(0);
+let closeScheduled = false;
+
+function scheduleClose() {
+  if (closeScheduled) return;
+  closeScheduled = true;
+  setTimeout(() => socket.destroy(), 1000);
+}
+
+socket.connect(PORT, HOST, () => {
+  console.log(`Connected. Sending logon:\n${prettyFIX(logon)}\n`);
+  socket.write(logon);
+});
+
+socket.on('data', (data) => {
+  recvBuffer = Buffer.concat([recvBuffer, data]);
+
+  while (recvBuffer.length > 0) {
+    const bufferText = recvBuffer.toString('latin1');
+    const checksumMatch = /(?:^|\x01)10=\d{3}\x01/.exec(bufferText);
+    if (!checksumMatch) break;
+
+    const frameEnd = checksumMatch.index + checksumMatch[0].length;
+    const msg = recvBuffer.subarray(0, frameEnd).toString('latin1');
+    recvBuffer = recvBuffer.subarray(frameEnd);
+
+    console.log(`\n<<< SERVER:\n${prettyFIX(msg)}`);
+    if (msg.includes('35=A')) {
+      console.log('\n✅ LOGON ACCEPTED — prod order entry authenticated');
+      scheduleClose();
+    } else if (msg.includes('35=3')) {
+      const reason = msg.match(/58=([^\x01]+)/)?.[1] || 'unknown';
+      console.log(`\n❌ REJECTED: ${reason}`);
+      scheduleClose();
+    }
+  }
+});
+
+const safetyTimer = setTimeout(() => socket.destroy(), 10000);
+socket.on('error', (e) => console.error('Error:', e.message));
+socket.on('close', () => {
+  clearTimeout(safetyTimer);
+  console.log('\nConnection closed.');
+});

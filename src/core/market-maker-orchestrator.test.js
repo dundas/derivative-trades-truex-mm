@@ -858,3 +858,51 @@ describe('balance snapshot job', () => {
     }
   });
 });
+
+// -----------------------------------------------------------------------
+// OE disconnect — inflight order flush
+// -----------------------------------------------------------------------
+describe('OE disconnect flushes inflight orders', () => {
+  it('removes cancelling and pending orders on OE disconnect', () => {
+    const orch = makeOrch();
+    orch.isRunning = true;
+    orch._wireEvents();
+
+    orch.quoteEngine.activeOrders.set('ord1', { status: 'cancelling', side: 'buy', level: 1 });
+    orch.quoteEngine.activeOrders.set('ord2', { status: 'pending',    side: 'sell', level: 1 });
+    orch.quoteEngine.activeOrders.set('ord3', { status: 'active',     side: 'buy', level: 2 });
+
+    orch.fixOE.emit('disconnect');
+
+    expect(orch.quoteEngine.activeOrders.has('ord1')).toBe(false);
+    expect(orch.quoteEngine.activeOrders.has('ord2')).toBe(false);
+    // active order preserved — reconciler handles it as orphan
+    expect(orch.quoteEngine.activeOrders.has('ord3')).toBe(true);
+  });
+
+  it('removes cancelling and pending orders on OE logout', () => {
+    const orch = makeOrch();
+    orch.isRunning = true;
+    orch._wireEvents();
+
+    orch.quoteEngine.activeOrders.set('ord1', { status: 'cancelling', side: 'sell', level: 1 });
+    orch.quoteEngine.activeOrders.set('ord2', { status: 'active',     side: 'buy',  level: 1 });
+
+    orch.fixOE.emit('logout', { text: 'server logout' });
+
+    expect(orch.quoteEngine.activeOrders.has('ord1')).toBe(false);
+    expect(orch.quoteEngine.activeOrders.has('ord2')).toBe(true);
+  });
+
+  it('does nothing when not running', () => {
+    const orch = makeOrch();
+    orch.isRunning = false;
+    orch._wireEvents();
+
+    orch.quoteEngine.activeOrders.set('ord1', { status: 'cancelling', side: 'buy', level: 1 });
+
+    orch.fixOE.emit('disconnect');
+
+    expect(orch.quoteEngine.activeOrders.has('ord1')).toBe(true);
+  });
+});
