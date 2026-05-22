@@ -89,7 +89,7 @@ socket.on('data', (data) => {
 
   while (recvBuffer.length > 0) {
     const bufferText = recvBuffer.toString('latin1');
-    const checksumMatch = /10=\d{3}\x01/.exec(bufferText);
+    const checksumMatch = /(?:^|\x01)10=\d{3}\x01/.exec(bufferText);
     if (!checksumMatch) break;
 
     const frameEnd = checksumMatch.index + checksumMatch[0].length;
