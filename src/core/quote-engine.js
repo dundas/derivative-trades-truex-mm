@@ -47,6 +47,8 @@ export class QuoteEngine extends EventEmitter {
       truexBookStaleThresholdMs: options.truexBookStaleThresholdMs || 10000,
       marketablePostOnlyAction: options.marketablePostOnlyAction || 'skip',
       replaceMode: options.replaceMode || 'passive-safe',
+      minActiveLevelsPerSide: options.minActiveLevelsPerSide ?? 0,
+      maxReplacementsPerSidePerCycle: options.maxReplacementsPerSidePerCycle ?? Number.POSITIVE_INFINITY,
       pendingReplacementTimeoutMs: options.pendingReplacementTimeoutMs || 5000,
       allowTakerOrders: options.allowTakerOrders || false,
       truexTakerFeeBps: options.truexTakerFeeBps ?? 0,
@@ -63,6 +65,7 @@ export class QuoteEngine extends EventEmitter {
     this.lastMid = 0;
     this.lastRepriceAt = 0;
     this.isQuoting = false;
+    this.quotingSuspended = false;
     this.orderSequence = 0;
 
     // Rate limiting
@@ -80,6 +83,9 @@ export class QuoteEngine extends EventEmitter {
     this.pendingReplacements = new Map(); // origClOrdID -> { quote, createdAt }
     this.suppressedLevels = new Map(); // side:level -> { reason, timestamp, quote }
     this.recentRejectsByReason = new Map();
+    this.lastReplacementSide = null;
+    this.lastReplacementLevelBySide = new Map();
+    this.deferredRepriceNeeded = false;
     this.lastMarketableAloSkip = null;
     this.truexBook = null;
     this.takerWindowStartedAt = Date.now();
@@ -103,6 +109,24 @@ export class QuoteEngine extends EventEmitter {
     };
   }
 
+  suspendQuoting() {
+    this.quotingSuspended = true;
+    this.isQuoting = false;
+  }
+
+  resumeQuoting() {
+    this.quotingSuspended = false;
+  }
+
+  invalidateQueuedWork(reprice = false) {
+    this.actionQueue = [];
+    this.deferredRepriceNeeded = reprice;
+  }
+
+  clearPendingReplacement(origClOrdID) {
+    this.pendingReplacements.delete(origClOrdID);
+  }
+
   /**
    * Main entry point: called on every PriceAggregator 'price' event.
    */
@@ -120,6 +144,9 @@ export class QuoteEngine extends EventEmitter {
     if (!mid || mid <= 0) return;
 
     this.lastMid = mid;
+    if (this.quotingSuspended) {
+      return;
+    }
 
     const now = Date.now();
 
@@ -154,10 +181,12 @@ export class QuoteEngine extends EventEmitter {
     }
 
     // Execute rate-limited
-    this.executeActions(actions);
+    const dispatched = this.executeActions(actions);
 
     this.isQuoting = true;
-    this.lastRepriceAt = Date.now();
+    if (dispatched) {
+      this.lastRepriceAt = Date.now();
+    }
     this.emit('quote-update', {
       bidLevels: desired.filter(q => q.side === 'buy').length,
       askLevels: desired.filter(q => q.side === 'sell').length,
@@ -338,13 +367,65 @@ export class QuoteEngine extends EventEmitter {
       orderedActions.push({ type: 'cancel', clOrdID: c.clOrdID, order: c.order });
     }
 
-    for (const r of actions.toReplace) {
-      if (this.config.replaceMode === 'place-before-cancel') {
+    if (this.config.replaceMode === 'place-before-cancel') {
+      for (const r of actions.toReplace) {
         orderedActions.push({ type: 'place', quote: r.place });
         orderedActions.push({ type: 'cancel', clOrdID: r.cancel, order: r.cancelOrder });
-      } else {
-        this.pendingReplacements.set(r.cancel, { quote: r.place, createdAt: Date.now() });
-        orderedActions.push({ type: 'cancel', clOrdID: r.cancel, order: r.cancelOrder });
+      }
+    } else {
+      const replacementCountsBySide = new Map();
+      const initialLiveCountsBySide = new Map();
+      const liveCountsBySide = new Map();
+      const inflightCountsBySide = new Map();
+      const pureCancelsBySide = new Map();
+
+      for (const [, order] of this.activeOrders) {
+        if (order.status === 'active') {
+          initialLiveCountsBySide.set(order.side, (initialLiveCountsBySide.get(order.side) || 0) + 1);
+          liveCountsBySide.set(order.side, (liveCountsBySide.get(order.side) || 0) + 1);
+          continue;
+        }
+        if (order.status === 'cancelling' || order.status === 'pending') {
+          inflightCountsBySide.set(order.side, (inflightCountsBySide.get(order.side) || 0) + 1);
+        }
+      }
+
+      for (const cancel of actions.toCancel) {
+        const side = cancel.order?.side;
+        if (!side) continue;
+        pureCancelsBySide.set(side, (pureCancelsBySide.get(side) || 0) + 1);
+      }
+
+      for (const [side, count] of pureCancelsBySide.entries()) {
+        liveCountsBySide.set(side, Math.max(0, (liveCountsBySide.get(side) || 0) - count));
+      }
+
+      const replacements = this._orderPassiveSafeReplacements(actions.toReplace);
+
+      for (const r of replacements) {
+        const side = r.cancelOrder?.side || r.place?.side;
+        const liveOnSide = liveCountsBySide.get(side) || 0;
+        const initialLiveOnSide = initialLiveCountsBySide.get(side) || 0;
+        const inflightOnSide = inflightCountsBySide.get(side) || 0;
+        const replacementsOnSide = replacementCountsBySide.get(side) || 0;
+        const singleQuoteException = this.config.minActiveLevelsPerSide === 1 &&
+          initialLiveOnSide === 1 &&
+          inflightOnSide === 0;
+
+        if ((!singleQuoteException && liveOnSide <= this.config.minActiveLevelsPerSide) ||
+            replacementsOnSide >= this.config.maxReplacementsPerSidePerCycle) {
+          this.deferredRepriceNeeded = true;
+          continue;
+        }
+
+        orderedActions.push({
+          type: 'replacement-cancel',
+          clOrdID: r.cancel,
+          order: r.cancelOrder,
+          quote: r.place,
+        });
+        liveCountsBySide.set(side, liveOnSide - 1);
+        replacementCountsBySide.set(side, replacementsOnSide + 1);
       }
     }
 
@@ -352,8 +433,14 @@ export class QuoteEngine extends EventEmitter {
       orderedActions.push({ type: 'place', quote: p });
     }
 
+    let dispatched = false;
     for (const action of orderedActions) {
       if (this.actionsThisSecond >= this.config.maxOrdersPerSecond) {
+        if (action.type === 'replacement-cancel') {
+          this.deferredRepriceNeeded = true;
+          this.emit('rate-limited', { action: action.type, queueDepth: this.actionQueue.length });
+          continue;
+        }
         // Defer to queue
         this.actionQueue.push(action);
         this.emit('rate-limited', { action: action.type, queueDepth: this.actionQueue.length });
@@ -361,14 +448,18 @@ export class QuoteEngine extends EventEmitter {
       }
 
       // Dup guard check
-      const guardKey = action.type === 'cancel' ? action.clOrdID : null;
+      const guardKey = action.type === 'cancel' || action.type === 'replacement-cancel'
+        ? action.clOrdID
+        : null;
       if (guardKey && this._isDupGuarded(guardKey)) {
         continue;
       }
 
       this._dispatchAction(action);
       this.actionsThisSecond++;
+      dispatched = true;
     }
+    return dispatched;
   }
 
   /**
@@ -376,6 +467,11 @@ export class QuoteEngine extends EventEmitter {
    */
   _dispatchAction(action) {
     if (action.type === 'cancel') {
+      this._sendCancel(action.clOrdID, action.order);
+    } else if (action.type === 'replacement-cancel') {
+      this.pendingReplacements.set(action.clOrdID, { quote: action.quote, createdAt: Date.now() });
+      this.lastReplacementSide = action.order?.side || null;
+      this.lastReplacementLevelBySide.set(action.order?.side, action.order?.level || 0);
       this._sendCancel(action.clOrdID, action.order);
     } else if (action.type === 'place') {
       this._sendNewOrder(action.quote);
@@ -593,6 +689,9 @@ export class QuoteEngine extends EventEmitter {
    */
   cancelAllQuotes(reason) {
     const orderCount = this.activeOrders.size;
+    this.suspendQuoting();
+    this.deferredRepriceNeeded = false;
+    this.actionQueue = [];
     if (orderCount === 0) return;
 
     this.logger.warn(`[QuoteEngine] Cancelling all ${orderCount} quotes: ${reason || 'emergency'}`);
@@ -716,6 +815,9 @@ export class QuoteEngine extends EventEmitter {
    */
   drainQueue() {
     this._expirePendingReplacements();
+    if (this.quotingSuspended) {
+      return;
+    }
     const now = Date.now();
     if (now - this.lastActionReset >= 1000) {
       this.actionsThisSecond = 0;
@@ -726,6 +828,10 @@ export class QuoteEngine extends EventEmitter {
       const action = this.actionQueue.shift();
       this._dispatchAction(action);
       this.actionsThisSecond++;
+    }
+
+    if (this.deferredRepriceNeeded && this.actionsThisSecond < this.config.maxOrdersPerSecond) {
+      this._runDeferredReprice();
     }
   }
 
@@ -870,6 +976,10 @@ export class QuoteEngine extends EventEmitter {
       this._recordSuppression(pending.quote, 'pending-replacement-expired');
       return;
     }
+    if (this.quotingSuspended || this.rejectBackoffUntil > Date.now()) {
+      this.deferredRepriceNeeded = true;
+      return;
+    }
     this._dispatchAction({ type: 'place', quote: pending.quote });
   }
 
@@ -910,5 +1020,73 @@ export class QuoteEngine extends EventEmitter {
       return (cumulativeBps / 10000) * mid;
     }
     return level * levelSpacingTicks * tickSize;
+  }
+
+  _orderPassiveSafeReplacements(replacements) {
+    const grouped = new Map();
+
+    for (const replacement of replacements) {
+      const side = replacement.cancelOrder?.side || replacement.place?.side || 'unknown';
+      if (!grouped.has(side)) grouped.set(side, []);
+      grouped.get(side).push(replacement);
+    }
+
+    const ordered = [];
+    const sides = [...grouped.keys()].sort();
+    if (this.lastReplacementSide && sides.includes(this.lastReplacementSide)) {
+      const startIndex = (sides.indexOf(this.lastReplacementSide) + 1) % sides.length;
+      sides.push(...sides.splice(0, startIndex));
+    }
+    for (const side of sides) {
+      const sideReplacements = grouped.get(side).sort((a, b) =>
+        (a.cancelOrder?.level || 0) - (b.cancelOrder?.level || 0)
+      );
+      const lastLevel = this.lastReplacementLevelBySide.get(side);
+      let startIndex = 0;
+      if (lastLevel !== undefined) {
+        const nextIndex = sideReplacements.findIndex((r) => (r.cancelOrder?.level || 0) > lastLevel);
+        startIndex = nextIndex >= 0 ? nextIndex : 0;
+      }
+      ordered.push(
+        ...sideReplacements.slice(startIndex),
+        ...sideReplacements.slice(0, startIndex),
+      );
+    }
+
+    return ordered;
+  }
+
+  _runDeferredReprice() {
+    if (this.quotingSuspended) {
+      this.deferredRepriceNeeded = true;
+      return false;
+    }
+    if (!this.lastMid || this.lastMid <= 0) return false;
+    const now = Date.now();
+    if (this.rejectBackoffUntil > now) {
+      this.deferredRepriceNeeded = true;
+      return false;
+    }
+    if (this.config.minRepriceIntervalMs > 0 &&
+        this.lastRepriceAt &&
+        (now - this.lastRepriceAt) < this.config.minRepriceIntervalMs) {
+      this.deferredRepriceNeeded = true;
+      return false;
+    }
+    const skew = this.inventoryManager
+      ? this.inventoryManager.getSkew()
+      : { bidSkewTicks: 0, askSkewTicks: 0 };
+    const desired = this.computeDesiredQuotes(this.lastMid, skew);
+    const actions = this.reconcileOrders(desired, this.activeOrders);
+    if (actions.toPlace.length || actions.toCancel.length || actions.toReplace.length) {
+      this.deferredRepriceNeeded = false;
+      const dispatched = this.executeActions(actions);
+      if (dispatched) {
+        this.lastRepriceAt = Date.now();
+      }
+      return !this.deferredRepriceNeeded;
+    }
+    this.deferredRepriceNeeded = false;
+    return true;
   }
 }

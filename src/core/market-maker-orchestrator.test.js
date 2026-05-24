@@ -24,6 +24,10 @@ function makeOrch(overrides = {}) {
   const mockQuoteEngine = new EventEmitter();
   mockQuoteEngine.onPriceUpdate = jest.fn();
   mockQuoteEngine.cancelAllQuotes = jest.fn();
+  mockQuoteEngine.suspendQuoting = jest.fn();
+  mockQuoteEngine.resumeQuoting = jest.fn();
+  mockQuoteEngine.invalidateQueuedWork = jest.fn();
+  mockQuoteEngine.clearPendingReplacement = jest.fn();
   mockQuoteEngine.activeOrders = new Map();
   mockQuoteEngine.getQuoteStatus = jest.fn().mockReturnValue({});
 
@@ -184,16 +188,17 @@ describe('dual-session gate', () => {
     expect(orch.quoteEngine.onPriceUpdate).toHaveBeenCalledWith(price);
   });
 
-  it('allows quoting when no marketDataFeed (OE-only mode)', () => {
+  it('blocks quoting when no marketDataFeed and OE is not logged on (OE-only mode)', () => {
     const orch = makeOrch(); // no marketDataFeed
     orch.isRunning = true;
-    orch.fixOE.isLoggedOn = false; // OE down, but gate only fires when MD feed present
+    orch.fixOE.isLoggedOn = false;
 
     const price = { weightedMidpoint: 50000 };
     orch._onPriceUpdate(price);
 
-    // No feed → gate is not applied
-    expect(orch.quoteEngine.onPriceUpdate).toHaveBeenCalledWith(price);
+    expect(orch.quoteEngine.suspendQuoting).toHaveBeenCalled();
+    expect(orch.quoteEngine.invalidateQueuedWork).toHaveBeenCalledWith(true);
+    expect(orch.quoteEngine.onPriceUpdate).not.toHaveBeenCalled();
   });
 
   it('blocks quoting when MD is not logged on (OE is up)', () => {
@@ -863,7 +868,7 @@ describe('balance snapshot job', () => {
 // OE disconnect — inflight order flush
 // -----------------------------------------------------------------------
 describe('OE disconnect flushes inflight orders', () => {
-  it('removes cancelling and pending orders on OE disconnect', () => {
+  it('restores cancelling and pending orders to active on OE disconnect', () => {
     const orch = makeOrch();
     orch.isRunning = true;
     orch._wireEvents();
@@ -874,13 +879,16 @@ describe('OE disconnect flushes inflight orders', () => {
 
     orch.fixOE.emit('disconnect');
 
-    expect(orch.quoteEngine.activeOrders.has('ord1')).toBe(false);
-    expect(orch.quoteEngine.activeOrders.has('ord2')).toBe(false);
-    // active order preserved — reconciler handles it as orphan
+    expect(orch.quoteEngine.suspendQuoting).toHaveBeenCalled();
+    expect(orch.quoteEngine.invalidateQueuedWork).toHaveBeenCalledWith(true);
+    expect(orch.quoteEngine.clearPendingReplacement).toHaveBeenCalledWith('ord1');
+    expect(orch.quoteEngine.clearPendingReplacement).toHaveBeenCalledWith('ord2');
+    expect(orch.quoteEngine.activeOrders.get('ord1').status).toBe('active');
+    expect(orch.quoteEngine.activeOrders.get('ord2').status).toBe('active');
     expect(orch.quoteEngine.activeOrders.has('ord3')).toBe(true);
   });
 
-  it('removes cancelling and pending orders on OE logout', () => {
+  it('restores cancelling orders to active on OE logout', () => {
     const orch = makeOrch();
     orch.isRunning = true;
     orch._wireEvents();
@@ -890,7 +898,8 @@ describe('OE disconnect flushes inflight orders', () => {
 
     orch.fixOE.emit('logout', { text: 'server logout' });
 
-    expect(orch.quoteEngine.activeOrders.has('ord1')).toBe(false);
+    expect(orch.quoteEngine.invalidateQueuedWork).toHaveBeenCalledWith(true);
+    expect(orch.quoteEngine.activeOrders.get('ord1').status).toBe('active');
     expect(orch.quoteEngine.activeOrders.has('ord2')).toBe(true);
   });
 
