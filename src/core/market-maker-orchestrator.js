@@ -89,6 +89,8 @@ export class MarketMakerOrchestrator extends EventEmitter {
       truexBookStaleThresholdMs: options.truexBookStaleThresholdMs || 10000,
       marketablePostOnlyAction: options.marketablePostOnlyAction || 'skip',
       replaceMode: options.replaceMode || 'passive-safe',
+      minActiveLevelsPerSide: options.minActiveLevelsPerSide ?? 1,
+      maxReplacementsPerSidePerCycle: options.maxReplacementsPerSidePerCycle ?? 1,
       pendingReplacementTimeoutMs: options.pendingReplacementTimeoutMs || 5000,
       allowTakerOrders: options.allowTakerOrders || false,
       truexTakerFeeBps: options.truexTakerFeeBps ?? 0,
@@ -449,42 +451,43 @@ export class MarketMakerOrchestrator extends EventEmitter {
     // Update MD freshness timestamp FIRST (so we know if data is arriving)
     this._lastMdUpdateTime = Date.now();
 
-    // Re-enable quoting gate if MD data is flowing again (was closed by staleness)
-    if (!this._quotingGateEnabled) {
-      this._quotingGateEnabled = true;
-      this.logger.info('[WATCHDOG] Quoting gate re-enabled: fresh MD update received');
+    // Continue operational mark-to-market even while quoting is gated.
+    if (aggregatedPrice.weightedMidpoint) {
+      this._lastMidPrice = aggregatedPrice.weightedMidpoint;
+      this.pnlTracker.markToMarket(aggregatedPrice.weightedMidpoint);
+    }
+
+    if (!this.fixOE.isLoggedOn) {
+      this.quoteEngine.suspendQuoting();
+      this.quoteEngine.invalidateQueuedWork?.(true);
+      this.logger.warn('[WATCHDOG] Quoting gate closed: OE not logged on');
+      return;
     }
 
     // Check dual-session gate: both OE and MD must be logged on
     if (this.marketDataFeed) {
-      if (!this.fixOE.isLoggedOn) {
-        this.logger.warn('[WATCHDOG] Quoting gate closed: OE not logged on');
-        return;
-      }
       if (this.marketDataFeed.isLoggedOn === false) {
+        this.quoteEngine.suspendQuoting();
+        this.quoteEngine.invalidateQueuedWork?.(true);
         this.logger.warn('[WATCHDOG] Quoting gate closed: MD not logged on');
         return;
       }
     }
 
-    // Check explicit gate (set by MD staleness)
+    // Re-enable quoting gate if MD data is flowing again (was closed by staleness)
     if (!this._quotingGateEnabled) {
-      this.logger.warn('[WATCHDOG] Quoting gate closed: gate disabled');
-      return;
+      this._quotingGateEnabled = true;
+      this.quoteEngine.resumeQuoting();
+      this.logger.info('[WATCHDOG] Quoting gate re-enabled: fresh MD update received');
     }
 
     // Feed price to QuoteEngine (gate passed)
+    this.quoteEngine.resumeQuoting();
     if (this.marketDataFeed?.getBestBidAsk) {
       this.quoteEngine.updateTrueXBook(this.marketDataFeed.getBestBidAsk());
     }
     this.quoteEngine.onPriceUpdate(aggregatedPrice);
     this._lastRepriceTime = Date.now();
-
-    // Update PnL mark-to-market and track last mid price for snapshots
-    if (aggregatedPrice.weightedMidpoint) {
-      this._lastMidPrice = aggregatedPrice.weightedMidpoint;
-      this.pnlTracker.markToMarket(aggregatedPrice.weightedMidpoint);
-    }
   }
 
   _onFIXMessage(message) {
@@ -658,23 +661,35 @@ export class MarketMakerOrchestrator extends EventEmitter {
   /**
    * Handle OE FIX disconnect or logout.
    *
-   * Any orders in 'cancelling' or 'pending' state are inflight on a now-dead
-   * FIX session — they will never receive execution reports. Clear them from
-   * local state so reconcileOrders() doesn't block new placements on reconnect.
-   * Active orders are left intact; the reconciler will find them as orphans and
-   * cancel them via REST on the next reconcile cycle.
+   * In-flight local orders may still be live on the venue if the disconnect
+   * raced with order entry or cancel processing. Restore both 'pending' and
+   * 'cancelling' orders to active state, discard stale replacement intent, and
+   * force a fresh reprice after reconnect while preserving late-ack recovery
+   * state for venue-facing cancels.
    */
   _onOEDisconnect() {
     if (!this.isRunning) return;
-    let flushed = 0;
+    this.quoteEngine.suspendQuoting();
+    this.quoteEngine.invalidateQueuedWork?.(true);
+    let restoredPending = 0;
+    let restoredCancelling = 0;
     for (const [clOrdID, order] of this.quoteEngine.activeOrders) {
-      if (order.status === 'cancelling' || order.status === 'pending') {
-        this.quoteEngine.activeOrders.delete(clOrdID);
-        flushed++;
+      if (order.status === 'cancelling') {
+        this.quoteEngine.clearPendingReplacement?.(clOrdID);
+        order.status = 'active';
+        restoredCancelling++;
+        continue;
+      }
+      if (order.status === 'pending') {
+        this.quoteEngine.clearPendingReplacement?.(clOrdID);
+        order.status = 'active';
+        restoredPending++;
       }
     }
-    if (flushed > 0) {
-      this.logger.warn(`[Orchestrator] OE disconnected — flushed ${flushed} inflight order(s) from local state`);
+    if (restoredPending > 0 || restoredCancelling > 0) {
+      this.logger.warn(
+        `[Orchestrator] OE disconnected — restored ${restoredPending} pending and ${restoredCancelling} cancelling order(s)`
+      );
     }
   }
 

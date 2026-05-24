@@ -410,6 +410,477 @@ describe('QuoteEngine', () => {
       expect(dispatchedTypes).toEqual(['place', 'cancel']);
     });
 
+    it('should stagger passive-safe replacements and preserve one live order per side', () => {
+      const fixMock = createMockFix();
+      const engine = createEngine({
+        fixConnection: fixMock,
+        maxOrdersPerSecond: 100,
+        levels: 2,
+        minActiveLevelsPerSide: 1,
+        maxReplacementsPerSidePerCycle: 1,
+      });
+
+      const buyL1 = { side: 'buy', price: 99000, size: 0.1, level: 1, status: 'active', placedAt: Date.now() };
+      const buyL2 = { side: 'buy', price: 98000, size: 0.1, level: 2, status: 'active', placedAt: Date.now() };
+      engine.activeOrders.set('B1', buyL1);
+      engine.activeOrders.set('B2', buyL2);
+
+      engine.executeActions({
+        toCancel: [],
+        toPlace: [],
+        toReplace: [
+          { cancel: 'B1', cancelOrder: buyL1, place: { side: 'buy', price: 99100, size: 0.1, level: 1 } },
+          { cancel: 'B2', cancelOrder: buyL2, place: { side: 'buy', price: 98100, size: 0.1, level: 2 } },
+        ],
+      });
+
+      expect(fixMock.sendMessage).toHaveBeenCalledTimes(1);
+      expect(fixMock.sendMessage.mock.calls[0][0]['35']).toBe('F');
+      const cancelledOrderId = fixMock.sendMessage.mock.calls[0][0]['41'];
+      expect(engine.pendingReplacements.has(cancelledOrderId)).toBe(true);
+      expect(
+        [...engine.activeOrders.entries()].filter(([, order]) =>
+          order.side === 'buy' && order.status === 'active'
+        ).length
+      ).toBe(1);
+    });
+
+    it('should still allow a single active quote to reprice in passive-safe mode', () => {
+      const fixMock = createMockFix();
+      const engine = createEngine({
+        fixConnection: fixMock,
+        maxOrdersPerSecond: 100,
+        levels: 1,
+        minActiveLevelsPerSide: 1,
+        maxReplacementsPerSidePerCycle: 1,
+      });
+
+      const oldOrder = { side: 'sell', price: 101000, size: 0.1, level: 1, status: 'active', placedAt: Date.now() };
+      engine.activeOrders.set('S1', oldOrder);
+
+      engine.executeActions({
+        toCancel: [],
+        toPlace: [],
+        toReplace: [
+          { cancel: 'S1', cancelOrder: oldOrder, place: { side: 'sell', price: 101100, size: 0.1, level: 1 } },
+        ],
+      });
+
+      expect(fixMock.sendMessage).toHaveBeenCalledTimes(1);
+      expect(fixMock.sendMessage.mock.calls[0][0]['35']).toBe('F');
+      expect(engine.pendingReplacements.has('S1')).toBe(true);
+      expect(engine.activeOrders.get('S1').status).toBe('cancelling');
+    });
+
+    it('should not use the single-quote exception when another replacement is already in flight on that side', () => {
+      const fixMock = createMockFix();
+      const engine = createEngine({
+        fixConnection: fixMock,
+        maxOrdersPerSecond: 100,
+        levels: 2,
+        minActiveLevelsPerSide: 1,
+        maxReplacementsPerSidePerCycle: 2,
+      });
+
+      const buyL1 = { side: 'buy', price: 99000, size: 0.1, level: 1, status: 'active', placedAt: Date.now() };
+      const buyL2 = { side: 'buy', price: 98000, size: 0.1, level: 2, status: 'cancelling', placedAt: Date.now() };
+      engine.activeOrders.set('B1', buyL1);
+      engine.activeOrders.set('B2', buyL2);
+      engine.pendingReplacements.set('B2', {
+        quote: { side: 'buy', price: 98100, size: 0.1, level: 2 },
+        createdAt: Date.now(),
+      });
+
+      engine.executeActions({
+        toCancel: [],
+        toPlace: [],
+        toReplace: [
+          { cancel: 'B1', cancelOrder: buyL1, place: { side: 'buy', price: 99100, size: 0.1, level: 1 } },
+        ],
+      });
+
+      expect(engine.deferredRepriceNeeded).toBe(true);
+      expect(fixMock.sendMessage).not.toHaveBeenCalled();
+      expect(engine.pendingReplacements.has('B1')).toBe(false);
+    });
+
+    it('should account for same-cycle pure cancels before allowing passive-safe replacements', () => {
+      const fixMock = createMockFix();
+      const engine = createEngine({
+        fixConnection: fixMock,
+        maxOrdersPerSecond: 100,
+        levels: 2,
+        minActiveLevelsPerSide: 1,
+        maxReplacementsPerSidePerCycle: 1,
+      });
+
+      const buyL1 = { side: 'buy', price: 99000, size: 0.1, level: 1, status: 'active', placedAt: Date.now() };
+      const buyL2 = { side: 'buy', price: 98000, size: 0.1, level: 2, status: 'active', placedAt: Date.now() };
+      engine.activeOrders.set('B1', buyL1);
+      engine.activeOrders.set('B2', buyL2);
+
+      engine.executeActions({
+        toCancel: [{ clOrdID: 'B1', order: buyL1 }],
+        toPlace: [],
+        toReplace: [
+          { cancel: 'B2', cancelOrder: buyL2, place: { side: 'buy', price: 98100, size: 0.1, level: 2 } },
+        ],
+      });
+
+      expect(fixMock.sendMessage).toHaveBeenCalledTimes(1);
+      expect(fixMock.sendMessage.mock.calls[0][0]['35']).toBe('F');
+      expect(fixMock.sendMessage.mock.calls[0][0]['41']).toBe('B1');
+      expect(engine.pendingReplacements.size).toBe(0);
+      expect(engine.activeOrders.get('B2').status).toBe('active');
+    });
+
+    it('should treat pending orders as inflight when enforcing the passive-safe live floor', () => {
+      const fixMock = createMockFix();
+      const engine = createEngine({
+        fixConnection: fixMock,
+        maxOrdersPerSecond: 100,
+        levels: 2,
+        minActiveLevelsPerSide: 1,
+        maxReplacementsPerSidePerCycle: 1,
+      });
+
+      const activeBuy = { side: 'buy', price: 99000, size: 0.1, level: 1, status: 'active', placedAt: Date.now() };
+      const pendingBuy = { side: 'buy', price: 98000, size: 0.1, level: 2, status: 'pending', placedAt: Date.now() };
+      engine.activeOrders.set('B1', activeBuy);
+      engine.activeOrders.set('B2', pendingBuy);
+
+      engine.executeActions({
+        toCancel: [],
+        toPlace: [],
+        toReplace: [
+          { cancel: 'B1', cancelOrder: activeBuy, place: { side: 'buy', price: 99100, size: 0.1, level: 1 } },
+        ],
+      });
+
+      expect(engine.deferredRepriceNeeded).toBe(true);
+      expect(fixMock.sendMessage).not.toHaveBeenCalled();
+      expect(engine.pendingReplacements.has('B1')).toBe(false);
+      expect(engine.activeOrders.get('B1').status).toBe('active');
+    });
+
+    it('should rotate passive-safe replacements across levels instead of always picking the deepest level', () => {
+      const fixMock = createMockFix();
+      const engine = createEngine({
+        fixConnection: fixMock,
+        maxOrdersPerSecond: 100,
+        levels: 3,
+        minActiveLevelsPerSide: 1,
+        maxReplacementsPerSidePerCycle: 1,
+      });
+
+      const buyL1 = { side: 'buy', price: 99000, size: 0.1, level: 1, status: 'active', placedAt: Date.now() };
+      const buyL2 = { side: 'buy', price: 98000, size: 0.1, level: 2, status: 'active', placedAt: Date.now() };
+      const buyL3 = { side: 'buy', price: 97000, size: 0.1, level: 3, status: 'active', placedAt: Date.now() };
+      engine.activeOrders.set('B1', buyL1);
+      engine.activeOrders.set('B2', buyL2);
+      engine.activeOrders.set('B3', buyL3);
+
+      const actions = {
+        toCancel: [],
+        toPlace: [],
+        toReplace: [
+          { cancel: 'B1', cancelOrder: buyL1, place: { side: 'buy', price: 99100, size: 0.1, level: 1 } },
+          { cancel: 'B2', cancelOrder: buyL2, place: { side: 'buy', price: 98100, size: 0.1, level: 2 } },
+          { cancel: 'B3', cancelOrder: buyL3, place: { side: 'buy', price: 97100, size: 0.1, level: 3 } },
+        ],
+      };
+
+      engine.executeActions(actions);
+      expect(fixMock.sendMessage.mock.calls[0][0]['41']).toBe('B1');
+      const firstCancelClOrdID = fixMock.sendMessage.mock.calls[0][0]['11'];
+      engine.onExecutionReport({ '11': firstCancelClOrdID, '39': '4', '54': '1' });
+      engine.onExecutionReport({ '11': fixMock.sendMessage.mock.calls[1][0]['11'], '39': '0', '54': '1' });
+
+      fixMock.sendMessage.mockClear();
+      engine.executeActions(actions);
+
+      expect(fixMock.sendMessage).toHaveBeenCalledTimes(1);
+      expect(fixMock.sendMessage.mock.calls[0][0]['41']).toBe('B2');
+    });
+
+    it('should rotate passive-safe replacement priority across sides after the last dispatched side', () => {
+      const engine = createEngine();
+      engine.lastReplacementSide = 'buy';
+
+      const ordered = engine._orderPassiveSafeReplacements([
+        { cancel: 'B1', cancelOrder: { side: 'buy', level: 1 }, place: { side: 'buy', level: 1 } },
+        { cancel: 'S1', cancelOrder: { side: 'sell', level: 1 }, place: { side: 'sell', level: 1 } },
+      ]);
+
+      expect(ordered.map((replacement) => replacement.cancelOrder.side)).toEqual(['sell', 'buy']);
+    });
+
+    it('should enforce passive-safe floors greater than one without using the single-quote exception', () => {
+      const fixMock = createMockFix();
+      const engine = createEngine({
+        fixConnection: fixMock,
+        maxOrdersPerSecond: 100,
+        levels: 2,
+        minActiveLevelsPerSide: 2,
+        maxReplacementsPerSidePerCycle: 1,
+      });
+
+      const buyL1 = { side: 'buy', price: 99000, size: 0.1, level: 1, status: 'active', placedAt: Date.now() };
+      const buyL2 = { side: 'buy', price: 98000, size: 0.1, level: 2, status: 'active', placedAt: Date.now() };
+      engine.activeOrders.set('B1', buyL1);
+      engine.activeOrders.set('B2', buyL2);
+
+      engine.executeActions({
+        toCancel: [],
+        toPlace: [],
+        toReplace: [
+          { cancel: 'B1', cancelOrder: buyL1, place: { side: 'buy', price: 99100, size: 0.1, level: 1 } },
+        ],
+      });
+
+      expect(fixMock.sendMessage).not.toHaveBeenCalled();
+      expect(engine.pendingReplacements.size).toBe(0);
+    });
+
+    it('should drop rate-limited passive-safe replacements instead of queueing stale cancel intents', () => {
+      const fixMock = createMockFix();
+      const engine = createEngine({
+        fixConnection: fixMock,
+        maxOrdersPerSecond: 1,
+        levels: 2,
+        minActiveLevelsPerSide: 1,
+        maxReplacementsPerSidePerCycle: 1,
+      });
+
+      const buyL1 = { side: 'buy', price: 99000, size: 0.1, level: 1, status: 'active', placedAt: Date.now() };
+      const buyL2 = { side: 'buy', price: 98000, size: 0.1, level: 2, status: 'active', placedAt: Date.now() };
+      engine.activeOrders.set('B1', buyL1);
+      engine.activeOrders.set('B2', buyL2);
+      engine.lastActionReset = Date.now();
+      engine.actionsThisSecond = 1;
+
+      const actions = {
+        toCancel: [],
+        toPlace: [],
+        toReplace: [
+          { cancel: 'B1', cancelOrder: buyL1, place: { side: 'buy', price: 99100, size: 0.1, level: 1 } },
+        ],
+      };
+
+      engine.executeActions(actions);
+
+      expect(engine.actionQueue.length).toBe(0);
+      expect(engine.pendingReplacements.size).toBe(0);
+      expect(fixMock.sendMessage).not.toHaveBeenCalled();
+
+      engine.lastActionReset = Date.now() - 1001;
+      engine.actionsThisSecond = 0;
+      engine.executeActions(actions);
+
+      expect(fixMock.sendMessage).toHaveBeenCalledTimes(1);
+      expect(fixMock.sendMessage.mock.calls[0][0]['35']).toBe('F');
+      expect(engine.pendingReplacements.has('B1')).toBe(true);
+    });
+
+    it('should trigger a deferred reprice retry after the rate window resets', () => {
+      const engine = createEngine({ maxOrdersPerSecond: 1 });
+      engine.deferredRepriceNeeded = true;
+      engine.actionsThisSecond = 0;
+      engine.lastActionReset = Date.now() - 1001;
+
+      let deferredRuns = 0;
+      engine._runDeferredReprice = () => {
+        deferredRuns++;
+        engine.deferredRepriceNeeded = false;
+        return true;
+      };
+
+      engine.drainQueue();
+
+      expect(deferredRuns).toBe(1);
+      expect(engine.deferredRepriceNeeded).toBe(false);
+    });
+
+    it('should preserve deferred reprices while quoting remains suspended during drain', () => {
+      const engine = createEngine();
+      engine.deferredRepriceNeeded = true;
+      engine.quotingSuspended = true;
+
+      engine.drainQueue();
+
+      expect(engine.deferredRepriceNeeded).toBe(true);
+    });
+
+    it('should schedule another deferred reprice when passive-safe throttles skip replacements', () => {
+      const fixMock = createMockFix();
+      const engine = createEngine({
+        fixConnection: fixMock,
+        maxOrdersPerSecond: 100,
+        levels: 2,
+        minActiveLevelsPerSide: 1,
+        maxReplacementsPerSidePerCycle: 1,
+      });
+
+      const buyL1 = { side: 'buy', price: 99000, size: 0.1, level: 1, status: 'active', placedAt: Date.now() };
+      const buyL2 = { side: 'buy', price: 98000, size: 0.1, level: 2, status: 'active', placedAt: Date.now() };
+      engine.activeOrders.set('B1', buyL1);
+      engine.activeOrders.set('B2', buyL2);
+
+      engine.executeActions({
+        toCancel: [],
+        toPlace: [],
+        toReplace: [
+          { cancel: 'B1', cancelOrder: buyL1, place: { side: 'buy', price: 99100, size: 0.1, level: 1 } },
+          { cancel: 'B2', cancelOrder: buyL2, place: { side: 'buy', price: 98100, size: 0.1, level: 2 } },
+        ],
+      });
+
+      expect(engine.deferredRepriceNeeded).toBe(true);
+      expect(fixMock.sendMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it('should not run deferred reprices while quoting is suspended', () => {
+      const engine = createEngine();
+      engine.lastMid = 100000;
+      engine.quotingSuspended = true;
+
+      expect(engine._runDeferredReprice()).toBe(false);
+      expect(engine.deferredRepriceNeeded).toBe(true);
+    });
+
+    it('should defer deferred-reprice execution until minRepriceInterval has elapsed', () => {
+      const engine = createEngine({ minRepriceIntervalMs: 1000 });
+      engine.lastMid = 100000;
+      engine.lastRepriceAt = Date.now();
+      engine.deferredRepriceNeeded = false;
+
+      expect(engine._runDeferredReprice()).toBe(false);
+      expect(engine.deferredRepriceNeeded).toBe(true);
+    });
+
+    it('should refresh lastRepriceAt after a successful deferred reprice', () => {
+      const engine = createEngine();
+      engine.lastMid = 100000;
+      engine.lastRepriceAt = 1;
+      engine.activeOrders.set('B1', { side: 'buy', price: 99000, size: 0.1, level: 1, status: 'active', placedAt: Date.now() });
+
+      const before = Date.now();
+      const ran = engine._runDeferredReprice();
+
+      expect(ran).toBe(true);
+      expect(engine.lastRepriceAt).toBeGreaterThanOrEqual(before);
+    });
+
+    it('should keep deferred repricing armed when a deferred retry still has passive-safe follow-up work', () => {
+      const fixMock = createMockFix();
+      const engine = createEngine({
+        fixConnection: fixMock,
+        maxOrdersPerSecond: 100,
+        levels: 2,
+        minActiveLevelsPerSide: 1,
+        maxReplacementsPerSidePerCycle: 1,
+      });
+
+      const buyL1 = { side: 'buy', price: 99000, size: 0.1, level: 1, status: 'active', placedAt: Date.now() };
+      const buyL2 = { side: 'buy', price: 98000, size: 0.1, level: 2, status: 'active', placedAt: Date.now() };
+      engine.activeOrders.set('B1', buyL1);
+      engine.activeOrders.set('B2', buyL2);
+      engine.lastMid = 100000;
+      engine.computeDesiredQuotes = () => [];
+      engine.reconcileOrders = () => ({
+        toCancel: [],
+        toPlace: [],
+        toReplace: [
+          { cancel: 'B1', cancelOrder: buyL1, place: { side: 'buy', price: 99100, size: 0.1, level: 1 } },
+          { cancel: 'B2', cancelOrder: buyL2, place: { side: 'buy', price: 98100, size: 0.1, level: 2 } },
+        ],
+      });
+
+      const completed = engine._runDeferredReprice();
+
+      expect(completed).toBe(false);
+      expect(engine.deferredRepriceNeeded).toBe(true);
+      expect(fixMock.sendMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it('should not advance lastRepriceAt when a passive-safe reprice defers all outbound actions', () => {
+      const engine = createEngine();
+      engine.lastRepriceAt = 123;
+      engine.computeDesiredQuotes = () => [{ side: 'buy', price: 99100, size: 0.1, level: 1 }];
+      engine.reconcileOrders = () => ({
+        toCancel: [],
+        toPlace: [],
+        toReplace: [{ cancel: 'B1', cancelOrder: { side: 'buy', level: 1 }, place: { side: 'buy', price: 99100, size: 0.1, level: 1 } }],
+      });
+      engine.executeActions = () => {
+        engine.deferredRepriceNeeded = true;
+        return false;
+      };
+
+      engine.onPriceUpdate(makePrice(100000, 0.95));
+
+      expect(engine.deferredRepriceNeeded).toBe(true);
+      expect(engine.lastRepriceAt).toBe(123);
+    });
+
+    it('should clear deferred reprices when cancelAllQuotes suspends quoting', () => {
+      const engine = createEngine();
+      engine.deferredRepriceNeeded = true;
+      engine.actionQueue.push({ type: 'place', quote: { side: 'buy', price: 100, size: 0.1, level: 1 } });
+      engine.activeOrders.set('B1', { side: 'buy', price: 99000, size: 0.1, level: 1, status: 'active', placedAt: Date.now() });
+
+      engine.cancelAllQuotes('Low confidence');
+
+      expect(engine.deferredRepriceNeeded).toBe(false);
+      expect(engine.actionQueue.length).toBe(0);
+      expect(engine.quotingSuspended).toBe(true);
+    });
+
+    it('should preserve queued actions and deferred reprices during ordinary suspension', () => {
+      const engine = createEngine();
+      engine.isQuoting = true;
+      engine.deferredRepriceNeeded = true;
+      engine.actionQueue.push({ type: 'place', quote: { side: 'buy', price: 100, size: 0.1, level: 1 } });
+
+      engine.suspendQuoting();
+
+      expect(engine.isQuoting).toBe(false);
+      expect(engine.deferredRepriceNeeded).toBe(true);
+      expect(engine.actionQueue.length).toBe(1);
+    });
+
+    it('should invalidate queued actions and re-arm a fresh deferred reprice when requested', () => {
+      const engine = createEngine();
+      engine.deferredRepriceNeeded = true;
+      engine.actionQueue.push({ type: 'place', quote: { side: 'buy', price: 100, size: 0.1, level: 1 } });
+
+      engine.invalidateQueuedWork(true);
+
+      expect(engine.deferredRepriceNeeded).toBe(true);
+      expect(engine.actionQueue.length).toBe(0);
+    });
+
+    it('should resume quoting explicitly after suspension', () => {
+      const engine = createEngine();
+      engine.suspendQuoting();
+
+      engine.resumeQuoting();
+
+      expect(engine.quotingSuspended).toBe(false);
+    });
+
+    it('should ignore direct price updates while quoting is suspended', () => {
+      const fixMock = createMockFix();
+      const engine = createEngine({ fixConnection: fixMock, maxOrdersPerSecond: 100, levels: 1 });
+
+      engine.suspendQuoting();
+      engine.onPriceUpdate({ weightedMidpoint: 100000, confidence: 1 });
+
+      expect(engine.lastMid).toBe(100000);
+      expect(fixMock.sendMessage).not.toHaveBeenCalled();
+      expect(engine.isQuoting).toBe(false);
+    });
+
     it('should skip marketable ALO buy orders before send', () => {
       const fixMock = createMockFix();
       const engine = createEngine({ fixConnection: fixMock });
@@ -486,6 +957,27 @@ describe('QuoteEngine', () => {
 
       expect(fixMock.sendMessage).toHaveBeenCalledTimes(1);
       expect(engine.getQuoteStatus().lastMarketableAloSkip.reason).toBe('marketable-post-only');
+    });
+
+    it('should not release pending replacements while quoting is suspended', () => {
+      const fixMock = createMockFix();
+      const engine = createEngine({ fixConnection: fixMock, maxOrdersPerSecond: 100, levels: 1 });
+      const oldClOrdID = 'OLD001';
+      const oldOrder = { side: 'buy', price: 99000, size: 0.1, level: 1, status: 'active', placedAt: Date.now() };
+      engine.activeOrders.set(oldClOrdID, oldOrder);
+
+      engine.executeActions({
+        toCancel: [],
+        toPlace: [],
+        toReplace: [{ cancel: oldClOrdID, cancelOrder: oldOrder, place: { side: 'buy', price: 99500, size: 0.1, level: 1 } }],
+      });
+
+      engine.suspendQuoting();
+      const cancelClOrdID = fixMock.sendMessage.mock.calls[0][0]['11'];
+      engine.onExecutionReport({ '11': cancelClOrdID, '39': '4', '54': '1' });
+
+      expect(fixMock.sendMessage).toHaveBeenCalledTimes(1);
+      expect(engine.deferredRepriceNeeded).toBe(true);
     });
 
     it('should expire pending replacements even when cancel ack never arrives', () => {
@@ -946,6 +1438,17 @@ describe('QuoteEngine', () => {
 
       expect(engine.activeOrders.get('ORIG003').status).toBe('active');
       expect(engine.cancelToOrigMap.has('CX003')).toBe(false);
+    });
+
+    it('should clear stale replacement intent without dropping late cancel recovery mapping', () => {
+      const engine = createEngine();
+      engine.pendingReplacements.set('ORIG005', { quote: { side: 'buy', price: 99, size: 0.1, level: 1 }, createdAt: Date.now() });
+      engine.cancelToOrigMap.set('CX005', 'ORIG005');
+
+      engine.clearPendingReplacement('ORIG005');
+
+      expect(engine.pendingReplacements.has('ORIG005')).toBe(false);
+      expect(engine.cancelToOrigMap.get('CX005')).toBe('ORIG005');
     });
 
     it('should increment consecutiveRejects and trigger backoff after 3', () => {

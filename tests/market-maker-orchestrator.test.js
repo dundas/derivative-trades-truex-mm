@@ -57,10 +57,15 @@ function createMockPnLTracker() {
 
 function createMockQuoteEngine() {
   const qe = new EventEmitter();
+  qe.activeOrders = new Map();
   qe.onPriceUpdate = jest.fn();
   qe.onExecutionReport = jest.fn();
   qe.onOrderCancelReject = jest.fn();
   qe.cancelAllQuotes = jest.fn();
+  qe.invalidateQueuedWork = jest.fn();
+  qe.clearPendingReplacement = jest.fn();
+  qe.suspendQuoting = jest.fn();
+  qe.resumeQuoting = jest.fn();
   qe.drainQueue = jest.fn();
   qe.getQuoteStatus = jest.fn(() => ({
     bidLevels: 0,
@@ -504,6 +509,35 @@ describe('MarketMakerOrchestrator', () => {
       await orchestrator.stop();
     });
 
+    test('keeps mark-to-market updating while OE-only quoting is suspended', async () => {
+      const { orchestrator, mocks } = createOrchestrator({ marketDataFeed: null });
+      await orchestrator.start();
+      mocks.fixConnection.isLoggedOn = false;
+
+      const price = { weightedMidpoint: 100250, confidence: 0.95 };
+      mocks.priceAggregator.emit('price', price);
+
+      expect(orchestrator._lastMidPrice).toBe(100250);
+      expect(mocks.pnlTracker.markToMarket).toHaveBeenCalledWith(100250);
+      expect(mocks.quoteEngine.invalidateQueuedWork).toHaveBeenCalledWith(true);
+      expect(mocks.quoteEngine.onPriceUpdate).not.toHaveBeenCalled();
+      await orchestrator.stop();
+    });
+
+    test('suspends quoting and skips price updates when OE is not logged on in OE-only mode', async () => {
+      const { orchestrator, mocks } = createOrchestrator({ marketDataFeed: null });
+      await orchestrator.start();
+      mocks.fixConnection.isLoggedOn = false;
+
+      const price = { weightedMidpoint: 100000, confidence: 0.95 };
+      mocks.priceAggregator.emit('price', price);
+
+      expect(mocks.quoteEngine.suspendQuoting).toHaveBeenCalled();
+      expect(mocks.quoteEngine.invalidateQueuedWork).toHaveBeenCalledWith(true);
+      expect(mocks.quoteEngine.onPriceUpdate).not.toHaveBeenCalled();
+      await orchestrator.stop();
+    });
+
     test('ignores price updates when not running', async () => {
       const { orchestrator, mocks } = createOrchestrator();
       await orchestrator.start();
@@ -664,6 +698,28 @@ describe('MarketMakerOrchestrator', () => {
       };
       // Should not throw
       mocks.fixConnection.emit('message', message);
+      await orchestrator.stop();
+    });
+  });
+
+  describe('event wiring: OE disconnects', () => {
+    test('restores in-flight orders to active and clears stale replacement intent without dropping late-ack recovery state', async () => {
+      const { orchestrator, mocks } = createOrchestrator();
+      await orchestrator.start();
+
+      mocks.quoteEngine.activeOrders.set('C1', { side: 'buy', status: 'cancelling' });
+      mocks.quoteEngine.activeOrders.set('P1', { side: 'sell', status: 'pending' });
+      mocks.quoteEngine.activeOrders.set('A1', { side: 'buy', status: 'active' });
+
+      mocks.fixConnection.emit('disconnect');
+
+      expect(mocks.quoteEngine.suspendQuoting).toHaveBeenCalled();
+      expect(mocks.quoteEngine.invalidateQueuedWork).toHaveBeenCalledWith(true);
+      expect(mocks.quoteEngine.clearPendingReplacement).toHaveBeenCalledWith('C1');
+      expect(mocks.quoteEngine.clearPendingReplacement).toHaveBeenCalledWith('P1');
+      expect(mocks.quoteEngine.activeOrders.get('C1').status).toBe('active');
+      expect(mocks.quoteEngine.activeOrders.get('P1').status).toBe('active');
+      expect(mocks.quoteEngine.activeOrders.has('A1')).toBe(true);
       await orchestrator.stop();
     });
   });
