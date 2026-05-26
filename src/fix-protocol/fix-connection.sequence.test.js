@@ -244,6 +244,83 @@ describe('FIXConnection sequence handling (7.4)', () => {
     expect(connection._forcedSequenceResetPending).toBe(true);
   });
 
+  it('restores local sequence numbers to 1 on every forced-reset retry with Redis enabled', () => {
+    connection.redisClient = {
+      get: jest.fn(),
+      set: jest.fn(),
+      del: jest.fn(),
+    };
+    connection.msgSeqNum = 7;
+    connection.expectedSeqNum = 9;
+    connection.hasConnectedBefore = true;
+    connection._forcedSequenceResetPending = true;
+
+    connection._applyForcedSequenceResetState();
+
+    expect(connection.msgSeqNum).toBe(1);
+    expect(connection.expectedSeqNum).toBe(1);
+    expect(connection.hasConnectedBefore).toBe(false);
+  });
+
+  it('waits for an in-flight forced reset before reconnecting', async () => {
+    let resolveReset;
+    connection._forcedSequenceResetPromise = new Promise((resolve) => {
+      resolveReset = resolve;
+    });
+    connection.initialReconnectDelay = 1;
+    connection.maxReconnectDelay = 1;
+    const connectSpy = jest.spyOn(connection, 'connect').mockResolvedValue();
+    const randomSpy = jest.spyOn(Math, 'random').mockReturnValue(0.5);
+
+    connection.attemptReconnect();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(connectSpy).not.toHaveBeenCalled();
+
+    resolveReset();
+    await Promise.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(connectSpy).toHaveBeenCalledTimes(1);
+    randomSpy.mockRestore();
+  });
+
+  it('times out waiting on a forced reset promise and keeps the local reset state', async () => {
+    connection.msgSeqNum = 1;
+    connection.expectedSeqNum = 1;
+    connection._forcedSequenceResetPromise = new Promise(() => {});
+
+    await connection._awaitForcedSequenceReset(5);
+
+    expect(connection.msgSeqNum).toBe(1);
+    expect(connection.expectedSeqNum).toBe(1);
+    expect(connection.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('Timed out waiting 5ms for forced sequence reset persistence')
+    );
+  });
+
+  it('cancels a delayed reconnect if disconnect is requested while reset is in flight', async () => {
+    let resolveReset;
+    connection._forcedSequenceResetPromise = new Promise((resolve) => {
+      resolveReset = resolve;
+    });
+    connection.initialReconnectDelay = 1;
+    connection.maxReconnectDelay = 1;
+    const connectSpy = jest.spyOn(connection, 'connect').mockResolvedValue();
+    const randomSpy = jest.spyOn(Math, 'random').mockReturnValue(0.5);
+
+    connection.attemptReconnect();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    connection.intentionalClose = true;
+    resolveReset();
+    await Promise.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(connectSpy).not.toHaveBeenCalled();
+    expect(connection.intentionalClose).toBe(false);
+    expect(connection.isReconnecting).toBe(false);
+    randomSpy.mockRestore();
+  });
+
   it('tracks pre-logon GapFills without forcing an immediate reset inside one attempt', () => {
     const resetSeqSpy = jest.spyOn(connection, 'resetSequenceNumbers').mockResolvedValue();
     connection.expectedSeqNum = 10;

@@ -88,6 +88,7 @@ export class FIXConnection extends EventEmitter {
     this._maxPreLogonRecoveryAttempts = options.maxPreLogonRecoveryAttempts || 3;
     this._sawPreLogonGapFillThisAttempt = false;
     this._forcedSequenceResetPending = false;
+    this._forcedSequenceResetPromise = null;
 
     // Logger
     this.logger = options.logger || console;
@@ -233,6 +234,61 @@ export class FIXConnection extends EventEmitter {
     }
   }
 
+  _applyForcedSequenceResetState() {
+    this.msgSeqNum = 1;
+    this.expectedSeqNum = 1;
+    this.hasConnectedBefore = false;
+  }
+
+  _beginForcedSequenceReset(reason) {
+    if (this._forcedSequenceResetPromise) {
+      return this._forcedSequenceResetPromise;
+    }
+
+    this._forcedSequenceResetPending = true;
+    this._applyForcedSequenceResetState();
+
+    const resetPromise = this.resetSequenceNumbers()
+      .catch((err) => {
+        this.logger.warn(`[FIXConnection] Failed to reset sequence numbers after ${reason}: ${err.message}`);
+      })
+      .finally(() => {
+        if (this._forcedSequenceResetPromise === resetPromise) {
+          this._forcedSequenceResetPromise = null;
+        }
+      });
+
+    this._forcedSequenceResetPromise = resetPromise;
+    return resetPromise;
+  }
+
+  async _awaitForcedSequenceReset(maxWaitMs = 2000) {
+    if (!this._forcedSequenceResetPromise) {
+      return;
+    }
+
+    let timeoutId = null;
+    let timedOut = false;
+    await Promise.race([
+      this._forcedSequenceResetPromise,
+      new Promise((resolve) => {
+        timeoutId = setTimeout(() => {
+          timedOut = true;
+          resolve();
+        }, maxWaitMs);
+      }),
+    ]);
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+    if (timedOut) {
+      this.logger.warn(
+        `[FIXConnection] Timed out waiting ${maxWaitMs}ms for forced sequence reset persistence; ` +
+        'continuing with local reset state'
+      );
+    }
+  }
+
   /**
    * Stop timers that should not survive a failed connection attempt.
    * @private
@@ -271,6 +327,12 @@ export class FIXConnection extends EventEmitter {
    * Connect to FIX server
    */
   async connect() {
+    await this._awaitForcedSequenceReset();
+    if (this.intentionalClose) {
+      this.isReconnecting = false;
+      throw new Error('Connection aborted by intentional disconnect');
+    }
+
     // Load persisted sequence numbers from Redis before connecting.
     // This handles both crash-recovery (first connect after restart) and mid-process reconnects.
     // loadSequenceNumbers() defaults to 1 when keys are absent, so no separate reset is needed
@@ -283,6 +345,7 @@ export class FIXConnection extends EventEmitter {
         this.logger.warn(`[FIXConnection] Redis seqnum load failed, starting from 1: ${err.message}`);
       }
     } else if (this._forcedSequenceResetPending) {
+      this._applyForcedSequenceResetState();
       this.logger.warn('[FIXConnection] Skipping Redis seqnum load while forced local reset is pending');
     }
 
@@ -1167,12 +1230,7 @@ export class FIXConnection extends EventEmitter {
           `[FIXConnection] Pre-logon recovery loop persisted for ${this._preLogonRecoveryAttempts} reconnects. ` +
           `Resetting local FIX sequence numbers before retry.`
         );
-        this._forcedSequenceResetPending = true;
-        void this.resetSequenceNumbers().catch((err) => {
-          this.logger.warn(
-            `[FIXConnection] Failed to reset sequence numbers after pre-logon recovery loop: ${err.message}`
-          );
-        });
+        void this._beginForcedSequenceReset('pre-logon recovery loop');
         this._preLogonRecoveryAttempts = 0;
       }
     } else if (this.intentionalClose || this.hasConnectedBefore) {
@@ -1242,8 +1300,14 @@ export class FIXConnection extends EventEmitter {
 
     this.logger.info(`[FIXConnection] Reconnecting to ${this.targetCompID} in ${Math.round(delay)}ms (attempt ${this.reconnectAttempts})`);
 
-    this.reconnectTimer = setTimeout(() => {
+    this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = null;
+      await this._awaitForcedSequenceReset();
+      if (this.intentionalClose) {
+        this.intentionalClose = false;
+        this.isReconnecting = false;
+        return;
+      }
       this.connect().catch((error) => {
         this.logger.error(`[FIXConnection] Reconnection failed: ${error.message}`);
         this.attemptReconnect();
