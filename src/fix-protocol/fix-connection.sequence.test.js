@@ -227,6 +227,43 @@ describe('FIXConnection sequence handling (7.4)', () => {
     });
   });
 
+  it('resets local sequence numbers after repeated failed pre-logon recovery attempts', async () => {
+    const resetSeqSpy = jest.spyOn(connection, 'resetSequenceNumbers').mockResolvedValue();
+    jest.spyOn(connection, 'attemptReconnect').mockImplementation(() => {});
+
+    connection.hasConnectedBefore = true;
+    connection.isLoggedOn = false;
+
+    for (let i = 0; i < 3; i++) {
+      connection._sawPreLogonGapFillThisAttempt = true;
+      connection.handleDisconnect();
+    }
+
+    expect(resetSeqSpy).toHaveBeenCalledTimes(1);
+    expect(connection._preLogonRecoveryAttempts).toBe(0);
+    expect(connection._forcedSequenceResetPending).toBe(true);
+  });
+
+  it('tracks pre-logon GapFills without forcing an immediate reset inside one attempt', () => {
+    const resetSeqSpy = jest.spyOn(connection, 'resetSequenceNumbers').mockResolvedValue();
+    connection.expectedSeqNum = 10;
+    connection.hasConnectedBefore = true;
+    connection.isLoggedOn = false;
+
+    connection.handleMessage({
+      fields: { '35': '4', '34': '10', '123': 'Y', '36': '12' }
+    });
+    connection.handleMessage({
+      fields: { '35': '4', '34': '12', '123': 'Y', '36': '14' }
+    });
+    connection.handleMessage({
+      fields: { '35': '4', '34': '14', '123': 'Y', '36': '16' }
+    });
+
+    expect(connection._sawPreLogonGapFillThisAttempt).toBe(true);
+    expect(resetSeqSpy).not.toHaveBeenCalled();
+  });
+
   it('does not reset on different gaps (resend counter resets)', () => {
     jest.spyOn(connection, 'requestResend').mockImplementation(() => {});
 

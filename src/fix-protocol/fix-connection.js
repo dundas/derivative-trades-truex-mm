@@ -84,6 +84,10 @@ export class FIXConnection extends EventEmitter {
     this._resendGapStart = null; // Track current gap begin seq
     this._resendAttempts = 0;    // Consecutive resend attempts for same gap
     this._maxResendAttempts = options.maxResendAttempts || 3; // Max before forcing reset
+    this._preLogonRecoveryAttempts = 0; // Consecutive reconnect attempts stuck before logon
+    this._maxPreLogonRecoveryAttempts = options.maxPreLogonRecoveryAttempts || 3;
+    this._sawPreLogonGapFillThisAttempt = false;
+    this._forcedSequenceResetPending = false;
 
     // Logger
     this.logger = options.logger || console;
@@ -272,12 +276,14 @@ export class FIXConnection extends EventEmitter {
     // loadSequenceNumbers() defaults to 1 when keys are absent, so no separate reset is needed
     // when Redis is available. The reset-to-1 in the socket callback is skipped when Redis is
     // configured (see below) to avoid overwriting the loaded values.
-    if (this.redisClient) {
+    if (this.redisClient && !this._forcedSequenceResetPending) {
       try {
         await this.loadSequenceNumbers();
       } catch (err) {
         this.logger.warn(`[FIXConnection] Redis seqnum load failed, starting from 1: ${err.message}`);
       }
+    } else if (this._forcedSequenceResetPending) {
+      this.logger.warn('[FIXConnection] Skipping Redis seqnum load while forced local reset is pending');
     }
 
     return new Promise((resolve, reject) => {
@@ -296,6 +302,7 @@ export class FIXConnection extends EventEmitter {
 
       // Clear the reconnect guard so a fresh connect attempt is always allowed.
       this.isReconnecting = false;
+      this._sawPreLogonGapFillThisAttempt = false;
       
       const generation = ++this._connectionGeneration;
       const socket = new net.Socket();
@@ -455,6 +462,9 @@ export class FIXConnection extends EventEmitter {
                 // Clear resend-failure tracking on successful logon
                 this._resendGapStart = null;
                 this._resendAttempts = 0;
+                this._preLogonRecoveryAttempts = 0;
+                this._sawPreLogonGapFillThisAttempt = false;
+                this._forcedSequenceResetPending = false;
                 // Do NOT reset reconnectAttempts immediately — _startStableTimer will
                 // reset it after 60s of stable uptime, preventing a brief drop from
                 // resetting the counter too eagerly.
@@ -821,6 +831,7 @@ export class FIXConnection extends EventEmitter {
   }
 
   handleSequenceReset(message) {
+    const previousExpectedSeqNum = this.expectedSeqNum;
     const newSeqNo = parseInt(message.fields['36'], 10);
     const gapFill = message.fields['123'] === 'Y';
     if (!Number.isFinite(newSeqNo) || newSeqNo < 1) {
@@ -837,6 +848,13 @@ export class FIXConnection extends EventEmitter {
     this._resendAttempts = 0;
     this.logger.warn(`[FIXConnection] SequenceReset received (${gapFill ? 'GapFill' : 'Reset'}): expectedSeqNum=${newSeqNo}`);
     this.emit('sequence-reset', { newSeqNo, gapFill, message });
+
+    if (gapFill && !this.isLoggedOn && this.hasConnectedBefore) {
+      this._sawPreLogonGapFillThisAttempt = true;
+      this.logger.warn(
+        `[FIXConnection] Pre-logon recovery GapFill observed: expected ${previousExpectedSeqNum}, advanced to ${newSeqNo}`
+      );
+    }
   }
   
   /**
@@ -935,6 +953,7 @@ export class FIXConnection extends EventEmitter {
     // Track resend statistics
     let resentCount = 0;
     let skippedCount = 0;
+    let missingStoredMessages = 0;
 
     // Helper: build and write a raw FIX message from a fields object.
     const writeRawMessage = (fields) => {
@@ -998,6 +1017,10 @@ export class FIXConnection extends EventEmitter {
       const stored = this.sentMessages.get(seq);
       const msgType = stored ? stored.fields['35'] : null;
 
+      if (!stored) {
+        missingStoredMessages++;
+      }
+
       if (!stored || APP_MSG_TYPES.has(msgType)) {
         // Accumulate into GapFill run
         if (gapStart === null) gapStart = seq;
@@ -1037,8 +1060,10 @@ export class FIXConnection extends EventEmitter {
       endSeqNo,
       count: resentCount,
       skipped: skippedCount,
-      requested: endSeqNo - beginSeqNo + 1
+      requested: endSeqNo - beginSeqNo + 1,
+      missingStoredMessages,
     });
+
   }
   
   /**
@@ -1111,6 +1136,11 @@ export class FIXConnection extends EventEmitter {
     if (socket && socket !== this.socket) return;
     if (generation !== this._connectionGeneration) return;
 
+    const preLogonRecoveryFailed =
+      !this.isLoggedOn &&
+      this.hasConnectedBefore &&
+      this._sawPreLogonGapFillThisAttempt;
+
     this.isConnected = false;
     this.isLoggedOn = false;
     this._clearLifecycleTimers();
@@ -1125,6 +1155,31 @@ export class FIXConnection extends EventEmitter {
       this.socket.destroy();
       this.socket = null;
     }
+
+    if (preLogonRecoveryFailed) {
+      this._preLogonRecoveryAttempts += 1;
+      this.logger.warn(
+        `[FIXConnection] Pre-logon recovery attempt failed ` +
+        `(${this._preLogonRecoveryAttempts}/${this._maxPreLogonRecoveryAttempts})`
+      );
+      if (this._preLogonRecoveryAttempts >= this._maxPreLogonRecoveryAttempts) {
+        this.logger.error(
+          `[FIXConnection] Pre-logon recovery loop persisted for ${this._preLogonRecoveryAttempts} reconnects. ` +
+          `Resetting local FIX sequence numbers before retry.`
+        );
+        this._forcedSequenceResetPending = true;
+        void this.resetSequenceNumbers().catch((err) => {
+          this.logger.warn(
+            `[FIXConnection] Failed to reset sequence numbers after pre-logon recovery loop: ${err.message}`
+          );
+        });
+        this._preLogonRecoveryAttempts = 0;
+      }
+    } else if (this.intentionalClose || this.hasConnectedBefore) {
+      this._preLogonRecoveryAttempts = 0;
+    }
+
+    this._sawPreLogonGapFillThisAttempt = false;
 
     this.emit('disconnect');
     
