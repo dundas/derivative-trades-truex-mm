@@ -282,6 +282,26 @@ describe('QuoteEngine', () => {
       const agg = { sources: [{ exchange: 'coinbase', bid: 65690, ask: 65710, isStale: true }] };
       expect(engine._extractAnchorBook(agg)).toBeNull();
     });
+
+    // Regression: deferred reprices must honour mirror mode, not silently fall back to mid.
+    it('_runDeferredReprice keeps coinbase-mirror anchoring (does not fall back to mid)', () => {
+      const sent = [];
+      const engine = createEngine({
+        levels: 1, quoteAnchorMode: 'coinbase-mirror', coinbaseAnchorBufferTicks: 1,
+        levelSpacingTicks: 2, tickSize: 0.50, baseSpreadBps: 80, baseSizeBTC: 0.01,
+        sizeDecimalPlaces: 4, minNotional: 1.0, priceBandPct: 2.5, clientId: 'T',
+        fixConnection: { sendMessage: (f) => sent.push(f) },
+      });
+      engine.lastMid = 100000;
+      engine.lastAnchorBook = { bestBid: 99990, bestAsk: 100010 };
+
+      engine._runDeferredReprice();
+
+      const bid = sent.filter(f => f['35'] === 'D' && f['54'] === '1').map(f => parseFloat(f['44']));
+      expect(bid.length).toBeGreaterThan(0);
+      // mirror L1 bid = 99990 - 0.50 = 99989.50; mid fallback (80bps) would be ~99599 — far off.
+      expect(Math.max(...bid)).toBeCloseTo(99989.50, 1);
+    });
   });
 
   describe('skew application', () => {

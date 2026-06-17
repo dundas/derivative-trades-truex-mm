@@ -1126,7 +1126,9 @@ export class QuoteEngine extends EventEmitter {
     const skew = this.inventoryManager
       ? this.inventoryManager.getSkew()
       : { bidSkewTicks: 0, askSkewTicks: 0 };
-    const desired = this.computeDesiredQuotes(this.lastMid, skew);
+    // Pass the last anchor book so deferred reprices honour coinbase-mirror mode too —
+    // otherwise they silently fall back to mid-anchored (baseSpreadBps) quotes.
+    const desired = this.computeDesiredQuotes(this.lastMid, skew, this.lastAnchorBook);
     const actions = this.reconcileOrders(desired, this.activeOrders);
     if (actions.toPlace.length || actions.toCancel.length || actions.toReplace.length) {
       this.deferredRepriceNeeded = false;
