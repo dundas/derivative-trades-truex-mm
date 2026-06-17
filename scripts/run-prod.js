@@ -75,16 +75,34 @@ const config = {
   //   Base size 0.01 BTC (~$1,000 at $100k)
   //   Total per side: ~0.018 BTC (0.01 + 0.008)
   levels: 2,
-  baseSpreadBps: 80,           // 0.8% spread — wider for safety in production
+  // Mirror Coinbase's book: we are effectively the entire TrueX book (sole liquidity), so
+  // anchoring our quotes to Coinbase best bid/ask (offset by a 1-tick buffer) makes TrueX show
+  // a Coinbase-tight market. baseSpreadBps is the fallback if the Coinbase book is absent.
+  //
+  // ACCEPTED RISK: prod has no TrueX top-of-book feed, so the marketable/slide guard is inert.
+  // Because we are the only resting liquidity there is effectively nothing to cross; the rare
+  // case (a third party rests inside our quote) is caught reactively by the reject-backoff
+  // (3 rejects → 5s pause). Revisit when a real TrueX book feed and/or hedge venue is wired.
+  quoteAnchorMode: 'coinbase-mirror',
+  coinbaseAnchorBufferTicks: 1,      // 1 tick ($0.50) outside Coinbase touch
+  // marketablePostOnlyAction stays at the default 'skip': the prod marketDataFeed (Coinbase
+  // adapter) does not expose getBestBidAsk(), so no TrueX top-of-book is available and the
+  // marketable/slide guard is inert. We are effectively the book, so this is acceptable;
+  // revisit if a real TrueX book feed is wired.
+  baseSpreadBps: 30,                 // fallback spread (15bps/side) when Coinbase book is absent
   levelSpacingTicks: 2,
   randomLevelSpacingBpsMin: 0.8,
   randomLevelSpacingBpsMax: 1.2,
-  repriceThresholdTicks: 3,    // Reprice after > $1.50 move
+  // Faster reprice regime for a tight mirrored spread: stale quotes are the main risk when
+  // mirroring Coinbase, and repricing only updates our own book. Tightened from 3 ticks/5s.
+  repriceThresholdTicks: 1,    // Reprice on any $0.50 move off the anchor
   baseSizeBTC: 0.01,           // ~$1,000 at $100k BTC
   sizeDecayFactor: 0.8,        // Each level 80% of previous
   sizeDecimalPlaces: 4,        // TrueX BTC increment: 0.0001
-  maxOrdersPerSecond: 4,
-  minRepriceIntervalMs: 5000,  // 5s minimum between reprices
+  // passive-safe replace = cancel+place, so a full 2-level/2-side reprice is ~8 FIX actions.
+  // At 6 msg/s that's ~1.3s — within the 1.5s min reprice interval and under TrueX's ~10 msg/s.
+  maxOrdersPerSecond: 6,
+  minRepriceIntervalMs: 1500,  // 1.5s minimum between reprices (was 5s)
   tickSize: 0.50,              // TrueX minimum increment
   minNotional: 1.0,            // TrueX minimum
   priceBandPct: 2.5,           // TrueX ±2.5% band
@@ -357,6 +375,8 @@ async function main() {
     // Quote engine
     levels: config.levels,
     baseSpreadBps: config.baseSpreadBps,
+    quoteAnchorMode: config.quoteAnchorMode,
+    coinbaseAnchorBufferTicks: config.coinbaseAnchorBufferTicks,
     levelSpacingTicks: config.levelSpacingTicks,
     randomLevelSpacingBpsMin: config.randomLevelSpacingBpsMin,
     randomLevelSpacingBpsMax: config.randomLevelSpacingBpsMax,
@@ -451,7 +471,7 @@ async function main() {
       `[STATUS] pos=${inv.netPosition?.toFixed(4) || '0'} BTC | ` +
       `side=${inv.side || 'flat'} | ` +
       `pnl=$${pnl.totalPnL?.toFixed(2) || '0'} | ` +
-      `quotes=${quotes.activeOrderCount || 0} active | ` +
+      `quotes=${quotes.activeCount || 0} active | ` +
       `fills=${inv.fillCount || 0} | ` +
       `base=${inv.baseBalance?.available?.toFixed(4) || '?'} BTC avail | ` +
       `quote=${inv.quoteBalance?.available?.toFixed(2) || '?'} PYUSD avail | ` +

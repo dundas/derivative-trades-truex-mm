@@ -152,6 +152,38 @@ describe('MarketMakerOrchestrator — Redis wiring (Task 1.4)', () => {
 });
 
 // -----------------------------------------------------------------------
+// coinbase-mirror anchor config threads through to the QuoteEngine
+// -----------------------------------------------------------------------
+describe('MarketMakerOrchestrator — anchor config wiring', () => {
+  function makeRealEngineOrch(overrides) {
+    return new MarketMakerOrchestrator({
+      truexHost: 'test.host', truexPort: 1234,
+      senderCompID: 'TEST_SENDER', targetCompID: 'TEST_TARGET',
+      apiKey: 'test-key', apiSecret: 'test-secret',
+      logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
+      ...overrides,
+    });
+  }
+
+  it('forwards quoteAnchorMode, coinbaseAnchorBufferTicks, and anchorExchange to the engine', () => {
+    const orch = makeRealEngineOrch({
+      quoteAnchorMode: 'coinbase-mirror',
+      coinbaseAnchorBufferTicks: 2,
+      anchorExchange: 'kraken', // non-default — proves it is actually threaded
+    });
+    expect(orch.quoteEngine.config.quoteAnchorMode).toBe('coinbase-mirror');
+    expect(orch.quoteEngine.config.coinbaseAnchorBufferTicks).toBe(2);
+    expect(orch.quoteEngine.config.anchorExchange).toBe('kraken');
+  });
+
+  it('defaults to mid mode / coinbase anchor when unset', () => {
+    const orch = makeRealEngineOrch({});
+    expect(orch.quoteEngine.config.quoteAnchorMode).toBe('mid');
+    expect(orch.quoteEngine.config.anchorExchange).toBe('coinbase');
+  });
+});
+
+// -----------------------------------------------------------------------
 // Task 3.1 — Dual-session gate
 // -----------------------------------------------------------------------
 describe('dual-session gate', () => {

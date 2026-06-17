@@ -26,6 +26,14 @@ export class QuoteEngine extends EventEmitter {
     this.config = {
       levels: options.levels || 5,
       baseSpreadBps: options.baseSpreadBps || 50,
+      // Quote anchoring: 'mid' = hang quotes off weighted mid by baseSpreadBps (default).
+      // 'coinbase-mirror' = anchor to the anchor venue's best bid/ask ± coinbaseAnchorBufferTicks
+      // so our spread tracks that venue's width. Falls back to 'mid' if the book is absent.
+      quoteAnchorMode: options.quoteAnchorMode || 'mid',
+      coinbaseAnchorBufferTicks: options.coinbaseAnchorBufferTicks ?? 1,
+      // Which venue's book to mirror. Anchor is sourced from this exchange's feed
+      // specifically (via aggregatedPrice.sources), NOT the cross-venue best bid/ask.
+      anchorExchange: options.anchorExchange || 'coinbase',
       levelSpacingTicks: options.levelSpacingTicks || 1,
       randomLevelSpacingBpsMin: options.randomLevelSpacingBpsMin || null,
       randomLevelSpacingBpsMax: options.randomLevelSpacingBpsMax || null,
@@ -63,6 +71,7 @@ export class QuoteEngine extends EventEmitter {
     // State
     this.activeOrders = new Map(); // clOrdID -> { side, price, size, level, status, placedAt }
     this.lastMid = 0;
+    this.lastAnchorBook = null; // { bestBid, bestAsk } from the anchor venue's feed (for coinbase-mirror)
     this.lastRepriceAt = 0;
     this.isQuoting = false;
     this.quotingSuspended = false;
@@ -128,6 +137,19 @@ export class QuoteEngine extends EventEmitter {
   }
 
   /**
+   * Extract the anchor venue's own best bid/ask from an aggregated price's per-venue sources.
+   * Returns { bestBid, bestAsk } for a fresh, valid book, or null (→ caller falls back to mid).
+   */
+  _extractAnchorBook(aggregatedPrice) {
+    const sources = aggregatedPrice?.sources;
+    if (!Array.isArray(sources)) return null;
+    const src = sources.find(
+      (s) => s && s.exchange === this.config.anchorExchange && !s.isStale && s.bid > 0 && s.ask > s.bid
+    );
+    return src ? { bestBid: src.bid, bestAsk: src.ask } : null;
+  }
+
+  /**
    * Main entry point: called on every PriceAggregator 'price' event.
    */
   onPriceUpdate(aggregatedPrice) {
@@ -148,6 +170,11 @@ export class QuoteEngine extends EventEmitter {
       return;
     }
 
+    // Capture the anchor venue's own best bid/ask for coinbase-mirror anchoring. Sourced from
+    // that venue's feed specifically — NOT aggregatedPrice.bestBid/bestAsk, which is the best
+    // across all venues and would mirror a synthetic cross-venue spread.
+    this.lastAnchorBook = this._extractAnchorBook(aggregatedPrice);
+
     const now = Date.now();
 
     // Rejection backoff: pause quoting after consecutive rejects
@@ -166,7 +193,7 @@ export class QuoteEngine extends EventEmitter {
       : { bidSkewTicks: 0, askSkewTicks: 0 };
 
     // Compute desired quotes
-    const desired = this.computeDesiredQuotes(mid, skew);
+    const desired = this.computeDesiredQuotes(mid, skew, this.lastAnchorBook);
 
     // Reconcile against active orders
     const actions = this.reconcileOrders(desired, this.activeOrders);
@@ -196,7 +223,7 @@ export class QuoteEngine extends EventEmitter {
   /**
    * Compute desired bid/ask quotes based on mid price and inventory skew.
    */
-  computeDesiredQuotes(mid, skew) {
+  computeDesiredQuotes(mid, skew, anchorBook = null) {
     const {
       levels,
       baseSpreadBps,
@@ -206,9 +233,26 @@ export class QuoteEngine extends EventEmitter {
       sizeDecayFactor,
       priceBandPct,
       minNotional,
+      quoteAnchorMode,
+      coinbaseAnchorBufferTicks,
     } = this.config;
 
     const halfSpread = (baseSpreadBps / 10000) * mid / 2;
+
+    // coinbase-mirror: anchor L1 to the anchor venue's best bid/ask offset out by a small buffer
+    // so our spread mirrors that venue's width while staying maker-safe. Deeper levels step out
+    // by the same ladder used in 'mid' mode. Requires a valid anchor book; otherwise we fall back
+    // to mid-anchored quoting so we never stop quoting on a missing reference.
+    const useMirror =
+      quoteAnchorMode === 'coinbase-mirror' &&
+      anchorBook &&
+      anchorBook.bestBid > 0 &&
+      anchorBook.bestAsk > anchorBook.bestBid;
+    const mirrorBuffer = coinbaseAnchorBufferTicks * tickSize;
+    const l1LadderOffset = useMirror
+      ? this._getLevelOffset(mid, 1, levelSpacingTicks, tickSize)
+      : 0;
+
     const bids = [];
     const asks = [];
 
@@ -231,12 +275,18 @@ export class QuoteEngine extends EventEmitter {
       const rawSize = baseSizeBTC * Math.pow(sizeDecayFactor, level - 1);
       const size = parseFloat(rawSize.toFixed(this.config.sizeDecimalPlaces));
 
-      // Bid price
-      const rawBid = mid - halfSpread - levelOffset - (skew.bidSkewTicks * tickSize);
+      let rawBid;
+      let rawAsk;
+      if (useMirror) {
+        // L1 sits at the anchor venue's touch ± buffer; deeper levels add the ladder beyond L1.
+        const ladder = levelOffset - l1LadderOffset;
+        rawBid = anchorBook.bestBid - mirrorBuffer - ladder - (skew.bidSkewTicks * tickSize);
+        rawAsk = anchorBook.bestAsk + mirrorBuffer + ladder + (skew.askSkewTicks * tickSize);
+      } else {
+        rawBid = mid - halfSpread - levelOffset - (skew.bidSkewTicks * tickSize);
+        rawAsk = mid + halfSpread + levelOffset + (skew.askSkewTicks * tickSize);
+      }
       const bidPrice = this.snapToTick(rawBid);
-
-      // Ask price
-      const rawAsk = mid + halfSpread + levelOffset + (skew.askSkewTicks * tickSize);
       const askPrice = this.snapToTick(rawAsk);
 
       // Filter bids — cap size to remaining available quote balance
@@ -1076,7 +1126,9 @@ export class QuoteEngine extends EventEmitter {
     const skew = this.inventoryManager
       ? this.inventoryManager.getSkew()
       : { bidSkewTicks: 0, askSkewTicks: 0 };
-    const desired = this.computeDesiredQuotes(this.lastMid, skew);
+    // Pass the last anchor book so deferred reprices honour coinbase-mirror mode too —
+    // otherwise they silently fall back to mid-anchored (baseSpreadBps) quotes.
+    const desired = this.computeDesiredQuotes(this.lastMid, skew, this.lastAnchorBook);
     const actions = this.reconcileOrders(desired, this.activeOrders);
     if (actions.toPlace.length || actions.toCancel.length || actions.toReplace.length) {
       this.deferredRepriceNeeded = false;
