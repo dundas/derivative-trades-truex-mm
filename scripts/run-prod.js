@@ -75,7 +75,7 @@ const config = {
   //   Base size 0.01 BTC (~$1,000 at $100k)
   //   Total per side: ~0.018 BTC (0.01 + 0.008)
   levels: 2,
-  baseSpreadBps: 80,           // 0.8% spread — wider for safety in production
+  baseSpreadBps: 30,           // 0.3% spread (15bps/side) — tightened toward Coinbase
   levelSpacingTicks: 2,
   randomLevelSpacingBpsMin: 0.8,
   randomLevelSpacingBpsMax: 1.2,
@@ -451,7 +451,7 @@ async function main() {
       `[STATUS] pos=${inv.netPosition?.toFixed(4) || '0'} BTC | ` +
       `side=${inv.side || 'flat'} | ` +
       `pnl=$${pnl.totalPnL?.toFixed(2) || '0'} | ` +
-      `quotes=${quotes.activeOrderCount || 0} active | ` +
+      `quotes=${quotes.activeCount || 0} active | ` +
       `fills=${inv.fillCount || 0} | ` +
       `base=${inv.baseBalance?.available?.toFixed(4) || '?'} BTC avail | ` +
       `quote=${inv.quoteBalance?.available?.toFixed(2) || '?'} PYUSD avail | ` +
