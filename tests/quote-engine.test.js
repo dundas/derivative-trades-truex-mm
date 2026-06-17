@@ -197,6 +197,93 @@ describe('QuoteEngine', () => {
     });
   });
 
+  describe('coinbase-mirror anchoring', () => {
+    const book = { bestBid: 99990, bestAsk: 100010 }; // anchor venue touch, $20 wide
+
+    it('anchors L1 to the venue touch offset by the buffer (1 tick)', () => {
+      const engine = createEngine({
+        levels: 1, quoteAnchorMode: 'coinbase-mirror', coinbaseAnchorBufferTicks: 1,
+        levelSpacingTicks: 2, tickSize: 0.50, baseSpreadBps: 30,
+      });
+      const quotes = engine.computeDesiredQuotes(100000, { bidSkewTicks: 0, askSkewTicks: 0 }, book);
+      const bid = quotes.find(q => q.side === 'buy');
+      const ask = quotes.find(q => q.side === 'sell');
+      // L1 bid = bestBid - 1*0.50 = 99989.50 ; L1 ask = bestAsk + 0.50 = 100010.50
+      expect(bid.price).toBeCloseTo(99989.50, 1);
+      expect(ask.price).toBeCloseTo(100010.50, 1);
+    });
+
+    it('produces a spread close to the venue width (much tighter than baseSpreadBps)', () => {
+      const engine = createEngine({
+        levels: 1, quoteAnchorMode: 'coinbase-mirror', coinbaseAnchorBufferTicks: 1,
+        levelSpacingTicks: 2, tickSize: 0.50, baseSpreadBps: 80,
+      });
+      const quotes = engine.computeDesiredQuotes(100000, { bidSkewTicks: 0, askSkewTicks: 0 }, book);
+      const bid = quotes.find(q => q.side === 'buy');
+      const ask = quotes.find(q => q.side === 'sell');
+      // mirror spread = 20 (venue) + 2*0.50 = 21, vs baseSpreadBps=80 → 800 wide off mid
+      expect(ask.price - bid.price).toBeCloseTo(21, 1);
+    });
+
+    it('steps deeper levels outward beyond L1', () => {
+      const engine = createEngine({
+        levels: 2, quoteAnchorMode: 'coinbase-mirror', coinbaseAnchorBufferTicks: 1,
+        levelSpacingTicks: 2, tickSize: 0.50,
+      });
+      const quotes = engine.computeDesiredQuotes(100000, { bidSkewTicks: 0, askSkewTicks: 0 }, book);
+      const bids = quotes.filter(q => q.side === 'buy').sort((a, b) => a.level - b.level);
+      const asks = quotes.filter(q => q.side === 'sell').sort((a, b) => a.level - b.level);
+      expect(bids[0].price).toBeGreaterThan(bids[1].price);
+      expect(asks[0].price).toBeLessThan(asks[1].price);
+    });
+
+    it('falls back to mid-anchored quoting when the anchor book is missing', () => {
+      const engine = createEngine({
+        levels: 1, quoteAnchorMode: 'coinbase-mirror', baseSpreadBps: 50,
+        levelSpacingTicks: 1, tickSize: 0.50,
+      });
+      const quotes = engine.computeDesiredQuotes(100000, { bidSkewTicks: 0, askSkewTicks: 0 }, null);
+      const bid = quotes.find(q => q.side === 'buy');
+      const ask = quotes.find(q => q.side === 'sell');
+      expect(bid.price).toBeCloseTo(99749.50, 1);
+      expect(ask.price).toBeCloseTo(100250.50, 1);
+    });
+
+    it('default mode stays mid-anchored even when a book is provided', () => {
+      const engine = createEngine({ levels: 1, baseSpreadBps: 50, levelSpacingTicks: 1, tickSize: 0.50 });
+      const quotes = engine.computeDesiredQuotes(100000, { bidSkewTicks: 0, askSkewTicks: 0 }, book);
+      const bid = quotes.find(q => q.side === 'buy');
+      expect(bid.price).toBeCloseTo(99749.50, 1); // unchanged mid behavior
+    });
+
+    // _extractAnchorBook: anchor must come from the named venue's feed, NOT the cross-venue BBO.
+    it('sources the anchor from the named venue feed, not cross-venue bestBid/bestAsk', () => {
+      const engine = createEngine({ quoteAnchorMode: 'coinbase-mirror', anchorExchange: 'coinbase' });
+      const agg = {
+        weightedMidpoint: 65700,
+        bestBid: 65699, bestAsk: 65701, // synthetic cross-venue BBO (tighter) — must be ignored
+        sources: [
+          { exchange: 'coinbase', bid: 65690, ask: 65710, isStale: false },
+          { exchange: 'kraken', bid: 65699, ask: 65701, isStale: false },
+        ],
+      };
+      expect(engine._extractAnchorBook(agg)).toEqual({ bestBid: 65690, bestAsk: 65710 });
+    });
+
+    it('returns null (→ mid fallback) when no fresh coinbase source is present', () => {
+      const engine = createEngine({ quoteAnchorMode: 'coinbase-mirror', anchorExchange: 'coinbase' });
+      expect(engine._extractAnchorBook({ sources: [{ exchange: 'kraken', bid: 1, ask: 2, isStale: false }] })).toBeNull();
+      expect(engine._extractAnchorBook({ sources: [] })).toBeNull();
+      expect(engine._extractAnchorBook({})).toBeNull();
+    });
+
+    it('ignores a stale coinbase source', () => {
+      const engine = createEngine({ quoteAnchorMode: 'coinbase-mirror', anchorExchange: 'coinbase' });
+      const agg = { sources: [{ exchange: 'coinbase', bid: 65690, ask: 65710, isStale: true }] };
+      expect(engine._extractAnchorBook(agg)).toBeNull();
+    });
+  });
+
   describe('skew application', () => {
     it('should shift bids down and asks up with positive skew', () => {
       const engine = createEngine({ levels: 1 });
