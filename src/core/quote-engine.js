@@ -688,6 +688,24 @@ export class QuoteEngine extends EventEmitter {
         break;
 
       case '4': // Cancelled
+        {
+          // Distinguish a cancel WE initiated (cancel ack: resolved via cancelToOrigMap, or the
+          // order was marked 'cancelling') from an UNSOLICITED venue cancel (the venue dropped a
+          // resting order we never asked to cancel — e.g. a post-only/ALO order it deemed
+          // marketable). Surface the latter so it stops vanishing silently.
+          const cancelled = this.activeOrders.get(resolvedClOrdID);
+          const selfInitiated = !!origClOrdID || cancelled?.status === 'cancelling';
+          if (cancelled && !selfInitiated) {
+            const reason = fields['58'] || 'unsolicited';
+            this.logger.warn(
+              `[QuoteEngine] Venue-cancelled ${cancelled.side} L${cancelled.level} @ ${cancelled.price} size=${cancelled.size}: ${reason}`
+            );
+            this.recentRejectsByReason.set(
+              `venue-cancel:${reason}`,
+              (this.recentRejectsByReason.get(`venue-cancel:${reason}`) || 0) + 1
+            );
+          }
+        }
         this.activeOrders.delete(resolvedClOrdID);
         this.cancelToOrigMap.delete(clOrdID);
         this._releasePendingReplacement(resolvedClOrdID);
