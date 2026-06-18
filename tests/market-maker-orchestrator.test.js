@@ -286,7 +286,10 @@ describe('MarketMakerOrchestrator', () => {
       await orchestrator._pollTruexEbbo();
 
       expect(orchestrator.restClient.getInstrument).toHaveBeenCalledWith('BTC-PYUSD');
-      expect(orchestrator.restClient.getMarketQuote).toHaveBeenCalledWith({ instrument_id: '78873627520270354' });
+      expect(orchestrator.restClient.getMarketQuote).toHaveBeenCalledWith(
+        { instrument_id: '78873627520270354' },
+        { timeoutMs: orchestrator.truexEbboPollTimeoutMs },
+      );
       expect(mocks.quoteEngine.updateTruexEbbo).toHaveBeenCalledWith(expect.objectContaining({
         bestBid: 100,
         bestAsk: 101,
@@ -340,6 +343,20 @@ describe('MarketMakerOrchestrator', () => {
 
       expect(orchestrator.restClient.getInstrument).not.toHaveBeenCalled();
       expect(orchestrator._scheduleNextTruexEbboPoll).toHaveBeenCalled();
+    });
+
+    test('does not start the poller when explicitly disabled with interval 0', () => {
+      const { orchestrator } = createOrchestrator({ truexEbboPollIntervalMs: 0 });
+      orchestrator.restClient = {
+        getInstrument: jest.fn(),
+        getMarketQuote: jest.fn(),
+      };
+      orchestrator._scheduleNextTruexEbboPoll = jest.fn();
+
+      orchestrator._startTruexEbboPoller();
+
+      expect(orchestrator.truexEbboPollIntervalMs).toBe(0);
+      expect(orchestrator._scheduleNextTruexEbboPoll).not.toHaveBeenCalled();
     });
   });
 

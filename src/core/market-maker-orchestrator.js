@@ -143,16 +143,16 @@ export class MarketMakerOrchestrator extends EventEmitter {
     }
     this.reconcileIntervalMs = options.reconcileIntervalMs || 300000; // 5 min
     this.balanceRefreshIntervalMs = options.balanceRefreshIntervalMs || 60000; // 1 min
-    this.truexEbboPollIntervalMs = options.truexEbboPollIntervalMs || 1000;
+    this.truexEbboPollIntervalMs = options.truexEbboPollIntervalMs ?? 1000;
     const configuredTruexEbboPollTimeoutMs =
-      options.truexEbboPollTimeoutMs || Math.max(250, this.truexEbboPollIntervalMs - 100);
+      options.truexEbboPollTimeoutMs ?? Math.max(250, this.truexEbboPollIntervalMs - 100);
     this.truexEbboPollTimeoutMs = Math.min(
       configuredTruexEbboPollTimeoutMs,
       Math.max(1, this.truexEbboPollIntervalMs - 1),
     );
-    this.truexEbboMaxBackoffMs = options.truexEbboMaxBackoffMs || 30000;
-    this.truexEbboFailureAlertThreshold = options.truexEbboFailureAlertThreshold || 3;
-    this.truexEbboInstrumentId = options.truexEbboInstrumentId || null;
+    this.truexEbboMaxBackoffMs = options.truexEbboMaxBackoffMs ?? 30000;
+    this.truexEbboFailureAlertThreshold = options.truexEbboFailureAlertThreshold ?? 3;
+    this.truexEbboInstrumentId = options.truexEbboInstrumentId ?? null;
 
     // State
     this.isRunning = false;
@@ -816,21 +816,6 @@ export class MarketMakerOrchestrator extends EventEmitter {
     return this.truexEbboInstrumentId;
   }
 
-  async _withTimeout(promise, timeoutMs, label) {
-    let timeoutId = null;
-    const timeoutPromise = new Promise((_, reject) => {
-      timeoutId = setTimeout(() => {
-        reject(new Error(`${label} timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
-    });
-
-    try {
-      return await Promise.race([promise, timeoutPromise]);
-    } finally {
-      if (timeoutId) clearTimeout(timeoutId);
-    }
-  }
-
   async _pollTruexEbbo() {
     if (!this.isRunning || !this.restClient) return;
     if (this._truexEbboPollInFlight) {
@@ -842,10 +827,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this._truexEbboPollInFlight = true;
     try {
       const instrumentId = await this._resolveTruexEbboInstrumentId();
-      const rawQuote = await this._withTimeout(
-        this.restClient.getMarketQuote({ instrument_id: instrumentId }),
-        this.truexEbboPollTimeoutMs,
-        'TrueX EBBO poll'
+      const rawQuote = await this.restClient.getMarketQuote(
+        { instrument_id: instrumentId },
+        { timeoutMs: this.truexEbboPollTimeoutMs }
       );
       const parsed = MarketMakerOrchestrator.parseMarketQuote(rawQuote, {
         instrumentId,
