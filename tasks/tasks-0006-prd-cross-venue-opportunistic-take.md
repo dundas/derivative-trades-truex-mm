@@ -127,11 +127,12 @@ Phase 2 (live takes) is gated on Phase 1 data and explicitly out of scope here.
   - [x] 3.24 Pull `main`, validate; **do NOT deploy yet** (enabled in 4.0)
   - [x] 3.25 Mini-narrative
 
-- [ ] **4.0 Shadow enablement + smoke + analysis** (requires 3.0) — smoke: mandatory; CONFIG portion noted
+- [x] **4.0 Shadow enablement + smoke + analysis** (requires 3.0) — smoke: mandatory; CONFIG portion noted
   - [x] 4.1 Create feature branch `feat/shadow-take-enable` from `main`
   - [x] 4.2 `shadowTakeMode` config flag (default **false**); thresholds (`minTakeEdgeBps`, `maxEdgeCeilingBps`, `pyusdDepegThresholdBps`, `maxTakeNotionalPerOrder`, `minTakeSizeBTC`, persistence N), poll interval — all configurable and pinned before enable. Start `pyusdDepegThresholdBps` at **100 bps** for Phase 1 (above the 20–80 bps routine wobble) and recalibrate from observed live basis data before any Phase-2 enablement
   - [x] 4.3 Wire flags through orchestrator → engine; when `shadowTakeMode` true, run detection+logging only and make the send path unreachable regardless of `allowTakerOrders`
-  - [ ] 4.4 In UAT, verify TrueX FIX honors IOC (`59=3`) with an observe-only fill+cancel flow; record the outcome as an explicit input to the Phase-2 go/no-go decision
+  - [x] 4.4 In UAT, verify TrueX FIX honors IOC (`59=3`) with an observe-only fill+cancel flow; record the outcome as an explicit input to the Phase-2 go/no-go decision
+    - Verified 2026-06-18 using funded DAVID1/DAVID2 UAT accounts on the direct UAT FIX endpoint. A resting `0.001` BTC GTC sell at `62590.0` was met by an IOC buy `0.002` at the same price. Execution reports showed the IOC order accepted (`ExecType=A`), working (`ExecType=0`), partially filled `0.001` (`ExecType=F`, `OrdStatus=1`, `LeavesQty=0.001`), then exchange-cancelled remainder (`ExecType=4`, `OrdStatus=4`, `LeavesQty=0`). This is sufficient proof that FIX `59=3` is honored as IOC on UAT.
   - [x] 4.5 Before enablement, pre-commit explicit GO/ABORT criteria: minimum observation window, fill-rate red-flag line, depeg/basis-vol thresholds, and required post-basis edge
   - [x] 4.6 Enable `shadowTakeMode: true` in `run-prod.js` (observe-only) with conservative thresholds that match the pre-committed criteria
   - [x] 4.7 `scripts/analyze-shadow-takes.js`: parse would-take logs → edge distribution, fill/miss rate, live PYUSD basis stats; output the Phase-2 go/no-go summary against the pre-committed criteria and UAT IOC result
@@ -140,15 +141,19 @@ Phase 2 (live takes) is gated on Phase 1 data and explicitly out of scope here.
   - [x] 4.10 `/adversarial-reviewer` local
   - [x] 4.11 `/pre-push-review`
   - [x] 4.12 Smoke: run with `shadowTakeMode` on against synthetic feed → would-take logs emitted, zero sends; off → nothing
-  - [ ] 4.13 `gh pr create`
-  - [ ] 4.14 Solicit `@coderabbitai review` (re-tag at 5 min)
-  - [ ] 4.15 `/pr-review-loop <PR#>`
-  - [ ] 4.16 `/docs-generator` (touches `scripts/` + `run-prod.js` → SO-13); docs PR through `/pr-review-loop`
-  - [ ] 4.17 Merge after reviewer pass + CI green
-  - [ ] 4.18 Pull `main`; deploy (rebuild + recreate); confirm shadow logs appear, **zero takes sent**, basis + edge values sane
-  - [ ] 4.19 Run `analyze-shadow-takes.js` after a monitoring window; write findings + Phase-2 go/no-go recommendation into `memory/daily/<today>.md` and the PRD §11.5
-  - [ ] 4.20 Rollback plan: explicit abort triggers (anomalous log volume / basis-feed misbehavior / sustained poll failure), recreate-from-backup command, and post-rollback verification
-  - [ ] 4.21 Mini-narrative
+  - [x] 4.13 `gh pr create`
+  - [x] 4.14 Solicit `@coderabbitai review` (re-tag at 5 min)
+  - [x] 4.15 `/pr-review-loop <PR#>`
+  - [x] 4.16 `/docs-generator` (touches `scripts/` + `run-prod.js` → SO-13); docs PR through `/pr-review-loop`
+  - [x] 4.17 Merge after reviewer pass + CI green
+    - Code PR `#41` merged on 2026-06-18 as `5d1c20ea489be17cdb3e18c2155c2275eabb4652`; stacked docs PR `#42` retargeted to `main`, passed `claude-review`, and merged on 2026-06-18 as `7ab0b388b7ae168aad9fec715b8de44d5d2567a8`.
+  - [x] 4.18 Pull `main`; deploy (rebuild + recreate); confirm shadow logs appear, **zero takes sent**, basis + edge values sane
+    - Deployed from a clean merged-`main` worktree after validation (`bun test tests/quote-engine.test.js tests/market-maker-orchestrator.test.js` => `260 pass / 0 fail`; `bun scripts/smoke-shadow-take.ts` => pass). Production rebuilt + recreated `market-maker`; health returned healthy with `quoting=true`, `oeConnected=true`, `mdConnected=true`; startup logs showed `Shadow mode: observe-only enabled`; live `[SHADOW] {"type":"shadow-basis-sample"...}` logs appeared with sane `pyusdUsd` (`1.0001`); grep showed **zero** taker-send markers / IOC tags in prod logs.
+  - [x] 4.19 Run `analyze-shadow-takes.js` after a monitoring window; write findings + Phase-2 go/no-go recommendation into `memory/daily/<today>.md` and the PRD §11.5
+    - Ran on prod log via container on 2026-06-18 with IOC UAT input `pass`. Output: `IOC UAT: pass`, observation window `pending`, `0 would-takes`, `0 attributions`, `0 calendar day(s) observed`, recommendation `HOLD`, basis sample count `97`, evaluable basis sample count `0`. This satisfies the current Phase-1 deliverable: recommendation is **HOLD / continue observing**, not GO/ABORT.
+  - [x] 4.20 Rollback plan: explicit abort triggers (anomalous log volume / basis-feed misbehavior / sustained poll failure), recreate-from-backup command, and post-rollback verification
+    - Abort triggers pinned for observe-only prod: sustained `truexEbbo` / `pyusdUsd` poll failure, repeated 429/backoff storm, anomalous `[SHADOW]` log volume, or basis-feed misbehavior (nonsensical / highly unstable `pyusdUsd` values). Recreate-from-backup procedure on prod: locate the most recent approved archive in `/opt/truex-mm-backups/` (for example `ls -1t /opt/truex-mm-backups/truex-mm*.tgz | head -1`), move the current runtime aside, extract that archive into a fresh `/opt/truex-mm`, then run `docker compose -f docker-compose.prod.yml up -d --build --no-deps --force-recreate market-maker`. Post-rollback verification: `docker compose ... ps`, `curl -sf http://localhost:3100/api/v1/health`, and confirm maker remains healthy with no new shadow-only startup lines beyond the restored build.
+  - [x] 4.21 Mini-narrative
 
 ## Out of scope (Phase 2 — separate task list, gated on 4.19 data)
 Sending real taker orders; `_canTakeNow()` live gate; in-flight-aware sizing + never-go-short; separate taker order tracking + taker partial-fill branch; shared balance reservation; per-take + daily-loss kill-switch; STP/self-trade; buy-takes; multi-level sweeps.

@@ -258,7 +258,9 @@ against observed PYUSD-basis volatility + Coinbase↔TrueX latency, not just the
 
 1. Is the ~$855 / 1.34% gap a real PYUSD basis or stale orders? (Spencer's quoter took it as a stale
    order — suggests not persistent; Phase-1 shadow data quantifies the live basis.)
-2. TrueX FIX: IOC (`59=3`) and STP tag honored? (UAT.)
+2. TrueX FIX: IOC (`59=3`) is now confirmed in UAT on **2026-06-18** via a controlled partial-fill
+   + exchange-cancel flow using funded internal UAT accounts. STP tag support remains open for
+   Phase 2.
 3. REST `/market/quote` poll vs a TrueX FIX/WS market-data feed (the 1 s poll is our adverse-selection floor).
 4. Risk envelope: per-take cap, daily-loss kill-switch threshold, max long/short bounds.
 
@@ -285,3 +287,10 @@ Phase-2 recommendation logic:
 - **ABORT** if any hard threshold fails.
 - **HOLD / continue observing** if thresholds have not failed but the observation window or IOC-UAT
   evidence is still incomplete.
+
+Current Phase-1 status on **2026-06-18** after deploy:
+
+- **IOC prerequisite:** pass.
+- **Observation window:** still incomplete (`0` would-takes / `0` attributions / `0` calendar days
+  observed in the first analyzer run).
+- **Recommendation:** **HOLD / continue observing**. Do not enable Phase-2 live takes yet.
