@@ -665,10 +665,11 @@ export class QuoteEngine extends EventEmitter {
         if (lastQty && lastQty > 0) {
           const tracked = this._emitFillEvent(resolvedClOrdID, side, lastPx, lastQty, execID);
           if (tracked) {
-            // Remaining size = LeavesQty (tag 151) if provided, else subtract LastQty.
-            const leavesQty = fields['151'] !== undefined
-              ? parseFloat(fields['151'])
-              : (tracked.size - lastQty);
+            // Remaining size = LeavesQty (tag 151) when it parses to a finite number, else
+            // subtract LastQty. Guards against tag 151 being absent OR an empty/garbage string
+            // (parseFloat('') === NaN, which would otherwise corrupt the tracked size to NaN).
+            const parsedLeaves = parseFloat(fields['151']);
+            const leavesQty = Number.isFinite(parsedLeaves) ? parsedLeaves : (tracked.size - lastQty);
             tracked.size = Math.max(0, leavesQty);
             // A fill proves the order is live, so promote 'pending' → 'active'. But preserve
             // 'cancelling' so reconcileOrders doesn't double-act on an in-flight cancel.

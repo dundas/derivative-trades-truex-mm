@@ -1571,6 +1571,15 @@ describe('QuoteEngine', () => {
       expect(engine.activeOrders.get('CLO007').size).toBeCloseTo(0.007, 8);
     });
 
+    it('should fall back to size-LastQty when LeavesQty (151) is an empty/garbage string', () => {
+      const engine = createEngine();
+      engine.activeOrders.set('CLO010', { side: 'buy', price: 99750, size: 0.01, level: 1, status: 'active', placedAt: Date.now() });
+      // tag 151 present but empty — parseFloat('') is NaN; must NOT corrupt size to NaN
+      engine.onExecutionReport({ '11': 'CLO010', '39': '1', '54': '1', '31': '99750', '32': '0.002', '151': '' });
+      expect(Number.isFinite(engine.activeOrders.get('CLO010').size)).toBe(true);
+      expect(engine.activeOrders.get('CLO010').size).toBeCloseTo(0.008, 8);
+    });
+
     it('should reset consecutiveRejects on a partial fill', () => {
       const engine = createEngine();
       engine.consecutiveRejects = 2;
