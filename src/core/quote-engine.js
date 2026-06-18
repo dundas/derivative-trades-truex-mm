@@ -708,6 +708,13 @@ export class QuoteEngine extends EventEmitter {
         }
         break;
 
+      case 'A': // PendingNew
+      case '6': // PendingCancel
+      case 'E': // PendingReplace
+        // Benign in-flight transition states (TrueX sends PendingNew before New on every
+        // order). Expected and frequent — no action, and must NOT hit the default warn.
+        break;
+
       default: // Surface anything we don't explicitly handle instead of silently dropping it
         this.logger.warn(`[QuoteEngine] Unhandled execution report ordStatus=${ordStatus} clOrdID=${clOrdID} execID=${execID}`);
         break;

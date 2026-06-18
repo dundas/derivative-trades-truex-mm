@@ -1526,6 +1526,16 @@ describe('QuoteEngine', () => {
       expect(mockLogger.warn.mock.calls.length).toBeGreaterThan(0);
     });
 
+    it('should NOT warn on expected pending transition states (A/6/E)', () => {
+      const mockLogger = createMockLogger();
+      const engine = createEngine({ logger: mockLogger });
+      // PendingNew arrives for every order — must be a benign no-op, not a default warn
+      engine.onExecutionReport({ '11': 'CLOA', '39': 'A', '54': '1' });
+      engine.onExecutionReport({ '11': 'CLOB', '39': '6', '54': '1' });
+      engine.onExecutionReport({ '11': 'CLOC', '39': 'E', '54': '1' });
+      expect(mockLogger.warn.mock.calls.length).toBe(0);
+    });
+
     it('should handle null fields gracefully', () => {
       const engine = createEngine();
       // Should not throw
