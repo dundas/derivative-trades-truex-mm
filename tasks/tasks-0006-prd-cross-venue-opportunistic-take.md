@@ -106,7 +106,7 @@ Phase 2 (live takes) is gated on Phase 1 data and explicitly out of scope here.
   - [ ] 3.5 Detection step: sell-take candidate when `truexEbbo.bestBid` adjusted-edge ≥ `minTakeEdgeBps`; size = `min(bestBidQty, balance-capped, maxPosition headroom, maxTakeNotionalPerOrder)`; inventory-reducing only (long); suppress dust via `minTakeSizeBTC`
   - [ ] 3.6 Corroboration guards (PB2): Coinbase-leg freshness/confidence; **multi-poll persistence** (pinned N, reset on disappearance); **max-edge suspicion ceiling** (suppress + warn if edge > ceiling); **TrueX tape/outlier guard only if 0.2 finds a real public source**
   - [ ] 3.7 Basis gate (PB1): suppress all detection if `pyusdUsd` stale/missing or `|pyusdUsd−1| > pyusdDepegThresholdBps`
-  - [ ] 3.8 Dedup (FR16): key on `bestBid + bestBidQty` (not timestamp); add qty-decay tolerance so a persisting partially-taken bid is not re-logged every poll
+  - [ ] 3.8 Dedup (FR16): key on `bestBid + bestBidQty` (not timestamp); add qty-decay tolerance (recommend treating reductions within 10% as the same persisting order) so a partially-taken bid is not re-logged every poll
   - [ ] 3.9 Structured `would-take` log: side, size, truexPrice, rawEdgeBps, basisAdjEdgeBps, pyusdUsd, coinbaseFresh, dedupKey, suppressReason(if any); include tape-age fields only if 0.2 found a usable source
   - [ ] 3.10 Fill/miss attribution: record whether the targeted bid disappears shortly after (TrueX's quoter likely took it) vs persists
   - [ ] 3.11 Shadow-path alerting (FR26): rate-thresholded alerts for sustained zero-detection while market is active, basis/depeg suppression spikes, and edge-ceiling trips
@@ -126,7 +126,7 @@ Phase 2 (live takes) is gated on Phase 1 data and explicitly out of scope here.
 
 - [ ] **4.0 Shadow enablement + smoke + analysis** (requires 3.0) — smoke: mandatory; CONFIG portion noted
   - [ ] 4.1 Create feature branch `feat/shadow-take-enable` from `main`
-  - [ ] 4.2 `shadowTakeMode` config flag (default **false**); thresholds (`minTakeEdgeBps`, `maxEdgeCeilingBps`, `pyusdDepegThresholdBps`, `maxTakeNotionalPerOrder`, `minTakeSizeBTC`, persistence N), poll interval — all configurable and pinned before enable
+  - [ ] 4.2 `shadowTakeMode` config flag (default **false**); thresholds (`minTakeEdgeBps`, `maxEdgeCeilingBps`, `pyusdDepegThresholdBps`, `maxTakeNotionalPerOrder`, `minTakeSizeBTC`, persistence N), poll interval — all configurable and pinned before enable. Start `pyusdDepegThresholdBps` at **100 bps** for Phase 1 (above the 20–80 bps routine wobble) and recalibrate from observed live basis data before any Phase-2 enablement
   - [ ] 4.3 Wire flags through orchestrator → engine; when `shadowTakeMode` true, run detection+logging only and make the send path unreachable regardless of `allowTakerOrders`
   - [ ] 4.4 In UAT, verify TrueX FIX honors IOC (`59=3`) with an observe-only fill+cancel flow; record the outcome as an explicit input to the Phase-2 go/no-go decision
   - [ ] 4.5 Before enablement, pre-commit explicit GO/ABORT criteria: minimum observation window, fill-rate red-flag line, depeg/basis-vol thresholds, and required post-basis edge

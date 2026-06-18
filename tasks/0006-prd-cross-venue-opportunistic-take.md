@@ -131,10 +131,10 @@ Coinbase fair value by more than fees + a buffer, and take it with an IOC order 
 
 Follows `.ai/protocols/STANDARD_DEV_WORKFLOW.md`. This is real-money taker execution, so:
 - TDD; feature branch off `main` (never push to main).
-- **4a `/adversarial-reviewer`** (mandatory — real-money order placement; not skippable).
-- **4b `/pre-push-review`** (semgrep + roborev) before every push.
-- **4c smoke** — engine logic + a take-detection smoke (synthetic dislocated book → asserts a
+- **4a `/pre-push-review`** (semgrep + roborev) before every push.
+- **4b smoke** — engine logic + a take-detection smoke (synthetic dislocated book → asserts a
   correctly-sized IOC sell-take is emitted; and that no take fires when stale/low-confidence/flat).
+- **4c `/adversarial-reviewer`** (mandatory — real-money order placement; not skippable).
 - **4d** PR + `/pr-review-loop` (CodeRabbit), reviewer pass + CI green before merge. Never CI-only.
 - **Deploy:** rebuild + recreate on Hetzner (`docker compose -f docker-compose.prod.yml up -d
   --no-deps --force-recreate market-maker`), backup prior file for rollback (as in #32–#34).
@@ -191,7 +191,9 @@ The v1 scope above is superseded by the two-phase plan here.
 - **PB1 — PYUSD/USD basis.** Edge compares `truexBid` (PYUSD) to `coinbaseBid` (USD) assuming
   1 PYUSD = 1 USD. Stablecoin wobble (20–80 bps routine) exceeds the 15 bps buffer. **Required:** a
   live PYUSD/USD reference in the edge formula + hard depeg-suppression gate
-  (`suppress all takes if |PYUSD-USD − 1| > pyusdDepegThresholdBps`).
+  (`suppress all takes if |PYUSD-USD − 1| > pyusdDepegThresholdBps`). **Starting point:** set
+  `pyusdDepegThresholdBps` conservatively above routine wobble (recommend **100 bps** for Phase 1),
+  then recalibrate from observed live basis distribution before any Phase-2 enablement.
 - **PB2 — Which venue is stale / adverse selection.** A large "edge" may mean Coinbase is the
   laggard (real move) and TrueX is correct → we'd sell into a rally. **A high fill rate on flagged
   opportunities is a RED FLAG, not success.** **Required:** Coinbase freshness/sequence check,
