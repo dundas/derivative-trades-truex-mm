@@ -156,6 +156,8 @@ function buildSummary({ wouldTakes, attributions, basisSamples, suppressions }, 
   const rawEdges = wouldTakes.map((entry) => Number(entry.rawEdgeBps)).filter(Number.isFinite);
   const sizes = wouldTakes.map((entry) => Number(entry.size)).filter(Number.isFinite);
   const evaluableBasisSamples = basisSamples.filter((entry) =>
+    entry.pyusdUsd !== null &&
+    entry.pyusdUsd !== undefined &&
     Number.isFinite(Number(entry.pyusdUsd)) &&
     !nonEvaluableSuppressReasons.has(entry.suppressReason)
   );
