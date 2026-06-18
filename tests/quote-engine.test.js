@@ -1507,6 +1507,42 @@ describe('QuoteEngine', () => {
       expect(engine.activeOrders.has('CLO003')).toBe(false);
     });
 
+    it('should WARN on an unsolicited venue cancel (active order, we did not cancel it)', () => {
+      const mockLogger = createMockLogger();
+      const engine = createEngine({ logger: mockLogger });
+      // Active order we never sent a cancel for — e.g. a post-only/ALO ask the venue cancels
+      engine.activeOrders.set('CLOV1', { side: 'sell', price: 64003, size: 0.01, level: 1, status: 'active', placedAt: Date.now() });
+
+      engine.onExecutionReport({ '11': 'CLOV1', '39': '4', '54': '2', '58': 'POST_ONLY_WOULD_CROSS' });
+
+      expect(engine.activeOrders.has('CLOV1')).toBe(false);
+      const msg = mockLogger.warn.mock.calls.map(c => c[0]).join(' ');
+      expect(msg).toContain('Venue-cancelled');
+      expect(msg).toContain('sell');
+      expect(engine.recentRejectsByReason.has('venue-cancel:POST_ONLY_WOULD_CROSS')).toBe(true);
+    });
+
+    it('should NOT warn when WE initiated the cancel (status cancelling)', () => {
+      const mockLogger = createMockLogger();
+      const engine = createEngine({ logger: mockLogger });
+      engine.activeOrders.set('CLOV2', { side: 'sell', price: 100250, size: 0.01, level: 1, status: 'cancelling', placedAt: Date.now() });
+
+      engine.onExecutionReport({ '11': 'CLOV2', '39': '4', '54': '2' });
+      expect(engine.activeOrders.has('CLOV2')).toBe(false);
+      expect(mockLogger.warn.mock.calls.length).toBe(0); // self-cancel is normal, no warn
+    });
+
+    it('should NOT warn on a self-cancel ack resolved via cancelToOrigMap', () => {
+      const mockLogger = createMockLogger();
+      const engine = createEngine({ logger: mockLogger });
+      engine.activeOrders.set('ORIGV3', { side: 'buy', price: 64000, size: 0.01, level: 1, status: 'cancelling', placedAt: Date.now() });
+      engine.cancelToOrigMap.set('CXV3', 'ORIGV3'); // our cancel request clOrdID -> original
+
+      engine.onExecutionReport({ '11': 'CXV3', '39': '4', '54': '1' });
+      expect(engine.activeOrders.has('ORIGV3')).toBe(false);
+      expect(mockLogger.warn.mock.calls.length).toBe(0);
+    });
+
     it('should remove order and log error on OrdStatus=8 (Rejected)', () => {
       const mockLogger = createMockLogger();
       const engine = createEngine({ logger: mockLogger });
