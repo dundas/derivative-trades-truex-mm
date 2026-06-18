@@ -118,10 +118,10 @@ Phase 2 (live takes) is gated on Phase 1 data and explicitly out of scope here.
   - [x] 3.15 Orchestrator-layer tests: new poll loop has zero call edges to FIX and invokes a non-dispatchable shadow-evaluation path only
   - [x] 3.16 Tests pass
   - [x] 3.17 `/adversarial-reviewer` local (real-money-adjacent logic even though no sends — verify the no-send invariant holds on all branches)
-  - [ ] 3.18 `/pre-push-review`
+  - [x] 3.18 `/pre-push-review`
   - [x] 3.19 Smoke (`scripts/smoke-shadow-take.ts`): synthetic dislocated book + fresh Coinbase + basis → asserts one would-take log with correct basis-adj edge AND zero FIX sends; second identical poll → deduped (no second log)
-  - [ ] 3.20 `gh pr create`
-  - [ ] 3.21 Solicit `@coderabbitai review` (re-tag at 5 min)
+  - [x] 3.20 `gh pr create`
+  - [x] 3.21 Solicit `@coderabbitai review` (re-tag at 5 min)
   - [ ] 3.22 `/pr-review-loop <PR#>`
   - [ ] 3.23 Merge after reviewer pass + CI green
   - [ ] 3.24 Pull `main`, validate; **do NOT deploy yet** (enabled in 4.0)
