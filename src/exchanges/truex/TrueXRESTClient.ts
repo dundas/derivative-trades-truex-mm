@@ -128,14 +128,41 @@ export interface InstrumentResponse {
   max_order_qty?: string;
 }
 
-export interface MarketQuoteResponse {
-  instrument_id: string;
-  bid_price: string;
-  bid_qty: string;
-  ask_price: string;
-  ask_qty: string;
-  timestamp: string;
+export interface MarketQuoteLevel {
+  price?: string;
+  qty?: string;
+  order_count?: string;
+  last_update?: string;
 }
+
+export interface MarketQuoteTrade {
+  price?: string;
+  qty?: string;
+  timestamp?: string;
+}
+
+export interface MarketQuoteEntry {
+  id: string;
+  symbol?: string;
+  info?: {
+    best_bid?: MarketQuoteLevel;
+    best_ask?: MarketQuoteLevel;
+    last_trade?: MarketQuoteTrade;
+    last_update?: string;
+  };
+}
+
+export interface FlatMarketQuoteResponse {
+  instrument_id?: string;
+  symbol?: string;
+  bid_price?: string;
+  ask_price?: string;
+  bid_qty?: string;
+  ask_qty?: string;
+  timestamp?: string;
+}
+
+export type MarketQuoteResponse = MarketQuoteEntry[] | FlatMarketQuoteResponse;
 
 export interface Balance {
   asset_id: string;
@@ -181,6 +208,11 @@ export interface TrueXRESTClientConfig {
   apiSecret: string;
   userId: string;
   timeout?: number;
+}
+
+interface TrueXRequestOptions {
+  signal?: AbortSignal;
+  timeoutMs?: number;
 }
 
 // ============================================================================
@@ -248,7 +280,8 @@ export class TrueXRESTClient {
     method: string,
     path: string,
     body?: unknown,
-    query?: Record<string, string | number | undefined>
+    query?: Record<string, string | number | undefined>,
+    options: TrueXRequestOptions = {}
   ): Promise<T> {
     // Build query string
     let url = `${this.baseURL}${path}`;
@@ -270,7 +303,20 @@ export class TrueXRESTClient {
     const headers = this.signRequest(method, `/api/v1${path}`, bodyString);
 
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), this.timeout);
+    const timeoutMs = options.timeoutMs ?? this.timeout;
+    let timedOut = false;
+    const abortFromUpstream = () => controller.abort(options.signal?.reason);
+    if (options.signal) {
+      if (options.signal.aborted) {
+        abortFromUpstream();
+      } else {
+        options.signal.addEventListener("abort", abortFromUpstream, { once: true });
+      }
+    }
+    const timeoutId = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
 
     try {
       const response = await fetch(url, {
@@ -281,6 +327,9 @@ export class TrueXRESTClient {
       });
 
       clearTimeout(timeoutId);
+      if (options.signal) {
+        options.signal.removeEventListener("abort", abortFromUpstream);
+      }
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
@@ -296,8 +345,18 @@ export class TrueXRESTClient {
       return response.json();
     } catch (error) {
       clearTimeout(timeoutId);
+      if (options.signal) {
+        options.signal.removeEventListener("abort", abortFromUpstream);
+      }
       if (error instanceof Error && error.name === "AbortError") {
-        throw new Error(`TrueX API: Request timeout after ${this.timeout}ms`);
+        if (timedOut) {
+          throw new Error(`TrueX API: Request timeout after ${timeoutMs}ms`);
+        }
+        if (options.signal?.aborted) {
+          const reason = options.signal.reason;
+          throw reason instanceof Error ? reason : new Error("TrueX API: Request aborted");
+        }
+        throw new Error("TrueX API: Request aborted");
       }
       throw error;
     }
@@ -369,8 +428,8 @@ export class TrueXRESTClient {
   async getMarketQuote(params: {
     instrument_id: string;
     as_of?: string;
-  }): Promise<MarketQuoteResponse> {
-    return this.request("GET", "/market/quote", undefined, params);
+  }, options: TrueXRequestOptions = {}): Promise<MarketQuoteResponse> {
+    return this.request("GET", "/market/quote", undefined, params, options);
   }
 
   /**

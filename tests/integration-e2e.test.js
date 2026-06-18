@@ -236,6 +236,7 @@ describe('Integration: End-to-End Market Making', () => {
         priceBandPct: 2.5,
         confidenceThreshold: 0.3,
         symbol: 'BTC-PYUSD',
+        replaceMode: 'place-before-cancel',
         logger,
       }),
       hedgeExecutor: new HedgeExecutor({

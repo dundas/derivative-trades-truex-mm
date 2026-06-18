@@ -59,6 +59,7 @@ function createMockQuoteEngine() {
   const qe = new EventEmitter();
   qe.activeOrders = new Map();
   qe.onPriceUpdate = jest.fn();
+  qe.updateTruexEbbo = jest.fn();
   qe.onExecutionReport = jest.fn();
   qe.onOrderCancelReject = jest.fn();
   qe.cancelAllQuotes = jest.fn();
@@ -73,6 +74,7 @@ function createMockQuoteEngine() {
     activeCount: 0,
     lastMid: 0,
     isQuoting: false,
+    truexEbbo: null,
   }));
   return qe;
 }
@@ -216,6 +218,178 @@ describe('MarketMakerOrchestrator', () => {
         hedgeExecutor: he,
       });
       expect(orch.logger).toBe(console);
+    });
+  });
+
+  describe('TrueX EBBO poller', () => {
+    test('parses the live nested /market/quote payload shape', () => {
+      const parsed = MarketMakerOrchestrator.parseMarketQuote([
+        {
+          id: '78873627520270354',
+          symbol: 'BTC-PYUSD',
+          info: {
+            last_trade: {
+              price: '63888.6',
+              qty: '0.00008',
+              timestamp: '1781794363428309171',
+            },
+            best_bid: {
+              price: '63788.5',
+              qty: '0.008',
+              order_count: '1',
+              last_update: '1781794727328321122',
+            },
+            best_ask: {
+              price: '63933.4',
+              qty: '0.00008',
+              order_count: '2',
+              last_update: '1781794942928366811',
+            },
+            last_update: '1781794942928366896',
+          },
+        },
+      ], { instrumentId: '78873627520270354', symbol: 'BTC-PYUSD' });
+
+      expect(parsed.bestBid).toBe(63788.5);
+      expect(parsed.bestAsk).toBe(63933.4);
+      expect(parsed.bestBidQty).toBe(0.008);
+      expect(parsed.bestAskQty).toBe(0.00008);
+      expect(parsed.bestBidOrderCount).toBe(1);
+      expect(parsed.bestAskOrderCount).toBe(2);
+      expect(parsed.lastTradePrice).toBe(63888.6);
+      expect(parsed.lastTradeQty).toBe(0.00008);
+      expect(parsed.lastTradeTs).toBeGreaterThan(0);
+      expect(parsed.timestamp).toBeGreaterThanOrEqual(parsed.lastTradeTs);
+    });
+
+    test('throws a clear error when /market/quote returns an empty array', () => {
+      expect(() => MarketMakerOrchestrator.parseMarketQuote([], {
+        instrumentId: '78873627520270354',
+        symbol: 'BTC-PYUSD',
+      })).toThrow('TrueX EBBO poll returned empty array');
+    });
+
+    test('parses the legacy flat /market/quote payload shape when encountered', () => {
+      const parsed = MarketMakerOrchestrator.parseMarketQuote({
+        instrument_id: 'legacy-1',
+        symbol: 'BTC-PYUSD',
+        bid_price: '100.25',
+        ask_price: '100.75',
+        bid_qty: '0.03',
+        ask_qty: '0.04',
+        timestamp: '1781794942928366896',
+      });
+
+      expect(parsed).toEqual(expect.objectContaining({
+        instrumentId: 'legacy-1',
+        symbol: 'BTC-PYUSD',
+        bestBid: 100.25,
+        bestAsk: 100.75,
+        bestBidQty: 0.03,
+        bestAskQty: 0.04,
+        bestBidOrderCount: null,
+        bestAskOrderCount: null,
+        lastTradePrice: null,
+        lastTradeQty: null,
+      }));
+      expect(parsed.timestamp).toBeGreaterThan(0);
+    });
+
+    test('polls /market/quote into quoteEngine.updateTruexEbbo without touching maker paths', async () => {
+      const alertManager = { sendAlert: jest.fn(async () => ({})), sendRecovery: jest.fn(async () => ({})) };
+      const { orchestrator, mocks } = createOrchestrator({ alertManager, truexEbboPollIntervalMs: 1000 });
+      orchestrator.restClient = {
+        getInstrument: jest.fn(async () => ({ id: '78873627520270354' })),
+        getMarketQuote: jest.fn(async () => ([
+          {
+            id: '78873627520270354',
+            symbol: 'BTC-PYUSD',
+            info: {
+              best_bid: { price: '100', qty: '0.01', order_count: '1', last_update: '1781794727328321122' },
+              best_ask: { price: '101', qty: '0.02', order_count: '2', last_update: '1781794942928366811' },
+              last_trade: { price: '100.5', qty: '0.001', timestamp: '1781794363428309171' },
+              last_update: '1781794942928366896',
+            },
+          },
+        ])),
+      };
+      orchestrator.isRunning = true;
+      orchestrator._scheduleNextTruexEbboPoll = jest.fn();
+
+      await orchestrator._pollTruexEbbo();
+
+      expect(orchestrator.restClient.getInstrument).toHaveBeenCalledWith('BTC-PYUSD');
+      expect(orchestrator.restClient.getMarketQuote).toHaveBeenCalledWith(
+        { instrument_id: '78873627520270354' },
+        { timeoutMs: orchestrator.truexEbboPollTimeoutMs },
+      );
+      expect(mocks.quoteEngine.updateTruexEbbo).toHaveBeenCalledWith(expect.objectContaining({
+        bestBid: 100,
+        bestAsk: 101,
+        bestBidQty: 0.01,
+        bestAskQty: 0.02,
+      }));
+      expect(mocks.quoteEngine.onPriceUpdate).not.toHaveBeenCalled();
+      expect(mocks.fixConnection.sendMessage).not.toHaveBeenCalled();
+      expect(alertManager.sendAlert).not.toHaveBeenCalled();
+    });
+
+    test('backs off and alerts after sustained poll failures', async () => {
+      const alertManager = { sendAlert: jest.fn(async () => ({})), sendRecovery: jest.fn(async () => ({})) };
+      const { orchestrator } = createOrchestrator({
+        alertManager,
+        truexEbboPollIntervalMs: 1000,
+        truexEbboFailureAlertThreshold: 2,
+      });
+      orchestrator.restClient = {
+        getInstrument: jest.fn(async () => ({ id: '78873627520270354' })),
+        getMarketQuote: jest.fn(async () => {
+          const err = new Error('rate limited');
+          err.status = 429;
+          throw err;
+        }),
+      };
+      orchestrator.isRunning = true;
+      orchestrator._scheduleNextTruexEbboPoll = jest.fn();
+
+      await orchestrator._pollTruexEbbo();
+      await orchestrator._pollTruexEbbo();
+
+      expect(orchestrator._truexEbboConsecutiveErrors).toBe(2);
+      expect(orchestrator._truexEbboCurrentBackoffMs).toBeGreaterThan(1000);
+      expect(alertManager.sendAlert).toHaveBeenCalledWith(expect.objectContaining({
+        reason: 'TrueX EBBO poll failing',
+      }));
+    });
+
+    test('skips overlapping ticks while a poll is already in flight', async () => {
+      const { orchestrator } = createOrchestrator({ truexEbboPollIntervalMs: 1000 });
+      orchestrator.restClient = {
+        getInstrument: jest.fn(async () => ({ id: '78873627520270354' })),
+        getMarketQuote: jest.fn(async () => ([])),
+      };
+      orchestrator.isRunning = true;
+      orchestrator._truexEbboPollInFlight = true;
+      orchestrator._scheduleNextTruexEbboPoll = jest.fn();
+
+      await orchestrator._pollTruexEbbo();
+
+      expect(orchestrator.restClient.getInstrument).not.toHaveBeenCalled();
+      expect(orchestrator._scheduleNextTruexEbboPoll).toHaveBeenCalled();
+    });
+
+    test('does not start the poller when explicitly disabled with interval 0', () => {
+      const { orchestrator } = createOrchestrator({ truexEbboPollIntervalMs: 0 });
+      orchestrator.restClient = {
+        getInstrument: jest.fn(),
+        getMarketQuote: jest.fn(),
+      };
+      orchestrator._scheduleNextTruexEbboPoll = jest.fn();
+
+      orchestrator._startTruexEbboPoller();
+
+      expect(orchestrator.truexEbboPollIntervalMs).toBe(0);
+      expect(orchestrator._scheduleNextTruexEbboPoll).not.toHaveBeenCalled();
     });
   });
 
@@ -483,6 +657,17 @@ describe('MarketMakerOrchestrator', () => {
       expect(status.marketData).not.toBeNull();
       expect(status.marketData.spread).toBeDefined();
       await orchestrator.stop();
+    });
+
+    test('exposes EBBO poll health fields', () => {
+      const { orchestrator } = createOrchestrator();
+      orchestrator._truexEbboLastSuccessAt = 1234567890;
+      orchestrator._truexEbboConsecutiveErrors = 2;
+
+      const status = orchestrator.getStatus();
+
+      expect(status.truexEbboLastSuccessAt).toBe(1234567890);
+      expect(status.truexEbboConsecutiveErrors).toBe(2);
     });
   });
 
