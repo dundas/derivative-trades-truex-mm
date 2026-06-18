@@ -1080,6 +1080,15 @@ export class MarketMakerOrchestrator extends EventEmitter {
   _handleShadowEvaluationResult(result) {
     if (!result?.evaluation) return;
     const now = Date.now();
+    const basisSample = {
+      type: 'shadow-basis-sample',
+      timestamp: result.evaluation.timestamp ?? now,
+      trigger: result.evaluation.trigger ?? 'unknown',
+      pyusdUsd: result.evaluation.pyusdUsd ?? null,
+      suppressReason: result.evaluation.suppressReason ?? null,
+      coinbaseFresh: result.evaluation.coinbaseFresh ?? null,
+      wouldTake: !!result.evaluation.wouldTake,
+    };
     this._rollShadowMetricsWindow(now);
     const zeroDetectionEligibleSuppressReasons = new Set([
       'coinbase-stale',
@@ -1130,6 +1139,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       this._shadowMetrics.edgeCeilings++;
     }
 
+    this.logger.info(`[SHADOW] ${JSON.stringify(basisSample)}`);
     for (const log of result.logs || []) {
       this.logger.info(`[SHADOW] ${JSON.stringify(log)}`);
     }

@@ -104,9 +104,15 @@ class MockHedgeExecutor extends EventEmitter {
 const fixConnection = new MockFIXConnection();
 const inventoryManager = new MockInventoryManager();
 const shadowLogs: string[] = [];
+const wouldTakeLogs: string[] = [];
 const logger = {
   info(message: string) {
-    if (message.startsWith('[SHADOW] ')) shadowLogs.push(message);
+    if (!message.startsWith('[SHADOW] ')) return;
+    shadowLogs.push(message);
+    const payload = JSON.parse(message.slice('[SHADOW] '.length));
+    if (payload.type === 'would-take') {
+      wouldTakeLogs.push(message);
+    }
   },
   warn() {},
   error() {},
@@ -214,11 +220,11 @@ orchestrator._onPriceUpdate({
 await orchestrator._pollTruexEbbo();
 await orchestrator._pollTruexEbbo();
 
-if (shadowLogs.length !== 1) {
-  fail(`expected exactly one shadow log across two identical polls, got ${shadowLogs.length}`);
+if (wouldTakeLogs.length !== 1) {
+  fail(`expected exactly one would-take log across two identical polls, got ${wouldTakeLogs.length}`);
 }
 
-const payload = JSON.parse(shadowLogs[0].slice('[SHADOW] '.length));
+const payload = JSON.parse(wouldTakeLogs[0].slice('[SHADOW] '.length));
 if (payload.type !== 'would-take' || payload.wouldTake !== true) {
   fail(`unexpected shadow log payload ${shadowLogs[0]}`);
 }

@@ -109,6 +109,7 @@ function parseShadowLogs(file) {
   const content = readFileSync(file, 'utf8');
   const wouldTakes = [];
   const attributions = [];
+  const basisSamples = [];
   const suppressions = new Map();
 
   for (const line of content.split('\n')) {
@@ -129,6 +130,8 @@ function parseShadowLogs(file) {
       wouldTakes.push(payload);
     } else if (payload.type === 'shadow-take-attribution') {
       attributions.push(payload);
+    } else if (payload.type === 'shadow-basis-sample') {
+      basisSamples.push(payload);
     } else if (payload.suppressReason) {
       suppressions.set(
         payload.suppressReason,
@@ -137,15 +140,15 @@ function parseShadowLogs(file) {
     }
   }
 
-  return { wouldTakes, attributions, suppressions };
+  return { wouldTakes, attributions, basisSamples, suppressions };
 }
 
-function buildSummary({ wouldTakes, attributions, suppressions }, criteria, iocUatResult) {
+function buildSummary({ wouldTakes, attributions, basisSamples, suppressions }, criteria, iocUatResult) {
   const timestamps = wouldTakes.map((entry) => Number(entry.timestamp)).filter(Number.isFinite);
   const basisAdjEdges = wouldTakes.map((entry) => Number(entry.basisAdjEdgeBps)).filter(Number.isFinite);
   const rawEdges = wouldTakes.map((entry) => Number(entry.rawEdgeBps)).filter(Number.isFinite);
   const sizes = wouldTakes.map((entry) => Number(entry.size)).filter(Number.isFinite);
-  const basisValues = wouldTakes.map((entry) => Number(entry.pyusdUsd)).filter(Number.isFinite);
+  const basisValues = basisSamples.map((entry) => Number(entry.pyusdUsd)).filter(Number.isFinite);
   const absBasisBps = basisValues.map((value) => Math.abs(value - 1) * 10000);
 
   const attributedCount = attributions.length;
@@ -153,11 +156,25 @@ function buildSummary({ wouldTakes, attributions, suppressions }, criteria, iocU
   const persistedCount = attributions.filter((entry) => entry.outcome === 'persisted').length;
   const disappearedRatePct = attributedCount > 0 ? (disappearedCount / attributedCount) * 100 : null;
 
-  const firstTs = timestamps.length ? Math.min(...timestamps) : null;
-  const lastTs = timestamps.length ? Math.max(...timestamps) : null;
-  const observationDays = firstTs !== null && lastTs !== null
-    ? ((lastTs - firstTs) / (24 * 60 * 60 * 1000))
-    : 0;
+  const allTimestamps = [
+    ...timestamps,
+    ...basisSamples.map((entry) => Number(entry.timestamp)).filter(Number.isFinite),
+  ];
+  const firstTs = allTimestamps.length ? Math.min(...allTimestamps) : null;
+  const lastTs = allTimestamps.length ? Math.max(...allTimestamps) : null;
+  const calendarDaysObserved = new Set(
+    allTimestamps.map((ts) => new Date(ts).toISOString().slice(0, 10)),
+  ).size;
+  const observationWindowPass =
+    wouldTakes.length >= criteria.minWouldTakeCount &&
+    attributedCount >= criteria.minAttributedCount &&
+    calendarDaysObserved >= criteria.minObservationDays;
+  const enoughEdgeData = wouldTakes.length >= criteria.minWouldTakeCount;
+  const enoughBasisData = basisSamples.length > 0;
+  const medianEdge = percentile(basisAdjEdges, 0.5);
+  const p25Edge = percentile(basisAdjEdges, 0.25);
+  const maxAbsBasis = absBasisBps.length ? Math.max(...absBasisBps) : null;
+  const p95AbsBasis = percentile(absBasisBps, 0.95);
 
   const findings = [
     {
@@ -167,33 +184,31 @@ function buildSummary({ wouldTakes, attributions, suppressions }, criteria, iocU
     },
     {
       name: 'Observation window',
-      status: wouldTakes.length >= criteria.minWouldTakeCount &&
-        observationDays >= criteria.minObservationDays &&
-        attributedCount >= criteria.minAttributedCount
-        ? 'pass'
-        : 'pending',
+      status: observationWindowPass ? 'pass' : 'pending',
       detail:
-        `${wouldTakes.length} would-takes, ${attributedCount} attributions, ${formatNumber(observationDays, 2)}d observed`,
+        `${wouldTakes.length} would-takes, ${attributedCount} attributions, ${calendarDaysObserved} calendar day(s) observed`,
     },
     {
       name: 'Edge quality',
-      status:
-        percentile(basisAdjEdges, 0.5) >= criteria.minMedianBasisAdjEdgeBps &&
-        percentile(basisAdjEdges, 0.25) >= criteria.minP25BasisAdjEdgeBps
+      status: !enoughEdgeData
+        ? 'pending'
+        : medianEdge >= criteria.minMedianBasisAdjEdgeBps &&
+            p25Edge >= criteria.minP25BasisAdjEdgeBps
           ? 'pass'
           : 'fail',
       detail:
-        `median=${formatNumber(percentile(basisAdjEdges, 0.5))}bps, p25=${formatNumber(percentile(basisAdjEdges, 0.25))}bps`,
+        `median=${formatNumber(medianEdge)}bps, p25=${formatNumber(p25Edge)}bps`,
     },
     {
       name: 'Basis health',
-      status:
-        Math.max(...absBasisBps, 0) <= criteria.maxAbsPyusdBasisBps &&
-        (percentile(absBasisBps, 0.95) ?? 0) <= criteria.maxP95AbsPyusdBasisBps
-          ? 'pass'
-          : 'fail',
+      status: !enoughBasisData
+        ? 'pending'
+        : maxAbsBasis > criteria.maxAbsPyusdBasisBps ||
+            (p95AbsBasis !== null && p95AbsBasis > criteria.maxP95AbsPyusdBasisBps)
+          ? 'fail'
+          : 'pass',
       detail:
-        `max=${formatNumber(Math.max(...absBasisBps, 0))}bps, p95=${formatNumber(percentile(absBasisBps, 0.95))}bps`,
+        `max=${formatNumber(maxAbsBasis)}bps, p95=${formatNumber(p95AbsBasis)}bps`,
     },
     {
       name: 'Adverse-selection proxy',
@@ -221,10 +236,11 @@ function buildSummary({ wouldTakes, attributions, suppressions }, criteria, iocU
     recommendation,
     metrics: {
       wouldTakeCount: wouldTakes.length,
+      basisSampleCount: basisSamples.length,
       attributedCount,
       disappearedCount,
       persistedCount,
-      observationDays,
+      calendarDaysObserved,
       firstSeenAt: firstTs ? new Date(firstTs).toISOString() : null,
       lastSeenAt: lastTs ? new Date(lastTs).toISOString() : null,
       basisAdjEdgeBps: {
@@ -248,8 +264,8 @@ function buildSummary({ wouldTakes, attributions, suppressions }, criteria, iocU
         average: average(sizes),
       },
       pyusdBasisBpsAbs: {
-        max: absBasisBps.length ? Math.max(...absBasisBps) : null,
-        p95: percentile(absBasisBps, 0.95),
+        max: maxAbsBasis,
+        p95: p95AbsBasis,
         average: average(absBasisBps),
       },
       suppressions: Object.fromEntries([...suppressions.entries()].sort((a, b) => b[1] - a[1])),
