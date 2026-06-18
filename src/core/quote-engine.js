@@ -1039,10 +1039,22 @@ export class QuoteEngine extends EventEmitter {
     return Number(this.inventoryManager?.netPosition ?? 0);
   }
 
+  _getCommittedSellInventoryBtc() {
+    let committed = 0;
+    for (const [, order] of this.activeOrders) {
+      if ((order.status === 'active' || order.status === 'pending') && order.side === 'sell') {
+        committed += Number(order.size) || 0;
+      }
+    }
+    return committed;
+  }
+
   _getSellableInventoryBtc() {
     const available = Number(this.inventoryManager?.getAvailableForSide?.('sell') ?? Infinity);
-    const netPosition = Math.max(0, this._getInventoryNetPosition());
-    return Math.max(0, Math.min(available, netPosition));
+    const committed = this._getCommittedSellInventoryBtc();
+    const netPosition = Math.max(0, this._getInventoryNetPosition() - committed);
+    const uncommittedAvailable = Math.max(0, available - committed);
+    return Math.max(0, Math.min(uncommittedAvailable, netPosition));
   }
 
   _getShadowCandidateKey(price, qty) {

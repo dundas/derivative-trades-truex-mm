@@ -117,7 +117,7 @@ Phase 2 (live takes) is gated on Phase 1 data and explicitly out of scope here.
   - [x] 3.14 Unit tests: edge math (basis), fires at/above threshold + not below, suppression (stale/low-conf Coinbase, stale truexEbbo, basis stale/depeg, edge>ceiling, tape-outlier if applicable), dedup, inventory-reducing-only, minTakeSize floor, **assert zero sendMessage on the take path**
   - [x] 3.15 Orchestrator-layer tests: new poll loop has zero call edges to FIX and invokes a non-dispatchable shadow-evaluation path only
   - [x] 3.16 Tests pass
-  - [ ] 3.17 `/adversarial-reviewer` local (real-money-adjacent logic even though no sends — verify the no-send invariant holds on all branches)
+  - [x] 3.17 `/adversarial-reviewer` local (real-money-adjacent logic even though no sends — verify the no-send invariant holds on all branches)
   - [ ] 3.18 `/pre-push-review`
   - [x] 3.19 Smoke (`scripts/smoke-shadow-take.ts`): synthetic dislocated book + fresh Coinbase + basis → asserts one would-take log with correct basis-adj edge AND zero FIX sends; second identical poll → deduped (no second log)
   - [ ] 3.20 `gh pr create`

@@ -1678,6 +1678,38 @@ describe('QuoteEngine', () => {
       });
       expect(shortResult.evaluation.suppressReason).toBe('take-size-too-small');
     });
+
+    it('caps shadow sell size by BTC already committed in live sell quotes', () => {
+      const engine = createEngine({
+        inventoryManager: {
+          getSkew: mock(() => ({ bidSkewTicks: 0, askSkewTicks: 0 })),
+          canQuote: mock(() => true),
+          getPositionSummary: mock(() => ({ netPosition: 0.4 })),
+          getAvailableForSide: mock(() => 0.4),
+        },
+        shadowPersistenceRequiredPolls: 1,
+        minTakeEdgeBps: 10,
+      });
+      engine.activeOrders.set('ASK-1', {
+        side: 'sell',
+        price: 101.7,
+        size: 0.2,
+        level: 1,
+        status: 'active',
+        placedAt: Date.now(),
+      });
+      seedFreshShadowInputs(engine, { bidQty: 0.3 });
+
+      const result = engine.evaluateShadowTake({
+        aggregatedPrice: makeShadowPrice({ coinbaseBid: 100 }),
+        truexTape: makeShadowTape({ price: 101.2 }),
+        now: Date.now(),
+        trigger: 'committed-inventory',
+      });
+
+      expect(result.evaluation.wouldTake).toBe(true);
+      expect(result.evaluation.size).toBeCloseTo(0.2, 8);
+    });
   });
 
   describe('price band filtering', () => {

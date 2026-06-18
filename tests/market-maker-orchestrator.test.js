@@ -997,6 +997,24 @@ describe('MarketMakerOrchestrator', () => {
       expect(mocks.quoteEngine.evaluateShadowTake).toHaveBeenCalledTimes(2);
       expect(mocks.fixConnection.sendMessage).not.toHaveBeenCalled();
     });
+
+    test('alerts on sustained zero detections even before the first would-take event', async () => {
+      const alertManager = { sendAlert: jest.fn(async () => ({})), sendRecovery: jest.fn(async () => ({})) };
+      const { orchestrator } = createOrchestrator({
+        alertManager,
+        shadowZeroDetectionAlertThresholdMs: 1000,
+      });
+
+      orchestrator._handleShadowEvaluationResult({
+        logs: [],
+        evaluation: { wouldTake: false, suppressReason: 'edge-too-low' },
+      });
+      orchestrator._updateShadowAlerts(orchestrator._shadowZeroDetectionWindowStartedAt + 1500);
+
+      expect(alertManager.sendAlert).toHaveBeenCalledWith(expect.objectContaining({
+        reason: 'Shadow take zero detections while market active',
+      }));
+    });
   });
 
   describe('event wiring: FIX execution reports', () => {

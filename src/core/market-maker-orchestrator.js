@@ -223,6 +223,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this._shadowLastCoinbaseFresh = null;
     this._shadowLastConfidenceOk = null;
     this._shadowLastDetectionAt = 0;
+    this._shadowZeroDetectionWindowStartedAt = 0;
     this._shadowNoDetectionAlertActive = false;
     this._shadowBasisSuppressionAlertActive = false;
     this._shadowEdgeCeilingAlertActive = false;
@@ -1042,8 +1043,8 @@ export class MarketMakerOrchestrator extends EventEmitter {
   }
 
   _updateShadowAlerts(now = Date.now()) {
-    if (this._shadowLastDetectionAt > 0) {
-      const noDetectionForMs = now - this._shadowLastDetectionAt;
+    if (this._shadowZeroDetectionWindowStartedAt > 0) {
+      const noDetectionForMs = now - this._shadowZeroDetectionWindowStartedAt;
       if (noDetectionForMs >= this.shadowZeroDetectionAlertThresholdMs && !this._shadowNoDetectionAlertActive) {
         this._shadowNoDetectionAlertActive = true;
         this.alertManager.sendAlert({
@@ -1077,12 +1078,16 @@ export class MarketMakerOrchestrator extends EventEmitter {
     if (!result?.evaluation) return;
     const now = Date.now();
     this._rollShadowMetricsWindow(now);
+    if (!this._shadowZeroDetectionWindowStartedAt) {
+      this._shadowZeroDetectionWindowStartedAt = now;
+    }
     this._shadowMetrics.evaluations++;
 
     const suppressReason = result.evaluation.suppressReason;
     if (result.evaluation.wouldTake) {
       this._shadowMetrics.detections++;
       this._shadowLastDetectionAt = now;
+      this._shadowZeroDetectionWindowStartedAt = now;
       if (this._shadowNoDetectionAlertActive) {
         this._shadowNoDetectionAlertActive = false;
         this.alertManager.sendRecovery({ reason: 'Shadow take zero detections while market active' })
