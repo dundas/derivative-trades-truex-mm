@@ -367,6 +367,43 @@ describe('QuoteEngine', () => {
       expect(actions.toReplace.length).toBe(0);
     });
 
+    it('should replenish a partially-filled (under-sized) order back to target size', () => {
+      const engine = createEngine({ levels: 1, repriceThresholdTicks: 1, tickSize: 0.50, minNotional: 1.0 });
+      const mid = 100000;
+      const desired = engine.computeDesiredQuotes(mid, { bidSkewTicks: 0, askSkewTicks: 0 });
+
+      // Active orders at the SAME price but reduced size (as if partially filled)
+      const active = new Map();
+      for (const dq of desired) {
+        active.set(`PF_${dq.side}_${dq.level}`, {
+          side: dq.side, price: dq.price, size: dq.size * 0.4, // 60% filled → under-quoted
+          level: dq.level, status: 'active', placedAt: Date.now(),
+        });
+      }
+
+      const actions = engine.reconcileOrders(desired, active);
+      expect(actions.toReplace.length).toBe(desired.length); // top up each under-sized level
+      expect(actions.toPlace.length).toBe(0);
+    });
+
+    it('should NOT replenish when the size shortfall is below minNotional (avoid churn)', () => {
+      const engine = createEngine({ levels: 1, repriceThresholdTicks: 1, tickSize: 0.50, minNotional: 1.0 });
+      const mid = 100000;
+      const desired = engine.computeDesiredQuotes(mid, { bidSkewTicks: 0, askSkewTicks: 0 });
+
+      const active = new Map();
+      for (const dq of desired) {
+        // shortfall * price must be < minNotional ($1): at $100k, shortfall < 0.00001 BTC
+        active.set(`TINY_${dq.side}_${dq.level}`, {
+          side: dq.side, price: dq.price, size: dq.size - 0.000005,
+          level: dq.level, status: 'active', placedAt: Date.now(),
+        });
+      }
+
+      const actions = engine.reconcileOrders(desired, active);
+      expect(actions.toReplace.length).toBe(0); // tiny shortfall ignored
+    });
+
     it('should cancel-replace when price moves >= repriceThresholdTicks', () => {
       const engine = createEngine({ levels: 1, repriceThresholdTicks: 1, tickSize: 0.50 });
       const mid = 100000;
@@ -1479,6 +1516,101 @@ describe('QuoteEngine', () => {
 
       expect(engine.activeOrders.has('CLO004')).toBe(false);
       expect(mockLogger.error.mock.calls.length).toBeGreaterThan(0);
+    });
+
+    it('should emit fill and keep the order (reduced) on OrdStatus=1 (PartiallyFilled)', () => {
+      const engine = createEngine();
+      const fillEvents = [];
+      engine.on('fill', (e) => fillEvents.push(e));
+      engine.activeOrders.set('CLO005', { side: 'sell', price: 100250, size: 0.01, level: 1, status: 'active', placedAt: Date.now() });
+
+      engine.onExecutionReport({
+        '11': 'CLO005', '39': '1', '54': '2',
+        '31': '100250.00', '32': '0.0034', '151': '0.0066', '17': 'EXEC555',
+      });
+
+      // Partial fill must be recorded for the filled portion
+      expect(fillEvents.length).toBe(1);
+      expect(fillEvents[0].side).toBe('sell');
+      expect(fillEvents[0].price).toBe(100250);
+      expect(fillEvents[0].size).toBe(0.0034);
+      expect(fillEvents[0].execID).toBe('EXEC555');
+      // Order stays live with its remaining (LeavesQty) size
+      expect(engine.activeOrders.has('CLO005')).toBe(true);
+      expect(engine.activeOrders.get('CLO005').size).toBeCloseTo(0.0066, 8);
+      expect(engine.activeOrders.get('CLO005').status).toBe('active');
+    });
+
+    it('should preserve cancelling status on a partial fill of an in-flight cancel', () => {
+      const engine = createEngine();
+      const fillEvents = [];
+      engine.on('fill', (e) => fillEvents.push(e));
+      // Order has a cancel in flight (status 'cancelling') when a partial fill lands
+      engine.activeOrders.set('CLO008', { side: 'sell', price: 100250, size: 0.01, level: 1, status: 'cancelling', placedAt: Date.now() });
+
+      engine.onExecutionReport({ '11': 'CLO008', '39': '1', '54': '2', '31': '100250', '32': '0.004', '151': '0.006' });
+
+      expect(fillEvents.length).toBe(1);                              // fill still recorded
+      expect(engine.activeOrders.get('CLO008').size).toBeCloseTo(0.006, 8);
+      expect(engine.activeOrders.get('CLO008').status).toBe('cancelling'); // NOT flipped to active
+    });
+
+    it('should promote a pending order to active on a partial fill (it is live on the venue)', () => {
+      const engine = createEngine();
+      // Partial fill arrives before a separate New ack — order still 'pending'
+      engine.activeOrders.set('CLO009', { side: 'buy', price: 99750, size: 0.01, level: 1, status: 'pending', placedAt: Date.now() });
+      engine.onExecutionReport({ '11': 'CLO009', '39': '1', '54': '1', '31': '99750', '32': '0.003', '151': '0.007' });
+      expect(engine.activeOrders.get('CLO009').status).toBe('active'); // not stuck pending
+      expect(engine.activeOrders.get('CLO009').size).toBeCloseTo(0.007, 8);
+    });
+
+    it('should reduce by LastQty when LeavesQty (151) is absent on a partial fill', () => {
+      const engine = createEngine();
+      engine.activeOrders.set('CLO007', { side: 'buy', price: 99750, size: 0.01, level: 1, status: 'active', placedAt: Date.now() });
+      engine.onExecutionReport({ '11': 'CLO007', '39': '1', '54': '1', '31': '99750', '32': '0.003' });
+      expect(engine.activeOrders.get('CLO007').size).toBeCloseTo(0.007, 8);
+    });
+
+    it('should fall back to size-LastQty when LeavesQty (151) is an empty/garbage string', () => {
+      const engine = createEngine();
+      engine.activeOrders.set('CLO010', { side: 'buy', price: 99750, size: 0.01, level: 1, status: 'active', placedAt: Date.now() });
+      // tag 151 present but empty — Number('') is 0; must NOT be used, fall back to size-LastQty
+      engine.onExecutionReport({ '11': 'CLO010', '39': '1', '54': '1', '31': '99750', '32': '0.002', '151': '' });
+      expect(Number.isFinite(engine.activeOrders.get('CLO010').size)).toBe(true);
+      expect(engine.activeOrders.get('CLO010').size).toBeCloseTo(0.008, 8);
+    });
+
+    it('should fall back when LeavesQty (151) is partially-numeric garbage like "0.007foo"', () => {
+      const engine = createEngine();
+      engine.activeOrders.set('CLO011', { side: 'buy', price: 99750, size: 0.01, level: 1, status: 'active', placedAt: Date.now() });
+      // parseFloat would accept '0.007' from this; strict Number() rejects it → fall back to size-LastQty
+      engine.onExecutionReport({ '11': 'CLO011', '39': '1', '54': '1', '31': '99750', '32': '0.002', '151': '0.007foo' });
+      expect(engine.activeOrders.get('CLO011').size).toBeCloseTo(0.008, 8); // 0.01 - 0.002, NOT 0.007
+    });
+
+    it('should reset consecutiveRejects on a partial fill', () => {
+      const engine = createEngine();
+      engine.consecutiveRejects = 2;
+      engine.activeOrders.set('CLO006', { side: 'buy', price: 99750, size: 0.01, level: 1, status: 'active', placedAt: Date.now() });
+      engine.onExecutionReport({ '11': 'CLO006', '39': '1', '54': '1', '31': '99750', '32': '0.005', '151': '0.005' });
+      expect(engine.consecutiveRejects).toBe(0);
+    });
+
+    it('should warn (not silently drop) on an unhandled OrdStatus', () => {
+      const mockLogger = createMockLogger();
+      const engine = createEngine({ logger: mockLogger });
+      engine.onExecutionReport({ '11': 'CLOX', '39': 'C', '54': '1' }); // 'C' = Expired — not explicitly handled
+      expect(mockLogger.warn.mock.calls.length).toBeGreaterThan(0);
+    });
+
+    it('should NOT warn on expected pending transition states (A/6/E)', () => {
+      const mockLogger = createMockLogger();
+      const engine = createEngine({ logger: mockLogger });
+      // PendingNew arrives for every order — must be a benign no-op, not a default warn
+      engine.onExecutionReport({ '11': 'CLOA', '39': 'A', '54': '1' });
+      engine.onExecutionReport({ '11': 'CLOB', '39': '6', '54': '1' });
+      engine.onExecutionReport({ '11': 'CLOC', '39': 'E', '54': '1' });
+      expect(mockLogger.warn.mock.calls.length).toBe(0);
     });
 
     it('should handle null fields gracefully', () => {

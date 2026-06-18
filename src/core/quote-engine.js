@@ -378,9 +378,15 @@ export class QuoteEngine extends EventEmitter {
         }
 
         const priceDiffTicks = Math.abs(match.order.price - dq.price) / this.config.tickSize;
+        const sizeShortfall = dq.size - match.order.size;
 
         if (priceDiffTicks >= this.config.repriceThresholdTicks) {
           // Price moved enough: cancel old, place new
+          toReplace.push({ cancel: match.clOrdID, cancelOrder: match.order, place: dq });
+        } else if (sizeShortfall > 0 && dq.price * sizeShortfall >= this.config.minNotional) {
+          // Order is under-quoted vs desired (e.g. left smaller by a partial fill) and the
+          // shortfall is economically meaningful — replace to replenish back to target size.
+          // The minNotional guard prevents churn on tiny rounding differences.
           toReplace.push({ cancel: match.clOrdID, cancelOrder: match.order, place: dq });
         }
         // Otherwise keep existing (no action)
@@ -617,6 +623,21 @@ export class QuoteEngine extends EventEmitter {
   /**
    * Handle inbound execution reports from FIX.
    */
+  _emitFillEvent(resolvedClOrdID, side, price, size, execID) {
+    const tracked = this.activeOrders.get(resolvedClOrdID);
+    this.emit('fill', {
+      side,
+      price,
+      size,
+      clOrdID: resolvedClOrdID,
+      execID,
+      orderIntent: tracked?.orderIntent || 'maker_quote',
+      liquidityRoleExpected: tracked?.liquidityRoleExpected || 'maker',
+      isMaker: (tracked?.liquidityRoleExpected || 'maker') === 'maker',
+    });
+    return tracked;
+  }
+
   onExecutionReport(fields) {
     if (!fields) return;
 
@@ -639,23 +660,32 @@ export class QuoteEngine extends EventEmitter {
         }
         break;
 
-      case '2': // Filled
-        {
-          const tracked = this.activeOrders.get(resolvedClOrdID);
+      case '1': // Partially Filled — record the partial, keep the order live (reduced)
+        this.consecutiveRejects = 0; // a fill means the order pipeline is healthy
+        if (lastQty && lastQty > 0) {
+          const tracked = this._emitFillEvent(resolvedClOrdID, side, lastPx, lastQty, execID);
+          if (tracked) {
+            // Remaining size = LeavesQty (tag 151) when it is a strictly-numeric value, else
+            // subtract LastQty. Strict Number() (not parseFloat) rejects partial garbage like
+            // '0.007foo'; the trim guard rejects absent/empty/whitespace (Number('') === 0).
+            const rawLeaves = fields['151'];
+            const parsedLeaves =
+              rawLeaves !== undefined && String(rawLeaves).trim() !== '' ? Number(rawLeaves) : NaN;
+            const leavesQty = Number.isFinite(parsedLeaves) ? parsedLeaves : (tracked.size - lastQty);
+            tracked.size = Math.max(0, leavesQty);
+            // A fill proves the order is live, so promote 'pending' → 'active'. But preserve
+            // 'cancelling' so reconcileOrders doesn't double-act on an in-flight cancel.
+            tracked.status = tracked.status === 'cancelling' ? 'cancelling' : 'active';
+          }
+        }
+        break;
+
+      case '2': // Filled — record the fill and remove the order
+        this.consecutiveRejects = 0;
+        this._emitFillEvent(resolvedClOrdID, side, lastPx, lastQty, execID);
         this.activeOrders.delete(resolvedClOrdID);
         this.cancelToOrigMap.delete(clOrdID);
-        this.emit('fill', {
-          side,
-          price: lastPx,
-          size: lastQty,
-          clOrdID: resolvedClOrdID,
-          execID,
-          orderIntent: tracked?.orderIntent || 'maker_quote',
-          liquidityRoleExpected: tracked?.liquidityRoleExpected || 'maker',
-          isMaker: (tracked?.liquidityRoleExpected || 'maker') === 'maker',
-        });
         break;
-        }
 
       case '4': // Cancelled
         this.activeOrders.delete(resolvedClOrdID);
@@ -687,6 +717,17 @@ export class QuoteEngine extends EventEmitter {
           this.recentRejectsByReason.set(reason, (this.recentRejectsByReason.get(reason) || 0) + 1);
           this.logger.error(`[QuoteEngine] Order rejected: clOrdID=${clOrdID}, reason=${reason}, code=${fields['103'] || 'n/a'}`);
         }
+        break;
+
+      case 'A': // PendingNew
+      case '6': // PendingCancel
+      case 'E': // PendingReplace
+        // Benign in-flight transition states (TrueX sends PendingNew before New on every
+        // order). Expected and frequent — no action, and must NOT hit the default warn.
+        break;
+
+      default: // Surface anything we don't explicitly handle instead of silently dropping it
+        this.logger.warn(`[QuoteEngine] Unhandled execution report ordStatus=${ordStatus} clOrdID=${clOrdID} execID=${execID}`);
         break;
     }
   }
