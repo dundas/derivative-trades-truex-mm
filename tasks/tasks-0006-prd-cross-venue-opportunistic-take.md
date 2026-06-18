@@ -85,14 +85,14 @@ Phase 2 (live takes) is gated on Phase 1 data and explicitly out of scope here.
   - [x] 2.14 Mini-narrative
 
 - [ ] **2.0b PYUSD/USD engine plumbing** — smoke: engine sees basis and suppresses on stale/missing
-  - [ ] 2.15 Create feature branch `feat/pyusd-usd-engine-plumbing` from `main`
-  - [ ] 2.16 Plumb `pyusdUsd` into the QuoteEngine (setter + freshness gate `_isPyusdBasisFresh()`); default to `null` when unavailable
-  - [ ] 2.17 Decision rule: if basis unavailable/stale, basis-dependent detection MUST suppress (no silent assume=1) — wired in 3.0, asserted here via the freshness gate
-  - [ ] 2.18 Unit tests: basis setter/freshness; null/stale handling; depeg value surfaced
-  - [ ] 2.19 Tests pass
-  - [ ] 2.20 `/adversarial-reviewer` local
-  - [ ] 2.21 `/pre-push-review`
-  - [ ] 2.22 Smoke: engine receives basis, stale basis is flagged/suppressed, no order send
+  - [x] 2.15 Create feature branch `feat/pyusd-usd-engine-plumbing` from `main`
+  - [x] 2.16 Plumb `pyusdUsd` into the QuoteEngine (setter + freshness gate `_isPyusdBasisFresh()`); default to `null` when unavailable
+  - [x] 2.17 Decision rule: if basis unavailable/stale, basis-dependent detection MUST suppress (no silent assume=1) — wired in 3.0, asserted here via the freshness gate
+  - [x] 2.18 Unit tests: basis setter/freshness; null/stale handling; depeg value surfaced
+  - [x] 2.19 Tests pass
+  - [x] 2.20 `/adversarial-reviewer` local
+  - [x] 2.21 `/pre-push-review`
+  - [x] 2.22 Smoke: engine receives basis, stale basis is flagged/suppressed, no order send
   - [ ] 2.23 `gh pr create`
   - [ ] 2.24 Solicit `@coderabbitai review` (re-tag at 5 min)
   - [ ] 2.25 `/pr-review-loop <PR#>`
