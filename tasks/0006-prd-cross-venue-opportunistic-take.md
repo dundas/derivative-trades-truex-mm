@@ -1,6 +1,11 @@
 # PRD 0006 — Cross-Venue Opportunistic Take
 
-**Status:** Draft (adversarially reviewed)
+> **⚠️ SCOPE REVISED (v2) after pairing review — see §11.** The original single-phase live-take v1
+> below is **superseded**: pairing review found it bounds notional, not loss, and rests on an
+> unverified premise (PYUSD basis = 1) and unverified mechanics (IOC on FIX). Authoritative scope is
+> now the **two-phase, shadow-first** plan in §11. Read §11 before implementing.
+
+**Status:** Draft v2 — pairing-reviewed, reshaped to shadow-first (see §11)
 **Author:** David (via Claude)
 **Date:** 2026-06-18
 **Related:** PR #32 (coinbase-mirror), #33 (partial-fill recording), #34 (venue-cancel logging); PRD 0005 (fee-aware quoting)
@@ -172,3 +177,85 @@ Follows `.ai/protocols/STANDARD_DEV_WORKFLOW.md`. This is real-money taker execu
 - **Scope challenge — should this exist at all?** Yes: passive maker capture is structurally blocked
   on this venue (validated: 120 ALO venue-cancels/2min), and the venue operator's own quoter profits
   by taking. Opportunistic taking is the demonstrated edge here. Kept, but bounded hard (v1 caps).
+
+---
+
+## 11. Pairing-Review Revisions (v2) — AUTHORITATIVE SCOPE
+
+Pairing session (`memory/pairing/2026-06-18-prd-0006-*.md`) — trading-risk skeptic returned
+**REJECTED as specified**; reliability engineer returned **4 block-merge issues + 8 code defects**.
+The v1 scope above is superseded by the two-phase plan here.
+
+### 11.1 Premise-breakers (must resolve before ANY live take)
+
+- **PB1 — PYUSD/USD basis.** Edge compares `truexBid` (PYUSD) to `coinbaseBid` (USD) assuming
+  1 PYUSD = 1 USD. Stablecoin wobble (20–80 bps routine) exceeds the 15 bps buffer. **Required:** a
+  live PYUSD/USD reference in the edge formula + hard depeg-suppression gate
+  (`suppress all takes if |PYUSD-USD − 1| > pyusdDepegThresholdBps`).
+- **PB2 — Which venue is stale / adverse selection.** A large "edge" may mean Coinbase is the
+  laggard (real move) and TrueX is correct → we'd sell into a rally. **A high fill rate on flagged
+  opportunities is a RED FLAG, not success.** **Required:** Coinbase freshness/sequence check,
+  multi-poll persistence of the dislocation, a max-edge *suspicion* ceiling, and a TrueX-trade-tape
+  recency/outlier check (a "fresh quote" can be an 8h-resting order).
+- **PB3 — IOC unproven on FIX.** `_sendNewOrder` hardcodes `59=1` (GTC); REST IOC typing ≠ FIX
+  support. **Required:** verify `59=3` honored in UAT (observe an IOC fill+cancel) + runtime TTL
+  guard that force-cancels any `taker_opportunity` order that reaches `active`.
+
+### 11.2 Phased rollout (replaces the single-phase v1)
+
+**Phase 1 — SHADOW / observe-only (NO real orders).** Build the real TrueX book feed (under a
+**separate `truexEbbo` field**, NOT by repurposing the maker guard's `truexBook`) + opportunity
+detection, but **log what we *would* take** instead of sending: side, size, TrueX price,
+basis-adjusted edge, Coinbase freshness, TrueX-tape recency, and whether TrueX's quoter beat us.
+Validates the edge is real (post-basis), that Coinbase is the fresh side, and our would-be
+fill/miss rate — **zero capital at risk.** Gate to Phase 2 on this data.
+
+**Phase 2 — LIVE takes (only after Phase-1 data confirms a real edge),** with ALL controls in 11.3.
+
+### 11.3 Additional functional requirements (Phase 2)
+
+- **FR16 Dedup:** key each opportunity on EBBO `timestamp`+`price`+`qty`; do not re-fire against an
+  unchanged book snapshot (else the same stale order is taken repeatedly until caps hit).
+- **FR17 Separate book field:** real TrueX EBBO under `truexEbbo` for take detection; the maker
+  marketable/slide guard keeps its current source (or is explicitly re-validated against a real
+  dislocated book) — do not let one `updateTrueXBook` mutate both behaviors.
+- **FR18 `_canTakeNow()` gate:** every take ANDs `allowTakerOrders && !quotingSuspended &&
+  rejectBackoffUntil<=now && !killSwitchEngaged && netPosition>minLongForTake && projected position
+  within maxPositionBTC && Coinbase-leg fresh+confident && truexEbbo fresh`. Kill-switch MUST set an
+  in-process flag, not only cancel via REST.
+- **FR19 In-flight-aware sizing + never-go-short:** size against `currentLong − Σ(in-flight unacked
+  sell-take qty)`; hard post-trade assertion that net position never crosses below 0 (else trip
+  kill-switch).
+- **FR20 Taker order isolation:** track taker IOC orders in a separate short-lived map (not
+  `activeOrders`), excluded from `reconcileOrders`, `_restReconcile` ghost-removal, and per-side
+  live/replacement counters; exec-report routing must not depend on the order still being tracked
+  (carry intent in a side table so taker fills aren't mis-tagged `maker_quote` → wrong fee in PnL).
+- **FR21 Taker partial-fill lifecycle:** in `onExecutionReport` case '1', branch on
+  `liquidityRoleExpected==='taker'`: record the partial but do NOT promote to `active` / retain
+  leaves (the IOC remainder is venue-cancelled, not resting).
+- **FR22 Shared balance reservation:** a single synchronously-updated `committedBase`/`committedQuote`
+  that both maker reconcile and take-sizing read/decrement before dispatch (prevents double-commit).
+- **FR23 Loss caps:** `maxTakeNotionalPerOrder`, a session/daily **realized-loss kill-switch**
+  (halt takes if cumulative take PnL < −$X), plus the existing per-minute caps. `minTakeSizeBTC`/
+  `minTakeNotional` floor so dust (e.g. 0.00004 BTC) doesn't fire.
+- **FR24 Self-trade:** confirm FIX STP tag and set it on takes; until confirmed, hard pre-send check
+  that the take price doesn't cross any of OUR own live orders (by order-ID, not price geometry).
+- **FR25 Poll resilience:** `/market/quote` poll with its own bounded timeout (<interval),
+  non-overlapping (in-flight guard), skip-on-error, backoff on 429/consecutive errors, alert on
+  sustained failure.
+- **FR26 Alerting + metrics:** wire take attempt/fill/reject/suppression and budget-exhaustion into
+  `alertManager` (rate-thresholded); record realized-vs-expected edge and fill/miss attribution.
+
+### 11.4 Edge formula correction
+
+Edge MUST be basis-adjusted: `edgeBps = ((truexBid / pyusdUsd) − coinbaseBid)/coinbaseBid × 10000 −
+truexTakerFeeBps − takeSlippageBufferBps − takeHedgeBufferBps`, and recalibrate `minTakeEdgeBps`
+against observed PYUSD-basis volatility + Coinbase↔TrueX latency, not just the 4 bps fee.
+
+### 11.5 Revised open questions (for VKG / David)
+
+1. Is the ~$855 / 1.34% gap a real PYUSD basis or stale orders? (Spencer's quoter took it as a stale
+   order — suggests not persistent; Phase-1 shadow data quantifies the live basis.)
+2. TrueX FIX: IOC (`59=3`) and STP tag honored? (UAT.)
+3. REST `/market/quote` poll vs a TrueX FIX/WS market-data feed (the 1 s poll is our adverse-selection floor).
+4. Risk envelope: per-take cap, daily-loss kill-switch threshold, max long/short bounds.
