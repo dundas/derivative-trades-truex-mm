@@ -58,9 +58,15 @@ function createMockPnLTracker() {
 function createMockQuoteEngine() {
   const qe = new EventEmitter();
   qe.activeOrders = new Map();
+  qe.config = {
+    confidenceThreshold: 0.3,
+    tickSize: 0.5,
+  };
   qe.onPriceUpdate = jest.fn();
   qe.updateTruexEbbo = jest.fn();
   qe.updatePyusdUsd = jest.fn();
+  qe.evaluateShadowTake = jest.fn(() => ({ logs: [], evaluation: null }));
+  qe._isTruexEbboFresh = jest.fn(() => true);
   qe.onExecutionReport = jest.fn();
   qe.onOrderCancelReject = jest.fn();
   qe.cancelAllQuotes = jest.fn();
@@ -409,6 +415,48 @@ describe('MarketMakerOrchestrator', () => {
 
       expect(orchestrator.truexEbboPollIntervalMs).toBe(0);
       expect(orchestrator._scheduleNextTruexEbboPoll).not.toHaveBeenCalled();
+    });
+
+    test('invokes the shadow evaluation path from the EBBO poll without touching FIX sends', async () => {
+      const alertManager = { sendAlert: jest.fn(async () => ({})), sendRecovery: jest.fn(async () => ({})) };
+      const { orchestrator, mocks } = createOrchestrator({ alertManager, truexEbboPollIntervalMs: 1000 });
+      orchestrator.restClient = {
+        getInstrument: jest.fn(async () => ({ id: '78873627520270354' })),
+        getMarketQuote: jest.fn(async () => ([
+          {
+            id: '78873627520270354',
+            symbol: 'BTC-PYUSD',
+            info: {
+              best_bid: { price: '100', qty: '0.01', order_count: '1', last_update: '1781794727328321122' },
+              best_ask: { price: '101', qty: '0.02', order_count: '2', last_update: '1781794942928366811' },
+              last_trade: { price: '100.5', qty: '0.001', timestamp: '1781794363428309171' },
+              last_update: '1781794942928366896',
+            },
+          },
+        ])),
+        getMarketTrades: jest.fn(async () => ([
+          { trade_price: '100.0', trade_qty: '0.1', timestamp: '1781794942928366896' },
+        ])),
+      };
+      orchestrator.lastAggregatedPrice = {
+        confidence: 0.95,
+        sources: [{ exchange: 'coinbase', bid: 99.5, isStale: false }],
+      };
+      mocks.quoteEngine.evaluateShadowTake.mockReturnValue({
+        logs: [{ type: 'would-take', dedupKey: '100.00:0.01000000', wouldTake: true }],
+        evaluation: { wouldTake: true, suppressReason: null },
+      });
+      orchestrator.isRunning = true;
+      orchestrator._scheduleNextTruexEbboPoll = jest.fn();
+
+      await orchestrator._pollTruexEbbo();
+
+      expect(mocks.quoteEngine.updateTruexEbbo).toHaveBeenCalledTimes(1);
+      expect(mocks.quoteEngine.evaluateShadowTake).toHaveBeenCalledWith(expect.objectContaining({
+        aggregatedPrice: orchestrator.lastAggregatedPrice,
+        trigger: 'truex-ebbo-poll',
+      }));
+      expect(mocks.fixConnection.sendMessage).not.toHaveBeenCalled();
     });
   });
 
@@ -878,6 +926,132 @@ describe('MarketMakerOrchestrator', () => {
       // Should not throw
       expect(orchestrator.isRunning).toBe(true);
       await orchestrator.stop();
+    });
+
+    test('coalesces shadow reevaluations on meaningful Coinbase changes and rate limits them', async () => {
+      const { orchestrator, mocks } = createOrchestrator({ truexEbboPollIntervalMs: 1000 });
+      await orchestrator.start();
+      const processSpy = jest.spyOn(orchestrator, '_processShadowEvaluation').mockResolvedValue();
+      mocks.quoteEngine._isTruexEbboFresh.mockReturnValue(true);
+
+      mocks.priceAggregator.emit('price', {
+        weightedMidpoint: 100000,
+        confidence: 0.95,
+        sources: [{ exchange: 'coinbase', bid: 100, isStale: false }],
+      });
+      await Promise.resolve();
+
+      mocks.priceAggregator.emit('price', {
+        weightedMidpoint: 100000.1,
+        confidence: 0.95,
+        sources: [{ exchange: 'coinbase', bid: 100.1, isStale: false }],
+      });
+      await Promise.resolve();
+
+      orchestrator._shadowLastReevalAt = Date.now() - 1500;
+      mocks.priceAggregator.emit('price', {
+        weightedMidpoint: 100001,
+        confidence: 0.1,
+        sources: [{ exchange: 'coinbase', bid: 101, isStale: false }],
+      });
+      await Promise.resolve();
+
+      expect(processSpy).toHaveBeenCalledTimes(2);
+      expect(processSpy).toHaveBeenNthCalledWith(1, 'coinbase-update', { refreshTape: false });
+      expect(processSpy).toHaveBeenNthCalledWith(2, 'coinbase-update', { refreshTape: false });
+      expect(mocks.fixConnection.sendMessage).not.toHaveBeenCalled();
+
+      processSpy.mockRestore();
+      await orchestrator.stop();
+    });
+  });
+
+  describe('shadow tape cache', () => {
+    test('reuses cached trade tape on Coinbase reevaluations instead of refetching every tick', async () => {
+      const { orchestrator, mocks } = createOrchestrator({ truexTradeCacheTtlMs: 10_000 });
+      orchestrator.isRunning = true;
+      orchestrator.lastAggregatedPrice = {
+        confidence: 0.95,
+        sources: [{ exchange: 'coinbase', bid: 100, isStale: false }],
+      };
+      orchestrator._truexTradeTape = {
+        latestTradePrice: 100.1,
+        latestTradeQty: 0.1,
+        latestTradeTs: Date.now(),
+        fetchedAt: Date.now(),
+        inFlight: false,
+      };
+      orchestrator.restClient = {
+        getInstrument: jest.fn(async () => ({ id: '78873627520270354' })),
+        getMarketTrades: jest.fn(async () => []),
+      };
+      mocks.quoteEngine.evaluateShadowTake.mockReturnValue({
+        logs: [],
+        evaluation: { wouldTake: false, suppressReason: 'edge-too-low' },
+      });
+
+      await orchestrator._processShadowEvaluation('coinbase-update', { refreshTape: false });
+      await orchestrator._processShadowEvaluation('coinbase-update', { refreshTape: false });
+
+      expect(orchestrator.restClient.getMarketTrades).not.toHaveBeenCalled();
+      expect(mocks.quoteEngine.evaluateShadowTake).toHaveBeenCalledTimes(2);
+      expect(mocks.fixConnection.sendMessage).not.toHaveBeenCalled();
+    });
+
+    test('alerts on sustained zero detections even before the first would-take event', async () => {
+      const alertManager = { sendAlert: jest.fn(async () => ({})), sendRecovery: jest.fn(async () => ({})) };
+      const { orchestrator } = createOrchestrator({
+        alertManager,
+        shadowZeroDetectionAlertThresholdMs: 1000,
+      });
+
+      orchestrator._handleShadowEvaluationResult({
+        logs: [],
+        evaluation: { wouldTake: false, suppressReason: 'edge-too-low' },
+      });
+      orchestrator._updateShadowAlerts(orchestrator._shadowZeroDetectionWindowStartedAt + 1500);
+
+      expect(alertManager.sendAlert).toHaveBeenCalledWith(expect.objectContaining({
+        reason: 'Shadow take zero detections while market active',
+      }));
+    });
+
+    test('does not arm the zero-detection timer while shadow inputs are not evaluable', async () => {
+      const alertManager = { sendAlert: jest.fn(async () => ({})), sendRecovery: jest.fn(async () => ({})) };
+      const { orchestrator } = createOrchestrator({
+        alertManager,
+        shadowZeroDetectionAlertThresholdMs: 1000,
+      });
+
+      orchestrator._handleShadowEvaluationResult({
+        logs: [],
+        evaluation: { wouldTake: false, suppressReason: 'coinbase-stale' },
+      });
+      orchestrator._updateShadowAlerts(Date.now() + 1500);
+
+      expect(orchestrator._shadowZeroDetectionWindowStartedAt).toBe(0);
+      expect(alertManager.sendAlert).not.toHaveBeenCalled();
+    });
+
+    test('clears an active zero-detection alert when the market becomes non-evaluable', async () => {
+      const alertManager = { sendAlert: jest.fn(async () => ({})), sendRecovery: jest.fn(async () => ({})) };
+      const { orchestrator } = createOrchestrator({
+        alertManager,
+        shadowZeroDetectionAlertThresholdMs: 1000,
+      });
+
+      orchestrator._shadowNoDetectionAlertActive = true;
+      orchestrator._shadowZeroDetectionWindowStartedAt = Date.now() - 1500;
+      orchestrator._handleShadowEvaluationResult({
+        logs: [],
+        evaluation: { wouldTake: false, suppressReason: 'coinbase-stale' },
+      });
+
+      expect(orchestrator._shadowNoDetectionAlertActive).toBe(false);
+      expect(orchestrator._shadowZeroDetectionWindowStartedAt).toBe(0);
+      expect(alertManager.sendRecovery).toHaveBeenCalledWith({
+        reason: 'Shadow take zero detections while market active',
+      });
     });
   });
 
