@@ -97,6 +97,7 @@ export class QuoteEngine extends EventEmitter {
     this.deferredRepriceNeeded = false;
     this.lastMarketableAloSkip = null;
     this.truexBook = null;
+    this.truexEbbo = null;
     this.takerWindowStartedAt = Date.now();
     this.takerOrdersThisWindow = 0;
     this.takerNotionalThisWindow = 0;
@@ -114,6 +115,22 @@ export class QuoteEngine extends EventEmitter {
       bestAsk,
       bestBidSize: book.bestBidSize ?? null,
       bestAskSize: book.bestAskSize ?? null,
+      timestamp: book.timestamp ?? null,
+    };
+  }
+
+  updateTruexEbbo(book) {
+    if (!book) return;
+    this.truexEbbo = {
+      bestBid: book.bestBid ?? null,
+      bestAsk: book.bestAsk ?? null,
+      bestBidQty: book.bestBidQty ?? null,
+      bestAskQty: book.bestAskQty ?? null,
+      bestBidOrderCount: book.bestBidOrderCount ?? null,
+      bestAskOrderCount: book.bestAskOrderCount ?? null,
+      lastTradePrice: book.lastTradePrice ?? null,
+      lastTradeQty: book.lastTradeQty ?? null,
+      lastTradeTs: book.lastTradeTs ?? null,
       timestamp: book.timestamp ?? null,
     };
   }
@@ -864,6 +881,8 @@ export class QuoteEngine extends EventEmitter {
       suppressed,
       lastMarketableAloSkip: this.lastMarketableAloSkip,
       recentRejectsByReason: Object.fromEntries(this.recentRejectsByReason),
+      truexEbbo: this.truexEbbo ? { ...this.truexEbbo } : null,
+      truexEbboFresh: this._isTruexEbboFresh(),
     };
   }
 
@@ -953,6 +972,10 @@ export class QuoteEngine extends EventEmitter {
   }
 
   _isBookFresh(book = this._getTrueXBook()) {
+    return !!(book && book.timestamp && (Date.now() - book.timestamp) <= this.config.truexBookStaleThresholdMs);
+  }
+
+  _isTruexEbboFresh(book = this.truexEbbo) {
     return !!(book && book.timestamp && (Date.now() - book.timestamp) <= this.config.truexBookStaleThresholdMs);
   }
 

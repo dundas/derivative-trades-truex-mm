@@ -1048,6 +1048,43 @@ describe('QuoteEngine', () => {
       expect(fixMock.sendMessage).toHaveBeenCalledTimes(2);
     });
 
+    it('stores truexEbbo separately from truexBook and reports freshness independently', () => {
+      const engine = createEngine({ truexBookStaleThresholdMs: 10 });
+      const timestamp = Date.now();
+
+      engine.updateTrueXBook({ bestBid: 99, bestAsk: 100, timestamp });
+      engine.updateTruexEbbo({
+        bestBid: 101,
+        bestAsk: 102,
+        bestBidQty: 0.5,
+        bestAskQty: 0.25,
+        bestBidOrderCount: 2,
+        bestAskOrderCount: 3,
+        lastTradePrice: 101.5,
+        lastTradeQty: 0.01,
+        lastTradeTs: timestamp - 1,
+        timestamp,
+      });
+
+      expect(engine.truexBook.bestBid).toBe(99);
+      expect(engine.truexEbbo.bestBid).toBe(101);
+      expect(engine._isTruexEbboFresh()).toBe(true);
+      expect(engine.getQuoteStatus().truexEbbo.bestBidOrderCount).toBe(2);
+      expect(engine.getQuoteStatus().truexEbboFresh).toBe(true);
+    });
+
+    it('treats stale truexEbbo timestamps as not fresh', () => {
+      const engine = createEngine({ truexBookStaleThresholdMs: 10 });
+      engine.updateTruexEbbo({
+        bestBid: 101,
+        bestAsk: 102,
+        timestamp: Date.now() - 1000,
+      });
+
+      expect(engine._isTruexEbboFresh()).toBe(false);
+      expect(engine.getQuoteStatus().truexEbboFresh).toBe(false);
+    });
+
     it('should not treat provider books without timestamps as fresh marketability data', () => {
       const fixMock = createMockFix();
       const engine = createEngine({

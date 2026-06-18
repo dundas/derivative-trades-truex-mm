@@ -82,11 +82,17 @@ export class AuditLogger {
     // Check if we need to rotate to a new file
     if (this.currentDate !== dateString) {
       if (this.currentStream) {
-        this.currentStream.end();
+        this.currentStream.destroy?.();
       }
       
       const logPath = this.getLogPath();
-      this.currentStream = fs.createWriteStream(logPath, { flags: 'a' });
+      // Writes are performed via appendFileSync for durability, so we only need
+      // rotation metadata here, not an async stream that can outlive test cleanup.
+      this.currentStream = {
+        path: logPath,
+        end() {},
+        destroy() {},
+      };
       this.currentDate = dateString;
       
       this.logger.info(`[AuditLogger] Rotated to new log file: ${logPath}`);
@@ -406,7 +412,8 @@ export class AuditLogger {
    */
   close() {
     if (this.currentStream) {
-      this.currentStream.end();
+      this.currentStream.end?.();
+      this.currentStream.destroy?.();
       this.currentStream = null;
       this.currentDate = null;
     }

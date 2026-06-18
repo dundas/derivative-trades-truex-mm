@@ -143,6 +143,16 @@ export class MarketMakerOrchestrator extends EventEmitter {
     }
     this.reconcileIntervalMs = options.reconcileIntervalMs || 300000; // 5 min
     this.balanceRefreshIntervalMs = options.balanceRefreshIntervalMs || 60000; // 1 min
+    this.truexEbboPollIntervalMs = options.truexEbboPollIntervalMs || 1000;
+    const configuredTruexEbboPollTimeoutMs =
+      options.truexEbboPollTimeoutMs || Math.max(250, this.truexEbboPollIntervalMs - 100);
+    this.truexEbboPollTimeoutMs = Math.min(
+      configuredTruexEbboPollTimeoutMs,
+      Math.max(1, this.truexEbboPollIntervalMs - 1),
+    );
+    this.truexEbboMaxBackoffMs = options.truexEbboMaxBackoffMs || 30000;
+    this.truexEbboFailureAlertThreshold = options.truexEbboFailureAlertThreshold || 3;
+    this.truexEbboInstrumentId = options.truexEbboInstrumentId || null;
 
     // State
     this.isRunning = false;
@@ -164,6 +174,12 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this._quotingGateEnabled = true; // false when MD stale or session down
     /** Normalized watchdog issue keys that were present on the last tick (for recovery diffing) */
     this._activeWatchdogIssues = new Set();
+    this._truexEbboPollTimer = null;
+    this._truexEbboPollInFlight = false;
+    this._truexEbboConsecutiveErrors = 0;
+    this._truexEbboCurrentBackoffMs = this.truexEbboPollIntervalMs;
+    this._truexEbboLastSuccessAt = 0;
+    this._truexEbboFailureAlertActive = false;
 
     // Alert manager (injectable for testing; defaults to env-driven config)
     this.alertManager = options.alertManager || new AlertManager({
@@ -274,6 +290,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
 
     this.isRunning = true;
     this.startedAt = Date.now();
+    this._startTruexEbboPoller();
 
     this.logger.info('[Orchestrator] Market maker started — waiting for price updates to begin quoting');
     this.emit('started', { sessionId: this.sessionId, timestamp: this.startedAt });
@@ -317,6 +334,10 @@ export class MarketMakerOrchestrator extends EventEmitter {
     if (this._balanceRefreshTimer) {
       clearInterval(this._balanceRefreshTimer);
       this._balanceRefreshTimer = null;
+    }
+    if (this._truexEbboPollTimer) {
+      clearTimeout(this._truexEbboPollTimer);
+      this._truexEbboPollTimer = null;
     }
     if (this._watchdogTimer) {
       clearInterval(this._watchdogTimer);
@@ -401,7 +422,76 @@ export class MarketMakerOrchestrator extends EventEmitter {
         isSubscribed: this.marketDataFeed.isSubscribed,
         spread: this.marketDataFeed.getSpread(),
       } : null,
+      truexEbbo: this.quoteEngine.getQuoteStatus()?.truexEbbo || null,
       dataPipeline: this.dataPipeline ? this.dataPipeline.getStats() : null,
+    };
+  }
+
+  static parseMarketQuote(rawQuote, { instrumentId, symbol } = {}) {
+    if (!rawQuote) {
+      throw new Error('TrueX EBBO poll returned empty payload');
+    }
+
+    const toNumber = (value) => {
+      if (value === null || value === undefined || value === '') return null;
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : null;
+    };
+    const nanosToMillis = (value) => {
+      if (!value) return null;
+      try {
+        return TrueXRESTClient.nanosToDate(String(value)).getTime();
+      } catch (_) {
+        return null;
+      }
+    };
+
+    if (Array.isArray(rawQuote)) {
+      const entry = rawQuote.find((item) =>
+        (instrumentId && item?.id === instrumentId) || (symbol && item?.symbol === symbol)
+      ) || rawQuote[0];
+      if (!entry?.info) {
+        throw new Error('TrueX EBBO payload missing info block');
+      }
+
+      const bestBid = entry.info.best_bid || {};
+      const bestAsk = entry.info.best_ask || {};
+      const lastTrade = entry.info.last_trade || {};
+      const timestamp =
+        nanosToMillis(entry.info.last_update) ??
+        nanosToMillis(bestBid.last_update) ??
+        nanosToMillis(bestAsk.last_update) ??
+        nanosToMillis(lastTrade.timestamp);
+
+      return {
+        instrumentId: entry.id || instrumentId || null,
+        symbol: entry.symbol || symbol || null,
+        bestBid: toNumber(bestBid.price),
+        bestAsk: toNumber(bestAsk.price),
+        bestBidQty: toNumber(bestBid.qty),
+        bestAskQty: toNumber(bestAsk.qty),
+        bestBidOrderCount: toNumber(bestBid.order_count),
+        bestAskOrderCount: toNumber(bestAsk.order_count),
+        lastTradePrice: toNumber(lastTrade.price),
+        lastTradeQty: toNumber(lastTrade.qty),
+        lastTradeTs: nanosToMillis(lastTrade.timestamp),
+        timestamp,
+      };
+    }
+
+    return {
+      instrumentId: rawQuote.instrument_id || instrumentId || null,
+      symbol: rawQuote.symbol || symbol || null,
+      bestBid: toNumber(rawQuote.bid_price),
+      bestAsk: toNumber(rawQuote.ask_price),
+      bestBidQty: toNumber(rawQuote.bid_qty),
+      bestAskQty: toNumber(rawQuote.ask_qty),
+      bestBidOrderCount: null,
+      bestAskOrderCount: null,
+      lastTradePrice: null,
+      lastTradeQty: null,
+      lastTradeTs: null,
+      timestamp: nanosToMillis(rawQuote.timestamp),
     };
   }
 
@@ -693,6 +783,124 @@ export class MarketMakerOrchestrator extends EventEmitter {
       this.logger.warn(
         `[Orchestrator] OE disconnected — restored ${restoredPending} pending and ${restoredCancelling} cancelling order(s)`
       );
+    }
+  }
+
+  _startTruexEbboPoller() {
+    if (!this.restClient || this.truexEbboPollIntervalMs <= 0) return;
+    this._scheduleNextTruexEbboPoll(0);
+    this.logger.info(
+      `[Orchestrator] TrueX EBBO poll enabled (every ${this.truexEbboPollIntervalMs}ms, timeout ${this.truexEbboPollTimeoutMs}ms)`
+    );
+  }
+
+  _scheduleNextTruexEbboPoll(delayMs = this.truexEbboPollIntervalMs) {
+    if (!this.isRunning) return;
+    if (this._truexEbboPollTimer) {
+      clearTimeout(this._truexEbboPollTimer);
+    }
+    this._truexEbboPollTimer = setTimeout(() => {
+      this._pollTruexEbbo().catch((err) => {
+        this.logger.warn(`[Orchestrator] TrueX EBBO poll loop error (non-fatal): ${err.message}`);
+      });
+    }, delayMs);
+  }
+
+  async _resolveTruexEbboInstrumentId() {
+    if (this.truexEbboInstrumentId) return this.truexEbboInstrumentId;
+    const instrument = await this.restClient.getInstrument(this.symbol);
+    if (!instrument?.id) {
+      throw new Error(`TrueX instrument lookup failed for ${this.symbol}`);
+    }
+    this.truexEbboInstrumentId = instrument.id;
+    return this.truexEbboInstrumentId;
+  }
+
+  async _withTimeout(promise, timeoutMs, label) {
+    let timeoutId = null;
+    const timeoutPromise = new Promise((_, reject) => {
+      timeoutId = setTimeout(() => {
+        reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+    });
+
+    try {
+      return await Promise.race([promise, timeoutPromise]);
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId);
+    }
+  }
+
+  async _pollTruexEbbo() {
+    if (!this.isRunning || !this.restClient) return;
+    if (this._truexEbboPollInFlight) {
+      this.logger.warn('[Orchestrator] TrueX EBBO poll still in flight — skipping overlapping tick');
+      this._scheduleNextTruexEbboPoll(this._truexEbboCurrentBackoffMs || this.truexEbboPollIntervalMs);
+      return;
+    }
+
+    this._truexEbboPollInFlight = true;
+    try {
+      const instrumentId = await this._resolveTruexEbboInstrumentId();
+      const rawQuote = await this._withTimeout(
+        this.restClient.getMarketQuote({ instrument_id: instrumentId }),
+        this.truexEbboPollTimeoutMs,
+        'TrueX EBBO poll'
+      );
+      const parsed = MarketMakerOrchestrator.parseMarketQuote(rawQuote, {
+        instrumentId,
+        symbol: this.symbol,
+      });
+      this.quoteEngine.updateTruexEbbo(parsed);
+
+      const hadFailureAlert = this._truexEbboFailureAlertActive;
+      this._truexEbboConsecutiveErrors = 0;
+      this._truexEbboCurrentBackoffMs = this.truexEbboPollIntervalMs;
+      this._truexEbboLastSuccessAt = Date.now();
+      this._truexEbboFailureAlertActive = false;
+
+      if (hadFailureAlert) {
+        this.alertManager.sendRecovery({ reason: 'TrueX EBBO poll failing' })
+          .catch((err) => this.logger.error(`[Orchestrator] TrueX EBBO recovery alert failed: ${err.message}`));
+      }
+    } catch (err) {
+      this._truexEbboConsecutiveErrors++;
+      const status = err?.status || err?.cause?.status;
+      const multiplier = status === 429 ? 2 : 1.5;
+      this._truexEbboCurrentBackoffMs = Math.min(
+        this.truexEbboMaxBackoffMs,
+        Math.max(
+          this.truexEbboPollIntervalMs,
+          Math.ceil(this._truexEbboCurrentBackoffMs * multiplier),
+        ),
+      );
+
+      this.logger.warn(
+        `[Orchestrator] TrueX EBBO poll failed (${this._truexEbboConsecutiveErrors} consecutive): ${err.message}`
+      );
+
+      if (
+        this._truexEbboConsecutiveErrors >= this.truexEbboFailureAlertThreshold &&
+        !this._truexEbboFailureAlertActive
+      ) {
+        this._truexEbboFailureAlertActive = true;
+        this.alertManager.sendAlert({
+          reason: 'TrueX EBBO poll failing',
+          level: 'error',
+          details: {
+            consecutiveErrors: this._truexEbboConsecutiveErrors,
+            backoffMs: this._truexEbboCurrentBackoffMs,
+            symbol: this.symbol,
+          },
+        }).catch((alertErr) =>
+          this.logger.error(`[Orchestrator] TrueX EBBO alert failed: ${alertErr.message}`)
+        );
+      }
+    } finally {
+      this._truexEbboPollInFlight = false;
+      if (this.isRunning) {
+        this._scheduleNextTruexEbboPoll(this._truexEbboCurrentBackoffMs || this.truexEbboPollIntervalMs);
+      }
     }
   }
 

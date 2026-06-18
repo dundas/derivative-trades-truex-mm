@@ -128,14 +128,31 @@ export interface InstrumentResponse {
   max_order_qty?: string;
 }
 
-export interface MarketQuoteResponse {
-  instrument_id: string;
-  bid_price: string;
-  bid_qty: string;
-  ask_price: string;
-  ask_qty: string;
-  timestamp: string;
+export interface MarketQuoteLevel {
+  price?: string;
+  qty?: string;
+  order_count?: string;
+  last_update?: string;
 }
+
+export interface MarketQuoteTrade {
+  price?: string;
+  qty?: string;
+  timestamp?: string;
+}
+
+export interface MarketQuoteEntry {
+  id: string;
+  symbol?: string;
+  info?: {
+    best_bid?: MarketQuoteLevel;
+    best_ask?: MarketQuoteLevel;
+    last_trade?: MarketQuoteTrade;
+    last_update?: string;
+  };
+}
+
+export type MarketQuoteResponse = MarketQuoteEntry[];
 
 export interface Balance {
   asset_id: string;

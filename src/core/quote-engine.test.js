@@ -115,6 +115,7 @@ describe('QuoteEngine.executeActions — replacement ordering', () => {
       minNotional: 1.0,
       sizeDecayFactor: 1.0,
       levelSpacingTicks: 1,
+      replaceMode: 'place-before-cancel',
     });
 
     engine.executeActions({
