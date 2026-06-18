@@ -78,6 +78,7 @@ function createMockQuoteEngine() {
     truexEbbo: null,
     pyusdUsd: null,
     pyusdUsdFresh: false,
+    pyusdBasisSuppressed: true,
   }));
   return qe;
 }

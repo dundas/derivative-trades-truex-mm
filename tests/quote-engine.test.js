@@ -1109,14 +1109,17 @@ describe('QuoteEngine', () => {
         pair: 'PYUSD/USD',
       });
       expect(engine.getQuoteStatus().pyusdUsdFresh).toBe(true);
+      expect(engine.getQuoteStatus().pyusdBasisSuppressed).toBe(false);
     });
 
     it('treats missing or stale pyusdUsd references as not fresh', () => {
       const engine = createEngine({ pyusdUsdStaleThresholdMs: 10 });
 
       expect(engine._isPyusdBasisFresh()).toBe(false);
+      expect(engine.shouldSuppressBasisDependentDetection()).toBe(true);
       expect(engine.getQuoteStatus().pyusdUsd).toBeNull();
       expect(engine.getQuoteStatus().pyusdUsdFresh).toBe(false);
+      expect(engine.getQuoteStatus().pyusdBasisSuppressed).toBe(true);
 
       engine.updatePyusdUsd({
         price: 0.9985,
@@ -1128,8 +1131,10 @@ describe('QuoteEngine', () => {
       });
 
       expect(engine._isPyusdBasisFresh()).toBe(false);
+      expect(engine.shouldSuppressBasisDependentDetection()).toBe(true);
       expect(engine.getQuoteStatus().pyusdUsd.price).toBe(0.9985);
       expect(engine.getQuoteStatus().pyusdUsdFresh).toBe(false);
+      expect(engine.getQuoteStatus().pyusdBasisSuppressed).toBe(true);
     });
 
     it('should not treat provider books without timestamps as fresh marketability data', () => {

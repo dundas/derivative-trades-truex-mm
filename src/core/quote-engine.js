@@ -899,6 +899,7 @@ export class QuoteEngine extends EventEmitter {
       truexEbboFresh: this._isTruexEbboFresh(),
       pyusdUsd: this.pyusdUsd ? { ...this.pyusdUsd } : null,
       pyusdUsdFresh: this._isPyusdBasisFresh(),
+      pyusdBasisSuppressed: this.shouldSuppressBasisDependentDetection(),
     };
   }
 
@@ -1001,6 +1002,10 @@ export class QuoteEngine extends EventEmitter {
       reference.timestamp &&
       (Date.now() - reference.timestamp) <= this.config.pyusdUsdStaleThresholdMs
     );
+  }
+
+  shouldSuppressBasisDependentDetection(reference = this.pyusdUsd) {
+    return !this._isPyusdBasisFresh(reference);
   }
 
   _isMarketablePostOnly(quote) {

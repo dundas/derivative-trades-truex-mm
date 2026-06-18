@@ -115,6 +115,7 @@ const orchestrator = new MarketMakerOrchestrator({
   priceAggregator: null,
   marketDataFeed: null,
   logger,
+  truexEbboPollIntervalMs: 0,
   pyusdUsdPollIntervalMs: 1000,
   pyusdUsdPollTimeoutMs: 100,
   pyusdUsdStaleThresholdMs: 1000,
@@ -158,6 +159,9 @@ if (engineStatus.pyusdUsd.price !== 1.00005) {
 if (!engineStatus.pyusdUsdFresh) {
   fail('expected quoteEngine pyusdUsd to be fresh');
 }
+if (engineStatus.pyusdBasisSuppressed) {
+  fail('expected fresh quoteEngine pyusdUsd to allow basis-dependent detection');
+}
 if (fixConnection.sentMessages.length !== 0) {
   fail(`expected zero FIX sends, got ${fixConnection.sentMessages.length}`);
 }
@@ -166,6 +170,9 @@ quoteEngine.pyusdUsd.timestamp = Date.now() - 5000;
 const staleStatus = quoteEngine.getQuoteStatus();
 if (staleStatus.pyusdUsdFresh) {
   fail('expected stale quoteEngine pyusdUsd reference to be flagged');
+}
+if (!staleStatus.pyusdBasisSuppressed) {
+  fail('expected stale quoteEngine pyusdUsd to suppress basis-dependent detection');
 }
 if (fixConnection.sentMessages.length !== 0) {
   fail(`expected zero FIX sends after stale transition, got ${fixConnection.sentMessages.length}`);
