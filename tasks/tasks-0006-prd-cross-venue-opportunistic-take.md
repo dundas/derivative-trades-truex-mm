@@ -48,25 +48,25 @@ Phase 2 (live takes) is gated on Phase 1 data and explicitly out of scope here.
   - [x] 0.4 Confirm whether `/market/quote` timestamps are nanos (→ `nanosToDate`) or ISO, for `_isTruexEbboFresh()`. **Finding (2026-06-18):** `last_trade.timestamp`, `best_bid.last_update`, `best_ask.last_update`, and `info.last_update` are all 19-digit nanosecond timestamps.
   - [x] 0.5 Write findings into this file's revisions section; adjust 2.0/3.0 sub-tasks to match reality before branching.
 
-- [ ] **1.0 Real TrueX EBBO feed (`truexEbbo`), resilient `/market/quote` poll** — smoke: poll round-trip (has outbound surface, NOT skippable)
-  - [ ] 1.1 Create feature branch `feat/truex-ebbo-feed` from `main`
-  - [ ] 1.2 Add `truexEbbo` state + `updateTruexEbbo(book)` to QuoteEngine — **separate** from `truexBook`; store `{bestBid,bestAsk,bestBidQty,bestAskQty,bestBidOrderCount,bestAskOrderCount,lastTradePrice,lastTradeQty,lastTradeTs,timestamp}`
-  - [ ] 1.3 Add `_isTruexEbboFresh()` using `truexBookStaleThresholdMs`
-  - [ ] 1.4 Orchestrator: configurable poll loop calling `restClient.getMarketQuote({instrument_id})`; add `parseMarketQuote` helper for the **array + nested `info.best_bid` / `info.best_ask` / `info.last_trade` shape** (string→number, nanos timestamps) and map response → `updateTruexEbbo`
-  - [ ] 1.5 Poll resilience (FR25): bounded timeout < interval, in-flight guard (no overlap), skip-on-error, exponential backoff on 429/consecutive errors, alert on sustained failure
-  - [ ] 1.6 Assert the new poll feeds **only** `truexEbbo` and does NOT wire into `truexBook` / `marketDataProvider` / maker guard behavior
-  - [ ] 1.7 Unit tests: `updateTruexEbbo`/freshness; orchestrator poll wiring; resilience (timeout, error skip, backoff, in-flight guard); **orchestrator-layer zero send path**; maker path unchanged
-  - [ ] 1.8 Tests pass (`bun test`)
-  - [ ] 1.9 Run `/adversarial-reviewer` locally — fix PAUSE/BLOCK before PR
-  - [ ] 1.10 Run `/pre-push-review` (semgrep + roborev)
-  - [ ] 1.11 Smoke: start engine, assert `truexEbbo` populates from a mock `/market/quote`; **no order send**
-  - [ ] 1.12 `gh pr create` (summary + test plan; note smoke result)
-  - [ ] 1.13 After each push, solicit `@coderabbitai review`; re-tag if no comments in 5 min
-  - [ ] 1.14 `/pr-review-loop <PR#>` — address findings; never merge on CI-only
-  - [ ] 1.15 Merge after reviewer pass + CI green (`gh pr merge --merge --delete-branch`)
-  - [ ] 1.16 Pull `main`, full local validation; deploy (rebuild + recreate) and confirm poll healthy + no behavior change
-  - [ ] 1.17 Mini-narrative in `memory/daily/<today>.md`
-  - [ ] 1.18 Rollback plan: define abort triggers (sustained poll failure / 429 storm), recreate-from-backup command, and post-rollback verification that maker behavior is unaffected
+- [x] **1.0 Real TrueX EBBO feed (`truexEbbo`), resilient `/market/quote` poll** — smoke: poll round-trip (has outbound surface, NOT skippable)
+  - [x] 1.1 Create feature branch `feat/truex-ebbo-feed` from `main`
+  - [x] 1.2 Add `truexEbbo` state + `updateTruexEbbo(book)` to QuoteEngine — **separate** from `truexBook`; store `{bestBid,bestAsk,bestBidQty,bestAskQty,bestBidOrderCount,bestAskOrderCount,lastTradePrice,lastTradeQty,lastTradeTs,timestamp}`
+  - [x] 1.3 Add `_isTruexEbboFresh()` using `truexBookStaleThresholdMs`
+  - [x] 1.4 Orchestrator: configurable poll loop calling `restClient.getMarketQuote({instrument_id})`; add `parseMarketQuote` helper for the **array + nested `info.best_bid` / `info.best_ask` / `info.last_trade` shape** (string→number, nanos timestamps) and map response → `updateTruexEbbo`
+  - [x] 1.5 Poll resilience (FR25): bounded timeout < interval, in-flight guard (no overlap), skip-on-error, exponential backoff on 429/consecutive errors, alert on sustained failure
+  - [x] 1.6 Assert the new poll feeds **only** `truexEbbo` and does NOT wire into `truexBook` / `marketDataProvider` / maker guard behavior
+  - [x] 1.7 Unit tests: `updateTruexEbbo`/freshness; orchestrator poll wiring; resilience (timeout, error skip, backoff, in-flight guard); **orchestrator-layer zero send path**; maker path unchanged
+  - [x] 1.8 Tests pass (`bun test`)
+  - [x] 1.9 Run `/adversarial-reviewer` locally — fix PAUSE/BLOCK before PR
+  - [x] 1.10 Run `/pre-push-review` (semgrep + roborev)
+  - [x] 1.11 Smoke: start engine, assert `truexEbbo` populates from a mock `/market/quote`; **no order send**
+  - [x] 1.12 `gh pr create` (summary + test plan; note smoke result)
+  - [x] 1.13 After each push, solicit `@coderabbitai review`; re-tag if no comments in 5 min
+  - [x] 1.14 `/pr-review-loop <PR#>` — address findings; never merge on CI-only
+  - [x] 1.15 Merge after reviewer pass + CI green (`gh pr merge --merge --delete-branch`)
+  - [x] 1.16 Pull `main`, full local validation; deploy (rebuild + recreate) and confirm poll healthy + no behavior change
+  - [x] 1.17 Mini-narrative in `memory/daily/<today>.md`
+  - [x] 1.18 Rollback plan: define abort triggers (sustained poll failure / 429 storm), recreate-from-backup command, and post-rollback verification that maker behavior is unaffected
 
 - [x] **2.0a PYUSD/USD basis feed** — smoke: basis value populates (outbound surface, NOT skippable)
   - [x] 2.1 Create feature branch `feat/pyusd-usd-basis-feed` from `main`
@@ -84,7 +84,7 @@ Phase 2 (live takes) is gated on Phase 1 data and explicitly out of scope here.
   - [x] 2.13 Pull `main`, validate; deploy + confirm basis value present in logs/status
   - [x] 2.14 Mini-narrative
 
-- [ ] **2.0b PYUSD/USD engine plumbing** — smoke: engine sees basis and suppresses on stale/missing
+- [x] **2.0b PYUSD/USD engine plumbing** — smoke: engine sees basis and suppresses on stale/missing
   - [x] 2.15 Create feature branch `feat/pyusd-usd-engine-plumbing` from `main`
   - [x] 2.16 Plumb `pyusdUsd` into the QuoteEngine (setter + freshness gate `_isPyusdBasisFresh()`); default to `null` when unavailable
   - [x] 2.17 Decision rule: if basis unavailable/stale, basis-dependent detection MUST suppress (no silent assume=1) — wired in 3.0, asserted here via the freshness gate
@@ -93,15 +93,15 @@ Phase 2 (live takes) is gated on Phase 1 data and explicitly out of scope here.
   - [x] 2.20 `/adversarial-reviewer` local
   - [x] 2.21 `/pre-push-review`
   - [x] 2.22 Smoke: engine receives basis, stale basis is flagged/suppressed, no order send
-  - [ ] 2.23 `gh pr create`
-  - [ ] 2.24 Solicit `@coderabbitai review` (re-tag at 5 min)
-  - [ ] 2.25 `/pr-review-loop <PR#>`
-  - [ ] 2.26 Merge after reviewer pass + CI green
-  - [ ] 2.27 Pull `main`, validate
-  - [ ] 2.28 Mini-narrative
+  - [x] 2.23 `gh pr create`
+  - [x] 2.24 Solicit `@coderabbitai review` (re-tag at 5 min)
+  - [x] 2.25 `/pr-review-loop <PR#>`
+  - [x] 2.26 Merge after reviewer pass + CI green
+  - [x] 2.27 Pull `main`, validate
+  - [x] 2.28 Mini-narrative
 
 - [ ] **3.0 Shadow opportunity detection + "would-take" logging** (requires 0.0 + 1.0 + 2.0b) — smoke: mandatory (`scripts/smoke-shadow-take.ts`)
-  - [ ] 3.1 Create feature branch `feat/shadow-take-detection` from `main`
+  - [x] 3.1 Create feature branch `feat/shadow-take-detection` from `main`
   - [ ] 3.2 Implement standalone `evaluateShadowTake()` that returns a loggable record only; it MUST NOT route through `_prepareQuoteForSend`, `_sendNewOrder`, or `_sendCancel`
   - [ ] 3.3 Basis-adjusted edge (§11.4): apply basis by calling `computeTakeEdgeBps` with `executionPrice = truexBid / pyusdUsd` and `fairValue = coinbaseBid`; do **not** modify `computeTakeEdgeBps`
   - [ ] 3.4 Trigger `evaluateShadowTake()` from the `/market/quote` poll handler after `updateTruexEbbo`, and also on **coalesced Coinbase fair-value changes** using cached `lastAggregatedPrice` when the detection input (`coinbaseBid`) moves by at least 1 TrueX tick or freshness/confidence flips; rate-limit these Coinbase-side reevaluations to no more than once per poll interval, and do NOT run on every raw `onPriceUpdate` tick in the hot maker path
