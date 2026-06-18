@@ -617,6 +617,21 @@ export class QuoteEngine extends EventEmitter {
   /**
    * Handle inbound execution reports from FIX.
    */
+  _emitFillEvent(resolvedClOrdID, side, price, size, execID) {
+    const tracked = this.activeOrders.get(resolvedClOrdID);
+    this.emit('fill', {
+      side,
+      price,
+      size,
+      clOrdID: resolvedClOrdID,
+      execID,
+      orderIntent: tracked?.orderIntent || 'maker_quote',
+      liquidityRoleExpected: tracked?.liquidityRoleExpected || 'maker',
+      isMaker: (tracked?.liquidityRoleExpected || 'maker') === 'maker',
+    });
+    return tracked;
+  }
+
   onExecutionReport(fields) {
     if (!fields) return;
 
@@ -639,23 +654,27 @@ export class QuoteEngine extends EventEmitter {
         }
         break;
 
-      case '2': // Filled
-        {
-          const tracked = this.activeOrders.get(resolvedClOrdID);
+      case '1': // Partially Filled — record the partial, keep the order live (reduced)
+        this.consecutiveRejects = 0; // a fill means the order pipeline is healthy
+        if (lastQty && lastQty > 0) {
+          const tracked = this._emitFillEvent(resolvedClOrdID, side, lastPx, lastQty, execID);
+          if (tracked) {
+            // Remaining size = LeavesQty (tag 151) if provided, else subtract LastQty.
+            const leavesQty = fields['151'] !== undefined
+              ? parseFloat(fields['151'])
+              : (tracked.size - lastQty);
+            tracked.size = Math.max(0, leavesQty);
+            tracked.status = 'active';
+          }
+        }
+        break;
+
+      case '2': // Filled — record the fill and remove the order
+        this.consecutiveRejects = 0;
+        this._emitFillEvent(resolvedClOrdID, side, lastPx, lastQty, execID);
         this.activeOrders.delete(resolvedClOrdID);
         this.cancelToOrigMap.delete(clOrdID);
-        this.emit('fill', {
-          side,
-          price: lastPx,
-          size: lastQty,
-          clOrdID: resolvedClOrdID,
-          execID,
-          orderIntent: tracked?.orderIntent || 'maker_quote',
-          liquidityRoleExpected: tracked?.liquidityRoleExpected || 'maker',
-          isMaker: (tracked?.liquidityRoleExpected || 'maker') === 'maker',
-        });
         break;
-        }
 
       case '4': // Cancelled
         this.activeOrders.delete(resolvedClOrdID);
@@ -687,6 +706,10 @@ export class QuoteEngine extends EventEmitter {
           this.recentRejectsByReason.set(reason, (this.recentRejectsByReason.get(reason) || 0) + 1);
           this.logger.error(`[QuoteEngine] Order rejected: clOrdID=${clOrdID}, reason=${reason}, code=${fields['103'] || 'n/a'}`);
         }
+        break;
+
+      default: // Surface anything we don't explicitly handle instead of silently dropping it
+        this.logger.warn(`[QuoteEngine] Unhandled execution report ordStatus=${ordStatus} clOrdID=${clOrdID} execID=${execID}`);
         break;
     }
   }

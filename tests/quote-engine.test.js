@@ -1481,6 +1481,51 @@ describe('QuoteEngine', () => {
       expect(mockLogger.error.mock.calls.length).toBeGreaterThan(0);
     });
 
+    it('should emit fill and keep the order (reduced) on OrdStatus=1 (PartiallyFilled)', () => {
+      const engine = createEngine();
+      const fillEvents = [];
+      engine.on('fill', (e) => fillEvents.push(e));
+      engine.activeOrders.set('CLO005', { side: 'sell', price: 100250, size: 0.01, level: 1, status: 'active', placedAt: Date.now() });
+
+      engine.onExecutionReport({
+        '11': 'CLO005', '39': '1', '54': '2',
+        '31': '100250.00', '32': '0.0034', '151': '0.0066', '17': 'EXEC555',
+      });
+
+      // Partial fill must be recorded for the filled portion
+      expect(fillEvents.length).toBe(1);
+      expect(fillEvents[0].side).toBe('sell');
+      expect(fillEvents[0].price).toBe(100250);
+      expect(fillEvents[0].size).toBe(0.0034);
+      expect(fillEvents[0].execID).toBe('EXEC555');
+      // Order stays live with its remaining (LeavesQty) size
+      expect(engine.activeOrders.has('CLO005')).toBe(true);
+      expect(engine.activeOrders.get('CLO005').size).toBeCloseTo(0.0066, 8);
+      expect(engine.activeOrders.get('CLO005').status).toBe('active');
+    });
+
+    it('should reduce by LastQty when LeavesQty (151) is absent on a partial fill', () => {
+      const engine = createEngine();
+      engine.activeOrders.set('CLO007', { side: 'buy', price: 99750, size: 0.01, level: 1, status: 'active', placedAt: Date.now() });
+      engine.onExecutionReport({ '11': 'CLO007', '39': '1', '54': '1', '31': '99750', '32': '0.003' });
+      expect(engine.activeOrders.get('CLO007').size).toBeCloseTo(0.007, 8);
+    });
+
+    it('should reset consecutiveRejects on a partial fill', () => {
+      const engine = createEngine();
+      engine.consecutiveRejects = 2;
+      engine.activeOrders.set('CLO006', { side: 'buy', price: 99750, size: 0.01, level: 1, status: 'active', placedAt: Date.now() });
+      engine.onExecutionReport({ '11': 'CLO006', '39': '1', '54': '1', '31': '99750', '32': '0.005', '151': '0.005' });
+      expect(engine.consecutiveRejects).toBe(0);
+    });
+
+    it('should warn (not silently drop) on an unhandled OrdStatus', () => {
+      const mockLogger = createMockLogger();
+      const engine = createEngine({ logger: mockLogger });
+      engine.onExecutionReport({ '11': 'CLOX', '39': 'C', '54': '1' }); // 'C' = Expired — not explicitly handled
+      expect(mockLogger.warn.mock.calls.length).toBeGreaterThan(0);
+    });
+
     it('should handle null fields gracefully', () => {
       const engine = createEngine();
       // Should not throw
