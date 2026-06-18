@@ -100,7 +100,7 @@ Phase 2 (live takes) is gated on Phase 1 data and explicitly out of scope here.
   - [x] 2.27 Pull `main`, validate
   - [x] 2.28 Mini-narrative
 
-- [ ] **3.0 Shadow opportunity detection + "would-take" logging** (requires 0.0 + 1.0 + 2.0b) — smoke: mandatory (`scripts/smoke-shadow-take.ts`)
+- [x] **3.0 Shadow opportunity detection + "would-take" logging** (requires 0.0 + 1.0 + 2.0b) — smoke: mandatory (`scripts/smoke-shadow-take.ts`)
   - [x] 3.1 Create feature branch `feat/shadow-take-detection` from `main`
   - [x] 3.2 Implement standalone `evaluateShadowTake()` that returns a loggable record only; it MUST NOT route through `_prepareQuoteForSend`, `_sendNewOrder`, or `_sendCancel`
   - [x] 3.3 Basis-adjusted edge (§11.4): apply basis by calling `computeTakeEdgeBps` with `executionPrice = truexBid / pyusdUsd` and `fairValue = coinbaseBid`; do **not** modify `computeTakeEdgeBps`
@@ -118,28 +118,28 @@ Phase 2 (live takes) is gated on Phase 1 data and explicitly out of scope here.
   - [x] 3.15 Orchestrator-layer tests: new poll loop has zero call edges to FIX and invokes a non-dispatchable shadow-evaluation path only
   - [x] 3.16 Tests pass
   - [x] 3.17 `/adversarial-reviewer` local (real-money-adjacent logic even though no sends — verify the no-send invariant holds on all branches)
-  - [ ] 3.18 `/pre-push-review`
+  - [x] 3.18 `/pre-push-review`
   - [x] 3.19 Smoke (`scripts/smoke-shadow-take.ts`): synthetic dislocated book + fresh Coinbase + basis → asserts one would-take log with correct basis-adj edge AND zero FIX sends; second identical poll → deduped (no second log)
-  - [ ] 3.20 `gh pr create`
-  - [ ] 3.21 Solicit `@coderabbitai review` (re-tag at 5 min)
-  - [ ] 3.22 `/pr-review-loop <PR#>`
-  - [ ] 3.23 Merge after reviewer pass + CI green
-  - [ ] 3.24 Pull `main`, validate; **do NOT deploy yet** (enabled in 4.0)
-  - [ ] 3.25 Mini-narrative
+  - [x] 3.20 `gh pr create`
+  - [x] 3.21 Solicit `@coderabbitai review` (re-tag at 5 min)
+  - [x] 3.22 `/pr-review-loop <PR#>`
+  - [x] 3.23 Merge after reviewer pass + CI green
+  - [x] 3.24 Pull `main`, validate; **do NOT deploy yet** (enabled in 4.0)
+  - [x] 3.25 Mini-narrative
 
 - [ ] **4.0 Shadow enablement + smoke + analysis** (requires 3.0) — smoke: mandatory; CONFIG portion noted
-  - [ ] 4.1 Create feature branch `feat/shadow-take-enable` from `main`
-  - [ ] 4.2 `shadowTakeMode` config flag (default **false**); thresholds (`minTakeEdgeBps`, `maxEdgeCeilingBps`, `pyusdDepegThresholdBps`, `maxTakeNotionalPerOrder`, `minTakeSizeBTC`, persistence N), poll interval — all configurable and pinned before enable. Start `pyusdDepegThresholdBps` at **100 bps** for Phase 1 (above the 20–80 bps routine wobble) and recalibrate from observed live basis data before any Phase-2 enablement
-  - [ ] 4.3 Wire flags through orchestrator → engine; when `shadowTakeMode` true, run detection+logging only and make the send path unreachable regardless of `allowTakerOrders`
+  - [x] 4.1 Create feature branch `feat/shadow-take-enable` from `main`
+  - [x] 4.2 `shadowTakeMode` config flag (default **false**); thresholds (`minTakeEdgeBps`, `maxEdgeCeilingBps`, `pyusdDepegThresholdBps`, `maxTakeNotionalPerOrder`, `minTakeSizeBTC`, persistence N), poll interval — all configurable and pinned before enable. Start `pyusdDepegThresholdBps` at **100 bps** for Phase 1 (above the 20–80 bps routine wobble) and recalibrate from observed live basis data before any Phase-2 enablement
+  - [x] 4.3 Wire flags through orchestrator → engine; when `shadowTakeMode` true, run detection+logging only and make the send path unreachable regardless of `allowTakerOrders`
   - [ ] 4.4 In UAT, verify TrueX FIX honors IOC (`59=3`) with an observe-only fill+cancel flow; record the outcome as an explicit input to the Phase-2 go/no-go decision
-  - [ ] 4.5 Before enablement, pre-commit explicit GO/ABORT criteria: minimum observation window, fill-rate red-flag line, depeg/basis-vol thresholds, and required post-basis edge
-  - [ ] 4.6 Enable `shadowTakeMode: true` in `run-prod.js` (observe-only) with conservative thresholds that match the pre-committed criteria
-  - [ ] 4.7 `scripts/analyze-shadow-takes.js`: parse would-take logs → edge distribution, fill/miss rate, live PYUSD basis stats; output the Phase-2 go/no-go summary against the pre-committed criteria and UAT IOC result
-  - [ ] 4.8 Unit tests: flag gating (off → no detection at all), config plumbing, and `shadowTakeMode=true && allowTakerOrders=true` still yields **zero `fixConnection.sendMessage`**
-  - [ ] 4.9 Tests pass
-  - [ ] 4.10 `/adversarial-reviewer` local
-  - [ ] 4.11 `/pre-push-review`
-  - [ ] 4.12 Smoke: run with `shadowTakeMode` on against synthetic feed → would-take logs emitted, zero sends; off → nothing
+  - [x] 4.5 Before enablement, pre-commit explicit GO/ABORT criteria: minimum observation window, fill-rate red-flag line, depeg/basis-vol thresholds, and required post-basis edge
+  - [x] 4.6 Enable `shadowTakeMode: true` in `run-prod.js` (observe-only) with conservative thresholds that match the pre-committed criteria
+  - [x] 4.7 `scripts/analyze-shadow-takes.js`: parse would-take logs → edge distribution, fill/miss rate, live PYUSD basis stats; output the Phase-2 go/no-go summary against the pre-committed criteria and UAT IOC result
+  - [x] 4.8 Unit tests: flag gating (off → no detection at all), config plumbing, and `shadowTakeMode=true && allowTakerOrders=true` still yields **zero `fixConnection.sendMessage`**
+  - [x] 4.9 Tests pass
+  - [x] 4.10 `/adversarial-reviewer` local
+  - [x] 4.11 `/pre-push-review`
+  - [x] 4.12 Smoke: run with `shadowTakeMode` on against synthetic feed → would-take logs emitted, zero sends; off → nothing
   - [ ] 4.13 `gh pr create`
   - [ ] 4.14 Solicit `@coderabbitai review` (re-tag at 5 min)
   - [ ] 4.15 `/pr-review-loop <PR#>`

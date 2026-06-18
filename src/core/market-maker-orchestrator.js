@@ -103,6 +103,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       takeHedgeBufferBps: options.takeHedgeBufferBps ?? 0,
       maxTakerOrdersPerMinute: options.maxTakerOrdersPerMinute ?? 0,
       maxTakerNotionalPerMinute: options.maxTakerNotionalPerMinute ?? 0,
+      shadowTakeMode: options.shadowTakeMode ?? false,
       shadowPersistenceRequiredPolls: options.shadowPersistenceRequiredPolls ?? 3,
       maxEdgeCeilingBps: options.maxEdgeCeilingBps ?? 250,
       pyusdDepegThresholdBps: options.pyusdDepegThresholdBps ?? 100,
@@ -183,6 +184,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this.shadowZeroDetectionAlertThresholdMs = options.shadowZeroDetectionAlertThresholdMs ?? 300000;
     this.shadowSuppressionAlertThreshold = options.shadowSuppressionAlertThreshold ?? 5;
     this.shadowEdgeCeilingAlertThreshold = options.shadowEdgeCeilingAlertThreshold ?? 3;
+    this.shadowTakeMode = options.shadowTakeMode ?? false;
 
     // State
     this.isRunning = false;
@@ -940,6 +942,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
   }
 
   _shouldTriggerShadowReevaluation(aggregatedPrice) {
+    if (!this.shadowTakeMode) return false;
     const coinbaseSource = this._extractCoinbaseSource(aggregatedPrice);
     if (!coinbaseSource?.bid) return false;
     if (!this.quoteEngine?._isTruexEbboFresh?.()) return false;
@@ -1077,6 +1080,16 @@ export class MarketMakerOrchestrator extends EventEmitter {
   _handleShadowEvaluationResult(result) {
     if (!result?.evaluation) return;
     const now = Date.now();
+    const suppressReason = result.evaluation.suppressReason;
+    const basisSample = {
+      type: 'shadow-basis-sample',
+      timestamp: result.evaluation.timestamp ?? now,
+      trigger: result.evaluation.trigger ?? 'unknown',
+      pyusdUsd: suppressReason === 'basis-stale' ? null : (result.evaluation.pyusdUsd ?? null),
+      suppressReason: suppressReason ?? null,
+      coinbaseFresh: result.evaluation.coinbaseFresh ?? null,
+      wouldTake: !!result.evaluation.wouldTake,
+    };
     this._rollShadowMetricsWindow(now);
     const zeroDetectionEligibleSuppressReasons = new Set([
       'coinbase-stale',
@@ -1098,7 +1111,6 @@ export class MarketMakerOrchestrator extends EventEmitter {
     }
     this._shadowMetrics.evaluations++;
 
-    const suppressReason = result.evaluation.suppressReason;
     if (result.evaluation.wouldTake) {
       this._shadowMetrics.detections++;
       this._shadowLastDetectionAt = now;
@@ -1127,6 +1139,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       this._shadowMetrics.edgeCeilings++;
     }
 
+    this.logger.info(`[SHADOW] ${JSON.stringify(basisSample)}`);
     for (const log of result.logs || []) {
       this.logger.info(`[SHADOW] ${JSON.stringify(log)}`);
     }
@@ -1135,7 +1148,10 @@ export class MarketMakerOrchestrator extends EventEmitter {
   }
 
   async _processShadowEvaluation(trigger, { refreshTape = false } = {}) {
-    if (!this.isRunning || !this.lastAggregatedPrice || typeof this.quoteEngine?.evaluateShadowTake !== 'function') {
+    if (!this.shadowTakeMode ||
+        !this.isRunning ||
+        !this.lastAggregatedPrice ||
+        typeof this.quoteEngine?.evaluateShadowTake !== 'function') {
       return;
     }
     if (refreshTape) {
@@ -1147,6 +1163,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       trigger,
       now: Date.now(),
     });
+    if (!result) return;
     this._handleShadowEvaluationResult(result);
   }
 

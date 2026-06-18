@@ -104,9 +104,15 @@ class MockHedgeExecutor extends EventEmitter {
 const fixConnection = new MockFIXConnection();
 const inventoryManager = new MockInventoryManager();
 const shadowLogs: string[] = [];
+const wouldTakeLogs: string[] = [];
 const logger = {
   info(message: string) {
-    if (message.startsWith('[SHADOW] ')) shadowLogs.push(message);
+    if (!message.startsWith('[SHADOW] ')) return;
+    shadowLogs.push(message);
+    const payload = JSON.parse(message.slice('[SHADOW] '.length));
+    if (payload.type === 'would-take') {
+      wouldTakeLogs.push(message);
+    }
   },
   warn() {},
   error() {},
@@ -118,6 +124,7 @@ const quoteEngine = new QuoteEngine({
   inventoryManager,
   logger,
   levels: 1,
+  shadowTakeMode: true,
   shadowPersistenceRequiredPolls: 1,
   minTakeEdgeBps: 10,
   maxTakeNotionalPerOrder: 1000,
@@ -138,6 +145,7 @@ const orchestrator = new MarketMakerOrchestrator({
   truexTradeCacheTtlMs: 0,
   truexTradePollTimeoutMs: 100,
   pyusdUsdPollIntervalMs: 0,
+  shadowTakeMode: true,
   shadowPersistenceRequiredPolls: 1,
   minTakeEdgeBps: 10,
   maxTakeNotionalPerOrder: 1000,
@@ -212,11 +220,11 @@ orchestrator._onPriceUpdate({
 await orchestrator._pollTruexEbbo();
 await orchestrator._pollTruexEbbo();
 
-if (shadowLogs.length !== 1) {
-  fail(`expected exactly one shadow log across two identical polls, got ${shadowLogs.length}`);
+if (wouldTakeLogs.length !== 1) {
+  fail(`expected exactly one would-take log across two identical polls, got ${wouldTakeLogs.length}`);
 }
 
-const payload = JSON.parse(shadowLogs[0].slice('[SHADOW] '.length));
+const payload = JSON.parse(wouldTakeLogs[0].slice('[SHADOW] '.length));
 if (payload.type !== 'would-take' || payload.wouldTake !== true) {
   fail(`unexpected shadow log payload ${shadowLogs[0]}`);
 }
@@ -230,5 +238,16 @@ if (fixConnection.sentMessages.length !== 0) {
   fail(`expected zero FIX sends, got ${fixConnection.sentMessages.length}`);
 }
 
+orchestrator.shadowTakeMode = false;
+quoteEngine.config.shadowTakeMode = false;
+const beforeDisabled = shadowLogs.length;
+await orchestrator._pollTruexEbbo();
+if (shadowLogs.length !== beforeDisabled) {
+  fail(`expected no additional shadow logs when mode is off, got ${shadowLogs.length - beforeDisabled}`);
+}
+if (fixConnection.sentMessages.length !== 0) {
+  fail(`expected zero FIX sends after mode-off poll, got ${fixConnection.sentMessages.length}`);
+}
+
 await orchestrator.stop();
-console.log(`PASS: one shadow would-take log with edge=${payload.basisAdjEdgeBps}bps and zero FIX sends`);
+console.log(`PASS: shadowTakeMode on => one would-take log; off => no log; zero FIX sends throughout`);

@@ -85,6 +85,7 @@ function createMockQuoteEngine() {
     pyusdUsd: null,
     pyusdUsdFresh: false,
     pyusdBasisSuppressed: true,
+    shadowTakeMode: false,
   }));
   return qe;
 }
@@ -322,7 +323,7 @@ describe('MarketMakerOrchestrator', () => {
 
     test('polls /market/quote into quoteEngine.updateTruexEbbo without touching maker paths', async () => {
       const alertManager = { sendAlert: jest.fn(async () => ({})), sendRecovery: jest.fn(async () => ({})) };
-      const { orchestrator, mocks } = createOrchestrator({ alertManager, truexEbboPollIntervalMs: 1000 });
+      const { orchestrator, mocks } = createOrchestrator({ alertManager, truexEbboPollIntervalMs: 1000, shadowTakeMode: true });
       orchestrator.restClient = {
         getInstrument: jest.fn(async () => ({ id: '78873627520270354' })),
         getMarketQuote: jest.fn(async () => ([
@@ -419,7 +420,7 @@ describe('MarketMakerOrchestrator', () => {
 
     test('invokes the shadow evaluation path from the EBBO poll without touching FIX sends', async () => {
       const alertManager = { sendAlert: jest.fn(async () => ({})), sendRecovery: jest.fn(async () => ({})) };
-      const { orchestrator, mocks } = createOrchestrator({ alertManager, truexEbboPollIntervalMs: 1000 });
+      const { orchestrator, mocks } = createOrchestrator({ alertManager, truexEbboPollIntervalMs: 1000, shadowTakeMode: true });
       orchestrator.restClient = {
         getInstrument: jest.fn(async () => ({ id: '78873627520270354' })),
         getMarketQuote: jest.fn(async () => ([
@@ -929,7 +930,7 @@ describe('MarketMakerOrchestrator', () => {
     });
 
     test('coalesces shadow reevaluations on meaningful Coinbase changes and rate limits them', async () => {
-      const { orchestrator, mocks } = createOrchestrator({ truexEbboPollIntervalMs: 1000 });
+      const { orchestrator, mocks } = createOrchestrator({ truexEbboPollIntervalMs: 1000, shadowTakeMode: true });
       await orchestrator.start();
       const processSpy = jest.spyOn(orchestrator, '_processShadowEvaluation').mockResolvedValue();
       mocks.quoteEngine._isTruexEbboFresh.mockReturnValue(true);
@@ -968,7 +969,7 @@ describe('MarketMakerOrchestrator', () => {
 
   describe('shadow tape cache', () => {
     test('reuses cached trade tape on Coinbase reevaluations instead of refetching every tick', async () => {
-      const { orchestrator, mocks } = createOrchestrator({ truexTradeCacheTtlMs: 10_000 });
+      const { orchestrator, mocks } = createOrchestrator({ truexTradeCacheTtlMs: 10_000, shadowTakeMode: true });
       orchestrator.isRunning = true;
       orchestrator.lastAggregatedPrice = {
         confidence: 0.95,
@@ -1003,6 +1004,7 @@ describe('MarketMakerOrchestrator', () => {
       const { orchestrator } = createOrchestrator({
         alertManager,
         shadowZeroDetectionAlertThresholdMs: 1000,
+        shadowTakeMode: true,
       });
 
       orchestrator._handleShadowEvaluationResult({
@@ -1021,6 +1023,7 @@ describe('MarketMakerOrchestrator', () => {
       const { orchestrator } = createOrchestrator({
         alertManager,
         shadowZeroDetectionAlertThresholdMs: 1000,
+        shadowTakeMode: true,
       });
 
       orchestrator._handleShadowEvaluationResult({
@@ -1038,6 +1041,7 @@ describe('MarketMakerOrchestrator', () => {
       const { orchestrator } = createOrchestrator({
         alertManager,
         shadowZeroDetectionAlertThresholdMs: 1000,
+        shadowTakeMode: true,
       });
 
       orchestrator._shadowNoDetectionAlertActive = true;
@@ -1052,6 +1056,26 @@ describe('MarketMakerOrchestrator', () => {
       expect(alertManager.sendRecovery).toHaveBeenCalledWith({
         reason: 'Shadow take zero detections while market active',
       });
+    });
+
+    test('does not invoke shadow evaluation when shadowTakeMode is false', async () => {
+      const { orchestrator, mocks } = createOrchestrator({ shadowTakeMode: false, truexEbboPollIntervalMs: 1000 });
+      await orchestrator.start();
+      const processSpy = jest.spyOn(orchestrator, '_processShadowEvaluation').mockResolvedValue();
+      mocks.quoteEngine._isTruexEbboFresh.mockReturnValue(true);
+
+      mocks.priceAggregator.emit('price', {
+        weightedMidpoint: 100000,
+        confidence: 0.95,
+        sources: [{ exchange: 'coinbase', bid: 100, isStale: false }],
+      });
+      await Promise.resolve();
+
+      expect(processSpy).not.toHaveBeenCalled();
+      expect(orchestrator.shadowTakeMode).toBe(false);
+
+      processSpy.mockRestore();
+      await orchestrator.stop();
     });
   });
 

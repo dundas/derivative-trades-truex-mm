@@ -261,3 +261,27 @@ against observed PYUSD-basis volatility + Coinbase↔TrueX latency, not just the
 2. TrueX FIX: IOC (`59=3`) and STP tag honored? (UAT.)
 3. REST `/market/quote` poll vs a TrueX FIX/WS market-data feed (the 1 s poll is our adverse-selection floor).
 4. Risk envelope: per-take cap, daily-loss kill-switch threshold, max long/short bounds.
+
+### 11.6 Phase-1 pre-committed go / abort criteria (pinned 2026-06-18)
+
+Before any Phase-2 live-take enablement, the shadow dataset must be evaluated against these fixed
+criteria:
+
+- **Observation window:** at least **3 calendar days**, **50 would-take opportunities**, and **40**
+  post-log attribution outcomes.
+- **IOC prerequisite:** UAT must show TrueX FIX honors **IOC (`59=3`)**; if IOC remains unverified
+  or fails in UAT, Phase 2 is **blocked** regardless of shadow metrics.
+- **Edge quality:** the observed **median** basis-adjusted edge must be **>= 20 bps**, and the
+  **25th percentile** must remain **>= 15 bps**.
+- **Basis health:** abort if `max(|PYUSD-USD - 1|)` exceeds **100 bps** or if the observed
+  **p95 absolute basis** exceeds **80 bps**.
+- **Adverse-selection proxy:** treat a high would-have-filled rate as dangerous, not validating.
+  Using the Phase-1 attribution proxy, abort if the targeted quote **disappears > 35%** of the time
+  within the attribution window.
+
+Phase-2 recommendation logic:
+
+- **GO** only if every criterion above passes.
+- **ABORT** if any hard threshold fails.
+- **HOLD / continue observing** if thresholds have not failed but the observation window or IOC-UAT
+  evidence is still incomplete.
