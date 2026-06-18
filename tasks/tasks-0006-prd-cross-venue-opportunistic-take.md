@@ -11,8 +11,9 @@ Phase 2 (live takes) is gated on Phase 1 data and explicitly out of scope here.
 - `tests/quote-engine.test.js` — unit tests: basis edge math, detection threshold, suppression (stale/low-confidence Coinbase, stale truexEbbo), dedup, **zero FIX sends in shadow**.
 - `src/core/market-maker-orchestrator.test.js` — poll wiring, truexEbbo feed, pyusdUsd plumbing, poll resilience (timeout/error/backoff/in-flight guard).
 - `src/exchanges/truex/TrueXRESTClient.ts` — reuse `getMarketQuote`; probe real quote payload shape during 0.0.
+- `src/connectors/kraken/KrakenRestClient.ts` — likely basis-feed source for 2.0a now that Coinbase `PYUSD-USD` is delisted on `ws-feed.exchange.coinbase.com`.
 - `src/connectors/aggregator/PriceAggregator.ts` — likely unchanged for 2.0a; only touch if the basis-feed design truly needs aggregator support.
-- `src/data-pipeline/coinbase-ws-ingest.js` — add PYUSD-USD subscription if WS is the basis source.
+- `src/data-pipeline/coinbase-ws-ingest.js` — **not** the basis source after 0.3 unless Coinbase relists `PYUSD-USD`; keep unchanged unless design changes again.
 - `scripts/run-prod.js` — `shadowTakeMode` config (off by default), thresholds, poll interval; wire into orchestrator.
 - `scripts/smoke-shadow-take.ts` — shadow smoke: synthetic dislocated book → asserts would-take log + zero sends.
 - `scripts/analyze-shadow-takes.js` — summarize would-take logs (edge dist, fill/miss, live PYUSD basis) for the Phase-2 go/no-go.
@@ -26,31 +27,32 @@ Phase 2 (live takes) is gated on Phase 1 data and explicitly out of scope here.
 
 ## Task Ordering & Dependencies
 
-- **0.0** (data-source spike) is a hard prerequisite for **2.0a** and **3.0**.
-- **1.0** (truexEbbo feed) is independent and should merge before **3.0**.
+- **0.0** (data-source spike) is a hard prerequisite for **1.0**, **2.0a**, and **3.0**.
+- **1.0** (truexEbbo feed) should start only after 0.0 findings are applied, then merge before **3.0**.
 - **2.0a** (real PYUSD/USD feed) must merge before **2.0b** (engine plumbing).
 - **3.0** (shadow detection + logging) requires 0.0 + 1.0 + 2.0b on `main`.
 - **4.0** (enablement + smoke + analysis) requires 3.0 on `main`.
-- **1.0** is a safe no-op in isolation. **2.0a** is not assumed to be one until the feed design is confirmed in 0.0.
+- **1.0** is a safe no-op in isolation once the 0.0 quote-shape findings are reflected. **2.0a** is not assumed to be one until the basis-feed design is confirmed in 0.0.
 
 ## Tasks
 
 > **Pairing-review amendments (2026-06-18) apply — see "Pairing-Review Revisions" at the bottom.**
-> Two false assumptions were corrected (no `last_trade`/`order_count` in `/market/quote`; no
-> PYUSD-USD feed exists). Task **0.0 (data-source spike) is now a hard prerequisite for 2.0 and 3.0.**
+> Live prod / live public checks on **2026-06-18** superseded several of those assumptions:
+> `/market/quote` **does** expose nested `last_trade` / `order_count`, `/market/trade` exists as a
+> public REST tape, and Coinbase `PYUSD-USD` is **delisted** on `ws-feed.exchange.coinbase.com`.
 
-- [ ] **0.0 Data-source spike (no code) — prerequisite for 2.0 & 3.0** — smoke: N/A (investigation)
-  - [ ] 0.1 Hit live prod `/market/quote` and dump the RAW response: confirm exact fields. (Pairing found `MarketQuoteResponse` = `{instrument_id, bid_price, bid_qty, ask_price, ask_qty, timestamp}` — **no `last_trade`, no `order_count`, fields are strings, `timestamp` is nanos**. PRD §7's field list is wrong.)
-  - [ ] 0.2 Find a TrueX **public trade tape** source for the PB2 recency/outlier guard: probe for a `/market/trade`/candle endpoint, or the unused `TrueXMarketDataFeed` FIX MD path. `/order/trade` is OUR fills only — not usable. **If none exists → drop the tape-outlier guard from Phase 1 and rely on multi-poll persistence + `bid_qty` decay as the staleness proxy** (record this decision).
-  - [ ] 0.3 Confirm Coinbase lists a **`PYUSD-USD`** product on `ws-feed.exchange.coinbase.com` (drives task 2.0 design: second `CoinbaseWsIngest` instance vs REST fallback).
-  - [ ] 0.4 Confirm whether `/market/quote` `timestamp` is nanos (→ `nanosToDate`) or ISO, for `_isTruexEbboFresh()`.
-  - [ ] 0.5 Write findings into this file's revisions section; adjust 2.0/3.0 sub-tasks to match reality before branching.
+- [x] **0.0 Data-source spike (no code) — prerequisite for 1.0, 2.0a, and 3.0** — smoke: N/A (investigation)
+  - [x] 0.1 Hit live prod `/market/quote` and dump the RAW response: confirm exact fields. **Finding (2026-06-18):** response is an **array** of instrument objects shaped like `{id, symbol, info}` where `info` contains nested `last_trade {price, qty, timestamp}`, `best_bid {price, qty, order_count, last_update}`, `best_ask {price, qty, order_count, last_update}`, and `last_update`. PRD §7's earlier flat field list is wrong.
+  - [x] 0.2 Find a TrueX **public trade tape** source for the PB2 recency/outlier guard. **Finding (2026-06-18):** prod REST `GET /market/trade?instrument_id=<BTC-PYUSD instrument>` returns public trade prints; `/market/candle` and `/market/candles` return 404; `/order/trade` is the authenticated account-trades endpoint and is not a public tape substitute.
+  - [x] 0.3 Confirm Coinbase lists a **`PYUSD-USD`** product on `ws-feed.exchange.coinbase.com`. **Finding (2026-06-18):** Coinbase Exchange still exposes `PYUSD-USD` in the product catalog, but it is **status=delisted** / `trading_disabled=true`; `ws-feed.exchange.coinbase.com` rejects subscription with `reason: \"PYUSD-USD is delisted\"`. This rules out a second `CoinbaseWsIngest` instance. For 2.0a, pivot to a live public alternative (currently Kraken public ticker `PYUSDUSD` is available).
+  - [x] 0.4 Confirm whether `/market/quote` timestamps are nanos (→ `nanosToDate`) or ISO, for `_isTruexEbboFresh()`. **Finding (2026-06-18):** `last_trade.timestamp`, `best_bid.last_update`, `best_ask.last_update`, and `info.last_update` are all 19-digit nanosecond timestamps.
+  - [x] 0.5 Write findings into this file's revisions section; adjust 2.0/3.0 sub-tasks to match reality before branching.
 
 - [ ] **1.0 Real TrueX EBBO feed (`truexEbbo`), resilient `/market/quote` poll** — smoke: poll round-trip (has outbound surface, NOT skippable)
   - [ ] 1.1 Create feature branch `feat/truex-ebbo-feed` from `main`
-  - [ ] 1.2 Add `truexEbbo` state + `updateTruexEbbo(book)` to QuoteEngine — **separate** from `truexBook`; store `{bestBid,bestAsk,bestBidQty,bestAskQty,timestamp}` only unless 0.2 finds a real public trade tape
+  - [ ] 1.2 Add `truexEbbo` state + `updateTruexEbbo(book)` to QuoteEngine — **separate** from `truexBook`; store `{bestBid,bestAsk,bestBidQty,bestAskQty,bestBidOrderCount,bestAskOrderCount,lastTradePrice,lastTradeQty,lastTradeTs,timestamp}`
   - [ ] 1.3 Add `_isTruexEbboFresh()` using `truexBookStaleThresholdMs`
-  - [ ] 1.4 Orchestrator: configurable poll loop calling `restClient.getMarketQuote({instrument_id})`; add `parseMarketQuote` helper (string→number, nanos timestamp) and map response → `updateTruexEbbo`
+  - [ ] 1.4 Orchestrator: configurable poll loop calling `restClient.getMarketQuote({instrument_id})`; add `parseMarketQuote` helper for the **array + nested `info.best_bid` / `info.best_ask` / `info.last_trade` shape** (string→number, nanos timestamps) and map response → `updateTruexEbbo`
   - [ ] 1.5 Poll resilience (FR25): bounded timeout < interval, in-flight guard (no overlap), skip-on-error, exponential backoff on 429/consecutive errors, alert on sustained failure
   - [ ] 1.6 Assert the new poll feeds **only** `truexEbbo` and does NOT wire into `truexBook` / `marketDataProvider` / maker guard behavior
   - [ ] 1.7 Unit tests: `updateTruexEbbo`/freshness; orchestrator poll wiring; resilience (timeout, error skip, backoff, in-flight guard); **orchestrator-layer zero send path**; maker path unchanged
@@ -68,7 +70,7 @@ Phase 2 (live takes) is gated on Phase 1 data and explicitly out of scope here.
 
 - [ ] **2.0a PYUSD/USD basis feed** — smoke: basis value populates (outbound surface, NOT skippable)
   - [ ] 2.1 Create feature branch `feat/pyusd-usd-basis-feed` from `main`
-  - [ ] 2.2 Use 0.3 findings to stand up a real PYUSD-USD source: second `CoinbaseWsIngest` instance if Coinbase WS lists the product, otherwise a lightweight REST poll with its own freshness/error handling
+  - [ ] 2.2 Use 0.3 findings to stand up a real PYUSD-USD source: **revalidate the live public candidates at implementation time**, then prefer Kraken public REST ticker `PYUSDUSD` if it is still available; keep the basis source configurable and fallback-capable, and do **not** use a second `CoinbaseWsIngest` instance unless Coinbase relists `PYUSD-USD`
   - [ ] 2.3 Expose `pyusdUsd` price + timestamp without altering the existing BTC-USD fair-value path used by the live maker
   - [ ] 2.4 Unit tests: feed wiring/freshness; null/stale handling; **maker regression guard** that adding the basis feed does NOT change BTC-USD confidence/freshness
   - [ ] 2.5 Tests pass
@@ -104,25 +106,26 @@ Phase 2 (live takes) is gated on Phase 1 data and explicitly out of scope here.
   - [ ] 3.3 Basis-adjusted edge (§11.4): apply basis by calling `computeTakeEdgeBps` with `executionPrice = truexBid / pyusdUsd` and `fairValue = coinbaseBid`; do **not** modify `computeTakeEdgeBps`
   - [ ] 3.4 Trigger `evaluateShadowTake()` from the `/market/quote` poll handler after `updateTruexEbbo`, and also on **coalesced Coinbase fair-value changes** using cached `lastAggregatedPrice` when the detection input (`coinbaseBid`) moves by at least 1 TrueX tick or freshness/confidence flips; rate-limit these Coinbase-side reevaluations to no more than once per poll interval, and do NOT run on every raw `onPriceUpdate` tick in the hot maker path
   - [ ] 3.5 Detection step: sell-take candidate when `truexEbbo.bestBid` adjusted-edge ≥ `minTakeEdgeBps`; size = `min(bestBidQty, balance-capped, maxPosition headroom, maxTakeNotionalPerOrder)`; inventory-reducing only (long); suppress dust via `minTakeSizeBTC`
-  - [ ] 3.6 Corroboration guards (PB2): Coinbase-leg freshness/confidence; **multi-poll persistence** (pinned N, reset on disappearance); **max-edge suspicion ceiling** (suppress + warn if edge > ceiling); **TrueX tape/outlier guard only if 0.2 finds a real public source**
-  - [ ] 3.7 Basis gate (PB1): suppress all detection if `pyusdUsd` stale/missing or `|pyusdUsd−1| > pyusdDepegThresholdBps`
-  - [ ] 3.8 Dedup (FR16): key on `bestBid + bestBidQty` (not timestamp); add qty-decay tolerance (recommend treating reductions within 10% as the same persisting order) so a partially-taken bid is not re-logged every poll
-  - [ ] 3.9 Structured `would-take` log: side, size, truexPrice, rawEdgeBps, basisAdjEdgeBps, pyusdUsd, coinbaseFresh, dedupKey, suppressReason(if any); include tape-age fields only if 0.2 found a usable source
-  - [ ] 3.10 Fill/miss attribution: record whether the targeted bid disappears shortly after (TrueX's quoter likely took it) vs persists
-  - [ ] 3.11 Shadow-path alerting (FR26): rate-thresholded alerts for sustained zero-detection while market is active, basis/depeg suppression spikes, and edge-ceiling trips
-  - [ ] 3.12 **HARD: no order dispatch** — detection returns/logs only; Phase 1 must not touch `_sendNewOrder` / `_sendCancel`; output type is non-dispatchable
-  - [ ] 3.13 Unit tests: edge math (basis), fires at/above threshold + not below, suppression (stale/low-conf Coinbase, stale truexEbbo, basis stale/depeg, edge>ceiling, tape-outlier if applicable), dedup, inventory-reducing-only, minTakeSize floor, **assert zero sendMessage on the take path**
-  - [ ] 3.14 Orchestrator-layer tests: new poll loop has zero call edges to FIX and invokes a non-dispatchable shadow-evaluation path only
-  - [ ] 3.15 Tests pass
-  - [ ] 3.16 `/adversarial-reviewer` local (real-money-adjacent logic even though no sends — verify the no-send invariant holds on all branches)
-  - [ ] 3.17 `/pre-push-review`
-  - [ ] 3.18 Smoke (`scripts/smoke-shadow-take.ts`): synthetic dislocated book + fresh Coinbase + basis → asserts one would-take log with correct basis-adj edge AND zero FIX sends; second identical poll → deduped (no second log)
-  - [ ] 3.19 `gh pr create`
-  - [ ] 3.20 Solicit `@coderabbitai review` (re-tag at 5 min)
-  - [ ] 3.21 `/pr-review-loop <PR#>`
-  - [ ] 3.22 Merge after reviewer pass + CI green
-  - [ ] 3.23 Pull `main`, validate; **do NOT deploy yet** (enabled in 4.0)
-  - [ ] 3.24 Mini-narrative
+  - [ ] 3.6 Corroboration guards (PB2): Coinbase-leg freshness/confidence; **multi-poll persistence** (pinned N, reset on disappearance); **max-edge suspicion ceiling** (suppress + warn if edge > ceiling); **TrueX `/market/trade` tape recency/outlier guard** using the public REST trade prints confirmed in 0.2
+  - [ ] 3.7 Tape ingestion strategy for the PB2 guard: define polling cadence, cache lifetime, timeout/backoff behavior, stale-data handling, and tests proving the tape check does **not** turn every `/market/quote` poll into a second hot-path REST loop
+  - [ ] 3.8 Basis gate (PB1): suppress all detection if `pyusdUsd` stale/missing or `|pyusdUsd−1| > pyusdDepegThresholdBps`
+  - [ ] 3.9 Dedup (FR16): key on `bestBid + bestBidQty` (not timestamp); add qty-decay tolerance (recommend treating reductions within 10% as the same persisting order) so a partially-taken bid is not re-logged every poll
+  - [ ] 3.10 Structured `would-take` log: side, size, truexPrice, rawEdgeBps, basisAdjEdgeBps, pyusdUsd, coinbaseFresh, truexTapeAgeS, dedupKey, suppressReason(if any)
+  - [ ] 3.11 Fill/miss attribution: record whether the targeted bid disappears shortly after (TrueX's quoter likely took it) vs persists
+  - [ ] 3.12 Shadow-path alerting (FR26): rate-thresholded alerts for sustained zero-detection while market is active, basis/depeg suppression spikes, and edge-ceiling trips
+  - [ ] 3.13 **HARD: no order dispatch** — detection returns/logs only; Phase 1 must not touch `_sendNewOrder` / `_sendCancel`; output type is non-dispatchable
+  - [ ] 3.14 Unit tests: edge math (basis), fires at/above threshold + not below, suppression (stale/low-conf Coinbase, stale truexEbbo, basis stale/depeg, edge>ceiling, tape-outlier if applicable), dedup, inventory-reducing-only, minTakeSize floor, **assert zero sendMessage on the take path**
+  - [ ] 3.15 Orchestrator-layer tests: new poll loop has zero call edges to FIX and invokes a non-dispatchable shadow-evaluation path only
+  - [ ] 3.16 Tests pass
+  - [ ] 3.17 `/adversarial-reviewer` local (real-money-adjacent logic even though no sends — verify the no-send invariant holds on all branches)
+  - [ ] 3.18 `/pre-push-review`
+  - [ ] 3.19 Smoke (`scripts/smoke-shadow-take.ts`): synthetic dislocated book + fresh Coinbase + basis → asserts one would-take log with correct basis-adj edge AND zero FIX sends; second identical poll → deduped (no second log)
+  - [ ] 3.20 `gh pr create`
+  - [ ] 3.21 Solicit `@coderabbitai review` (re-tag at 5 min)
+  - [ ] 3.22 `/pr-review-loop <PR#>`
+  - [ ] 3.23 Merge after reviewer pass + CI green
+  - [ ] 3.24 Pull `main`, validate; **do NOT deploy yet** (enabled in 4.0)
+  - [ ] 3.25 Mini-narrative
 
 - [ ] **4.0 Shadow enablement + smoke + analysis** (requires 3.0) — smoke: mandatory; CONFIG portion noted
   - [ ] 4.1 Create feature branch `feat/shadow-take-enable` from `main`
@@ -165,22 +168,23 @@ Sending real taker orders; `_canTakeNow()` live gate; in-flight-aware sizing + n
 Two internal lenses (plan-completeness skeptic = REVISE; codebase-feasibility engineer = 2 false
 assumptions). Amendments below override the task bodies above where they conflict.
 
-### Feasibility corrections (false assumptions found)
-- **R1 (task 0.0/3.4/3.7/3.8):** `/market/quote` has **no `last_trade` and no `order_count`** — the
-  PB2 TrueX-tape recency/outlier guard has no data. Spike (0.0) must find a tape source or **drop
-  the tape check** and rely on multi-poll persistence + `bid_qty` decay. Remove `truexTapeAgeS` from
-  the log (3.7) unless 0.2 finds a source.
-- **R2 (task 1.4):** add a `parseMarketQuote` helper (string→float, nanos `timestamp`); response is
-  not pre-parsed. PRD §7 field list is inaccurate — trust 0.1's raw dump.
+### Feasibility corrections (updated by live 0.0 findings)
+- **R1 (task 0.0/1.0/3.0):** live prod `/market/quote` on **2026-06-18** returns an **array** with
+  nested `info.last_trade`, `info.best_bid.order_count`, `info.best_ask.order_count`, and nanos
+  `last_update` fields. The earlier flat `MarketQuoteResponse` assumption was wrong; Phase 1 should
+  use the nested live payload rather than the stale pairing assumption.
+- **R2 (task 1.4):** add a `parseMarketQuote` helper for the real **array + nested info** response
+  shape (string→float, nanos timestamps). PRD §7's earlier field list is inaccurate — trust 0.1's
+  raw prod dump.
 - **R3 (task 1.0/1.6):** the maker marketable/slide guard is **already inert in prod** (Coinbase
   adapter has no `getBestBidAsk`, so `truexBook` never populates). Adding `truexEbbo` is a safe
   additive field. Reword 1.6: assert the poll feeds **only** `truexEbbo` and does NOT wire into
   `truexBook`/`marketDataProvider` (guards against scope-creep, not a live regression). Engine side
   of 1.0 is small; the **poll loop + resilience (1.5) is the real work** (no existing pattern to copy).
-- **R4 (task 2.0 — SPLIT):** no PYUSD-USD source exists; `PriceAggregator` is single-symbol. Split:
-  **2.0a** stand up + verify a real PYUSD-USD feed (second `CoinbaseWsIngest` instance, or REST
-  fallback if 0.3 shows no WS product) with its own freshness; **2.0b** plumb `pyusdUsd` setter +
-  `_isPyusdBasisFresh()` into the engine (null-default). 2.0a is the hidden-size risk.
+- **R4 (task 2.0 — SPLIT):** Coinbase `PYUSD-USD` is **delisted** on `ws-feed.exchange.coinbase.com`,
+  so a second `CoinbaseWsIngest` instance is off the table. Use a live public alternative for
+  **2.0a** (currently Kraken REST ticker `PYUSDUSD` is confirmed live), then plumb `pyusdUsd` into
+  the engine in **2.0b**.
 - **R5 (task 3.2):** do **not** modify `computeTakeEdgeBps` (it's on the live maker-adjacent path).
   Apply basis by passing `executionPrice = truexBid / pyusdUsd` (fairValue = coinbaseBid) — formula
   works unchanged.
@@ -197,6 +201,10 @@ assumptions). Amendments below override the task bodies above where they conflic
 - **R8 (task 3.6 dedup):** key on **`bestBid + bestBidQty`** (NOT `timestamp` — it changes every
   poll and would defeat dedup). Add a qty-decay tolerance so a partially-taken persisting order
   isn't re-logged each poll.
+- **R17 (task 0.2/3.6/3.9):** a public REST tape **does** exist at `GET /market/trade?instrument_id=<id>`.
+  The endpoint returns recent public prints for `BTC-PYUSD`; unknown pagination params like `limit`,
+  `page_size`, and `start` are rejected. Use this as the initial PB2 tape source and restore
+  `truexTapeAgeS` to the shadow log.
 
 ### Plan/safety gaps (added requirements)
 - **R9 — `shadowTakeMode` precedence (task 4.3 + new test):** when `shadowTakeMode === true`, the
