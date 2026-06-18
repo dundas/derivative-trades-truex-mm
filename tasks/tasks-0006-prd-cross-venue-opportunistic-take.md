@@ -138,7 +138,7 @@ Phase 2 (live takes) is gated on Phase 1 data and explicitly out of scope here.
   - [x] 4.8 Unit tests: flag gating (off → no detection at all), config plumbing, and `shadowTakeMode=true && allowTakerOrders=true` still yields **zero `fixConnection.sendMessage`**
   - [x] 4.9 Tests pass
   - [x] 4.10 `/adversarial-reviewer` local
-  - [ ] 4.11 `/pre-push-review`
+  - [x] 4.11 `/pre-push-review`
   - [x] 4.12 Smoke: run with `shadowTakeMode` on against synthetic feed → would-take logs emitted, zero sends; off → nothing
   - [ ] 4.13 `gh pr create`
   - [ ] 4.14 Solicit `@coderabbitai review` (re-tag at 5 min)
