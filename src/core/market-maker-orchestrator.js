@@ -1090,6 +1090,11 @@ export class MarketMakerOrchestrator extends EventEmitter {
       this._shadowZeroDetectionWindowStartedAt = now;
     } else if (!zeroDetectionEligible) {
       this._shadowZeroDetectionWindowStartedAt = 0;
+      if (this._shadowNoDetectionAlertActive) {
+        this._shadowNoDetectionAlertActive = false;
+        this.alertManager.sendRecovery({ reason: 'Shadow take zero detections while market active' })
+          .catch((err) => this.logger.error(`[Orchestrator] Shadow zero-detection recovery failed: ${err.message}`));
+      }
     }
     this._shadowMetrics.evaluations++;
 

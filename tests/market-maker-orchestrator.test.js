@@ -1032,6 +1032,27 @@ describe('MarketMakerOrchestrator', () => {
       expect(orchestrator._shadowZeroDetectionWindowStartedAt).toBe(0);
       expect(alertManager.sendAlert).not.toHaveBeenCalled();
     });
+
+    test('clears an active zero-detection alert when the market becomes non-evaluable', async () => {
+      const alertManager = { sendAlert: jest.fn(async () => ({})), sendRecovery: jest.fn(async () => ({})) };
+      const { orchestrator } = createOrchestrator({
+        alertManager,
+        shadowZeroDetectionAlertThresholdMs: 1000,
+      });
+
+      orchestrator._shadowNoDetectionAlertActive = true;
+      orchestrator._shadowZeroDetectionWindowStartedAt = Date.now() - 1500;
+      orchestrator._handleShadowEvaluationResult({
+        logs: [],
+        evaluation: { wouldTake: false, suppressReason: 'coinbase-stale' },
+      });
+
+      expect(orchestrator._shadowNoDetectionAlertActive).toBe(false);
+      expect(orchestrator._shadowZeroDetectionWindowStartedAt).toBe(0);
+      expect(alertManager.sendRecovery).toHaveBeenCalledWith({
+        reason: 'Shadow take zero detections while market active',
+      });
+    });
   });
 
   describe('event wiring: FIX execution reports', () => {
