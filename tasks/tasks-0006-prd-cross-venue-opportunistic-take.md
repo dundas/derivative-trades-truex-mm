@@ -123,9 +123,9 @@ Phase 2 (live takes) is gated on Phase 1 data and explicitly out of scope here.
   - [ ] 3.20 `gh pr create`
   - [ ] 3.21 Solicit `@coderabbitai review` (re-tag at 5 min)
   - [ ] 3.22 `/pr-review-loop <PR#>`
-  - [ ] 3.22 Merge after reviewer pass + CI green
-  - [ ] 3.23 Pull `main`, validate; **do NOT deploy yet** (enabled in 4.0)
-  - [ ] 3.24 Mini-narrative
+  - [ ] 3.23 Merge after reviewer pass + CI green
+  - [ ] 3.24 Pull `main`, validate; **do NOT deploy yet** (enabled in 4.0)
+  - [ ] 3.25 Mini-narrative
 
 - [ ] **4.0 Shadow enablement + smoke + analysis** (requires 3.0) — smoke: mandatory; CONFIG portion noted
   - [ ] 4.1 Create feature branch `feat/shadow-take-enable` from `main`
