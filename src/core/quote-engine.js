@@ -378,9 +378,15 @@ export class QuoteEngine extends EventEmitter {
         }
 
         const priceDiffTicks = Math.abs(match.order.price - dq.price) / this.config.tickSize;
+        const sizeShortfall = dq.size - match.order.size;
 
         if (priceDiffTicks >= this.config.repriceThresholdTicks) {
           // Price moved enough: cancel old, place new
+          toReplace.push({ cancel: match.clOrdID, cancelOrder: match.order, place: dq });
+        } else if (sizeShortfall > 0 && dq.price * sizeShortfall >= this.config.minNotional) {
+          // Order is under-quoted vs desired (e.g. left smaller by a partial fill) and the
+          // shortfall is economically meaningful — replace to replenish back to target size.
+          // The minNotional guard prevents churn on tiny rounding differences.
           toReplace.push({ cancel: match.clOrdID, cancelOrder: match.order, place: dq });
         }
         // Otherwise keep existing (no action)
@@ -664,7 +670,8 @@ export class QuoteEngine extends EventEmitter {
               ? parseFloat(fields['151'])
               : (tracked.size - lastQty);
             tracked.size = Math.max(0, leavesQty);
-            tracked.status = 'active';
+            // Preserve status: a partial fill of an order with a cancel already in flight must
+            // stay 'cancelling' so reconcileOrders doesn't double-act on an in-flight order.
           }
         }
         break;

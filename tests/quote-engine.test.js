@@ -367,6 +367,43 @@ describe('QuoteEngine', () => {
       expect(actions.toReplace.length).toBe(0);
     });
 
+    it('should replenish a partially-filled (under-sized) order back to target size', () => {
+      const engine = createEngine({ levels: 1, repriceThresholdTicks: 1, tickSize: 0.50, minNotional: 1.0 });
+      const mid = 100000;
+      const desired = engine.computeDesiredQuotes(mid, { bidSkewTicks: 0, askSkewTicks: 0 });
+
+      // Active orders at the SAME price but reduced size (as if partially filled)
+      const active = new Map();
+      for (const dq of desired) {
+        active.set(`PF_${dq.side}_${dq.level}`, {
+          side: dq.side, price: dq.price, size: dq.size * 0.4, // 60% filled → under-quoted
+          level: dq.level, status: 'active', placedAt: Date.now(),
+        });
+      }
+
+      const actions = engine.reconcileOrders(desired, active);
+      expect(actions.toReplace.length).toBe(desired.length); // top up each under-sized level
+      expect(actions.toPlace.length).toBe(0);
+    });
+
+    it('should NOT replenish when the size shortfall is below minNotional (avoid churn)', () => {
+      const engine = createEngine({ levels: 1, repriceThresholdTicks: 1, tickSize: 0.50, minNotional: 1.0 });
+      const mid = 100000;
+      const desired = engine.computeDesiredQuotes(mid, { bidSkewTicks: 0, askSkewTicks: 0 });
+
+      const active = new Map();
+      for (const dq of desired) {
+        // shortfall * price must be < minNotional ($1): at $100k, shortfall < 0.00001 BTC
+        active.set(`TINY_${dq.side}_${dq.level}`, {
+          side: dq.side, price: dq.price, size: dq.size - 0.000005,
+          level: dq.level, status: 'active', placedAt: Date.now(),
+        });
+      }
+
+      const actions = engine.reconcileOrders(desired, active);
+      expect(actions.toReplace.length).toBe(0); // tiny shortfall ignored
+    });
+
     it('should cancel-replace when price moves >= repriceThresholdTicks', () => {
       const engine = createEngine({ levels: 1, repriceThresholdTicks: 1, tickSize: 0.50 });
       const mid = 100000;
@@ -1502,6 +1539,20 @@ describe('QuoteEngine', () => {
       expect(engine.activeOrders.has('CLO005')).toBe(true);
       expect(engine.activeOrders.get('CLO005').size).toBeCloseTo(0.0066, 8);
       expect(engine.activeOrders.get('CLO005').status).toBe('active');
+    });
+
+    it('should preserve cancelling status on a partial fill of an in-flight cancel', () => {
+      const engine = createEngine();
+      const fillEvents = [];
+      engine.on('fill', (e) => fillEvents.push(e));
+      // Order has a cancel in flight (status 'cancelling') when a partial fill lands
+      engine.activeOrders.set('CLO008', { side: 'sell', price: 100250, size: 0.01, level: 1, status: 'cancelling', placedAt: Date.now() });
+
+      engine.onExecutionReport({ '11': 'CLO008', '39': '1', '54': '2', '31': '100250', '32': '0.004', '151': '0.006' });
+
+      expect(fillEvents.length).toBe(1);                              // fill still recorded
+      expect(engine.activeOrders.get('CLO008').size).toBeCloseTo(0.006, 8);
+      expect(engine.activeOrders.get('CLO008').status).toBe('cancelling'); // NOT flipped to active
     });
 
     it('should reduce by LastQty when LeavesQty (151) is absent on a partial fill', () => {
