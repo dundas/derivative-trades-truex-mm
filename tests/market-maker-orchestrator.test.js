@@ -60,6 +60,7 @@ function createMockQuoteEngine() {
   qe.activeOrders = new Map();
   qe.onPriceUpdate = jest.fn();
   qe.updateTruexEbbo = jest.fn();
+  qe.updatePyusdUsd = jest.fn();
   qe.onExecutionReport = jest.fn();
   qe.onOrderCancelReject = jest.fn();
   qe.cancelAllQuotes = jest.fn();
@@ -75,6 +76,8 @@ function createMockQuoteEngine() {
     lastMid: 0,
     isQuoting: false,
     truexEbbo: null,
+    pyusdUsd: null,
+    pyusdUsdFresh: false,
   }));
   return qe;
 }
@@ -716,7 +719,14 @@ describe('MarketMakerOrchestrator', () => {
 
       expect(mocks.krakenRestClient.getTicker).toHaveBeenCalledWith('PYUSD/USD', { timeoutMs: 1 });
       expect(orchestrator.pyusdUsd.price).toBe(1.00005);
+      expect(mocks.quoteEngine.updatePyusdUsd).toHaveBeenCalledWith(expect.objectContaining({
+        price: 1.00005,
+        bid: 1.0,
+        ask: 1.0001,
+        source: 'kraken-rest',
+      }));
       expect(mocks.quoteEngine.onPriceUpdate).not.toHaveBeenCalled();
+      expect(mocks.fixConnection.sendMessage).not.toHaveBeenCalled();
     });
 
     test('falls back to the next source when the first source fails', async () => {

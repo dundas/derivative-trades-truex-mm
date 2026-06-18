@@ -90,6 +90,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       symbol: this.symbol,
       clientId: options.clientId || null,
       truexBookStaleThresholdMs: options.truexBookStaleThresholdMs || 10000,
+      pyusdUsdStaleThresholdMs: options.pyusdUsdStaleThresholdMs ?? 15000,
       marketablePostOnlyAction: options.marketablePostOnlyAction || 'skip',
       replaceMode: options.replaceMode || 'passive-safe',
       minActiveLevelsPerSide: options.minActiveLevelsPerSide ?? 1,
@@ -943,6 +944,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       }
 
       this.pyusdUsd = reference;
+      this.quoteEngine.updatePyusdUsd?.(reference);
       const hadFailureAlert = this._pyusdUsdFailureAlertActive;
       this._pyusdUsdConsecutiveErrors = 0;
       this._pyusdUsdCurrentBackoffMs = this.pyusdUsdPollIntervalMs;

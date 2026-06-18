@@ -53,6 +53,7 @@ export class QuoteEngine extends EventEmitter {
       targetCompID: options.targetCompID || 'TRUEX_UAT_OE',
       clientId: options.clientId || null, // TrueX PartyID (tag 448) — required for order entry
       truexBookStaleThresholdMs: options.truexBookStaleThresholdMs || 10000,
+      pyusdUsdStaleThresholdMs: options.pyusdUsdStaleThresholdMs || 15000,
       marketablePostOnlyAction: options.marketablePostOnlyAction || 'skip',
       replaceMode: options.replaceMode || 'passive-safe',
       minActiveLevelsPerSide: options.minActiveLevelsPerSide ?? 0,
@@ -98,6 +99,7 @@ export class QuoteEngine extends EventEmitter {
     this.lastMarketableAloSkip = null;
     this.truexBook = null;
     this.truexEbbo = null;
+    this.pyusdUsd = null;
     this.takerWindowStartedAt = Date.now();
     this.takerOrdersThisWindow = 0;
     this.takerNotionalThisWindow = 0;
@@ -132,6 +134,18 @@ export class QuoteEngine extends EventEmitter {
       lastTradeQty: book.lastTradeQty ?? null,
       lastTradeTs: book.lastTradeTs ?? null,
       timestamp: book.timestamp ?? null,
+    };
+  }
+
+  updatePyusdUsd(reference) {
+    if (!reference) return;
+    this.pyusdUsd = {
+      price: reference.price ?? null,
+      bid: reference.bid ?? null,
+      ask: reference.ask ?? null,
+      timestamp: reference.timestamp ?? null,
+      source: reference.source ?? null,
+      pair: reference.pair ?? null,
     };
   }
 
@@ -883,6 +897,8 @@ export class QuoteEngine extends EventEmitter {
       recentRejectsByReason: Object.fromEntries(this.recentRejectsByReason),
       truexEbbo: this.truexEbbo ? { ...this.truexEbbo } : null,
       truexEbboFresh: this._isTruexEbboFresh(),
+      pyusdUsd: this.pyusdUsd ? { ...this.pyusdUsd } : null,
+      pyusdUsdFresh: this._isPyusdBasisFresh(),
     };
   }
 
@@ -977,6 +993,14 @@ export class QuoteEngine extends EventEmitter {
 
   _isTruexEbboFresh(book = this.truexEbbo) {
     return !!(book && book.timestamp && (Date.now() - book.timestamp) <= this.config.truexBookStaleThresholdMs);
+  }
+
+  _isPyusdBasisFresh(reference = this.pyusdUsd) {
+    return !!(
+      reference &&
+      reference.timestamp &&
+      (Date.now() - reference.timestamp) <= this.config.pyusdUsdStaleThresholdMs
+    );
   }
 
   _isMarketablePostOnly(quote) {
