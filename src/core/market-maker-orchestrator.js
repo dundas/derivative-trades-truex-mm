@@ -1078,8 +1078,18 @@ export class MarketMakerOrchestrator extends EventEmitter {
     if (!result?.evaluation) return;
     const now = Date.now();
     this._rollShadowMetricsWindow(now);
-    if (!this._shadowZeroDetectionWindowStartedAt) {
+    const zeroDetectionEligibleSuppressReasons = new Set([
+      'coinbase-stale',
+      'coinbase-low-confidence',
+      'truex-ebbo-stale',
+      'truex-tape-stale',
+      'basis-stale',
+    ]);
+    const zeroDetectionEligible = !zeroDetectionEligibleSuppressReasons.has(result.evaluation.suppressReason);
+    if (zeroDetectionEligible && !this._shadowZeroDetectionWindowStartedAt) {
       this._shadowZeroDetectionWindowStartedAt = now;
+    } else if (!zeroDetectionEligible) {
+      this._shadowZeroDetectionWindowStartedAt = 0;
     }
     this._shadowMetrics.evaluations++;
 

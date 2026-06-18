@@ -1015,6 +1015,23 @@ describe('MarketMakerOrchestrator', () => {
         reason: 'Shadow take zero detections while market active',
       }));
     });
+
+    test('does not arm the zero-detection timer while shadow inputs are not evaluable', async () => {
+      const alertManager = { sendAlert: jest.fn(async () => ({})), sendRecovery: jest.fn(async () => ({})) };
+      const { orchestrator } = createOrchestrator({
+        alertManager,
+        shadowZeroDetectionAlertThresholdMs: 1000,
+      });
+
+      orchestrator._handleShadowEvaluationResult({
+        logs: [],
+        evaluation: { wouldTake: false, suppressReason: 'coinbase-stale' },
+      });
+      orchestrator._updateShadowAlerts(Date.now() + 1500);
+
+      expect(orchestrator._shadowZeroDetectionWindowStartedAt).toBe(0);
+      expect(alertManager.sendAlert).not.toHaveBeenCalled();
+    });
   });
 
   describe('event wiring: FIX execution reports', () => {
