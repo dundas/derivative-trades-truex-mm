@@ -64,11 +64,13 @@ If reason=1, remove from local tracking. Otherwise restore to 'active'.
 ### Critical Rules
 - Never cancel 'pending' orders — TrueX returns "Unknown order"
 - reconcileOrders skips 'pending' AND 'cancelling' status orders
-- minRepriceIntervalMs=5000 prevents cascading cancel/place failures
+- Current production `minRepriceIntervalMs=1500` limits reprice churn; the engine default
+  remains higher in older configs and UAT-style scripts.
 - 3+ consecutive rejects trigger 5s backoff (rejectBackoffUntil)
 - cancelToOrigMap tracks cancel clOrdID → original clOrdID for ack matching
 - 50 open order limit per client ID on UAT
-- Rate limit: ~10 msg/sec. maxOrdersPerSecond default=8 with queue overflow
+- Production rate limit is `maxOrdersPerSecond=6`; engine-level defaults in generic
+  constructors remain higher, with overflow drained from the queue.
 - TimeInForce: GTC (59=1) and IOC (59=3) ONLY. No GTD/TTL.
 - BTC size increment: 0.0001 (sizeDecimalPlaces=4), tick size: $0.50
 
@@ -142,7 +144,8 @@ Detection inputs:
 - Coinbase bid/freshness/confidence from aggregated price state
 
 Logs:
-- `[SHADOW] {"type":"shadow-basis-sample", ...}` on every evaluable shadow pass
+- `[SHADOW] {"type":"shadow-basis-sample", ...}` on every shadow evaluation;
+  non-evaluable samples are marked by `suppressReason` and may carry `pyusdUsd: null`
 - `[SHADOW] {"type":"would-take", ...}` only for deduped, persistence-confirmed opportunities
 - `[SHADOW] {"type":"shadow-take-attribution", ...}` when a logged target later persists or disappears
 
