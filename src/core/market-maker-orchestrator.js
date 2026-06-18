@@ -153,7 +153,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this.truexEbboMaxBackoffMs = options.truexEbboMaxBackoffMs ?? 30000;
     this.truexEbboFailureAlertThreshold = options.truexEbboFailureAlertThreshold ?? 3;
     this.truexEbboInstrumentId = options.truexEbboInstrumentId ?? null;
-    this.pyusdUsdPollIntervalMs = options.pyusdUsdPollIntervalMs ?? 5000;
+    this.pyusdUsdPollIntervalMs = options.pyusdUsdPollIntervalMs ?? 0;
     const configuredPyusdUsdPollTimeoutMs =
       options.pyusdUsdPollTimeoutMs ?? Math.max(250, this.pyusdUsdPollIntervalMs - 100);
     this.pyusdUsdPollTimeoutMs = Math.min(
@@ -233,6 +233,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
    */
   async start() {
     this.logger.info(`[Orchestrator] Starting market maker session ${this.sessionId}`);
+    this._validatePyusdUsdPollingConfig();
 
     // 1. Wire event handlers
     this._wireEvents();
@@ -860,14 +861,18 @@ export class MarketMakerOrchestrator extends EventEmitter {
   }
 
   _startPyusdUsdPoller() {
-    if (this.pyusdUsdPollIntervalMs <= 0 || this.pyusdUsdReferenceSources.length === 0) return;
-    if (!this.krakenRestClient && this.pyusdUsdReferenceSources.some((source) => source.type === 'kraken-rest')) {
-      throw new Error('PYUSD/USD reference polling requires options.krakenRestClient for kraken-rest sources');
-    }
+    if (this.pyusdUsdPollIntervalMs <= 0 || this.pyusdUsdReferenceSources.length === 0 || !this.krakenRestClient) return;
     this._scheduleNextPyusdUsdPoll(0);
     this.logger.info(
       `[Orchestrator] PYUSD/USD reference poll enabled (every ${this.pyusdUsdPollIntervalMs}ms, timeout ${this.pyusdUsdPollTimeoutMs}ms)`
     );
+  }
+
+  _validatePyusdUsdPollingConfig() {
+    if (this.pyusdUsdPollIntervalMs <= 0) return;
+    if (!this.krakenRestClient && this.pyusdUsdReferenceSources.some((source) => source.type === 'kraken-rest')) {
+      throw new Error('PYUSD/USD reference polling requires options.krakenRestClient for kraken-rest sources');
+    }
   }
 
   _scheduleNextPyusdUsdPoll(delayMs = this.pyusdUsdPollIntervalMs) {
