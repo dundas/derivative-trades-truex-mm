@@ -26,10 +26,10 @@ Phase 2 (live takes) is gated on Phase 1 data and explicitly out of scope here.
 
 ## Task Ordering & Dependencies
 
-- **0.0** (data-source spike) is a hard prerequisite for **2.0a** and informs **3.0**.
+- **0.0** (data-source spike) is a hard prerequisite for **2.0a** and **3.0**.
 - **1.0** (truexEbbo feed) is independent and should merge before **3.0**.
 - **2.0a** (real PYUSD/USD feed) must merge before **2.0b** (engine plumbing).
-- **3.0** (shadow detection + logging) requires 1.0 + 2.0b on `main`.
+- **3.0** (shadow detection + logging) requires 0.0 + 1.0 + 2.0b on `main`.
 - **4.0** (enablement + smoke + analysis) requires 3.0 on `main`.
 - **1.0** is a safe no-op in isolation. **2.0a** is not assumed to be one until the feed design is confirmed in 0.0.
 
@@ -98,11 +98,11 @@ Phase 2 (live takes) is gated on Phase 1 data and explicitly out of scope here.
   - [ ] 2.27 Pull `main`, validate
   - [ ] 2.28 Mini-narrative
 
-- [ ] **3.0 Shadow opportunity detection + "would-take" logging** (requires 1.0 + 2.0b) — smoke: mandatory (`scripts/smoke-shadow-take.ts`)
+- [ ] **3.0 Shadow opportunity detection + "would-take" logging** (requires 0.0 + 1.0 + 2.0b) — smoke: mandatory (`scripts/smoke-shadow-take.ts`)
   - [ ] 3.1 Create feature branch `feat/shadow-take-detection` from `main`
   - [ ] 3.2 Implement standalone `evaluateShadowTake()` that returns a loggable record only; it MUST NOT route through `_prepareQuoteForSend`, `_sendNewOrder`, or `_sendCancel`
   - [ ] 3.3 Basis-adjusted edge (§11.4): apply basis by calling `computeTakeEdgeBps` with `executionPrice = truexBid / pyusdUsd` and `fairValue = coinbaseBid`; do **not** modify `computeTakeEdgeBps`
-  - [ ] 3.4 Trigger `evaluateShadowTake()` only from the `/market/quote` poll handler after `updateTruexEbbo`, using cached `lastAggregatedPrice`; do NOT run it from `onPriceUpdate`
+  - [ ] 3.4 Trigger `evaluateShadowTake()` from the `/market/quote` poll handler after `updateTruexEbbo`, and also on **material/coalesced** Coinbase fair-value changes using cached `lastAggregatedPrice`; do NOT run it on every raw `onPriceUpdate` tick in the hot maker path
   - [ ] 3.5 Detection step: sell-take candidate when `truexEbbo.bestBid` adjusted-edge ≥ `minTakeEdgeBps`; size = `min(bestBidQty, balance-capped, maxPosition headroom, maxTakeNotionalPerOrder)`; inventory-reducing only (long); suppress dust via `minTakeSizeBTC`
   - [ ] 3.6 Corroboration guards (PB2): Coinbase-leg freshness/confidence; **multi-poll persistence** (pinned N, reset on disappearance); **max-edge suspicion ceiling** (suppress + warn if edge > ceiling); **TrueX tape/outlier guard only if 0.2 finds a real public source**
   - [ ] 3.7 Basis gate (PB1): suppress all detection if `pyusdUsd` stale/missing or `|pyusdUsd−1| > pyusdDepegThresholdBps`
@@ -128,9 +128,9 @@ Phase 2 (live takes) is gated on Phase 1 data and explicitly out of scope here.
   - [ ] 4.1 Create feature branch `feat/shadow-take-enable` from `main`
   - [ ] 4.2 `shadowTakeMode` config flag (default **false**); thresholds (`minTakeEdgeBps`, `maxEdgeCeilingBps`, `pyusdDepegThresholdBps`, `maxTakeNotionalPerOrder`, `minTakeSizeBTC`, persistence N), poll interval — all configurable and pinned before enable
   - [ ] 4.3 Wire flags through orchestrator → engine; when `shadowTakeMode` true, run detection+logging only and make the send path unreachable regardless of `allowTakerOrders`
-  - [ ] 4.4 Enable `shadowTakeMode: true` in `run-prod.js` (observe-only) with conservative thresholds
-  - [ ] 4.5 In UAT, verify TrueX FIX honors IOC (`59=3`) with an observe-only fill+cancel flow; record the outcome as an explicit input to the Phase-2 go/no-go decision
-  - [ ] 4.6 Before enablement, pre-commit explicit GO/ABORT criteria: minimum observation window, fill-rate red-flag line, depeg/basis-vol thresholds, and required post-basis edge
+  - [ ] 4.4 In UAT, verify TrueX FIX honors IOC (`59=3`) with an observe-only fill+cancel flow; record the outcome as an explicit input to the Phase-2 go/no-go decision
+  - [ ] 4.5 Before enablement, pre-commit explicit GO/ABORT criteria: minimum observation window, fill-rate red-flag line, depeg/basis-vol thresholds, and required post-basis edge
+  - [ ] 4.6 Enable `shadowTakeMode: true` in `run-prod.js` (observe-only) with conservative thresholds that match the pre-committed criteria
   - [ ] 4.7 `scripts/analyze-shadow-takes.js`: parse would-take logs → edge distribution, fill/miss rate, live PYUSD basis stats; output the Phase-2 go/no-go summary against the pre-committed criteria and UAT IOC result
   - [ ] 4.8 Unit tests: flag gating (off → no detection at all), config plumbing, and `shadowTakeMode=true && allowTakerOrders=true` still yields **zero `fixConnection.sendMessage`**
   - [ ] 4.9 Tests pass
@@ -152,7 +152,7 @@ Sending real taker orders; `_canTakeNow()` live gate; in-flight-aware sizing + n
 
 ## Adversarial review of this task list
 - **No-send invariant** is made an explicit, tested sub-task in every parent (1.11, 2.8/2.22, 3.12/3.13/3.18, 4.8/4.12) — the executor cannot accidentally ship a live take.
-- **Sequencing** enforced: 3.0 lists "requires 1.0+2.0b on main"; 4.0 requires 3.0; 3.23 explicitly says don't deploy until 4.0.
+- **Sequencing** enforced: 3.0 lists "requires 0.0+1.0+2.0b on main"; 4.0 requires 3.0; 3.23 explicitly says don't deploy until 4.0.
 - **C3/FR17 regression** (feed-swap breaking maker guard) gets its own guard sub-task (1.6) and test.
 - **Basis-never-assume-1** is structural: 2.16 defaults `pyusdUsd` to null, 3.7 suppresses on missing/stale — no silent =1.
 - **Go/no-go is a deliverable** (4.6/4.19), so Phase 1 actually produces the decision data, not just logs.
