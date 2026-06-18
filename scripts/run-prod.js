@@ -33,6 +33,7 @@
 import { MarketMakerOrchestrator } from '../src/core/market-maker-orchestrator.js';
 import { DataPipelineManager } from '../src/data-pipeline/data-pipeline-manager.js';
 import { PriceAggregator } from '../src/connectors/aggregator/PriceAggregator.ts';
+import { KrakenRestClient } from '../src/connectors/kraken/KrakenRestClient.ts';
 import { CoinbaseWsIngest } from '../src/data-pipeline/coinbase-ws-ingest.js';
 import { CoinbaseMarketDataAdapter } from '../src/data-pipeline/coinbase-market-data-adapter.js';
 
@@ -127,6 +128,13 @@ const config = {
 
   // REST URL for reconciliation + balance fetching
   restUrl: process.env.TRUEX_REST_URL || 'http://178.156.230.110:3006',
+  pyusdUsdPollIntervalMs: parseInt(process.env.PYUSD_USD_POLL_INTERVAL_MS || '5000', 10),
+  pyusdUsdPollTimeoutMs: parseInt(process.env.PYUSD_USD_POLL_TIMEOUT_MS || '1000', 10),
+  pyusdUsdStaleThresholdMs: parseInt(process.env.PYUSD_USD_STALE_THRESHOLD_MS || '15000', 10),
+  pyusdUsdReferenceSources: [
+    { type: 'kraken-rest', pair: process.env.PYUSD_USD_PRIMARY_PAIR || 'PYUSD/USD' },
+    { type: 'kraken-rest', pair: process.env.PYUSD_USD_FALLBACK_PAIR || 'PYUSDUSD' },
+  ],
 };
 
 // ---------------------------------------------------------------------------
@@ -215,6 +223,7 @@ let orchestrator = null;
 let coinbaseIngest = null;
 let coinbaseMdAdapter = null;
 let priceAggregator = null;
+let krakenRestClient = null;
 let dataPipeline = null;
 let isShuttingDown = false;
 
@@ -240,6 +249,8 @@ async function main() {
   logger.info(`Redis:         ${config.redisUrl ? 'configured' : 'none'}`);
   logger.info(`PostgreSQL:    ${config.pgUrl ? 'configured' : 'none'}`);
   logger.info('');
+
+  krakenRestClient = new KrakenRestClient({});
 
   // 0. Cancel orphaned orders from previous sessions via REST API
   logger.info('[0/5] Cancelling orphaned orders via REST API...');
@@ -412,6 +423,11 @@ async function main() {
 
     // REST reconciliation + balance refresh
     restUrl: config.restUrl,
+    pyusdUsdPollIntervalMs: config.pyusdUsdPollIntervalMs,
+    pyusdUsdPollTimeoutMs: config.pyusdUsdPollTimeoutMs,
+    pyusdUsdStaleThresholdMs: config.pyusdUsdStaleThresholdMs,
+    pyusdUsdReferenceSources: config.pyusdUsdReferenceSources,
+    krakenRestClient,
 
     // No hedging initially
     krakenClient: null,
@@ -467,6 +483,7 @@ async function main() {
     const inv = status.inventory;
     const pnl = status.pnl;
     const quotes = status.quotes;
+    const pyusdUsd = status.pyusdUsd;
     logger.info(
       `[STATUS] pos=${inv.netPosition?.toFixed(4) || '0'} BTC | ` +
       `side=${inv.side || 'flat'} | ` +
@@ -475,6 +492,7 @@ async function main() {
       `fills=${inv.fillCount || 0} | ` +
       `base=${inv.baseBalance?.available?.toFixed(4) || '?'} BTC avail | ` +
       `quote=${inv.quoteBalance?.available?.toFixed(2) || '?'} PYUSD avail | ` +
+      `pyusdUsd=${pyusdUsd?.price?.toFixed?.(6) || '?'}${status.pyusdUsdFresh ? '' : ' stale'} | ` +
       `uptime=${((status.uptimeMs || 0) / 1000 / 60).toFixed(1)}min`
     );
   }, 60000);

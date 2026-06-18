@@ -153,6 +153,20 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this.truexEbboMaxBackoffMs = options.truexEbboMaxBackoffMs ?? 30000;
     this.truexEbboFailureAlertThreshold = options.truexEbboFailureAlertThreshold ?? 3;
     this.truexEbboInstrumentId = options.truexEbboInstrumentId ?? null;
+    this.pyusdUsdPollIntervalMs = options.pyusdUsdPollIntervalMs ?? 0;
+    const configuredPyusdUsdPollTimeoutMs =
+      options.pyusdUsdPollTimeoutMs ?? Math.max(250, this.pyusdUsdPollIntervalMs - 100);
+    this.pyusdUsdPollTimeoutMs = Math.min(
+      configuredPyusdUsdPollTimeoutMs,
+      Math.max(1, this.pyusdUsdPollIntervalMs - 1),
+    );
+    this.pyusdUsdStaleThresholdMs = options.pyusdUsdStaleThresholdMs ?? 15000;
+    this.pyusdUsdMaxBackoffMs = options.pyusdUsdMaxBackoffMs ?? 30000;
+    this.pyusdUsdFailureAlertThreshold = options.pyusdUsdFailureAlertThreshold ?? 3;
+    this.pyusdUsdReferenceSources = this._buildPyusdUsdReferenceSources(options.pyusdUsdReferenceSources);
+    this.krakenRestClient =
+      options.krakenRestClient ||
+      (options.krakenClient && typeof options.krakenClient.getTicker === 'function' ? options.krakenClient : null);
 
     // State
     this.isRunning = false;
@@ -180,6 +194,13 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this._truexEbboCurrentBackoffMs = this.truexEbboPollIntervalMs;
     this._truexEbboLastSuccessAt = 0;
     this._truexEbboFailureAlertActive = false;
+    this._pyusdUsdPollTimer = null;
+    this._pyusdUsdPollInFlight = false;
+    this._pyusdUsdConsecutiveErrors = 0;
+    this._pyusdUsdCurrentBackoffMs = this.pyusdUsdPollIntervalMs;
+    this._pyusdUsdLastSuccessAt = 0;
+    this._pyusdUsdFailureAlertActive = false;
+    this.pyusdUsd = null;
 
     // Alert manager (injectable for testing; defaults to env-driven config)
     this.alertManager = options.alertManager || new AlertManager({
@@ -212,6 +233,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
    */
   async start() {
     this.logger.info(`[Orchestrator] Starting market maker session ${this.sessionId}`);
+    this._validatePyusdUsdPollingConfig();
 
     // 1. Wire event handlers
     this._wireEvents();
@@ -291,6 +313,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this.isRunning = true;
     this.startedAt = Date.now();
     this._startTruexEbboPoller();
+    this._startPyusdUsdPoller();
 
     this.logger.info('[Orchestrator] Market maker started — waiting for price updates to begin quoting');
     this.emit('started', { sessionId: this.sessionId, timestamp: this.startedAt });
@@ -338,6 +361,10 @@ export class MarketMakerOrchestrator extends EventEmitter {
     if (this._truexEbboPollTimer) {
       clearTimeout(this._truexEbboPollTimer);
       this._truexEbboPollTimer = null;
+    }
+    if (this._pyusdUsdPollTimer) {
+      clearTimeout(this._pyusdUsdPollTimer);
+      this._pyusdUsdPollTimer = null;
     }
     if (this._watchdogTimer) {
       clearInterval(this._watchdogTimer);
@@ -425,6 +452,10 @@ export class MarketMakerOrchestrator extends EventEmitter {
       truexEbbo: this.quoteEngine.getQuoteStatus()?.truexEbbo || null,
       truexEbboLastSuccessAt: this._truexEbboLastSuccessAt || null,
       truexEbboConsecutiveErrors: this._truexEbboConsecutiveErrors,
+      pyusdUsd: this.pyusdUsd ? { ...this.pyusdUsd } : null,
+      pyusdUsdFresh: this._isPyusdUsdFresh(),
+      pyusdUsdLastSuccessAt: this._pyusdUsdLastSuccessAt || null,
+      pyusdUsdConsecutiveErrors: this._pyusdUsdConsecutiveErrors,
       dataPipeline: this.dataPipeline ? this.dataPipeline.getStats() : null,
     };
   }
@@ -809,6 +840,156 @@ export class MarketMakerOrchestrator extends EventEmitter {
         this.logger.warn(`[Orchestrator] TrueX EBBO poll loop error (non-fatal): ${err.message}`);
       });
     }, delayMs);
+  }
+
+  _buildPyusdUsdReferenceSources(configuredSources) {
+    const fallbackSources = [
+      { type: 'kraken-rest', pair: 'PYUSD/USD' },
+      { type: 'kraken-rest', pair: 'PYUSDUSD' },
+    ];
+
+    if (!Array.isArray(configuredSources) || configuredSources.length === 0) {
+      return fallbackSources;
+    }
+
+    return configuredSources
+      .filter((source) => source && typeof source.type === 'string')
+      .map((source) => ({
+        type: source.type,
+        pair: source.pair || null,
+      }));
+  }
+
+  _startPyusdUsdPoller() {
+    if (this.pyusdUsdPollIntervalMs <= 0 || this.pyusdUsdReferenceSources.length === 0 || !this.krakenRestClient) return;
+    this._scheduleNextPyusdUsdPoll(0);
+    this.logger.info(
+      `[Orchestrator] PYUSD/USD reference poll enabled (every ${this.pyusdUsdPollIntervalMs}ms, timeout ${this.pyusdUsdPollTimeoutMs}ms)`
+    );
+  }
+
+  _validatePyusdUsdPollingConfig() {
+    if (this.pyusdUsdPollIntervalMs <= 0) return;
+    if (!this.krakenRestClient && this.pyusdUsdReferenceSources.some((source) => source.type === 'kraken-rest')) {
+      throw new Error('PYUSD/USD reference polling requires options.krakenRestClient for kraken-rest sources');
+    }
+  }
+
+  _scheduleNextPyusdUsdPoll(delayMs = this.pyusdUsdPollIntervalMs) {
+    if (!this.isRunning) return;
+    if (this._pyusdUsdPollTimer) {
+      clearTimeout(this._pyusdUsdPollTimer);
+    }
+    this._pyusdUsdPollTimer = setTimeout(() => {
+      this._pollPyusdUsdReference().catch((err) => {
+        this.logger.warn(`[Orchestrator] PYUSD/USD poll loop error (non-fatal): ${err.message}`);
+      });
+    }, delayMs);
+  }
+
+  _isPyusdUsdFresh(reference = this.pyusdUsd) {
+    if (!reference?.timestamp) return false;
+    return Date.now() - reference.timestamp <= this.pyusdUsdStaleThresholdMs;
+  }
+
+  async _fetchPyusdUsdReferenceFromSource(source) {
+    if (source?.type !== 'kraken-rest') {
+      throw new Error(`Unsupported PYUSD/USD reference source: ${source?.type || 'unknown'}`);
+    }
+    if (!this.krakenRestClient) {
+      throw new Error('Kraken REST client unavailable for PYUSD/USD reference poll');
+    }
+
+    const ticker = await this.krakenRestClient.getTicker(source.pair || 'PYUSD/USD', {
+      timeoutMs: this.pyusdUsdPollTimeoutMs,
+    });
+    return {
+      price: ticker.last,
+      bid: ticker.bid,
+      ask: ticker.ask,
+      timestamp: ticker.timestamp,
+      source: source.type,
+      pair: source.pair || ticker.symbol,
+    };
+  }
+
+  async _pollPyusdUsdReference() {
+    if (!this.isRunning || !this.krakenRestClient) return;
+    if (this._pyusdUsdPollInFlight) {
+      this.logger.warn('[Orchestrator] PYUSD/USD poll still in flight — skipping overlapping tick');
+      this._scheduleNextPyusdUsdPoll(this._pyusdUsdCurrentBackoffMs || this.pyusdUsdPollIntervalMs);
+      return;
+    }
+
+    this._pyusdUsdPollInFlight = true;
+    try {
+      const candidates = this.pyusdUsdReferenceSources.length > 0
+        ? this.pyusdUsdReferenceSources
+        : this._buildPyusdUsdReferenceSources();
+      let lastError = null;
+      let reference = null;
+
+      for (const source of candidates) {
+        try {
+          reference = await this._fetchPyusdUsdReferenceFromSource(source);
+          break;
+        } catch (err) {
+          lastError = err;
+        }
+      }
+
+      if (!reference) {
+        throw lastError || new Error('PYUSD/USD reference poll returned no usable source');
+      }
+
+      this.pyusdUsd = reference;
+      const hadFailureAlert = this._pyusdUsdFailureAlertActive;
+      this._pyusdUsdConsecutiveErrors = 0;
+      this._pyusdUsdCurrentBackoffMs = this.pyusdUsdPollIntervalMs;
+      this._pyusdUsdLastSuccessAt = Date.now();
+      this._pyusdUsdFailureAlertActive = false;
+
+      if (hadFailureAlert) {
+        this.alertManager.sendRecovery({ reason: 'PYUSD/USD reference poll failing' })
+          .catch((err) => this.logger.error(`[Orchestrator] PYUSD/USD recovery alert failed: ${err.message}`));
+      }
+    } catch (err) {
+      this._pyusdUsdConsecutiveErrors++;
+      this._pyusdUsdCurrentBackoffMs = Math.min(
+        this.pyusdUsdMaxBackoffMs,
+        Math.max(
+          this.pyusdUsdPollIntervalMs,
+          Math.ceil(this._pyusdUsdCurrentBackoffMs * 1.5),
+        ),
+      );
+
+      this.logger.warn(
+        `[Orchestrator] PYUSD/USD poll failed (${this._pyusdUsdConsecutiveErrors} consecutive): ${err.message}`
+      );
+
+      if (
+        this._pyusdUsdConsecutiveErrors >= this.pyusdUsdFailureAlertThreshold &&
+        !this._pyusdUsdFailureAlertActive
+      ) {
+        this._pyusdUsdFailureAlertActive = true;
+        this.alertManager.sendAlert({
+          reason: 'PYUSD/USD reference poll failing',
+          level: 'error',
+          details: {
+            consecutiveErrors: this._pyusdUsdConsecutiveErrors,
+            backoffMs: this._pyusdUsdCurrentBackoffMs,
+            symbol: this.symbol,
+          },
+        }).catch((alertErr) =>
+          this.logger.error(`[Orchestrator] PYUSD/USD alert failed: ${alertErr.message}`)
+        );
+      }
+    } finally {
+      this._pyusdUsdPollInFlight = false;
+      if (this.isRunning) {
+        this._scheduleNextPyusdUsdPoll(this._pyusdUsdCurrentBackoffMs || this.pyusdUsdPollIntervalMs);
+      }
+    }
   }
 
   async _resolveTruexEbboInstrumentId() {
