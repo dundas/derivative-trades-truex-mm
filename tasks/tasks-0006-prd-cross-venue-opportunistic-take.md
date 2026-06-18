@@ -102,7 +102,7 @@ Phase 2 (live takes) is gated on Phase 1 data and explicitly out of scope here.
   - [ ] 3.1 Create feature branch `feat/shadow-take-detection` from `main`
   - [ ] 3.2 Implement standalone `evaluateShadowTake()` that returns a loggable record only; it MUST NOT route through `_prepareQuoteForSend`, `_sendNewOrder`, or `_sendCancel`
   - [ ] 3.3 Basis-adjusted edge (§11.4): apply basis by calling `computeTakeEdgeBps` with `executionPrice = truexBid / pyusdUsd` and `fairValue = coinbaseBid`; do **not** modify `computeTakeEdgeBps`
-  - [ ] 3.4 Trigger `evaluateShadowTake()` from the `/market/quote` poll handler after `updateTruexEbbo`, and also on **material/coalesced** Coinbase fair-value changes using cached `lastAggregatedPrice`; do NOT run it on every raw `onPriceUpdate` tick in the hot maker path
+  - [ ] 3.4 Trigger `evaluateShadowTake()` from the `/market/quote` poll handler after `updateTruexEbbo`, and also on **coalesced Coinbase fair-value changes** using cached `lastAggregatedPrice` when weighted midpoint moves by at least 1 TrueX tick or freshness/confidence flips; rate-limit these Coinbase-side reevaluations to no more than once per poll interval, and do NOT run on every raw `onPriceUpdate` tick in the hot maker path
   - [ ] 3.5 Detection step: sell-take candidate when `truexEbbo.bestBid` adjusted-edge ≥ `minTakeEdgeBps`; size = `min(bestBidQty, balance-capped, maxPosition headroom, maxTakeNotionalPerOrder)`; inventory-reducing only (long); suppress dust via `minTakeSizeBTC`
   - [ ] 3.6 Corroboration guards (PB2): Coinbase-leg freshness/confidence; **multi-poll persistence** (pinned N, reset on disappearance); **max-edge suspicion ceiling** (suppress + warn if edge > ceiling); **TrueX tape/outlier guard only if 0.2 finds a real public source**
   - [ ] 3.7 Basis gate (PB1): suppress all detection if `pyusdUsd` stale/missing or `|pyusdUsd−1| > pyusdDepegThresholdBps`
@@ -190,7 +190,9 @@ assumptions). Amendments below override the task bodies above where they conflic
   dispatchable quote object.
 - **R7 (task 3.0 trigger):** run `evaluateShadowTake` from the **`/market/quote` poll handler**
   (after `updateTruexEbbo`), reading a cached `this.lastAggregatedPrice` (add it in `onPriceUpdate`).
-  Do NOT hang detection off `onPriceUpdate` (hot maker path, fires many times/sec).
+  Also allow **coalesced Coinbase-side reevaluations** when cached fair value moves by at least
+  1 TrueX tick or freshness/confidence flips, but rate-limit them to no more than once per poll
+  interval. Do **not** run detection on every raw `onPriceUpdate` tick in the hot maker path.
 - **R8 (task 3.6 dedup):** key on **`bestBid + bestBidQty`** (NOT `timestamp` — it changes every
   poll and would defeat dedup). Add a qty-decay tolerance so a partially-taken persisting order
   isn't re-logged each poll.
