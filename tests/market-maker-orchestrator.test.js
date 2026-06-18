@@ -714,7 +714,7 @@ describe('MarketMakerOrchestrator', () => {
 
       await orchestrator._pollPyusdUsdReference();
 
-      expect(mocks.krakenRestClient.getTicker).toHaveBeenCalledWith('PYUSD/USD');
+      expect(mocks.krakenRestClient.getTicker).toHaveBeenCalledWith('PYUSD/USD', { timeoutMs: 1 });
       expect(orchestrator.pyusdUsd.price).toBe(1.00005);
       expect(mocks.quoteEngine.onPriceUpdate).not.toHaveBeenCalled();
     });
@@ -745,8 +745,8 @@ describe('MarketMakerOrchestrator', () => {
 
       await orchestrator._pollPyusdUsdReference();
 
-      expect(krakenRestClient.getTicker).toHaveBeenNthCalledWith(1, 'PYUSD/USD');
-      expect(krakenRestClient.getTicker).toHaveBeenNthCalledWith(2, 'PYUSDUSD');
+      expect(krakenRestClient.getTicker).toHaveBeenNthCalledWith(1, 'PYUSD/USD', { timeoutMs: 1 });
+      expect(krakenRestClient.getTicker).toHaveBeenNthCalledWith(2, 'PYUSDUSD', { timeoutMs: 1 });
       expect(orchestrator.pyusdUsd.pair).toBe('PYUSDUSD');
       expect(orchestrator.pyusdUsd.price).toBe(1.0001);
     });

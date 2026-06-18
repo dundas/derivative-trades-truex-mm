@@ -33,6 +33,7 @@
 import { MarketMakerOrchestrator } from '../src/core/market-maker-orchestrator.js';
 import { DataPipelineManager } from '../src/data-pipeline/data-pipeline-manager.js';
 import { PriceAggregator } from '../src/connectors/aggregator/PriceAggregator.ts';
+import { KrakenRestClient } from '../src/connectors/kraken/KrakenRestClient.ts';
 import { CoinbaseWsIngest } from '../src/data-pipeline/coinbase-ws-ingest.js';
 import { CoinbaseMarketDataAdapter } from '../src/data-pipeline/coinbase-market-data-adapter.js';
 
@@ -222,6 +223,7 @@ let orchestrator = null;
 let coinbaseIngest = null;
 let coinbaseMdAdapter = null;
 let priceAggregator = null;
+let krakenRestClient = null;
 let dataPipeline = null;
 let isShuttingDown = false;
 
@@ -247,6 +249,8 @@ async function main() {
   logger.info(`Redis:         ${config.redisUrl ? 'configured' : 'none'}`);
   logger.info(`PostgreSQL:    ${config.pgUrl ? 'configured' : 'none'}`);
   logger.info('');
+
+  krakenRestClient = new KrakenRestClient({});
 
   // 0. Cancel orphaned orders from previous sessions via REST API
   logger.info('[0/5] Cancelling orphaned orders via REST API...');
@@ -423,6 +427,7 @@ async function main() {
     pyusdUsdPollTimeoutMs: config.pyusdUsdPollTimeoutMs,
     pyusdUsdStaleThresholdMs: config.pyusdUsdStaleThresholdMs,
     pyusdUsdReferenceSources: config.pyusdUsdReferenceSources,
+    krakenRestClient,
 
     // No hedging initially
     krakenClient: null,

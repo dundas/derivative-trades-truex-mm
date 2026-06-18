@@ -55,4 +55,23 @@ describe("KrakenRestClient", () => {
       "Kraken ticker missing bid/ask/last for PYUSD/USD",
     );
   });
+
+  test("honors per-call ticker timeout", async () => {
+    let aborted = false;
+    global.fetch = ((_url: string, init?: RequestInit) => {
+      const signal = init?.signal;
+      return new Promise((_resolve, reject) => {
+        signal?.addEventListener("abort", () => {
+          aborted = true;
+          const error = new Error("aborted");
+          error.name = "AbortError";
+          reject(error);
+        }, { once: true });
+      });
+    }) as typeof fetch;
+
+    const client = new KrakenRestClient({});
+    await expect(client.getTicker("PYUSD/USD", { timeoutMs: 5 })).rejects.toThrow("aborted");
+    expect(aborted).toBe(true);
+  });
 });

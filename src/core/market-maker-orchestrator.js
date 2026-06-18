@@ -8,7 +8,6 @@ import { QuoteEngine } from './quote-engine.js';
 import { HedgeExecutor } from './hedge-executor.js';
 import { TrueXMarketDataFeed } from './truex-market-data.js';
 import { TrueXRESTClient } from '../exchanges/truex/TrueXRESTClient.js';
-import { KrakenRestClient } from '../connectors/kraken/KrakenRestClient.ts';
 import { AlertManager, normalizeAlertReason } from '../alerts/alert-manager.js';
 
 /**
@@ -167,9 +166,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this.pyusdUsdReferenceSources = this._buildPyusdUsdReferenceSources(options.pyusdUsdReferenceSources);
     this.krakenRestClient =
       options.krakenRestClient ||
-      (this.pyusdUsdReferenceSources.some((source) => source.type === 'kraken-rest')
-        ? new KrakenRestClient({ baseUrl: options.krakenRestUrl })
-        : null);
+      (options.krakenClient && typeof options.krakenClient.getTicker === 'function' ? options.krakenClient : null);
 
     // State
     this.isRunning = false;
@@ -895,7 +892,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
       throw new Error('Kraken REST client unavailable for PYUSD/USD reference poll');
     }
 
-    const ticker = await this.krakenRestClient.getTicker(source.pair || 'PYUSD/USD');
+    const ticker = await this.krakenRestClient.getTicker(source.pair || 'PYUSD/USD', {
+      timeoutMs: this.pyusdUsdPollTimeoutMs,
+    });
     return {
       price: ticker.last,
       bid: ticker.bid,

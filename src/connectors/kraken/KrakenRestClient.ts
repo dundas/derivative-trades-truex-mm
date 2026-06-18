@@ -242,11 +242,11 @@ export class KrakenRestClient {
     return { pair: params.pair, candles, last };
   }
 
-  async getTicker(pair: string): Promise<TickerUpdate> {
+  async getTicker(pair: string, options?: { timeoutMs?: number }): Promise<TickerUpdate> {
     const krakenPair = this.toKrakenPair(pair.trim());
     const result = await this.publicRequest<KrakenTickerResult>("/0/public/Ticker", {
       pair: krakenPair,
-    });
+    }, options);
     const entry = result?.[krakenPair] ?? result?.[Object.keys(result ?? {})[0] ?? ""];
 
     const bid = Number(entry?.b?.[0] ?? 0);
@@ -361,12 +361,13 @@ export class KrakenRestClient {
     return crypto.createHmac("sha512", secret).update(message).digest("base64");
   }
 
-  private async publicRequest<T>(path: string, query: Record<string, string>): Promise<T> {
+  private async publicRequest<T>(path: string, query: Record<string, string>, options?: { timeoutMs?: number }): Promise<T> {
     const params = new URLSearchParams(query);
     const url = params.size > 0 ? `${this.baseUrl}${path}?${params.toString()}` : `${this.baseUrl}${path}`;
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.requestTimeoutMs);
+    const timeoutMs = options?.timeoutMs ?? this.requestTimeoutMs;
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
     let resp: Response;
     try {
