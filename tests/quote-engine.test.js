@@ -1535,12 +1535,14 @@ describe('QuoteEngine', () => {
     it('should NOT warn on a self-cancel ack resolved via cancelToOrigMap', () => {
       const mockLogger = createMockLogger();
       const engine = createEngine({ logger: mockLogger });
-      engine.activeOrders.set('ORIGV3', { side: 'buy', price: 64000, size: 0.01, level: 1, status: 'cancelling', placedAt: Date.now() });
+      // status 'active' (NOT cancelling) so the suppression relies ONLY on cancelToOrigMap —
+      // isolates the origClOrdID branch from the 'cancelling'-status branch.
+      engine.activeOrders.set('ORIGV3', { side: 'buy', price: 64000, size: 0.01, level: 1, status: 'active', placedAt: Date.now() });
       engine.cancelToOrigMap.set('CXV3', 'ORIGV3'); // our cancel request clOrdID -> original
 
       engine.onExecutionReport({ '11': 'CXV3', '39': '4', '54': '1' });
       expect(engine.activeOrders.has('ORIGV3')).toBe(false);
-      expect(mockLogger.warn.mock.calls.length).toBe(0);
+      expect(mockLogger.warn.mock.calls.length).toBe(0); // origClOrdID alone marks it self-initiated
     });
 
     it('should remove order and log error on OrdStatus=8 (Rejected)', () => {
