@@ -1522,6 +1522,15 @@ describe('QuoteEngine', () => {
       expect(engine.recentRejectsByReason.has('venue-cancel:POST_ONLY_WOULD_CROSS')).toBe(true);
     });
 
+    it('should WARN on an unsolicited venue cancel of a pending order', () => {
+      const mockLogger = createMockLogger();
+      const engine = createEngine({ logger: mockLogger });
+      // Placed but no New ack yet (pending) and the venue cancels it — still unsolicited.
+      engine.activeOrders.set('CLOV4', { side: 'sell', price: 64003, size: 0.01, level: 1, status: 'pending', placedAt: Date.now() });
+      engine.onExecutionReport({ '11': 'CLOV4', '39': '4', '54': '2', '58': 'POST_ONLY_WOULD_CROSS' });
+      expect(mockLogger.warn.mock.calls.map(c => c[0]).join(' ')).toContain('Venue-cancelled');
+    });
+
     it('should NOT warn when WE initiated the cancel (status cancelling)', () => {
       const mockLogger = createMockLogger();
       const engine = createEngine({ logger: mockLogger });
