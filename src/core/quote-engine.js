@@ -665,10 +665,12 @@ export class QuoteEngine extends EventEmitter {
         if (lastQty && lastQty > 0) {
           const tracked = this._emitFillEvent(resolvedClOrdID, side, lastPx, lastQty, execID);
           if (tracked) {
-            // Remaining size = LeavesQty (tag 151) when it parses to a finite number, else
-            // subtract LastQty. Guards against tag 151 being absent OR an empty/garbage string
-            // (parseFloat('') === NaN, which would otherwise corrupt the tracked size to NaN).
-            const parsedLeaves = parseFloat(fields['151']);
+            // Remaining size = LeavesQty (tag 151) when it is a strictly-numeric value, else
+            // subtract LastQty. Strict Number() (not parseFloat) rejects partial garbage like
+            // '0.007foo'; the trim guard rejects absent/empty/whitespace (Number('') === 0).
+            const rawLeaves = fields['151'];
+            const parsedLeaves =
+              rawLeaves !== undefined && String(rawLeaves).trim() !== '' ? Number(rawLeaves) : NaN;
             const leavesQty = Number.isFinite(parsedLeaves) ? parsedLeaves : (tracked.size - lastQty);
             tracked.size = Math.max(0, leavesQty);
             // A fill proves the order is live, so promote 'pending' → 'active'. But preserve

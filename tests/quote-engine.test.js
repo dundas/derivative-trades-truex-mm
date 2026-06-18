@@ -1574,10 +1574,18 @@ describe('QuoteEngine', () => {
     it('should fall back to size-LastQty when LeavesQty (151) is an empty/garbage string', () => {
       const engine = createEngine();
       engine.activeOrders.set('CLO010', { side: 'buy', price: 99750, size: 0.01, level: 1, status: 'active', placedAt: Date.now() });
-      // tag 151 present but empty — parseFloat('') is NaN; must NOT corrupt size to NaN
+      // tag 151 present but empty — Number('') is 0; must NOT be used, fall back to size-LastQty
       engine.onExecutionReport({ '11': 'CLO010', '39': '1', '54': '1', '31': '99750', '32': '0.002', '151': '' });
       expect(Number.isFinite(engine.activeOrders.get('CLO010').size)).toBe(true);
       expect(engine.activeOrders.get('CLO010').size).toBeCloseTo(0.008, 8);
+    });
+
+    it('should fall back when LeavesQty (151) is partially-numeric garbage like "0.007foo"', () => {
+      const engine = createEngine();
+      engine.activeOrders.set('CLO011', { side: 'buy', price: 99750, size: 0.01, level: 1, status: 'active', placedAt: Date.now() });
+      // parseFloat would accept '0.007' from this; strict Number() rejects it → fall back to size-LastQty
+      engine.onExecutionReport({ '11': 'CLO011', '39': '1', '54': '1', '31': '99750', '32': '0.002', '151': '0.007foo' });
+      expect(engine.activeOrders.get('CLO011').size).toBeCloseTo(0.008, 8); // 0.01 - 0.002, NOT 0.007
     });
 
     it('should reset consecutiveRejects on a partial fill', () => {
