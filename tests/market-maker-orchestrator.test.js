@@ -145,6 +145,20 @@ function createMockLogger() {
   };
 }
 
+function createMockKrakenRestClient() {
+  return {
+    getTicker: jest.fn(async () => ({
+      exchange: 'kraken',
+      symbol: 'PYUSD/USD',
+      timestamp: Date.now(),
+      bid: 1.0,
+      ask: 1.0001,
+      last: 1.00005,
+      volume24h: 1000,
+    })),
+  };
+}
+
 function createOrchestrator(overrides = {}) {
   const mocks = {
     fixConnection: createMockFIXConnection(),
@@ -157,6 +171,7 @@ function createOrchestrator(overrides = {}) {
     dataManager: createMockDataManager(),
     auditLogger: createMockAuditLogger(),
     logger: createMockLogger(),
+    krakenRestClient: createMockKrakenRestClient(),
     ...overrides,
   };
 
@@ -668,6 +683,94 @@ describe('MarketMakerOrchestrator', () => {
 
       expect(status.truexEbboLastSuccessAt).toBe(1234567890);
       expect(status.truexEbboConsecutiveErrors).toBe(2);
+    });
+
+    test('exposes PYUSD/USD basis fields and freshness', () => {
+      const { orchestrator } = createOrchestrator();
+      orchestrator.pyusdUsd = {
+        price: 1.00005,
+        bid: 1.0,
+        ask: 1.0001,
+        timestamp: Date.now(),
+        source: 'kraken-rest',
+        pair: 'PYUSD/USD',
+      };
+      orchestrator._pyusdUsdLastSuccessAt = 1234567891;
+      orchestrator._pyusdUsdConsecutiveErrors = 1;
+
+      const status = orchestrator.getStatus();
+
+      expect(status.pyusdUsd.price).toBe(1.00005);
+      expect(status.pyusdUsdFresh).toBe(true);
+      expect(status.pyusdUsdLastSuccessAt).toBe(1234567891);
+      expect(status.pyusdUsdConsecutiveErrors).toBe(1);
+    });
+  });
+
+  describe('PYUSD/USD basis poller', () => {
+    test('polls Kraken ticker and stores PYUSD/USD reference separately from maker price updates', async () => {
+      const { orchestrator, mocks } = createOrchestrator({ pyusdUsdPollIntervalMs: 0 });
+      orchestrator.isRunning = true;
+
+      await orchestrator._pollPyusdUsdReference();
+
+      expect(mocks.krakenRestClient.getTicker).toHaveBeenCalledWith('PYUSD/USD');
+      expect(orchestrator.pyusdUsd.price).toBe(1.00005);
+      expect(mocks.quoteEngine.onPriceUpdate).not.toHaveBeenCalled();
+    });
+
+    test('falls back to the next source when the first source fails', async () => {
+      const krakenRestClient = createMockKrakenRestClient();
+      krakenRestClient.getTicker = jest.fn()
+        .mockRejectedValueOnce(new Error('pair unavailable'))
+        .mockResolvedValueOnce({
+          exchange: 'kraken',
+          symbol: 'PYUSDUSD',
+          timestamp: Date.now(),
+          bid: 1.0,
+          ask: 1.0002,
+          last: 1.0001,
+          volume24h: 1000,
+        });
+
+      const { orchestrator } = createOrchestrator({
+        krakenRestClient,
+        pyusdUsdPollIntervalMs: 0,
+        pyusdUsdReferenceSources: [
+          { type: 'kraken-rest', pair: 'PYUSD/USD' },
+          { type: 'kraken-rest', pair: 'PYUSDUSD' },
+        ],
+      });
+      orchestrator.isRunning = true;
+
+      await orchestrator._pollPyusdUsdReference();
+
+      expect(krakenRestClient.getTicker).toHaveBeenNthCalledWith(1, 'PYUSD/USD');
+      expect(krakenRestClient.getTicker).toHaveBeenNthCalledWith(2, 'PYUSDUSD');
+      expect(orchestrator.pyusdUsd.pair).toBe('PYUSDUSD');
+      expect(orchestrator.pyusdUsd.price).toBe(1.0001);
+    });
+
+    test('marks stale basis references as not fresh without affecting BTC-USD price path', async () => {
+      const { orchestrator, mocks } = createOrchestrator({ pyusdUsdStaleThresholdMs: 1000, pyusdUsdPollIntervalMs: 0 });
+      await orchestrator.start();
+
+      orchestrator.pyusdUsd = {
+        price: 0.9998,
+        bid: 0.9997,
+        ask: 0.9999,
+        timestamp: Date.now() - 5000,
+        source: 'kraken-rest',
+        pair: 'PYUSD/USD',
+      };
+
+      const price = { weightedMidpoint: 100000, confidence: 0.95 };
+      mocks.priceAggregator.emit('price', price);
+
+      expect(orchestrator.getStatus().pyusdUsdFresh).toBe(false);
+      expect(mocks.quoteEngine.onPriceUpdate).toHaveBeenCalledWith(price);
+      expect(mocks.pnlTracker.markToMarket).toHaveBeenCalledWith(100000);
+      await orchestrator.stop();
     });
   });
 

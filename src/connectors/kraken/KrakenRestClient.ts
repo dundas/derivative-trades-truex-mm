@@ -1,4 +1,5 @@
 import * as crypto from "node:crypto";
+import type { TickerUpdate } from "../IExchangeConnector";
 
 export type KrakenTradeVolumeResult = {
   currency?: string;
@@ -111,6 +112,16 @@ export type KrakenWebSocketsTokenResult = {
   expires?: number;
 };
 
+export type KrakenTickerResult = Record<
+  string,
+  {
+    a?: [string, string?, string?];
+    b?: [string, string?, string?];
+    c?: [string, string?];
+    v?: [string, string?];
+  }
+>;
+
 export class KrakenRestClient {
   private readonly baseUrl: string;
   private readonly apiKey?: string;
@@ -127,6 +138,7 @@ export class KrakenRestClient {
   private static readonly KRAKEN_SYMBOL_MAP: Record<string, string> = {
     "BTC/USD": "XXBTZUSD",
     "ETH/USD": "XETHZUSD",
+    "PYUSD/USD": "PYUSDUSD",
     "SOL/USD": "SOLUSD",
     "XRP/USD": "XXRPZUSD",
     "ADA/USD": "ADAUSD",
@@ -228,6 +240,33 @@ export class KrakenRestClient {
       : [];
 
     return { pair: params.pair, candles, last };
+  }
+
+  async getTicker(pair: string): Promise<TickerUpdate> {
+    const krakenPair = this.toKrakenPair(pair.trim());
+    const result = await this.publicRequest<KrakenTickerResult>("/0/public/Ticker", {
+      pair: krakenPair,
+    });
+    const entry = result?.[krakenPair] ?? result?.[Object.keys(result ?? {})[0] ?? ""];
+
+    const bid = Number(entry?.b?.[0] ?? 0);
+    const ask = Number(entry?.a?.[0] ?? 0);
+    const last = Number(entry?.c?.[0] ?? 0);
+    const volume24h = Number(entry?.v?.[1] ?? entry?.v?.[0] ?? 0);
+
+    if (!Number.isFinite(bid) || bid <= 0 || !Number.isFinite(ask) || ask <= 0 || !Number.isFinite(last) || last <= 0) {
+      throw new Error(`Kraken ticker missing bid/ask/last for ${pair}`);
+    }
+
+    return {
+      exchange: "kraken",
+      symbol: pair,
+      timestamp: Date.now(),
+      bid,
+      ask,
+      last,
+      volume24h: Number.isFinite(volume24h) ? volume24h : 0,
+    };
   }
 
   async getBalance(): Promise<KrakenBalanceResult> {
