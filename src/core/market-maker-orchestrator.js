@@ -1080,12 +1080,13 @@ export class MarketMakerOrchestrator extends EventEmitter {
   _handleShadowEvaluationResult(result) {
     if (!result?.evaluation) return;
     const now = Date.now();
+    const suppressReason = result.evaluation.suppressReason;
     const basisSample = {
       type: 'shadow-basis-sample',
       timestamp: result.evaluation.timestamp ?? now,
       trigger: result.evaluation.trigger ?? 'unknown',
-      pyusdUsd: result.evaluation.pyusdUsd ?? null,
-      suppressReason: result.evaluation.suppressReason ?? null,
+      pyusdUsd: suppressReason === 'basis-stale' ? null : (result.evaluation.pyusdUsd ?? null),
+      suppressReason: suppressReason ?? null,
       coinbaseFresh: result.evaluation.coinbaseFresh ?? null,
       wouldTake: !!result.evaluation.wouldTake,
     };
@@ -1110,7 +1111,6 @@ export class MarketMakerOrchestrator extends EventEmitter {
     }
     this._shadowMetrics.evaluations++;
 
-    const suppressReason = result.evaluation.suppressReason;
     if (result.evaluation.wouldTake) {
       this._shadowMetrics.detections++;
       this._shadowLastDetectionAt = now;

@@ -144,11 +144,22 @@ function parseShadowLogs(file) {
 }
 
 function buildSummary({ wouldTakes, attributions, basisSamples, suppressions }, criteria, iocUatResult) {
+  const nonEvaluableSuppressReasons = new Set([
+    'basis-stale',
+    'coinbase-stale',
+    'coinbase-low-confidence',
+    'truex-ebbo-stale',
+    'truex-tape-stale',
+  ]);
   const timestamps = wouldTakes.map((entry) => Number(entry.timestamp)).filter(Number.isFinite);
   const basisAdjEdges = wouldTakes.map((entry) => Number(entry.basisAdjEdgeBps)).filter(Number.isFinite);
   const rawEdges = wouldTakes.map((entry) => Number(entry.rawEdgeBps)).filter(Number.isFinite);
   const sizes = wouldTakes.map((entry) => Number(entry.size)).filter(Number.isFinite);
-  const basisValues = basisSamples.map((entry) => Number(entry.pyusdUsd)).filter(Number.isFinite);
+  const evaluableBasisSamples = basisSamples.filter((entry) =>
+    Number.isFinite(Number(entry.pyusdUsd)) &&
+    !nonEvaluableSuppressReasons.has(entry.suppressReason)
+  );
+  const basisValues = evaluableBasisSamples.map((entry) => Number(entry.pyusdUsd)).filter(Number.isFinite);
   const absBasisBps = basisValues.map((value) => Math.abs(value - 1) * 10000);
 
   const attributedCount = attributions.length;
@@ -158,7 +169,7 @@ function buildSummary({ wouldTakes, attributions, basisSamples, suppressions }, 
 
   const allTimestamps = [
     ...timestamps,
-    ...basisSamples.map((entry) => Number(entry.timestamp)).filter(Number.isFinite),
+    ...evaluableBasisSamples.map((entry) => Number(entry.timestamp)).filter(Number.isFinite),
   ];
   const firstTs = allTimestamps.length ? Math.min(...allTimestamps) : null;
   const lastTs = allTimestamps.length ? Math.max(...allTimestamps) : null;
@@ -170,7 +181,7 @@ function buildSummary({ wouldTakes, attributions, basisSamples, suppressions }, 
     attributedCount >= criteria.minAttributedCount &&
     calendarDaysObserved >= criteria.minObservationDays;
   const enoughEdgeData = wouldTakes.length >= criteria.minWouldTakeCount;
-  const enoughBasisData = basisSamples.length > 0;
+  const enoughBasisData = evaluableBasisSamples.length > 0;
   const medianEdge = percentile(basisAdjEdges, 0.5);
   const p25Edge = percentile(basisAdjEdges, 0.25);
   const maxAbsBasis = absBasisBps.length ? Math.max(...absBasisBps) : null;
@@ -237,6 +248,7 @@ function buildSummary({ wouldTakes, attributions, basisSamples, suppressions }, 
     metrics: {
       wouldTakeCount: wouldTakes.length,
       basisSampleCount: basisSamples.length,
+      evaluableBasisSampleCount: evaluableBasisSamples.length,
       attributedCount,
       disappearedCount,
       persistedCount,
