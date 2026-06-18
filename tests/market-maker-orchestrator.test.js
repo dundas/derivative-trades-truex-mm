@@ -772,6 +772,18 @@ describe('MarketMakerOrchestrator', () => {
       expect(mocks.pnlTracker.markToMarket).toHaveBeenCalledWith(100000);
       await orchestrator.stop();
     });
+
+    test('fails loudly when kraken-rest sources are configured without a krakenRestClient', async () => {
+      const { orchestrator } = createOrchestrator({
+        krakenRestClient: null,
+        pyusdUsdPollIntervalMs: 1000,
+        pyusdUsdReferenceSources: [{ type: 'kraken-rest', pair: 'PYUSD/USD' }],
+      });
+
+      await expect(orchestrator.start()).rejects.toThrow(
+        'PYUSD/USD reference polling requires options.krakenRestClient for kraken-rest sources',
+      );
+    });
   });
 
   describe('event wiring: price updates', () => {

@@ -860,7 +860,10 @@ export class MarketMakerOrchestrator extends EventEmitter {
   }
 
   _startPyusdUsdPoller() {
-    if (!this.krakenRestClient || this.pyusdUsdPollIntervalMs <= 0 || this.pyusdUsdReferenceSources.length === 0) return;
+    if (this.pyusdUsdPollIntervalMs <= 0 || this.pyusdUsdReferenceSources.length === 0) return;
+    if (!this.krakenRestClient && this.pyusdUsdReferenceSources.some((source) => source.type === 'kraken-rest')) {
+      throw new Error('PYUSD/USD reference polling requires options.krakenRestClient for kraken-rest sources');
+    }
     this._scheduleNextPyusdUsdPoll(0);
     this.logger.info(
       `[Orchestrator] PYUSD/USD reference poll enabled (every ${this.pyusdUsdPollIntervalMs}ms, timeout ${this.pyusdUsdPollTimeoutMs}ms)`
