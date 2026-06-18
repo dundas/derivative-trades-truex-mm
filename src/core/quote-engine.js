@@ -670,8 +670,9 @@ export class QuoteEngine extends EventEmitter {
               ? parseFloat(fields['151'])
               : (tracked.size - lastQty);
             tracked.size = Math.max(0, leavesQty);
-            // Preserve status: a partial fill of an order with a cancel already in flight must
-            // stay 'cancelling' so reconcileOrders doesn't double-act on an in-flight order.
+            // A fill proves the order is live, so promote 'pending' → 'active'. But preserve
+            // 'cancelling' so reconcileOrders doesn't double-act on an in-flight cancel.
+            tracked.status = tracked.status === 'cancelling' ? 'cancelling' : 'active';
           }
         }
         break;

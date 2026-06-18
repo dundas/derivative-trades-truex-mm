@@ -1555,6 +1555,15 @@ describe('QuoteEngine', () => {
       expect(engine.activeOrders.get('CLO008').status).toBe('cancelling'); // NOT flipped to active
     });
 
+    it('should promote a pending order to active on a partial fill (it is live on the venue)', () => {
+      const engine = createEngine();
+      // Partial fill arrives before a separate New ack — order still 'pending'
+      engine.activeOrders.set('CLO009', { side: 'buy', price: 99750, size: 0.01, level: 1, status: 'pending', placedAt: Date.now() });
+      engine.onExecutionReport({ '11': 'CLO009', '39': '1', '54': '1', '31': '99750', '32': '0.003', '151': '0.007' });
+      expect(engine.activeOrders.get('CLO009').status).toBe('active'); // not stuck pending
+      expect(engine.activeOrders.get('CLO009').size).toBeCloseTo(0.007, 8);
+    });
+
     it('should reduce by LastQty when LeavesQty (151) is absent on a partial fill', () => {
       const engine = createEngine();
       engine.activeOrders.set('CLO007', { side: 'buy', price: 99750, size: 0.01, level: 1, status: 'active', placedAt: Date.now() });
