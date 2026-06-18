@@ -1,10 +1,10 @@
 # TrueX Market Maker - Architecture
 
-> Generated from source code on 2026-04-04 (rev2). Source is the single source of truth.
+> Generated from source code on 2026-06-18 (rev3). Source is the single source of truth.
 
 ## Overview
 
-Automated BTC-PYUSD market maker on TrueX exchange using FIX protocol, with Coinbase price feed, balance-aware quoting, and a PostgreSQL data pipeline. The system runs on a local Mac, connecting to TrueX through proxy servers hosted on Hetzner, which forward traffic over WireGuard VPN to TrueX infrastructure.
+Automated BTC-PYUSD market maker on TrueX exchange using FIX protocol, with Coinbase price feed, additive TrueX EBBO and PYUSD/USD reference polling for shadow-take observation, balance-aware quoting, and a PostgreSQL data pipeline. Production runs on Hetzner-hosted Docker services and connects to TrueX over WireGuard-backed proxies.
 
 ---
 
@@ -205,7 +205,7 @@ Computes bid/ask ladder quotes with inventory skew, manages order lifecycle thro
 - Cancel unmatched active orders (orphans in local state)
 - Default replacement mode is `passive-safe`: cancel the old quote first, hold the replacement as pending, then release it only after the cancel ack. `replaceMode='place-before-cancel'` is available only as an explicit legacy override.
 - Pending replacements expire after `pendingReplacementTimeoutMs` and are reported in quote status as suppressed levels.
-- Rate limited: `maxOrdersPerSecond` (default 4-8), overflow queued. Queued placements and pending replacement releases are rechecked immediately before FIX send.
+- Rate limited: `maxOrdersPerSecond` (prod 6), overflow queued. Queued placements and pending replacement releases are rechecked immediately before FIX send.
 
 **TrueX book and ALO safety:**
 - The orchestrator injects the latest TrueX best bid/ask into QuoteEngine through `marketDataProvider` / `updateTrueXBook()`.
@@ -224,6 +224,12 @@ Computes bid/ask ladder quotes with inventory skew, manages order lifecycle thro
 - Post-fee edge is `grossEdgeBps - truexTakerFeeBps - takeSlippageBufferBps - takeHedgeBufferBps`; it must be at least `minTakeEdgeBps`.
 - `maxTakerOrdersPerMinute` and `maxTakerNotionalPerMinute` enforce minute-window taker budgets when set to positive values.
 - Active orders and fills carry `orderIntent`, `liquidityRoleExpected`, and final `isMaker`; orchestrator forwards `isMaker=false` taker fills to PnL and audit/data records.
+
+**Shadow observe-only path:**
+- `shadowTakeMode` defaults false in engine/orchestrator constructors, but production wiring enables it explicitly in `scripts/run-prod.js`.
+- When `shadowTakeMode=true`, `evaluateShadowTake()` still runs, but `_prepareTakerQuote()` returns `null` before `allowTakerOrders` is checked, making the send path unreachable.
+- Detection uses additive `truexEbbo`, Kraken `pyusdUsd`, and cached TrueX public trade tape; it logs `would-take`, `shadow-basis-sample`, and attribution records under `[SHADOW]`.
+- `scripts/analyze-shadow-takes.js` consumes those logs and emits the pinned Phase-2 `GO | HOLD | ABORT` recommendation.
 
 **Rejection handling:**
 - `consecutiveRejects` counter, backoff for 5 seconds after 3+ consecutive rejects

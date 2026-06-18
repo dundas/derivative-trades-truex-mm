@@ -1,9 +1,10 @@
 # TrueX Market Maker (true_markets_mm)
-# Generated: 2026-04-04 (rev2)
+# Generated: 2026-06-18 (rev3)
 # Audience: AI agents operating or debugging this system
 
 > Automated BTC-PYUSD market maker on TrueX exchange using FIX protocol,
-> with Coinbase price feed, balance-aware quoting, and PostgreSQL data pipeline.
+> with Coinbase price feed, additive TrueX EBBO + PYUSD/USD shadow-take observation,
+> balance-aware quoting, and PostgreSQL data pipeline.
 
 ## Architecture
 
@@ -20,10 +21,12 @@ Coinbase WS → PriceAggregator → QuoteEngine → FIXConnection → TrueX
 ```
 
 Orchestrator wires all modules. QuoteEngine computes ladder quotes with inventory
-skew. InventoryManager tracks position/balances. PnLTracker: FIFO spread PnL for
-matched round-trips (realizedPnL=$0 for sell-only) + cash-flow tracking
-(netCashFlow=sellProceeds-buyCost, accurate for sell-heavy/inventory-liquidation accounts).
-HedgeExecutor offloads to Kraken. DataPipelineManager: audit JSONL → Redis → PG.
+skew and now also evaluates observe-only shadow-take opportunities from additive
+TrueX EBBO + PYUSD/USD reference inputs. InventoryManager tracks position/balances.
+PnLTracker handles both FIFO spread PnL for matched round-trips (realizedPnL=$0
+for sell-only) and cash-flow tracking (netCashFlow=sellProceeds-buyCost,
+accurate for sell-heavy/inventory-liquidation accounts). HedgeExecutor offloads
+to Kraken. DataPipelineManager: audit JSONL → Redis → PG.
 
 ### Key Files
 - `src/core/market-maker-orchestrator.js` — Lifecycle, event wiring, reconciliation
@@ -32,6 +35,7 @@ HedgeExecutor offloads to Kraken. DataPipelineManager: audit JSONL → Redis →
 - `src/exchanges/truex/TrueXRESTClient.ts` — REST API client with HMAC auth
 - `src/fix-protocol/fix-connection.js` — FIX 5.0 SP2 over FIXT.1.1
 - `scripts/run-prod.js` — Production config and startup
+- `scripts/analyze-shadow-takes.js` — Phase-1 shadow log analyzer and go/no-go summary
 - `scripts/kill-switch.js` — Emergency order cancellation via REST
 
 ## FIX Protocol (FIXT.1.1 / FIX.5.0SP2)
@@ -60,11 +64,13 @@ If reason=1, remove from local tracking. Otherwise restore to 'active'.
 ### Critical Rules
 - Never cancel 'pending' orders — TrueX returns "Unknown order"
 - reconcileOrders skips 'pending' AND 'cancelling' status orders
-- minRepriceIntervalMs=5000 prevents cascading cancel/place failures
+- Current production `minRepriceIntervalMs=1500` limits reprice churn; the engine default
+  remains higher in older configs and UAT-style scripts.
 - 3+ consecutive rejects trigger 5s backoff (rejectBackoffUntil)
 - cancelToOrigMap tracks cancel clOrdID → original clOrdID for ack matching
 - 50 open order limit per client ID on UAT
-- Rate limit: ~10 msg/sec. maxOrdersPerSecond default=8 with queue overflow
+- Production rate limit is `maxOrdersPerSecond=6`; engine-level defaults in generic
+  constructors remain higher, with overflow drained from the queue.
 - TimeInForce: GTC (59=1) and IOC (59=3) ONLY. No GTD/TTL.
 - BTC size increment: 0.0001 (sizeDecimalPlaces=4), tick size: $0.50
 
@@ -92,7 +98,9 @@ Headers:
 - DELETE /order/:id?id_type=exchange|client → cancel single order
 - POST /order → { external_id, info: { client_id, instrument_id, side, type, qty, price, tif } }
 - GET /instrument → { id, symbol, base_asset_id, quote_asset_id }
-- GET /market/quote?instrument_id=X → { bid_price, ask_price, bid_qty, ask_qty }
+- GET /market/quote?instrument_id=X → array payload:
+  `[{ id, symbol, info: { best_bid, best_ask, last_trade, last_update } }]`
+- GET /market/trade?instrument_id=X → recent public trade tape for EBBO corroboration
 
 ### Asset ID Mapping (hardcoded fallback)
 78873627519877132=USD, 78873627519877133=PYUSD, 78873627519877134=BTC
@@ -104,10 +112,16 @@ Note: API has typo `exeuted_qty` (not `executed_qty`).
 ## Configuration Defaults
 
 ### Production (run-prod.js)
-levels=2, baseSpreadBps=80, baseSizeBTC=0.01, maxPositionBTC=0.05,
-emergencyLimitBTC=0.06, minRepriceIntervalMs=5000, maxOrdersPerSecond=4,
-tickSize=0.50, priceBandPct=2.5, heartbeatInterval=30s.
+levels=2, quoteAnchorMode=coinbase-mirror, coinbaseAnchorBufferTicks=1,
+baseSpreadBps=30 (fallback only), baseSizeBTC=0.01, maxPositionBTC=0.05,
+emergencyLimitBTC=0.06, minRepriceIntervalMs=1500, maxOrdersPerSecond=6,
+repriceThresholdTicks=1, tickSize=0.50, priceBandPct=2.5, heartbeatInterval=30s.
 reconcileIntervalMs=300000 (5min), balanceRefreshIntervalMs=60000 (1min).
+PYUSD/USD poll: 5000ms interval, 1000ms timeout, 15000ms stale threshold.
+Shadow observe-only mode defaults ON in `run-prod.js` with:
+  minTakeEdgeBps=15, maxEdgeCeilingBps=250, pyusdDepegThresholdBps=100,
+  maxTakeNotionalPerOrder=250, minTakeSizeBTC=0.0001,
+  shadowPersistenceRequiredPolls=3, truexEbboPollIntervalMs=1000.
 
 ### UAT (run-uat-paper-trading.js)
 levels=5, baseSpreadBps=50, baseSizeBTC=0.02, maxPositionBTC=0.10,
@@ -117,6 +131,28 @@ emergencyLimitBTC=0.12, sizeDecayFactor=0.8.
 Dynamic via env: TRUEX_MAKER_FEE_BPS, TRUEX_TAKER_FEE_BPS, HEDGE_MAKER_FEE_BPS,
 HEDGE_TAKER_FEE_BPS. parseFee() with NaN guard, range [0,500]. Currently 0/0
 per TrueX agreement.
+
+## Shadow Observation Mode
+
+Phase 1 shadow-take logic is observe-only. Even if `allowTakerOrders=true`,
+`shadowTakeMode=true` makes the taker send path unreachable before FIX dispatch.
+
+Detection inputs:
+- TrueX EBBO from REST `/market/quote` under additive `truexEbbo`
+- PYUSD/USD basis from Kraken REST
+- TrueX public tape from `/market/trade`
+- Coinbase bid/freshness/confidence from aggregated price state
+
+Logs:
+- `[SHADOW] {"type":"shadow-basis-sample", ...}` on every shadow evaluation;
+  non-evaluable samples are marked by `suppressReason` and may carry `pyusdUsd: null`
+- `[SHADOW] {"type":"would-take", ...}` only for deduped, persistence-confirmed opportunities
+- `[SHADOW] {"type":"shadow-take-attribution", ...}` when a logged target later persists or disappears
+
+Analyzer:
+- `bun scripts/analyze-shadow-takes.js --file /app/logs/market-maker.log --ioc-uat-result pending`
+- Outputs `GO | HOLD | ABORT` against the pinned Phase-2 criteria.
+- IOC UAT (`59=3`) is a hard prerequisite; missing IOC evidence keeps the recommendation at `HOLD`.
 
 ## Balance-Aware Quoting
 
@@ -269,6 +305,7 @@ Auto-failover: Redis fails → direct Memory→PG flush every 5s.
 ```sh
 bun scripts/run-prod.js               # Production
 bun scripts/run-uat-paper-trading.js   # UAT paper trading
+bun scripts/analyze-shadow-takes.js    # Summarize shadow logs / Phase-2 decision
 bun scripts/kill-switch.js --prod      # Emergency cancel all orders
 bun test                               # Run test suite (712 tests)
 ```
