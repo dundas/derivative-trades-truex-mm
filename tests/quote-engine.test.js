@@ -1287,6 +1287,30 @@ describe('QuoteEngine', () => {
       expect(engine.getQuoteStatus().suppressed.at(-1).reason).toBe('taker-disabled');
     });
 
+    it('should make the taker send path unreachable when shadowTakeMode is true even if allowTakerOrders is enabled', () => {
+      const fixMock = createMockFix();
+      const engine = createEngine({
+        fixConnection: fixMock,
+        allowTakerOrders: true,
+        shadowTakeMode: true,
+        minTakeEdgeBps: 1,
+      });
+
+      const result = engine._sendNewOrder({
+        side: 'buy',
+        price: 99,
+        executionPrice: 99,
+        fairValue: 100,
+        size: 0.1,
+        level: 1,
+        postOnly: false,
+      });
+
+      expect(result).toBeNull();
+      expect(fixMock.sendMessage).not.toHaveBeenCalled();
+      expect(engine.getQuoteStatus().suppressed.at(-1).reason).toBe('shadow-mode-observe-only');
+    });
+
     it('should not use stale lastMid as implicit fair value for taker orders', () => {
       const fixMock = createMockFix();
       const engine = createEngine({ fixConnection: fixMock, allowTakerOrders: true });
@@ -1450,6 +1474,7 @@ describe('QuoteEngine', () => {
       const engine = createEngine({
         fixConnection: fixMock,
         inventoryManager,
+        shadowTakeMode: true,
         shadowPersistenceRequiredPolls: 3,
         minTakeEdgeBps: 10,
         maxTakeNotionalPerOrder: 1000,
@@ -1485,6 +1510,7 @@ describe('QuoteEngine', () => {
           getPositionSummary: mock(() => ({ netPosition: 0.4 })),
           getAvailableForSide: mock(() => 0.4),
         },
+        shadowTakeMode: true,
         shadowPersistenceRequiredPolls: 1,
         minTakeEdgeBps: 10,
         pyusdDepegThresholdBps: 150,
@@ -1511,6 +1537,7 @@ describe('QuoteEngine', () => {
           getPositionSummary: mock(() => ({ netPosition: 0.4 })),
           getAvailableForSide: mock(() => 0.4),
         },
+        shadowTakeMode: true,
         shadowPersistenceRequiredPolls: 1,
         pyusdUsdStaleThresholdMs: 1000,
       });
@@ -1536,6 +1563,7 @@ describe('QuoteEngine', () => {
           getPositionSummary: mock(() => ({ netPosition: 0.4 })),
           getAvailableForSide: mock(() => 0.4),
         },
+        shadowTakeMode: true,
         shadowPersistenceRequiredPolls: 1,
         pyusdDepegThresholdBps: 100,
       });
@@ -1560,6 +1588,7 @@ describe('QuoteEngine', () => {
           getPositionSummary: mock(() => ({ netPosition: 0.4 })),
           getAvailableForSide: mock(() => 0.4),
         },
+        shadowTakeMode: true,
         shadowPersistenceRequiredPolls: 1,
         minTakeEdgeBps: 10,
       });
@@ -1583,6 +1612,7 @@ describe('QuoteEngine', () => {
           getPositionSummary: mock(() => ({ netPosition: 0.4 })),
           getAvailableForSide: mock(() => 0.4),
         },
+        shadowTakeMode: true,
         shadowPersistenceRequiredPolls: 1,
         confidenceThreshold: 0.3,
       });
@@ -1615,6 +1645,7 @@ describe('QuoteEngine', () => {
       };
       const edgeEngine = createEngine({
         inventoryManager: baseInventory,
+        shadowTakeMode: true,
         shadowPersistenceRequiredPolls: 1,
         maxEdgeCeilingBps: 50,
       });
@@ -1629,6 +1660,7 @@ describe('QuoteEngine', () => {
 
       const outlierEngine = createEngine({
         inventoryManager: baseInventory,
+        shadowTakeMode: true,
         shadowPersistenceRequiredPolls: 1,
         truexTapeOutlierThresholdBps: 10,
       });
@@ -1648,6 +1680,7 @@ describe('QuoteEngine', () => {
           getPositionSummary: mock(() => ({ netPosition: 0.00005 })),
           getAvailableForSide: mock(() => 0.00005),
         },
+        shadowTakeMode: true,
         shadowPersistenceRequiredPolls: 1,
         minTakeSizeBTC: 0.0001,
       });
@@ -1667,6 +1700,7 @@ describe('QuoteEngine', () => {
           getPositionSummary: mock(() => ({ netPosition: -0.25 })),
           getAvailableForSide: mock(() => 0.25),
         },
+        shadowTakeMode: true,
         shadowPersistenceRequiredPolls: 1,
       });
       seedFreshShadowInputs(shortEngine);
@@ -1687,6 +1721,7 @@ describe('QuoteEngine', () => {
           getPositionSummary: mock(() => ({ netPosition: 0.4 })),
           getAvailableForSide: mock(() => 0.4),
         },
+        shadowTakeMode: true,
         shadowPersistenceRequiredPolls: 1,
         minTakeEdgeBps: 10,
       });
@@ -1709,6 +1744,21 @@ describe('QuoteEngine', () => {
 
       expect(result.evaluation.wouldTake).toBe(true);
       expect(result.evaluation.size).toBeCloseTo(0.2, 8);
+    });
+
+    it('does not evaluate shadow opportunities when shadowTakeMode is false', () => {
+      const engine = createEngine();
+      seedFreshShadowInputs(engine);
+
+      const result = engine.evaluateShadowTake({
+        aggregatedPrice: makeShadowPrice({ coinbaseBid: 100 }),
+        truexTape: makeShadowTape({ price: 101.2 }),
+        now: Date.now(),
+        trigger: 'mode-off',
+      });
+
+      expect(result).toBeNull();
+      expect(engine.getQuoteStatus().shadowTakeMode).toBe(false);
     });
   });
 

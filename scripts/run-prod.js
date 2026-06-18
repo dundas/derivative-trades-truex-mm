@@ -52,6 +52,32 @@ function parseFee(envVar, defaultVal = 0) {
   return val;
 }
 
+function parseNumber(envVar, defaultVal) {
+  const raw = process.env[envVar];
+  if (raw === undefined || raw === null || raw === '') return defaultVal;
+  const val = Number(raw);
+  return Number.isFinite(val) ? val : defaultVal;
+}
+
+function parseBoolean(envVar, defaultVal) {
+  const raw = process.env[envVar];
+  if (raw === undefined || raw === null || raw === '') return defaultVal;
+  if (['1', 'true', 'yes', 'on'].includes(String(raw).toLowerCase())) return true;
+  if (['0', 'false', 'no', 'off'].includes(String(raw).toLowerCase())) return false;
+  return defaultVal;
+}
+
+const shadowPhase2Criteria = {
+  minObservationDays: parseNumber('SHADOW_GO_MIN_OBSERVATION_DAYS', 3),
+  minWouldTakeCount: parseNumber('SHADOW_GO_MIN_WOULD_TAKE_COUNT', 50),
+  minAttributedCount: parseNumber('SHADOW_GO_MIN_ATTRIBUTED_COUNT', 40),
+  minMedianBasisAdjEdgeBps: parseNumber('SHADOW_GO_MIN_MEDIAN_BASIS_ADJ_EDGE_BPS', 20),
+  minP25BasisAdjEdgeBps: parseNumber('SHADOW_GO_MIN_P25_BASIS_ADJ_EDGE_BPS', 15),
+  maxDisappearedRatePct: parseNumber('SHADOW_ABORT_MAX_DISAPPEARED_RATE_PCT', 35),
+  maxAbsPyusdBasisBps: parseNumber('SHADOW_ABORT_MAX_ABS_PYUSD_BASIS_BPS', 100),
+  maxP95AbsPyusdBasisBps: parseNumber('SHADOW_ABORT_MAX_P95_ABS_PYUSD_BASIS_BPS', 80),
+};
+
 // ---------------------------------------------------------------------------
 // Configuration — PRODUCTION
 // ---------------------------------------------------------------------------
@@ -135,6 +161,21 @@ const config = {
     { type: 'kraken-rest', pair: process.env.PYUSD_USD_PRIMARY_PAIR || 'PYUSD/USD' },
     { type: 'kraken-rest', pair: process.env.PYUSD_USD_FALLBACK_PAIR || 'PYUSDUSD' },
   ],
+
+  // Shadow take mode — observe-only, no FIX sends. Phase 1 runs enabled by default in
+  // production so we collect data while keeping the taker path unreachable.
+  shadowTakeMode: parseBoolean('SHADOW_TAKE_MODE', true),
+  minTakeEdgeBps: parseNumber('SHADOW_MIN_TAKE_EDGE_BPS', 15),
+  maxEdgeCeilingBps: parseNumber('SHADOW_MAX_EDGE_CEILING_BPS', 250),
+  pyusdDepegThresholdBps: parseNumber('SHADOW_PYUSD_DEPEG_THRESHOLD_BPS', 100),
+  maxTakeNotionalPerOrder: parseNumber('SHADOW_MAX_TAKE_NOTIONAL_PER_ORDER', 250),
+  minTakeSizeBTC: parseNumber('SHADOW_MIN_TAKE_SIZE_BTC', 0.0001),
+  shadowPersistenceRequiredPolls: parseInt(process.env.SHADOW_PERSISTENCE_POLLS || '3', 10),
+  truexEbboPollIntervalMs: parseInt(process.env.TRUEX_EBBO_POLL_INTERVAL_MS || '1000', 10),
+  shadowZeroDetectionAlertThresholdMs: parseInt(process.env.SHADOW_ZERO_DETECTION_ALERT_THRESHOLD_MS || '300000', 10),
+  shadowSuppressionAlertThreshold: parseInt(process.env.SHADOW_SUPPRESSION_ALERT_THRESHOLD || '5', 10),
+  shadowEdgeCeilingAlertThreshold: parseInt(process.env.SHADOW_EDGE_CEILING_ALERT_THRESHOLD || '3', 10),
+  shadowPhase2Criteria,
 };
 
 // ---------------------------------------------------------------------------
@@ -248,6 +289,16 @@ async function main() {
   logger.info(`Emergency:     ${config.emergencyLimitBTC} BTC`);
   logger.info(`Redis:         ${config.redisUrl ? 'configured' : 'none'}`);
   logger.info(`PostgreSQL:    ${config.pgUrl ? 'configured' : 'none'}`);
+  logger.info(`Shadow mode:   ${config.shadowTakeMode ? 'observe-only enabled' : 'off'}`);
+  logger.info(
+    `Shadow gate:   >=${config.shadowPhase2Criteria.minWouldTakeCount} would-takes over >=${config.shadowPhase2Criteria.minObservationDays}d, ` +
+    `median edge >=${config.shadowPhase2Criteria.minMedianBasisAdjEdgeBps}bps, p25 edge >=${config.shadowPhase2Criteria.minP25BasisAdjEdgeBps}bps`
+  );
+  logger.info(
+    `Shadow abort:  disappeared rate >${config.shadowPhase2Criteria.maxDisappearedRatePct}% ` +
+    `or |PYUSD basis| >${config.shadowPhase2Criteria.maxAbsPyusdBasisBps}bps ` +
+    `or p95(|basis|) >${config.shadowPhase2Criteria.maxP95AbsPyusdBasisBps}bps`
+  );
   logger.info('');
 
   krakenRestClient = new KrakenRestClient({});
@@ -428,6 +479,17 @@ async function main() {
     pyusdUsdStaleThresholdMs: config.pyusdUsdStaleThresholdMs,
     pyusdUsdReferenceSources: config.pyusdUsdReferenceSources,
     krakenRestClient,
+    shadowTakeMode: config.shadowTakeMode,
+    minTakeEdgeBps: config.minTakeEdgeBps,
+    maxEdgeCeilingBps: config.maxEdgeCeilingBps,
+    pyusdDepegThresholdBps: config.pyusdDepegThresholdBps,
+    maxTakeNotionalPerOrder: config.maxTakeNotionalPerOrder,
+    minTakeSizeBTC: config.minTakeSizeBTC,
+    shadowPersistenceRequiredPolls: config.shadowPersistenceRequiredPolls,
+    truexEbboPollIntervalMs: config.truexEbboPollIntervalMs,
+    shadowZeroDetectionAlertThresholdMs: config.shadowZeroDetectionAlertThresholdMs,
+    shadowSuppressionAlertThreshold: config.shadowSuppressionAlertThreshold,
+    shadowEdgeCeilingAlertThreshold: config.shadowEdgeCeilingAlertThreshold,
 
     // No hedging initially
     krakenClient: null,
@@ -493,6 +555,7 @@ async function main() {
       `base=${inv.baseBalance?.available?.toFixed(4) || '?'} BTC avail | ` +
       `quote=${inv.quoteBalance?.available?.toFixed(2) || '?'} PYUSD avail | ` +
       `pyusdUsd=${pyusdUsd?.price?.toFixed?.(6) || '?'}${status.pyusdUsdFresh ? '' : ' stale'} | ` +
+      `shadow=${quotes.shadowTakeMode ? 'on' : 'off'} | ` +
       `uptime=${((status.uptimeMs || 0) / 1000 / 60).toFixed(1)}min`
     );
   }, 60000);

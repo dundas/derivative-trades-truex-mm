@@ -118,6 +118,7 @@ const quoteEngine = new QuoteEngine({
   inventoryManager,
   logger,
   levels: 1,
+  shadowTakeMode: true,
   shadowPersistenceRequiredPolls: 1,
   minTakeEdgeBps: 10,
   maxTakeNotionalPerOrder: 1000,
@@ -138,6 +139,7 @@ const orchestrator = new MarketMakerOrchestrator({
   truexTradeCacheTtlMs: 0,
   truexTradePollTimeoutMs: 100,
   pyusdUsdPollIntervalMs: 0,
+  shadowTakeMode: true,
   shadowPersistenceRequiredPolls: 1,
   minTakeEdgeBps: 10,
   maxTakeNotionalPerOrder: 1000,
@@ -230,5 +232,16 @@ if (fixConnection.sentMessages.length !== 0) {
   fail(`expected zero FIX sends, got ${fixConnection.sentMessages.length}`);
 }
 
+orchestrator.shadowTakeMode = false;
+quoteEngine.config.shadowTakeMode = false;
+const beforeDisabled = shadowLogs.length;
+await orchestrator._pollTruexEbbo();
+if (shadowLogs.length !== beforeDisabled) {
+  fail(`expected no additional shadow logs when mode is off, got ${shadowLogs.length - beforeDisabled}`);
+}
+if (fixConnection.sentMessages.length !== 0) {
+  fail(`expected zero FIX sends after mode-off poll, got ${fixConnection.sentMessages.length}`);
+}
+
 await orchestrator.stop();
-console.log(`PASS: one shadow would-take log with edge=${payload.basisAdjEdgeBps}bps and zero FIX sends`);
+console.log(`PASS: shadowTakeMode on => one would-take log; off => no log; zero FIX sends throughout`);

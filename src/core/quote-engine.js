@@ -66,6 +66,7 @@ export class QuoteEngine extends EventEmitter {
       takeHedgeBufferBps: options.takeHedgeBufferBps ?? 0,
       maxTakerOrdersPerMinute: options.maxTakerOrdersPerMinute ?? 0,
       maxTakerNotionalPerMinute: options.maxTakerNotionalPerMinute ?? 0,
+      shadowTakeMode: options.shadowTakeMode ?? false,
       shadowPersistenceRequiredPolls: options.shadowPersistenceRequiredPolls ?? 3,
       maxEdgeCeilingBps: options.maxEdgeCeilingBps ?? 250,
       pyusdDepegThresholdBps: options.pyusdDepegThresholdBps ?? 100,
@@ -914,6 +915,7 @@ export class QuoteEngine extends EventEmitter {
       pyusdUsd: this.pyusdUsd ? { ...this.pyusdUsd } : null,
       pyusdUsdFresh: this._isPyusdBasisFresh(),
       pyusdBasisSuppressed: this.shouldSuppressBasisDependentDetection(),
+      shadowTakeMode: this.config.shadowTakeMode,
       shadowState: {
         activeCandidate: this.shadowState.activeCandidate ? { ...this.shadowState.activeCandidate } : null,
         lastLoggedCandidate: this.shadowState.lastLoggedCandidate ? { ...this.shadowState.lastLoggedCandidate } : null,
@@ -1129,6 +1131,10 @@ export class QuoteEngine extends EventEmitter {
   }
 
   evaluateShadowTake({ aggregatedPrice, truexTape = null, now = Date.now(), trigger = 'unknown' }) {
+    if (!this.config.shadowTakeMode) {
+      return null;
+    }
+
     const coinbaseSource = this._extractCoinbaseSource(aggregatedPrice);
     const coinbaseBid = Number(coinbaseSource?.bid ?? 0);
     const coinbaseFresh = !!coinbaseSource && !coinbaseSource.isStale;
@@ -1485,6 +1491,11 @@ export class QuoteEngine extends EventEmitter {
 
   _prepareTakerQuote(quote) {
     const prepared = { ...quote };
+    if (this.config.shadowTakeMode) {
+      this._recordSuppression(prepared, 'shadow-mode-observe-only');
+      return null;
+    }
+
     if (!this.config.allowTakerOrders) {
       this._recordSuppression(prepared, 'taker-disabled');
       return null;
