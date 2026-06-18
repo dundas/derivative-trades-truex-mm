@@ -1085,6 +1085,58 @@ describe('QuoteEngine', () => {
       expect(engine.getQuoteStatus().truexEbboFresh).toBe(false);
     });
 
+    it('stores pyusdUsd separately and reports freshness independently', () => {
+      const engine = createEngine({ pyusdUsdStaleThresholdMs: 10 });
+      const timestamp = Date.now();
+
+      engine.updatePyusdUsd({
+        price: 1.0004,
+        bid: 1.0003,
+        ask: 1.0005,
+        timestamp,
+        source: 'kraken-rest',
+        pair: 'PYUSD/USD',
+      });
+
+      expect(engine.pyusdUsd.price).toBe(1.0004);
+      expect(engine._isPyusdBasisFresh()).toBe(true);
+      expect(engine.getQuoteStatus().pyusdUsd).toEqual({
+        price: 1.0004,
+        bid: 1.0003,
+        ask: 1.0005,
+        timestamp,
+        source: 'kraken-rest',
+        pair: 'PYUSD/USD',
+      });
+      expect(engine.getQuoteStatus().pyusdUsdFresh).toBe(true);
+      expect(engine.getQuoteStatus().pyusdBasisSuppressed).toBe(false);
+    });
+
+    it('treats missing or stale pyusdUsd references as not fresh', () => {
+      const engine = createEngine({ pyusdUsdStaleThresholdMs: 10 });
+
+      expect(engine._isPyusdBasisFresh()).toBe(false);
+      expect(engine.shouldSuppressBasisDependentDetection()).toBe(true);
+      expect(engine.getQuoteStatus().pyusdUsd).toBeNull();
+      expect(engine.getQuoteStatus().pyusdUsdFresh).toBe(false);
+      expect(engine.getQuoteStatus().pyusdBasisSuppressed).toBe(true);
+
+      engine.updatePyusdUsd({
+        price: 0.9985,
+        bid: 0.9984,
+        ask: 0.9986,
+        timestamp: Date.now() - 1000,
+        source: 'kraken-rest',
+        pair: 'PYUSD/USD',
+      });
+
+      expect(engine._isPyusdBasisFresh()).toBe(false);
+      expect(engine.shouldSuppressBasisDependentDetection()).toBe(true);
+      expect(engine.getQuoteStatus().pyusdUsd.price).toBe(0.9985);
+      expect(engine.getQuoteStatus().pyusdUsdFresh).toBe(false);
+      expect(engine.getQuoteStatus().pyusdBasisSuppressed).toBe(true);
+    });
+
     it('should not treat provider books without timestamps as fresh marketability data', () => {
       const fixMock = createMockFix();
       const engine = createEngine({

@@ -68,31 +68,31 @@ Phase 2 (live takes) is gated on Phase 1 data and explicitly out of scope here.
   - [ ] 1.17 Mini-narrative in `memory/daily/<today>.md`
   - [ ] 1.18 Rollback plan: define abort triggers (sustained poll failure / 429 storm), recreate-from-backup command, and post-rollback verification that maker behavior is unaffected
 
-- [ ] **2.0a PYUSD/USD basis feed** — smoke: basis value populates (outbound surface, NOT skippable)
-  - [ ] 2.1 Create feature branch `feat/pyusd-usd-basis-feed` from `main`
-  - [ ] 2.2 Use 0.3 findings to stand up a real PYUSD-USD source: **revalidate the live public candidates at implementation time**, then prefer Kraken public REST ticker `PYUSDUSD` if it is still available; keep the basis source configurable and fallback-capable, and do **not** use a second `CoinbaseWsIngest` instance unless Coinbase relists `PYUSD-USD`
-  - [ ] 2.3 Expose `pyusdUsd` price + timestamp without altering the existing BTC-USD fair-value path used by the live maker
-  - [ ] 2.4 Unit tests: feed wiring/freshness; null/stale handling; **maker regression guard** that adding the basis feed does NOT change BTC-USD confidence/freshness
-  - [ ] 2.5 Tests pass
-  - [ ] 2.6 `/adversarial-reviewer` local
-  - [ ] 2.7 `/pre-push-review`
-  - [ ] 2.8 Smoke: feed → `pyusdUsd` populated; stale → flagged; no order send
-  - [ ] 2.9 `gh pr create`
-  - [ ] 2.10 Solicit `@coderabbitai review` (re-tag at 5 min)
-  - [ ] 2.11 `/pr-review-loop <PR#>`
-  - [ ] 2.12 Merge after reviewer pass + CI green
-  - [ ] 2.13 Pull `main`, validate; deploy + confirm basis value present in logs/status
-  - [ ] 2.14 Mini-narrative
+- [x] **2.0a PYUSD/USD basis feed** — smoke: basis value populates (outbound surface, NOT skippable)
+  - [x] 2.1 Create feature branch `feat/pyusd-usd-basis-feed` from `main`
+  - [x] 2.2 Use 0.3 findings to stand up a real PYUSD-USD source: **revalidate the live public candidates at implementation time**, then prefer Kraken public REST ticker `PYUSDUSD` if it is still available; keep the basis source configurable and fallback-capable, and do **not** use a second `CoinbaseWsIngest` instance unless Coinbase relists `PYUSD-USD`
+  - [x] 2.3 Expose `pyusdUsd` price + timestamp without altering the existing BTC-USD fair-value path used by the live maker
+  - [x] 2.4 Unit tests: feed wiring/freshness; null/stale handling; **maker regression guard** that adding the basis feed does NOT change BTC-USD confidence/freshness
+  - [x] 2.5 Tests pass
+  - [x] 2.6 `/adversarial-reviewer` local
+  - [x] 2.7 `/pre-push-review`
+  - [x] 2.8 Smoke: feed → `pyusdUsd` populated; stale → flagged; no order send
+  - [x] 2.9 `gh pr create`
+  - [x] 2.10 Solicit `@coderabbitai review` (re-tag at 5 min)
+  - [x] 2.11 `/pr-review-loop <PR#>`
+  - [x] 2.12 Merge after reviewer pass + CI green
+  - [x] 2.13 Pull `main`, validate; deploy + confirm basis value present in logs/status
+  - [x] 2.14 Mini-narrative
 
 - [ ] **2.0b PYUSD/USD engine plumbing** — smoke: engine sees basis and suppresses on stale/missing
-  - [ ] 2.15 Create feature branch `feat/pyusd-usd-engine-plumbing` from `main`
-  - [ ] 2.16 Plumb `pyusdUsd` into the QuoteEngine (setter + freshness gate `_isPyusdBasisFresh()`); default to `null` when unavailable
-  - [ ] 2.17 Decision rule: if basis unavailable/stale, basis-dependent detection MUST suppress (no silent assume=1) — wired in 3.0, asserted here via the freshness gate
-  - [ ] 2.18 Unit tests: basis setter/freshness; null/stale handling; depeg value surfaced
-  - [ ] 2.19 Tests pass
-  - [ ] 2.20 `/adversarial-reviewer` local
-  - [ ] 2.21 `/pre-push-review`
-  - [ ] 2.22 Smoke: engine receives basis, stale basis is flagged/suppressed, no order send
+  - [x] 2.15 Create feature branch `feat/pyusd-usd-engine-plumbing` from `main`
+  - [x] 2.16 Plumb `pyusdUsd` into the QuoteEngine (setter + freshness gate `_isPyusdBasisFresh()`); default to `null` when unavailable
+  - [x] 2.17 Decision rule: if basis unavailable/stale, basis-dependent detection MUST suppress (no silent assume=1) — wired in 3.0, asserted here via the freshness gate
+  - [x] 2.18 Unit tests: basis setter/freshness; null/stale handling; depeg value surfaced
+  - [x] 2.19 Tests pass
+  - [x] 2.20 `/adversarial-reviewer` local
+  - [x] 2.21 `/pre-push-review`
+  - [x] 2.22 Smoke: engine receives basis, stale basis is flagged/suppressed, no order send
   - [ ] 2.23 `gh pr create`
   - [ ] 2.24 Solicit `@coderabbitai review` (re-tag at 5 min)
   - [ ] 2.25 `/pr-review-loop <PR#>`
