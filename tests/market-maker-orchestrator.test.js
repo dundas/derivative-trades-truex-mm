@@ -262,6 +262,39 @@ describe('MarketMakerOrchestrator', () => {
       expect(parsed.timestamp).toBeGreaterThanOrEqual(parsed.lastTradeTs);
     });
 
+    test('throws a clear error when /market/quote returns an empty array', () => {
+      expect(() => MarketMakerOrchestrator.parseMarketQuote([], {
+        instrumentId: '78873627520270354',
+        symbol: 'BTC-PYUSD',
+      })).toThrow('TrueX EBBO poll returned empty array');
+    });
+
+    test('parses the legacy flat /market/quote payload shape when encountered', () => {
+      const parsed = MarketMakerOrchestrator.parseMarketQuote({
+        instrument_id: 'legacy-1',
+        symbol: 'BTC-PYUSD',
+        bid_price: '100.25',
+        ask_price: '100.75',
+        bid_qty: '0.03',
+        ask_qty: '0.04',
+        timestamp: '1781794942928366896',
+      });
+
+      expect(parsed).toEqual(expect.objectContaining({
+        instrumentId: 'legacy-1',
+        symbol: 'BTC-PYUSD',
+        bestBid: 100.25,
+        bestAsk: 100.75,
+        bestBidQty: 0.03,
+        bestAskQty: 0.04,
+        bestBidOrderCount: null,
+        bestAskOrderCount: null,
+        lastTradePrice: null,
+        lastTradeQty: null,
+      }));
+      expect(parsed.timestamp).toBeGreaterThan(0);
+    });
+
     test('polls /market/quote into quoteEngine.updateTruexEbbo without touching maker paths', async () => {
       const alertManager = { sendAlert: jest.fn(async () => ({})), sendRecovery: jest.fn(async () => ({})) };
       const { orchestrator, mocks } = createOrchestrator({ alertManager, truexEbboPollIntervalMs: 1000 });
@@ -624,6 +657,17 @@ describe('MarketMakerOrchestrator', () => {
       expect(status.marketData).not.toBeNull();
       expect(status.marketData.spread).toBeDefined();
       await orchestrator.stop();
+    });
+
+    test('exposes EBBO poll health fields', () => {
+      const { orchestrator } = createOrchestrator();
+      orchestrator._truexEbboLastSuccessAt = 1234567890;
+      orchestrator._truexEbboConsecutiveErrors = 2;
+
+      const status = orchestrator.getStatus();
+
+      expect(status.truexEbboLastSuccessAt).toBe(1234567890);
+      expect(status.truexEbboConsecutiveErrors).toBe(2);
     });
   });
 

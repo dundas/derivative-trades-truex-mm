@@ -423,6 +423,8 @@ export class MarketMakerOrchestrator extends EventEmitter {
         spread: this.marketDataFeed.getSpread(),
       } : null,
       truexEbbo: this.quoteEngine.getQuoteStatus()?.truexEbbo || null,
+      truexEbboLastSuccessAt: this._truexEbboLastSuccessAt || null,
+      truexEbboConsecutiveErrors: this._truexEbboConsecutiveErrors,
       dataPipeline: this.dataPipeline ? this.dataPipeline.getStats() : null,
     };
   }
@@ -447,6 +449,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
     };
 
     if (Array.isArray(rawQuote)) {
+      if (rawQuote.length === 0) {
+        throw new Error('TrueX EBBO poll returned empty array');
+      }
       const entry = rawQuote.find((item) =>
         (instrumentId && item?.id === instrumentId) || (symbol && item?.symbol === symbol)
       ) || rawQuote[0];

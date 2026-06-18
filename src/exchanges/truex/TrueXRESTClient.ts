@@ -152,7 +152,17 @@ export interface MarketQuoteEntry {
   };
 }
 
-export type MarketQuoteResponse = MarketQuoteEntry[];
+export interface FlatMarketQuoteResponse {
+  instrument_id?: string;
+  symbol?: string;
+  bid_price?: string;
+  ask_price?: string;
+  bid_qty?: string;
+  ask_qty?: string;
+  timestamp?: string;
+}
+
+export type MarketQuoteResponse = MarketQuoteEntry[] | FlatMarketQuoteResponse;
 
 export interface Balance {
   asset_id: string;
