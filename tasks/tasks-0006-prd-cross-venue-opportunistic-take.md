@@ -102,24 +102,24 @@ Phase 2 (live takes) is gated on Phase 1 data and explicitly out of scope here.
 
 - [ ] **3.0 Shadow opportunity detection + "would-take" logging** (requires 0.0 + 1.0 + 2.0b) — smoke: mandatory (`scripts/smoke-shadow-take.ts`)
   - [x] 3.1 Create feature branch `feat/shadow-take-detection` from `main`
-  - [ ] 3.2 Implement standalone `evaluateShadowTake()` that returns a loggable record only; it MUST NOT route through `_prepareQuoteForSend`, `_sendNewOrder`, or `_sendCancel`
-  - [ ] 3.3 Basis-adjusted edge (§11.4): apply basis by calling `computeTakeEdgeBps` with `executionPrice = truexBid / pyusdUsd` and `fairValue = coinbaseBid`; do **not** modify `computeTakeEdgeBps`
-  - [ ] 3.4 Trigger `evaluateShadowTake()` from the `/market/quote` poll handler after `updateTruexEbbo`, and also on **coalesced Coinbase fair-value changes** using cached `lastAggregatedPrice` when the detection input (`coinbaseBid`) moves by at least 1 TrueX tick or freshness/confidence flips; rate-limit these Coinbase-side reevaluations to no more than once per poll interval, and do NOT run on every raw `onPriceUpdate` tick in the hot maker path
-  - [ ] 3.5 Detection step: sell-take candidate when `truexEbbo.bestBid` adjusted-edge ≥ `minTakeEdgeBps`; size = `min(bestBidQty, balance-capped, maxPosition headroom, maxTakeNotionalPerOrder)`; inventory-reducing only (long); suppress dust via `minTakeSizeBTC`
-  - [ ] 3.6 Corroboration guards (PB2): Coinbase-leg freshness/confidence; **multi-poll persistence** (pinned N, reset on disappearance); **max-edge suspicion ceiling** (suppress + warn if edge > ceiling); **TrueX `/market/trade` tape recency/outlier guard** using the public REST trade prints confirmed in 0.2
-  - [ ] 3.7 Tape ingestion strategy for the PB2 guard: define polling cadence, cache lifetime, timeout/backoff behavior, stale-data handling, and tests proving the tape check does **not** turn every `/market/quote` poll into a second hot-path REST loop
-  - [ ] 3.8 Basis gate (PB1): suppress all detection if `pyusdUsd` stale/missing or `|pyusdUsd−1| > pyusdDepegThresholdBps`
-  - [ ] 3.9 Dedup (FR16): key on `bestBid + bestBidQty` (not timestamp); add qty-decay tolerance (recommend treating reductions within 10% as the same persisting order) so a partially-taken bid is not re-logged every poll
-  - [ ] 3.10 Structured `would-take` log: side, size, truexPrice, rawEdgeBps, basisAdjEdgeBps, pyusdUsd, coinbaseFresh, truexTapeAgeS, dedupKey, suppressReason(if any)
-  - [ ] 3.11 Fill/miss attribution: record whether the targeted bid disappears shortly after (TrueX's quoter likely took it) vs persists
-  - [ ] 3.12 Shadow-path alerting (FR26): rate-thresholded alerts for sustained zero-detection while market is active, basis/depeg suppression spikes, and edge-ceiling trips
-  - [ ] 3.13 **HARD: no order dispatch** — detection returns/logs only; Phase 1 must not touch `_sendNewOrder` / `_sendCancel`; output type is non-dispatchable
-  - [ ] 3.14 Unit tests: edge math (basis), fires at/above threshold + not below, suppression (stale/low-conf Coinbase, stale truexEbbo, basis stale/depeg, edge>ceiling, tape-outlier if applicable), dedup, inventory-reducing-only, minTakeSize floor, **assert zero sendMessage on the take path**
-  - [ ] 3.15 Orchestrator-layer tests: new poll loop has zero call edges to FIX and invokes a non-dispatchable shadow-evaluation path only
-  - [ ] 3.16 Tests pass
+  - [x] 3.2 Implement standalone `evaluateShadowTake()` that returns a loggable record only; it MUST NOT route through `_prepareQuoteForSend`, `_sendNewOrder`, or `_sendCancel`
+  - [x] 3.3 Basis-adjusted edge (§11.4): apply basis by calling `computeTakeEdgeBps` with `executionPrice = truexBid / pyusdUsd` and `fairValue = coinbaseBid`; do **not** modify `computeTakeEdgeBps`
+  - [x] 3.4 Trigger `evaluateShadowTake()` from the `/market/quote` poll handler after `updateTruexEbbo`, and also on **coalesced Coinbase fair-value changes** using cached `lastAggregatedPrice` when the detection input (`coinbaseBid`) moves by at least 1 TrueX tick or freshness/confidence flips; rate-limit these Coinbase-side reevaluations to no more than once per poll interval, and do NOT run on every raw `onPriceUpdate` tick in the hot maker path
+  - [x] 3.5 Detection step: sell-take candidate when `truexEbbo.bestBid` adjusted-edge ≥ `minTakeEdgeBps`; size = `min(bestBidQty, balance-capped, maxPosition headroom, maxTakeNotionalPerOrder)`; inventory-reducing only (long); suppress dust via `minTakeSizeBTC`
+  - [x] 3.6 Corroboration guards (PB2): Coinbase-leg freshness/confidence; **multi-poll persistence** (pinned N, reset on disappearance); **max-edge suspicion ceiling** (suppress + warn if edge > ceiling); **TrueX `/market/trade` tape recency/outlier guard** using the public REST trade prints confirmed in 0.2
+  - [x] 3.7 Tape ingestion strategy for the PB2 guard: define polling cadence, cache lifetime, timeout/backoff behavior, stale-data handling, and tests proving the tape check does **not** turn every `/market/quote` poll into a second hot-path REST loop
+  - [x] 3.8 Basis gate (PB1): suppress all detection if `pyusdUsd` stale/missing or `|pyusdUsd−1| > pyusdDepegThresholdBps`
+  - [x] 3.9 Dedup (FR16): key on `bestBid + bestBidQty` (not timestamp); add qty-decay tolerance (recommend treating reductions within 10% as the same persisting order) so a partially-taken bid is not re-logged every poll
+  - [x] 3.10 Structured `would-take` log: side, size, truexPrice, rawEdgeBps, basisAdjEdgeBps, pyusdUsd, coinbaseFresh, truexTapeAgeS, dedupKey, suppressReason(if any)
+  - [x] 3.11 Fill/miss attribution: record whether the targeted bid disappears shortly after (TrueX's quoter likely took it) vs persists
+  - [x] 3.12 Shadow-path alerting (FR26): rate-thresholded alerts for sustained zero-detection while market is active, basis/depeg suppression spikes, and edge-ceiling trips
+  - [x] 3.13 **HARD: no order dispatch** — detection returns/logs only; Phase 1 must not touch `_sendNewOrder` / `_sendCancel`; output type is non-dispatchable
+  - [x] 3.14 Unit tests: edge math (basis), fires at/above threshold + not below, suppression (stale/low-conf Coinbase, stale truexEbbo, basis stale/depeg, edge>ceiling, tape-outlier if applicable), dedup, inventory-reducing-only, minTakeSize floor, **assert zero sendMessage on the take path**
+  - [x] 3.15 Orchestrator-layer tests: new poll loop has zero call edges to FIX and invokes a non-dispatchable shadow-evaluation path only
+  - [x] 3.16 Tests pass
   - [ ] 3.17 `/adversarial-reviewer` local (real-money-adjacent logic even though no sends — verify the no-send invariant holds on all branches)
   - [ ] 3.18 `/pre-push-review`
-  - [ ] 3.19 Smoke (`scripts/smoke-shadow-take.ts`): synthetic dislocated book + fresh Coinbase + basis → asserts one would-take log with correct basis-adj edge AND zero FIX sends; second identical poll → deduped (no second log)
+  - [x] 3.19 Smoke (`scripts/smoke-shadow-take.ts`): synthetic dislocated book + fresh Coinbase + basis → asserts one would-take log with correct basis-adj edge AND zero FIX sends; second identical poll → deduped (no second log)
   - [ ] 3.20 `gh pr create`
   - [ ] 3.21 Solicit `@coderabbitai review` (re-tag at 5 min)
   - [ ] 3.22 `/pr-review-loop <PR#>`

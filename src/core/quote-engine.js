@@ -66,6 +66,15 @@ export class QuoteEngine extends EventEmitter {
       takeHedgeBufferBps: options.takeHedgeBufferBps ?? 0,
       maxTakerOrdersPerMinute: options.maxTakerOrdersPerMinute ?? 0,
       maxTakerNotionalPerMinute: options.maxTakerNotionalPerMinute ?? 0,
+      shadowPersistenceRequiredPolls: options.shadowPersistenceRequiredPolls ?? 3,
+      maxEdgeCeilingBps: options.maxEdgeCeilingBps ?? 250,
+      pyusdDepegThresholdBps: options.pyusdDepegThresholdBps ?? 100,
+      minTakeSizeBTC: options.minTakeSizeBTC ?? 0.0001,
+      maxTakeNotionalPerOrder: options.maxTakeNotionalPerOrder ?? 1000,
+      shadowTakeQtyDecayTolerancePct: options.shadowTakeQtyDecayTolerancePct ?? 0.1,
+      shadowAttributionMaxAgeMs: options.shadowAttributionMaxAgeMs ?? 5000,
+      truexTapeMaxAgeMs: options.truexTapeMaxAgeMs ?? 5000,
+      truexTapeOutlierThresholdBps: options.truexTapeOutlierThresholdBps ?? 50,
       marketDataProvider: options.marketDataProvider || null,
     };
 
@@ -103,6 +112,11 @@ export class QuoteEngine extends EventEmitter {
     this.takerWindowStartedAt = Date.now();
     this.takerOrdersThisWindow = 0;
     this.takerNotionalThisWindow = 0;
+    this.shadowState = {
+      activeCandidate: null,
+      lastLoggedCandidate: null,
+      pendingAttribution: null,
+    };
 
     // Optional randomized bps ladder (stable for this engine instance).
     this.levelSpacingBpsByLevel = this._buildLevelSpacingBpsLadder();
@@ -900,6 +914,11 @@ export class QuoteEngine extends EventEmitter {
       pyusdUsd: this.pyusdUsd ? { ...this.pyusdUsd } : null,
       pyusdUsdFresh: this._isPyusdBasisFresh(),
       pyusdBasisSuppressed: this.shouldSuppressBasisDependentDetection(),
+      shadowState: {
+        activeCandidate: this.shadowState.activeCandidate ? { ...this.shadowState.activeCandidate } : null,
+        lastLoggedCandidate: this.shadowState.lastLoggedCandidate ? { ...this.shadowState.lastLoggedCandidate } : null,
+        pendingAttribution: this.shadowState.pendingAttribution ? { ...this.shadowState.pendingAttribution } : null,
+      },
     };
   }
 
@@ -1006,6 +1025,397 @@ export class QuoteEngine extends EventEmitter {
 
   shouldSuppressBasisDependentDetection(reference = this.pyusdUsd) {
     return !this._isPyusdBasisFresh(reference);
+  }
+
+  _extractCoinbaseSource(aggregatedPrice) {
+    if (!Array.isArray(aggregatedPrice?.sources)) return null;
+    return aggregatedPrice.sources.find((source) => source?.exchange === 'coinbase') || null;
+  }
+
+  _getInventoryNetPosition() {
+    if (typeof this.inventoryManager?.getPositionSummary === 'function') {
+      return Number(this.inventoryManager.getPositionSummary()?.netPosition ?? 0);
+    }
+    return Number(this.inventoryManager?.netPosition ?? 0);
+  }
+
+  _getSellableInventoryBtc() {
+    const available = Number(this.inventoryManager?.getAvailableForSide?.('sell') ?? Infinity);
+    const netPosition = Math.max(0, this._getInventoryNetPosition());
+    return Math.max(0, Math.min(available, netPosition));
+  }
+
+  _getShadowCandidateKey(price, qty) {
+    return `${Number(price).toFixed(2)}:${Number(qty).toFixed(8)}`;
+  }
+
+  _isSameShadowOrder(a, b) {
+    if (!a || !b) return false;
+    if (Number(a.price) !== Number(b.price)) return false;
+    const baseQty = Math.max(Number(a.qty) || 0, Number(b.qty) || 0);
+    if (baseQty <= 0) return false;
+    const delta = Math.abs(Number(a.qty) - Number(b.qty));
+    return (delta / baseQty) <= this.config.shadowTakeQtyDecayTolerancePct;
+  }
+
+  _buildShadowEvaluation({
+    now,
+    trigger,
+    coinbaseBid,
+    coinbaseFresh,
+    rawEdgeBps,
+    basisAdjEdgeBps,
+    size,
+    truexTapeAgeS,
+    dedupKey,
+    suppressReason = null,
+    wouldTake = false,
+  }) {
+    return {
+      timestamp: now,
+      trigger,
+      side: 'sell',
+      size,
+      truexPrice: this.truexEbbo?.bestBid ?? null,
+      rawEdgeBps,
+      basisAdjEdgeBps,
+      pyusdUsd: this.pyusdUsd?.price ?? null,
+      coinbaseBid,
+      coinbaseFresh,
+      truexTapeAgeS,
+      dedupKey,
+      suppressReason,
+      wouldTake,
+    };
+  }
+
+  _resolvePendingShadowAttribution({ now, currentCandidate }) {
+    const pending = this.shadowState.pendingAttribution;
+    if (!pending) return [];
+
+    const ageMs = now - pending.loggedAt;
+    if (ageMs < this.config.shadowAttributionMaxAgeMs && this._isSameShadowOrder(pending, currentCandidate)) {
+      return [];
+    }
+
+    const outcome = this._isSameShadowOrder(pending, currentCandidate) ? 'persisted' : 'disappeared';
+    const attribution = {
+      type: 'shadow-take-attribution',
+      timestamp: now,
+      dedupKey: pending.dedupKey,
+      outcome,
+      ageMs,
+      truexPrice: pending.price,
+      truexQty: pending.qty,
+    };
+    this.shadowState.pendingAttribution = null;
+    return [attribution];
+  }
+
+  _resetShadowCandidate() {
+    this.shadowState.activeCandidate = null;
+  }
+
+  evaluateShadowTake({ aggregatedPrice, truexTape = null, now = Date.now(), trigger = 'unknown' }) {
+    const coinbaseSource = this._extractCoinbaseSource(aggregatedPrice);
+    const coinbaseBid = Number(coinbaseSource?.bid ?? 0);
+    const coinbaseFresh = !!coinbaseSource && !coinbaseSource.isStale;
+    const logs = this._resolvePendingShadowAttribution({
+      now,
+      currentCandidate: this.truexEbbo
+        ? { price: this.truexEbbo.bestBid, qty: this.truexEbbo.bestBidQty }
+        : null,
+    });
+
+    if (!coinbaseFresh || !coinbaseBid || aggregatedPrice?.confidence < this.config.confidenceThreshold) {
+      this._resetShadowCandidate();
+      return {
+        logs,
+        evaluation: this._buildShadowEvaluation({
+          now,
+          trigger,
+          coinbaseBid: coinbaseBid || null,
+          coinbaseFresh,
+          rawEdgeBps: null,
+          basisAdjEdgeBps: null,
+          size: null,
+          truexTapeAgeS: truexTape?.ageS ?? null,
+          dedupKey: null,
+          suppressReason: !coinbaseFresh ? 'coinbase-stale' : 'coinbase-low-confidence',
+        }),
+      };
+    }
+
+    if (!this._isTruexEbboFresh() || !this.truexEbbo?.bestBid || !this.truexEbbo?.bestBidQty) {
+      this._resetShadowCandidate();
+      return {
+        logs,
+        evaluation: this._buildShadowEvaluation({
+          now,
+          trigger,
+          coinbaseBid,
+          coinbaseFresh,
+          rawEdgeBps: null,
+          basisAdjEdgeBps: null,
+          size: null,
+          truexTapeAgeS: truexTape?.ageS ?? null,
+          dedupKey: null,
+          suppressReason: 'truex-ebbo-stale',
+        }),
+      };
+    }
+
+    if (this.shouldSuppressBasisDependentDetection()) {
+      this._resetShadowCandidate();
+      return {
+        logs,
+        evaluation: this._buildShadowEvaluation({
+          now,
+          trigger,
+          coinbaseBid,
+          coinbaseFresh,
+          rawEdgeBps: null,
+          basisAdjEdgeBps: null,
+          size: null,
+          truexTapeAgeS: truexTape?.ageS ?? null,
+          dedupKey: null,
+          suppressReason: 'basis-stale',
+        }),
+      };
+    }
+
+    const pyusdUsd = Number(this.pyusdUsd?.price ?? 0);
+    const depegBps = Math.abs(pyusdUsd - 1) * 10000;
+    if (depegBps > this.config.pyusdDepegThresholdBps) {
+      this._resetShadowCandidate();
+      return {
+        logs,
+        evaluation: this._buildShadowEvaluation({
+          now,
+          trigger,
+          coinbaseBid,
+          coinbaseFresh,
+          rawEdgeBps: null,
+          basisAdjEdgeBps: null,
+          size: null,
+          truexTapeAgeS: truexTape?.ageS ?? null,
+          dedupKey: null,
+          suppressReason: 'basis-depeg',
+        }),
+      };
+    }
+
+    const rawEdgeBps = this.computeTakeEdgeBps({
+      side: 'sell',
+      fairValue: coinbaseBid,
+      executionPrice: this.truexEbbo.bestBid,
+    });
+    const basisAdjEdgeBps = this.computeTakeEdgeBps({
+      side: 'sell',
+      fairValue: coinbaseBid,
+      executionPrice: this.truexEbbo.bestBid / pyusdUsd,
+    });
+    const truexTapeAgeS = truexTape?.ageS ?? null;
+    const dedupKey = this._getShadowCandidateKey(this.truexEbbo.bestBid, this.truexEbbo.bestBidQty);
+
+    if (!truexTape?.latestTradePrice || !truexTape?.latestTradeTs || truexTapeAgeS === null) {
+      this._resetShadowCandidate();
+      return {
+        logs,
+        evaluation: this._buildShadowEvaluation({
+          now,
+          trigger,
+          coinbaseBid,
+          coinbaseFresh,
+          rawEdgeBps,
+          basisAdjEdgeBps,
+          size: null,
+          truexTapeAgeS,
+          dedupKey,
+          suppressReason: 'truex-tape-stale',
+        }),
+      };
+    }
+
+    if ((now - truexTape.latestTradeTs) > this.config.truexTapeMaxAgeMs) {
+      this._resetShadowCandidate();
+      return {
+        logs,
+        evaluation: this._buildShadowEvaluation({
+          now,
+          trigger,
+          coinbaseBid,
+          coinbaseFresh,
+          rawEdgeBps,
+          basisAdjEdgeBps,
+          size: null,
+          truexTapeAgeS,
+          dedupKey,
+          suppressReason: 'truex-tape-stale',
+        }),
+      };
+    }
+
+    const tapeDistanceBps = Math.abs((Number(truexTape.latestTradePrice) - this.truexEbbo.bestBid) / this.truexEbbo.bestBid) * 10000;
+    if (tapeDistanceBps > this.config.truexTapeOutlierThresholdBps) {
+      this._resetShadowCandidate();
+      return {
+        logs,
+        evaluation: this._buildShadowEvaluation({
+          now,
+          trigger,
+          coinbaseBid,
+          coinbaseFresh,
+          rawEdgeBps,
+          basisAdjEdgeBps,
+          size: null,
+          truexTapeAgeS,
+          dedupKey,
+          suppressReason: 'truex-tape-outlier',
+        }),
+      };
+    }
+
+    if (basisAdjEdgeBps > this.config.maxEdgeCeilingBps) {
+      this._resetShadowCandidate();
+      return {
+        logs,
+        evaluation: this._buildShadowEvaluation({
+          now,
+          trigger,
+          coinbaseBid,
+          coinbaseFresh,
+          rawEdgeBps,
+          basisAdjEdgeBps,
+          size: null,
+          truexTapeAgeS,
+          dedupKey,
+          suppressReason: 'edge-too-high',
+        }),
+      };
+    }
+
+    if (basisAdjEdgeBps < this.config.minTakeEdgeBps) {
+      this._resetShadowCandidate();
+      return {
+        logs,
+        evaluation: this._buildShadowEvaluation({
+          now,
+          trigger,
+          coinbaseBid,
+          coinbaseFresh,
+          rawEdgeBps,
+          basisAdjEdgeBps,
+          size: null,
+          truexTapeAgeS,
+          dedupKey,
+          suppressReason: 'edge-too-low',
+        }),
+      };
+    }
+
+    const maxSizeByNotional = this.config.maxTakeNotionalPerOrder > 0
+      ? this.config.maxTakeNotionalPerOrder / this.truexEbbo.bestBid
+      : Infinity;
+    const size = Math.min(
+      Number(this.truexEbbo.bestBidQty),
+      this._getSellableInventoryBtc(),
+      maxSizeByNotional,
+    );
+
+    if (!Number.isFinite(size) || size < this.config.minTakeSizeBTC) {
+      this._resetShadowCandidate();
+      return {
+        logs,
+        evaluation: this._buildShadowEvaluation({
+          now,
+          trigger,
+          coinbaseBid,
+          coinbaseFresh,
+          rawEdgeBps,
+          basisAdjEdgeBps,
+          size,
+          truexTapeAgeS,
+          dedupKey,
+          suppressReason: 'take-size-too-small',
+        }),
+      };
+    }
+
+    const candidate = {
+      price: this.truexEbbo.bestBid,
+      qty: Number(this.truexEbbo.bestBidQty),
+      dedupKey,
+      persistenceCount: 1,
+    };
+    if (this._isSameShadowOrder(this.shadowState.activeCandidate, candidate)) {
+      candidate.persistenceCount = this.shadowState.activeCandidate.persistenceCount + 1;
+    }
+    this.shadowState.activeCandidate = candidate;
+
+    if (candidate.persistenceCount < this.config.shadowPersistenceRequiredPolls) {
+      return {
+        logs,
+        evaluation: this._buildShadowEvaluation({
+          now,
+          trigger,
+          coinbaseBid,
+          coinbaseFresh,
+          rawEdgeBps,
+          basisAdjEdgeBps,
+          size,
+          truexTapeAgeS,
+          dedupKey,
+          suppressReason: 'persistence-pending',
+        }),
+      };
+    }
+
+    if (this._isSameShadowOrder(this.shadowState.lastLoggedCandidate, candidate)) {
+      return {
+        logs,
+        evaluation: this._buildShadowEvaluation({
+          now,
+          trigger,
+          coinbaseBid,
+          coinbaseFresh,
+          rawEdgeBps,
+          basisAdjEdgeBps,
+          size,
+          truexTapeAgeS,
+          dedupKey,
+          suppressReason: 'deduped',
+        }),
+      };
+    }
+
+    const log = {
+      type: 'would-take',
+      ...this._buildShadowEvaluation({
+        now,
+        trigger,
+        coinbaseBid,
+        coinbaseFresh,
+        rawEdgeBps,
+        basisAdjEdgeBps,
+        size,
+        truexTapeAgeS,
+        dedupKey,
+        wouldTake: true,
+      }),
+      persistenceCount: candidate.persistenceCount,
+    };
+
+    this.shadowState.lastLoggedCandidate = candidate;
+    this.shadowState.pendingAttribution = {
+      price: candidate.price,
+      qty: candidate.qty,
+      dedupKey,
+      loggedAt: now,
+    };
+
+    logs.push(log);
+    return { logs, evaluation: log };
   }
 
   _isMarketablePostOnly(quote) {

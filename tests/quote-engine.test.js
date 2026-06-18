@@ -1388,6 +1388,298 @@ describe('QuoteEngine', () => {
     });
   });
 
+  describe('shadow take detection', () => {
+    function makeShadowPrice({ coinbaseBid = 100, confidence = 0.95, isStale = false } = {}) {
+      return {
+        weightedMidpoint: coinbaseBid + 0.5,
+        confidence,
+        sources: [
+          {
+            exchange: 'coinbase',
+            bid: coinbaseBid,
+            ask: coinbaseBid + 1,
+            midpoint: coinbaseBid + 0.5,
+            weight: 1,
+            isStale,
+            latencyMs: 25,
+          },
+        ],
+      };
+    }
+
+    function makeShadowTape({ price = 101.2, qty = 0.25, ts = Date.now() - 500 } = {}) {
+      return {
+        latestTradePrice: price,
+        latestTradeQty: qty,
+        latestTradeTs: ts,
+        ageS: (Date.now() - ts) / 1000,
+      };
+    }
+
+    function seedFreshShadowInputs(engine, { bid = 101.2, bidQty = 0.25, pyusd = 1.0, now = Date.now() } = {}) {
+      engine.updateTruexEbbo({
+        bestBid: bid,
+        bestAsk: bid + 0.5,
+        bestBidQty: bidQty,
+        bestAskQty: 0.2,
+        bestBidOrderCount: 1,
+        bestAskOrderCount: 1,
+        lastTradePrice: bid,
+        lastTradeQty: bidQty,
+        lastTradeTs: now,
+        timestamp: now,
+      });
+      engine.updatePyusdUsd({
+        price: pyusd,
+        bid: pyusd,
+        ask: pyusd,
+        timestamp: now,
+        source: 'kraken-rest',
+        pair: 'PYUSD/USD',
+      });
+    }
+
+    it('logs a would-take only after the persistence threshold and keeps FIX send count at zero', () => {
+      const fixMock = createMockFix();
+      const inventoryManager = {
+        getSkew: mock(() => ({ bidSkewTicks: 0, askSkewTicks: 0 })),
+        canQuote: mock(() => true),
+        getPositionSummary: mock(() => ({ netPosition: 0.4 })),
+        getAvailableForSide: mock(() => 0.4),
+      };
+      const engine = createEngine({
+        fixConnection: fixMock,
+        inventoryManager,
+        shadowPersistenceRequiredPolls: 3,
+        minTakeEdgeBps: 10,
+        maxTakeNotionalPerOrder: 1000,
+      });
+      seedFreshShadowInputs(engine);
+      const aggregatedPrice = makeShadowPrice({ coinbaseBid: 100 });
+      const truexTape = makeShadowTape({ price: 101.2 });
+
+      const first = engine.evaluateShadowTake({ aggregatedPrice, truexTape, now: Date.now(), trigger: 'poll-1' });
+      const second = engine.evaluateShadowTake({ aggregatedPrice, truexTape, now: Date.now() + 1, trigger: 'poll-2' });
+      const third = engine.evaluateShadowTake({ aggregatedPrice, truexTape, now: Date.now() + 2, trigger: 'poll-3' });
+
+      expect(first.evaluation.suppressReason).toBe('persistence-pending');
+      expect(second.evaluation.suppressReason).toBe('persistence-pending');
+      expect(third.logs).toHaveLength(1);
+      expect(third.logs[0]).toEqual(expect.objectContaining({
+        type: 'would-take',
+        wouldTake: true,
+        side: 'sell',
+        truexPrice: 101.2,
+      }));
+      expect(third.logs[0].rawEdgeBps).toBeCloseTo(120, 6);
+      expect(third.logs[0].basisAdjEdgeBps).toBeCloseTo(120, 6);
+      expect(third.logs[0].size).toBeCloseTo(0.25, 8);
+      expect(fixMock.sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('applies basis-adjusted edge math without modifying computeTakeEdgeBps', () => {
+      const engine = createEngine({
+        inventoryManager: {
+          getSkew: mock(() => ({ bidSkewTicks: 0, askSkewTicks: 0 })),
+          canQuote: mock(() => true),
+          getPositionSummary: mock(() => ({ netPosition: 0.4 })),
+          getAvailableForSide: mock(() => 0.4),
+        },
+        shadowPersistenceRequiredPolls: 1,
+        minTakeEdgeBps: 10,
+        pyusdDepegThresholdBps: 150,
+      });
+      seedFreshShadowInputs(engine, { bid: 101.2, pyusd: 1.01 });
+
+      const result = engine.evaluateShadowTake({
+        aggregatedPrice: makeShadowPrice({ coinbaseBid: 100 }),
+        truexTape: makeShadowTape({ price: 101.2 }),
+        now: Date.now(),
+        trigger: 'basis-math',
+      });
+
+      expect(result.evaluation.rawEdgeBps).toBeCloseTo(120, 6);
+      expect(result.evaluation.basisAdjEdgeBps).toBeCloseTo(19.801980198, 6);
+      expect(result.evaluation.wouldTake).toBe(true);
+    });
+
+    it('suppresses detection when basis is stale or missing', () => {
+      const engine = createEngine({
+        inventoryManager: {
+          getSkew: mock(() => ({ bidSkewTicks: 0, askSkewTicks: 0 })),
+          canQuote: mock(() => true),
+          getPositionSummary: mock(() => ({ netPosition: 0.4 })),
+          getAvailableForSide: mock(() => 0.4),
+        },
+        shadowPersistenceRequiredPolls: 1,
+        pyusdUsdStaleThresholdMs: 1000,
+      });
+      seedFreshShadowInputs(engine);
+      engine.pyusdUsd.timestamp = Date.now() - 10_000;
+
+      const result = engine.evaluateShadowTake({
+        aggregatedPrice: makeShadowPrice({ coinbaseBid: 100 }),
+        truexTape: makeShadowTape({ price: 101.2 }),
+        now: Date.now(),
+        trigger: 'basis-stale',
+      });
+
+      expect(result.evaluation.suppressReason).toBe('basis-stale');
+      expect(result.evaluation.wouldTake).toBe(false);
+    });
+
+    it('suppresses detection when basis is depegged beyond threshold', () => {
+      const engine = createEngine({
+        inventoryManager: {
+          getSkew: mock(() => ({ bidSkewTicks: 0, askSkewTicks: 0 })),
+          canQuote: mock(() => true),
+          getPositionSummary: mock(() => ({ netPosition: 0.4 })),
+          getAvailableForSide: mock(() => 0.4),
+        },
+        shadowPersistenceRequiredPolls: 1,
+        pyusdDepegThresholdBps: 100,
+      });
+      seedFreshShadowInputs(engine, { pyusd: 1.02 });
+
+      const result = engine.evaluateShadowTake({
+        aggregatedPrice: makeShadowPrice({ coinbaseBid: 100 }),
+        truexTape: makeShadowTape({ price: 101.2 }),
+        now: Date.now(),
+        trigger: 'basis-depeg',
+      });
+
+      expect(result.evaluation.suppressReason).toBe('basis-depeg');
+      expect(result.evaluation.wouldTake).toBe(false);
+    });
+
+    it('dedupes an identical persisting order on subsequent polls', () => {
+      const engine = createEngine({
+        inventoryManager: {
+          getSkew: mock(() => ({ bidSkewTicks: 0, askSkewTicks: 0 })),
+          canQuote: mock(() => true),
+          getPositionSummary: mock(() => ({ netPosition: 0.4 })),
+          getAvailableForSide: mock(() => 0.4),
+        },
+        shadowPersistenceRequiredPolls: 1,
+        minTakeEdgeBps: 10,
+      });
+      seedFreshShadowInputs(engine);
+      const aggregatedPrice = makeShadowPrice({ coinbaseBid: 100 });
+      const truexTape = makeShadowTape({ price: 101.2 });
+
+      const first = engine.evaluateShadowTake({ aggregatedPrice, truexTape, now: Date.now(), trigger: 'first' });
+      const second = engine.evaluateShadowTake({ aggregatedPrice, truexTape, now: Date.now() + 1, trigger: 'second' });
+
+      expect(first.logs).toHaveLength(1);
+      expect(second.logs).toHaveLength(0);
+      expect(second.evaluation.suppressReason).toBe('deduped');
+    });
+
+    it('suppresses detection for stale coinbase or low-confidence inputs', () => {
+      const engine = createEngine({
+        inventoryManager: {
+          getSkew: mock(() => ({ bidSkewTicks: 0, askSkewTicks: 0 })),
+          canQuote: mock(() => true),
+          getPositionSummary: mock(() => ({ netPosition: 0.4 })),
+          getAvailableForSide: mock(() => 0.4),
+        },
+        shadowPersistenceRequiredPolls: 1,
+        confidenceThreshold: 0.3,
+      });
+      seedFreshShadowInputs(engine);
+      const truexTape = makeShadowTape({ price: 101.2 });
+
+      const staleCoinbase = engine.evaluateShadowTake({
+        aggregatedPrice: makeShadowPrice({ coinbaseBid: 100, isStale: true }),
+        truexTape,
+        now: Date.now(),
+        trigger: 'stale-coinbase',
+      });
+      const lowConfidence = engine.evaluateShadowTake({
+        aggregatedPrice: makeShadowPrice({ coinbaseBid: 100, confidence: 0.1 }),
+        truexTape,
+        now: Date.now() + 1,
+        trigger: 'low-confidence',
+      });
+
+      expect(staleCoinbase.evaluation.suppressReason).toBe('coinbase-stale');
+      expect(lowConfidence.evaluation.suppressReason).toBe('coinbase-low-confidence');
+    });
+
+    it('suppresses edge ceilings, tape outliers, dust size, and short inventory states', () => {
+      const baseInventory = {
+        getSkew: mock(() => ({ bidSkewTicks: 0, askSkewTicks: 0 })),
+        canQuote: mock(() => true),
+        getPositionSummary: mock(() => ({ netPosition: 0.4 })),
+        getAvailableForSide: mock(() => 0.4),
+      };
+      const edgeEngine = createEngine({
+        inventoryManager: baseInventory,
+        shadowPersistenceRequiredPolls: 1,
+        maxEdgeCeilingBps: 50,
+      });
+      seedFreshShadowInputs(edgeEngine);
+      const edgeResult = edgeEngine.evaluateShadowTake({
+        aggregatedPrice: makeShadowPrice({ coinbaseBid: 100 }),
+        truexTape: makeShadowTape({ price: 101.2 }),
+        now: Date.now(),
+        trigger: 'edge-too-high',
+      });
+      expect(edgeResult.evaluation.suppressReason).toBe('edge-too-high');
+
+      const outlierEngine = createEngine({
+        inventoryManager: baseInventory,
+        shadowPersistenceRequiredPolls: 1,
+        truexTapeOutlierThresholdBps: 10,
+      });
+      seedFreshShadowInputs(outlierEngine);
+      const outlierResult = outlierEngine.evaluateShadowTake({
+        aggregatedPrice: makeShadowPrice({ coinbaseBid: 100 }),
+        truexTape: makeShadowTape({ price: 99 }),
+        now: Date.now(),
+        trigger: 'tape-outlier',
+      });
+      expect(outlierResult.evaluation.suppressReason).toBe('truex-tape-outlier');
+
+      const dustEngine = createEngine({
+        inventoryManager: {
+          getSkew: mock(() => ({ bidSkewTicks: 0, askSkewTicks: 0 })),
+          canQuote: mock(() => true),
+          getPositionSummary: mock(() => ({ netPosition: 0.00005 })),
+          getAvailableForSide: mock(() => 0.00005),
+        },
+        shadowPersistenceRequiredPolls: 1,
+        minTakeSizeBTC: 0.0001,
+      });
+      seedFreshShadowInputs(dustEngine, { bidQty: 0.00005 });
+      const dustResult = dustEngine.evaluateShadowTake({
+        aggregatedPrice: makeShadowPrice({ coinbaseBid: 100 }),
+        truexTape: makeShadowTape({ price: 101.2 }),
+        now: Date.now(),
+        trigger: 'dust-size',
+      });
+      expect(dustResult.evaluation.suppressReason).toBe('take-size-too-small');
+
+      const shortEngine = createEngine({
+        inventoryManager: {
+          getSkew: mock(() => ({ bidSkewTicks: 0, askSkewTicks: 0 })),
+          canQuote: mock(() => true),
+          getPositionSummary: mock(() => ({ netPosition: -0.25 })),
+          getAvailableForSide: mock(() => 0.25),
+        },
+        shadowPersistenceRequiredPolls: 1,
+      });
+      seedFreshShadowInputs(shortEngine);
+      const shortResult = shortEngine.evaluateShadowTake({
+        aggregatedPrice: makeShadowPrice({ coinbaseBid: 100 }),
+        truexTape: makeShadowTape({ price: 101.2 }),
+        now: Date.now(),
+        trigger: 'short-position',
+      });
+      expect(shortResult.evaluation.suppressReason).toBe('take-size-too-small');
+    });
+  });
+
   describe('price band filtering', () => {
     it('should filter out quotes outside +/-2.5% band', () => {
       const engine = createEngine({

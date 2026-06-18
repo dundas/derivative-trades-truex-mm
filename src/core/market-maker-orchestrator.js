@@ -103,6 +103,15 @@ export class MarketMakerOrchestrator extends EventEmitter {
       takeHedgeBufferBps: options.takeHedgeBufferBps ?? 0,
       maxTakerOrdersPerMinute: options.maxTakerOrdersPerMinute ?? 0,
       maxTakerNotionalPerMinute: options.maxTakerNotionalPerMinute ?? 0,
+      shadowPersistenceRequiredPolls: options.shadowPersistenceRequiredPolls ?? 3,
+      maxEdgeCeilingBps: options.maxEdgeCeilingBps ?? 250,
+      pyusdDepegThresholdBps: options.pyusdDepegThresholdBps ?? 100,
+      minTakeSizeBTC: options.minTakeSizeBTC ?? 0.0001,
+      maxTakeNotionalPerOrder: options.maxTakeNotionalPerOrder ?? 1000,
+      shadowTakeQtyDecayTolerancePct: options.shadowTakeQtyDecayTolerancePct ?? 0.1,
+      shadowAttributionMaxAgeMs: options.shadowAttributionMaxAgeMs ?? 5000,
+      truexTapeMaxAgeMs: options.truexTapeMaxAgeMs ?? 5000,
+      truexTapeOutlierThresholdBps: options.truexTapeOutlierThresholdBps ?? 50,
       marketDataProvider: () => this.marketDataFeed?.getBestBidAsk?.(),
       logger: this.logger,
     });
@@ -168,6 +177,12 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this.krakenRestClient =
       options.krakenRestClient ||
       (options.krakenClient && typeof options.krakenClient.getTicker === 'function' ? options.krakenClient : null);
+    this.truexTradePollSize = options.truexTradePollSize ?? 10;
+    this.truexTradePollTimeoutMs = options.truexTradePollTimeoutMs ?? this.truexEbboPollTimeoutMs;
+    this.truexTradeCacheTtlMs = options.truexTradeCacheTtlMs ?? Math.max(this.truexEbboPollIntervalMs, 1000);
+    this.shadowZeroDetectionAlertThresholdMs = options.shadowZeroDetectionAlertThresholdMs ?? 300000;
+    this.shadowSuppressionAlertThreshold = options.shadowSuppressionAlertThreshold ?? 5;
+    this.shadowEdgeCeilingAlertThreshold = options.shadowEdgeCeilingAlertThreshold ?? 3;
 
     // State
     this.isRunning = false;
@@ -202,6 +217,24 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this._pyusdUsdLastSuccessAt = 0;
     this._pyusdUsdFailureAlertActive = false;
     this.pyusdUsd = null;
+    this.lastAggregatedPrice = null;
+    this._shadowLastReevalAt = 0;
+    this._shadowLastCoinbaseBid = null;
+    this._shadowLastCoinbaseFresh = null;
+    this._shadowLastConfidenceOk = null;
+    this._shadowLastDetectionAt = 0;
+    this._shadowNoDetectionAlertActive = false;
+    this._shadowBasisSuppressionAlertActive = false;
+    this._shadowEdgeCeilingAlertActive = false;
+    this._shadowMetricsWindowStartedAt = 0;
+    this._shadowMetrics = { evaluations: 0, detections: 0, basisSuppressions: 0, edgeCeilings: 0 };
+    this._truexTradeTape = {
+      latestTradePrice: null,
+      latestTradeQty: null,
+      latestTradeTs: null,
+      fetchedAt: 0,
+      inFlight: false,
+    };
 
     // Alert manager (injectable for testing; defaults to env-driven config)
     this.alertManager = options.alertManager || new AlertManager({
@@ -577,6 +610,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
 
   _onPriceUpdate(aggregatedPrice) {
     if (!this.isRunning) return;
+    this.lastAggregatedPrice = aggregatedPrice || null;
 
     // Update MD freshness timestamp FIRST (so we know if data is arriving)
     this._lastMdUpdateTime = Date.now();
@@ -618,6 +652,12 @@ export class MarketMakerOrchestrator extends EventEmitter {
     }
     this.quoteEngine.onPriceUpdate(aggregatedPrice);
     this._lastRepriceTime = Date.now();
+
+    if (this._shouldTriggerShadowReevaluation(aggregatedPrice)) {
+      this._processShadowEvaluation('coinbase-update', { refreshTape: false }).catch((err) => {
+        this.logger.warn(`[Orchestrator] Shadow coinbase reevaluation failed (non-fatal): ${err.message}`);
+      });
+    }
   }
 
   _onFIXMessage(message) {
@@ -893,6 +933,203 @@ export class MarketMakerOrchestrator extends EventEmitter {
     return Date.now() - reference.timestamp <= this.pyusdUsdStaleThresholdMs;
   }
 
+  _extractCoinbaseSource(aggregatedPrice = this.lastAggregatedPrice) {
+    if (!Array.isArray(aggregatedPrice?.sources)) return null;
+    return aggregatedPrice.sources.find((source) => source?.exchange === 'coinbase') || null;
+  }
+
+  _shouldTriggerShadowReevaluation(aggregatedPrice) {
+    const coinbaseSource = this._extractCoinbaseSource(aggregatedPrice);
+    if (!coinbaseSource?.bid) return false;
+    if (!this.quoteEngine?._isTruexEbboFresh?.()) return false;
+
+    const confidenceOk = aggregatedPrice.confidence >= (this.quoteEngine?.config?.confidenceThreshold ?? 0.3);
+    const coinbaseFresh = !coinbaseSource.isStale;
+    const bidMovedEnough = this._shadowLastCoinbaseBid === null ||
+      Math.abs(Number(coinbaseSource.bid) - Number(this._shadowLastCoinbaseBid)) >= (this.quoteEngine?.config?.tickSize ?? 0.5);
+    const freshnessFlipped = this._shadowLastCoinbaseFresh !== null && coinbaseFresh !== this._shadowLastCoinbaseFresh;
+    const confidenceFlipped = this._shadowLastConfidenceOk !== null && confidenceOk !== this._shadowLastConfidenceOk;
+    const shouldEvaluate = bidMovedEnough || freshnessFlipped || confidenceFlipped;
+
+    this._shadowLastCoinbaseBid = Number(coinbaseSource.bid);
+    this._shadowLastCoinbaseFresh = coinbaseFresh;
+    this._shadowLastConfidenceOk = confidenceOk;
+
+    if (!shouldEvaluate) return false;
+
+    const now = Date.now();
+    const minIntervalMs = Math.max(this.truexEbboPollIntervalMs, 1);
+    if (this._shadowLastReevalAt && (now - this._shadowLastReevalAt) < minIntervalMs) {
+      return false;
+    }
+
+    this._shadowLastReevalAt = now;
+    return true;
+  }
+
+  _normalizeTruexTradeTapeResponse(trades) {
+    if (!Array.isArray(trades) || trades.length === 0) return null;
+    for (const trade of trades) {
+      const latestTradePrice = Number(trade?.trade_price ?? trade?.price ?? 0);
+      const latestTradeQty = Number(trade?.trade_qty ?? trade?.qty ?? 0);
+      const latestTradeTs = trade?.timestamp ? TrueXRESTClient.nanosToDate(String(trade.timestamp)).getTime() : null;
+      if (latestTradePrice > 0 && latestTradeTs) {
+        return {
+          latestTradePrice,
+          latestTradeQty: latestTradeQty > 0 ? latestTradeQty : null,
+          latestTradeTs,
+        };
+      }
+    }
+    return null;
+  }
+
+  async _refreshTruexTradeTapeIfNeeded() {
+    if (!this.isRunning || !this.restClient) return;
+    const now = Date.now();
+    if (this._truexTradeTape.inFlight) return;
+    if (this._truexTradeTape.fetchedAt && (now - this._truexTradeTape.fetchedAt) < this.truexTradeCacheTtlMs) {
+      return;
+    }
+
+    this._truexTradeTape.inFlight = true;
+    try {
+      const instrumentId = await this._resolveTruexEbboInstrumentId();
+      const trades = await this.restClient.getMarketTrades(
+        { instrument_id: instrumentId, size: this.truexTradePollSize },
+        { timeoutMs: this.truexTradePollTimeoutMs },
+      );
+      const normalized = this._normalizeTruexTradeTapeResponse(trades);
+      if (normalized) {
+        this._truexTradeTape = {
+          ...this._truexTradeTape,
+          ...normalized,
+          fetchedAt: now,
+        };
+      } else {
+        this._truexTradeTape = {
+          ...this._truexTradeTape,
+          latestTradePrice: null,
+          latestTradeQty: null,
+          latestTradeTs: null,
+          fetchedAt: now,
+        };
+      }
+    } catch (err) {
+      this.logger.warn(`[Orchestrator] TrueX trade tape refresh failed (non-fatal): ${err.message}`);
+    } finally {
+      this._truexTradeTape.inFlight = false;
+    }
+  }
+
+  _getTruexTapeContext() {
+    if (!this._truexTradeTape.latestTradeTs || !this._truexTradeTape.latestTradePrice) {
+      return null;
+    }
+    return {
+      latestTradePrice: this._truexTradeTape.latestTradePrice,
+      latestTradeQty: this._truexTradeTape.latestTradeQty,
+      latestTradeTs: this._truexTradeTape.latestTradeTs,
+      ageS: (Date.now() - this._truexTradeTape.latestTradeTs) / 1000,
+    };
+  }
+
+  _rollShadowMetricsWindow(now = Date.now()) {
+    if (!this._shadowMetricsWindowStartedAt || (now - this._shadowMetricsWindowStartedAt) > this.shadowZeroDetectionAlertThresholdMs) {
+      this._shadowMetricsWindowStartedAt = now;
+      this._shadowMetrics = { evaluations: 0, detections: 0, basisSuppressions: 0, edgeCeilings: 0 };
+    }
+  }
+
+  _updateShadowAlerts(now = Date.now()) {
+    if (this._shadowLastDetectionAt > 0) {
+      const noDetectionForMs = now - this._shadowLastDetectionAt;
+      if (noDetectionForMs >= this.shadowZeroDetectionAlertThresholdMs && !this._shadowNoDetectionAlertActive) {
+        this._shadowNoDetectionAlertActive = true;
+        this.alertManager.sendAlert({
+          reason: 'Shadow take zero detections while market active',
+          level: 'warn',
+          details: { noDetectionForMs, symbol: this.symbol },
+        }).catch((err) => this.logger.error(`[Orchestrator] Shadow zero-detection alert failed: ${err.message}`));
+      }
+    }
+
+    if (this._shadowMetrics.basisSuppressions >= this.shadowSuppressionAlertThreshold && !this._shadowBasisSuppressionAlertActive) {
+      this._shadowBasisSuppressionAlertActive = true;
+      this.alertManager.sendAlert({
+        reason: 'Shadow take basis suppression spike',
+        level: 'warn',
+        details: { count: this._shadowMetrics.basisSuppressions, symbol: this.symbol },
+      }).catch((err) => this.logger.error(`[Orchestrator] Shadow basis-suppression alert failed: ${err.message}`));
+    }
+
+    if (this._shadowMetrics.edgeCeilings >= this.shadowEdgeCeilingAlertThreshold && !this._shadowEdgeCeilingAlertActive) {
+      this._shadowEdgeCeilingAlertActive = true;
+      this.alertManager.sendAlert({
+        reason: 'Shadow take edge ceiling trips',
+        level: 'warn',
+        details: { count: this._shadowMetrics.edgeCeilings, symbol: this.symbol },
+      }).catch((err) => this.logger.error(`[Orchestrator] Shadow edge-ceiling alert failed: ${err.message}`));
+    }
+  }
+
+  _handleShadowEvaluationResult(result) {
+    if (!result?.evaluation) return;
+    const now = Date.now();
+    this._rollShadowMetricsWindow(now);
+    this._shadowMetrics.evaluations++;
+
+    const suppressReason = result.evaluation.suppressReason;
+    if (result.evaluation.wouldTake) {
+      this._shadowMetrics.detections++;
+      this._shadowLastDetectionAt = now;
+      if (this._shadowNoDetectionAlertActive) {
+        this._shadowNoDetectionAlertActive = false;
+        this.alertManager.sendRecovery({ reason: 'Shadow take zero detections while market active' })
+          .catch((err) => this.logger.error(`[Orchestrator] Shadow zero-detection recovery failed: ${err.message}`));
+      }
+      if (this._shadowBasisSuppressionAlertActive) {
+        this._shadowBasisSuppressionAlertActive = false;
+        this.alertManager.sendRecovery({ reason: 'Shadow take basis suppression spike' })
+          .catch((err) => this.logger.error(`[Orchestrator] Shadow basis-suppression recovery failed: ${err.message}`));
+      }
+      if (this._shadowEdgeCeilingAlertActive) {
+        this._shadowEdgeCeilingAlertActive = false;
+        this.alertManager.sendRecovery({ reason: 'Shadow take edge ceiling trips' })
+          .catch((err) => this.logger.error(`[Orchestrator] Shadow edge-ceiling recovery failed: ${err.message}`));
+      }
+    }
+
+    if (suppressReason === 'basis-stale' || suppressReason === 'basis-depeg') {
+      this._shadowMetrics.basisSuppressions++;
+    }
+    if (suppressReason === 'edge-too-high') {
+      this._shadowMetrics.edgeCeilings++;
+    }
+
+    for (const log of result.logs || []) {
+      this.logger.info(`[SHADOW] ${JSON.stringify(log)}`);
+    }
+
+    this._updateShadowAlerts(now);
+  }
+
+  async _processShadowEvaluation(trigger, { refreshTape = false } = {}) {
+    if (!this.isRunning || !this.lastAggregatedPrice || typeof this.quoteEngine?.evaluateShadowTake !== 'function') {
+      return;
+    }
+    if (refreshTape) {
+      await this._refreshTruexTradeTapeIfNeeded();
+    }
+    const result = this.quoteEngine.evaluateShadowTake({
+      aggregatedPrice: this.lastAggregatedPrice,
+      truexTape: this._getTruexTapeContext(),
+      trigger,
+      now: Date.now(),
+    });
+    this._handleShadowEvaluationResult(result);
+  }
+
   async _fetchPyusdUsdReferenceFromSource(source) {
     if (source?.type !== 'kraken-rest') {
       throw new Error(`Unsupported PYUSD/USD reference source: ${source?.type || 'unknown'}`);
@@ -1024,6 +1261,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
         symbol: this.symbol,
       });
       this.quoteEngine.updateTruexEbbo(parsed);
+      await this._processShadowEvaluation('truex-ebbo-poll', { refreshTape: true });
 
       const hadFailureAlert = this._truexEbboFailureAlertActive;
       this._truexEbboConsecutiveErrors = 0;

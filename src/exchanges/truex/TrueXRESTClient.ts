@@ -141,6 +141,16 @@ export interface MarketQuoteTrade {
   timestamp?: string;
 }
 
+export interface PublicMarketTradeResponse {
+  instrument_id?: string;
+  price?: string;
+  qty?: string;
+  timestamp?: string;
+  trade_price?: string;
+  trade_qty?: string;
+  match_id?: string;
+}
+
 export interface MarketQuoteEntry {
   id: string;
   symbol?: string;
@@ -447,6 +457,16 @@ export class TrueXRESTClient {
       instrument_id: instrument.id,
       as_of: asOf,
     });
+  }
+
+  /**
+   * Get recent public market trades for an instrument.
+   */
+  async getMarketTrades(params: {
+    instrument_id: string;
+    size?: number;
+  }, options: TrueXRequestOptions = {}): Promise<PublicMarketTradeResponse[]> {
+    return this.request("GET", "/market/trade", undefined, params, options);
   }
 
   // ==========================================================================
