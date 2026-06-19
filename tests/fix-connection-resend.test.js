@@ -266,6 +266,84 @@ describe('FIXConnection - Resend Request Handling', () => {
     expect(written).toContain('36=4');   // NewSeqNo = 3+1
   });
 
+  test('does not treat missing pre-logon resend history as a reset signal by itself', async () => {
+    const resetSeqSpy = jest.spyOn(fixConnection, 'resetSequenceNumbers').mockResolvedValue();
+    fixConnection.isLoggedOn = false;
+    fixConnection.hasConnectedBefore = true;
+
+    await fixConnection.sendMessage({
+      '35': 'D',
+      '49': 'TEST',
+      '56': 'SERVER',
+      '11': 'ORDER1'
+    });
+    await fixConnection.sendMessage({
+      '35': 'D',
+      '49': 'TEST',
+      '56': 'SERVER',
+      '11': 'ORDER2'
+    });
+
+    fixConnection.sentMessages.delete(1);
+    mockSocket.write.mockClear();
+
+    const resendCompletedPromise = new Promise(resolve => {
+      fixConnection.once('resendCompleted', resolve);
+    });
+
+    fixConnection.handleResendRequest({
+      fields: {
+        '35': '2',
+        '7': '1',
+        '16': '2'
+      }
+    });
+
+    const result = await resendCompletedPromise;
+
+    expect(result.missingStoredMessages).toBe(1);
+    expect(fixConnection._sawPreLogonGapFillThisAttempt).toBe(false);
+    expect(fixConnection._forcedSequenceResetPending).toBe(false);
+    expect(resetSeqSpy).not.toHaveBeenCalled();
+    expect(mockSocket.write).toHaveBeenCalledTimes(1);
+  });
+
+  test('does not force a reset for incomplete resend history on the initial pre-logon connect', async () => {
+    const resetSeqSpy = jest.spyOn(fixConnection, 'resetSequenceNumbers').mockResolvedValue();
+    fixConnection.isLoggedOn = false;
+    fixConnection.hasConnectedBefore = false;
+
+    await fixConnection.sendMessage({
+      '35': 'D',
+      '49': 'TEST',
+      '56': 'SERVER',
+      '11': 'ORDER1'
+    });
+
+    fixConnection.sentMessages.delete(1);
+    mockSocket.write.mockClear();
+
+    const resendCompletedPromise = new Promise(resolve => {
+      fixConnection.once('resendCompleted', resolve);
+    });
+
+    fixConnection.handleResendRequest({
+      fields: {
+        '35': '2',
+        '7': '1',
+        '16': '1'
+      }
+    });
+
+    const result = await resendCompletedPromise;
+
+    expect(result.missingStoredMessages).toBe(1);
+    expect(fixConnection._sawPreLogonGapFillThisAttempt).toBe(false);
+    expect(fixConnection._forcedSequenceResetPending).toBe(false);
+    expect(resetSeqSpy).not.toHaveBeenCalled();
+    expect(mockSocket.write).toHaveBeenCalledTimes(1);
+  });
+
   test('validates invalid resend ranges', () => {
     // Act & Assert - beginSeqNo < 1
     const resendCompletedPromise1 = new Promise(resolve => {
@@ -621,8 +699,8 @@ describe('FIXConnection - Integration Scenarios', () => {
       endSeqNo: 7,
       count: 1,    // 1 GapFill write
       skipped: 0,
-      requested: 5
+      requested: 5,
+      missingStoredMessages: 0,
     });
   });
 });
-
