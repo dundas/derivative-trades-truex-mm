@@ -134,6 +134,43 @@ describe('FIXConnection', () => {
       c._consecutiveLogonTimeouts = 99;
       expect(c._shouldUseLogonResetFallback(true)).toBe(false);
     });
+
+    it('returns false once reset-fallback budget is exhausted (loop guard)', () => {
+      connection._consecutiveLogonTimeouts = 99;
+      connection._consecutiveResetFallbacks = connection._maxConsecutiveResetFallbacks;
+      expect(connection._shouldUseLogonResetFallback(true)).toBe(false);
+    });
+
+    it('still allows fallback while reset-fallback budget remains', () => {
+      connection._consecutiveLogonTimeouts = 99;
+      connection._consecutiveResetFallbacks = connection._maxConsecutiveResetFallbacks - 1;
+      expect(connection._shouldUseLogonResetFallback(true)).toBe(true);
+    });
+  });
+
+  describe('loop guard constructor wiring', () => {
+    it('defaults maxConsecutiveResetFallbacks to 3', () => {
+      expect(connection._maxConsecutiveResetFallbacks).toBe(3);
+      expect(connection._consecutiveResetFallbacks).toBe(0);
+    });
+
+    it('honors valid maxConsecutiveResetFallbacks override', () => {
+      const c = new FIXConnection({
+        host: 'h', port: 1, targetCompID: 'T', apiKey: 'k', apiSecret: 's',
+        maxConsecutiveResetFallbacks: 5,
+      });
+      expect(c._maxConsecutiveResetFallbacks).toBe(5);
+    });
+
+    it('rejects non-positive / non-integer maxConsecutiveResetFallbacks and keeps default', () => {
+      for (const bad of [0, -1, 1.5, NaN, undefined, null, 'abc']) {
+        const c = new FIXConnection({
+          host: 'h', port: 1, targetCompID: 'T', apiKey: 'k', apiSecret: 's',
+          maxConsecutiveResetFallbacks: bad,
+        });
+        expect(c._maxConsecutiveResetFallbacks).toBe(3);
+      }
+    });
   });
   
   describe('connect()', () => {
@@ -244,6 +281,129 @@ describe('FIXConnection', () => {
 
       await expect(shortTimeoutConnection.connect()).rejects.toThrow('Connection timeout');
     }, 5000);
+
+    it('fires logon-reset fallback end-to-end when counter has reached threshold on a reconnect', async () => {
+      // Simulate the live failure mode: hasConnectedBefore=true (so isReconnect),
+      // counter at threshold, persisted seq high. After the connect ceremony the
+      // fallback should: emit the event, reset sequence numbers, send a Logon
+      // with 141=Y and seq=1, then on Ack clear both counters.
+      connection.hasConnectedBefore = true;
+      connection.msgSeqNum = 144247;
+      connection.expectedSeqNum = 144247;
+      connection._consecutiveLogonTimeouts = 3;
+      connection._consecutiveResetFallbacks = 0;
+
+      const resetSpy = jest.spyOn(connection, 'resetSequenceNumbers');
+      const fallbackEvents = [];
+      connection.on('logon-reset-fallback', (e) => fallbackEvents.push(e));
+
+      const connectPromise = connection.connect();
+      mockSocketInstance = connection.socket;
+      const connectCallback = mockSocketInstance.connect.mock.calls[0][2];
+      connectCallback();
+
+      await new Promise((resolve) => {
+        const check = setInterval(() => {
+          if (mockSocketInstance.write.mock.calls.length > 0) {
+            clearInterval(check);
+            const ack = '8=FIXT.1.1\x019=50\x0135=A\x0149=TRUEX_UAT_OE\x0156=CLI_CLIENT\x0134=1\x0152=20251007-13:40:00.000\x0110=123\x01';
+            mockSocketInstance.emit('data', Buffer.from(ack));
+            resolve();
+          }
+        }, 20);
+      });
+
+      await connectPromise;
+
+      // Reset was invoked exactly once during the fallback
+      expect(resetSpy).toHaveBeenCalledTimes(1);
+      // Fallback event fired with the right shape
+      expect(fallbackEvents).toHaveLength(1);
+      expect(fallbackEvents[0].targetCompID).toBe('TRUEX_UAT_OE');
+      expect(fallbackEvents[0].fallbackAttempt).toBe(1);
+      expect(fallbackEvents[0].maxFallbacks).toBe(3);
+      // Logon sent with 141=Y and seq reset to 1
+      const sentMessage = mockSocketInstance.write.mock.calls[0][0];
+      expect(sentMessage).toContain('141=Y');
+      expect(sentMessage).toContain('34=1');
+      // Successful Ack cleared both counters
+      expect(connection.isLoggedOn).toBe(true);
+      expect(connection._consecutiveLogonTimeouts).toBe(0);
+      expect(connection._consecutiveResetFallbacks).toBe(0);
+
+      resetSpy.mockRestore();
+    }, 10000);
+
+    it('emits logon-reset-fallback-exhausted on the fire that hits the loop-guard cap', async () => {
+      // Pre-seed the connection at the brink: one more fallback fire will hit
+      // the cap, which must surface as `logon-reset-fallback-exhausted`.
+      connection.hasConnectedBefore = true;
+      connection._consecutiveLogonTimeouts = 3;
+      connection._consecutiveResetFallbacks = 2; // max is 3 → this fire makes it 3
+
+      const exhaustedEvents = [];
+      connection.on('logon-reset-fallback-exhausted', (e) => exhaustedEvents.push(e));
+
+      const connectPromise = connection.connect();
+      mockSocketInstance = connection.socket;
+      const connectCallback = mockSocketInstance.connect.mock.calls[0][2];
+      connectCallback();
+
+      await new Promise((resolve) => {
+        const check = setInterval(() => {
+          if (mockSocketInstance.write.mock.calls.length > 0) {
+            clearInterval(check);
+            const ack = '8=FIXT.1.1\x019=50\x0135=A\x0149=TRUEX_UAT_OE\x0156=CLI_CLIENT\x0134=1\x0152=20251007-13:40:00.000\x0110=123\x01';
+            mockSocketInstance.emit('data', Buffer.from(ack));
+            resolve();
+          }
+        }, 20);
+      });
+
+      await connectPromise;
+
+      expect(exhaustedEvents).toHaveLength(1);
+      expect(exhaustedEvents[0].targetCompID).toBe('TRUEX_UAT_OE');
+      expect(exhaustedEvents[0].attempts).toBe(3);
+    }, 10000);
+
+    it('does NOT fire the fallback when loop-guard budget is already exhausted', async () => {
+      // Counter is at threshold but reset budget is already at the cap. The
+      // gate must keep us on the normal session-resume path (no 141=Y).
+      connection.hasConnectedBefore = true;
+      connection._consecutiveLogonTimeouts = 3;
+      connection._consecutiveResetFallbacks = 3; // exhausted
+
+      const resetSpy = jest.spyOn(connection, 'resetSequenceNumbers');
+      const fallbackEvents = [];
+      connection.on('logon-reset-fallback', (e) => fallbackEvents.push(e));
+
+      const connectPromise = connection.connect();
+      mockSocketInstance = connection.socket;
+      const connectCallback = mockSocketInstance.connect.mock.calls[0][2];
+      connectCallback();
+
+      await new Promise((resolve) => {
+        const check = setInterval(() => {
+          if (mockSocketInstance.write.mock.calls.length > 0) {
+            clearInterval(check);
+            const ack = '8=FIXT.1.1\x019=50\x0135=A\x0149=TRUEX_UAT_OE\x0156=CLI_CLIENT\x0134=1\x0152=20251007-13:40:00.000\x0110=123\x01';
+            mockSocketInstance.emit('data', Buffer.from(ack));
+            resolve();
+          }
+        }, 20);
+      });
+
+      await connectPromise;
+
+      expect(resetSpy).not.toHaveBeenCalled();
+      expect(fallbackEvents).toHaveLength(0);
+      // Sent Logon must NOT have 141=Y because reset path was skipped
+      const sentMessage = mockSocketInstance.write.mock.calls[0][0];
+      expect(sentMessage).not.toContain('141=Y');
+
+      resetSpy.mockRestore();
+    }, 10000);
 
     it('should emit duplicate-logon and tear down attempted socket on Already authenticated reject', async () => {
       const duplicateHandler = jest.fn();

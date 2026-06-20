@@ -98,6 +98,15 @@ export class FIXConnection extends EventEmitter {
     this._logonResetThreshold = Number.isInteger(rawThreshold) && rawThreshold > 0
       ? rawThreshold
       : 3;
+    // Loop guard: if the reset fallback fires this many times in a row without
+    // a successful Logon Ack, stop trying resets (we are clearly not the bug)
+    // and emit `logon-reset-fallback-exhausted` for ops escalation. Prevents
+    // churning TrueX-side session state when the real failure is elsewhere.
+    this._consecutiveResetFallbacks = 0;
+    const rawMax = options.maxConsecutiveResetFallbacks;
+    this._maxConsecutiveResetFallbacks = Number.isInteger(rawMax) && rawMax > 0
+      ? rawMax
+      : 3;
 
     // Logger
     this.logger = options.logger || console;
@@ -413,15 +422,34 @@ export class FIXConnection extends EventEmitter {
           // GapFill without Logon-Ack. Gate by env flag for safety.
           let logonIsReconnect = isReconnect;
           if (this._shouldUseLogonResetFallback(isReconnect)) {
+            this._consecutiveResetFallbacks++;
             this.logger.warn(
               `[FIXConnection] ${this._consecutiveLogonTimeouts} consecutive logon timeouts ` +
-              `for ${this.targetCompID} — falling back to ResetSeqNumFlag=Y (force session reset)`
+              `for ${this.targetCompID} — falling back to ResetSeqNumFlag=Y ` +
+              `(force session reset, fallback ${this._consecutiveResetFallbacks}/${this._maxConsecutiveResetFallbacks})`
             );
             this.emit('logon-reset-fallback', {
               targetCompID: this.targetCompID,
               consecutiveTimeouts: this._consecutiveLogonTimeouts,
               threshold: this._logonResetThreshold,
+              fallbackAttempt: this._consecutiveResetFallbacks,
+              maxFallbacks: this._maxConsecutiveResetFallbacks,
             });
+            // If this fire just exhausted the budget, alert ops. Future
+            // attempts will hit the `< _maxConsecutiveResetFallbacks` gate
+            // in _shouldUseLogonResetFallback and fall through to a
+            // normal session-resume Logon (which will keep failing, but
+            // won't churn TrueX-side session state).
+            if (this._consecutiveResetFallbacks >= this._maxConsecutiveResetFallbacks) {
+              this.logger.error(
+                `[FIXConnection] logon-reset fallback exhausted for ${this.targetCompID} ` +
+                `after ${this._consecutiveResetFallbacks} consecutive attempts — escalating`
+              );
+              this.emit('logon-reset-fallback-exhausted', {
+                targetCompID: this.targetCompID,
+                attempts: this._consecutiveResetFallbacks,
+              });
+            }
             try {
               await this.resetSequenceNumbers();
             } catch (resetErr) {
@@ -509,8 +537,9 @@ export class FIXConnection extends EventEmitter {
                 // Clear resend-failure tracking on successful logon
                 this._resendGapStart = null;
                 this._resendAttempts = 0;
-                // Successful logon clears the timeout fallback counter
+                // Successful logon clears both fallback counters
                 this._consecutiveLogonTimeouts = 0;
+                this._consecutiveResetFallbacks = 0;
                 // Do NOT reset reconnectAttempts immediately — _startStableTimer will
                 // reset it after 60s of stable uptime, preventing a brief drop from
                 // resetting the counter too eagerly.
@@ -567,7 +596,8 @@ export class FIXConnection extends EventEmitter {
     return (
       this._logonResetFallbackEnabled &&
       isReconnect &&
-      this._consecutiveLogonTimeouts >= this._logonResetThreshold
+      this._consecutiveLogonTimeouts >= this._logonResetThreshold &&
+      this._consecutiveResetFallbacks < this._maxConsecutiveResetFallbacks
     );
   }
 
