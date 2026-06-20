@@ -46,13 +46,10 @@ export class MarketMakerOrchestrator extends EventEmitter {
       redisClient: this.redis,
       // Default ON: after 3 consecutive logon timeouts, fall back to
       // ResetSeqNumFlag=Y so a counterparty FIX-gateway restart doesn't
-      // wedge us in a multi-hour session-resume loop. Invalid threshold env
-      // (NaN, 0, negative) is rejected by FIXConnection's own guard.
+      // wedge us in a multi-hour session-resume loop. FIXConnection is the
+      // sole validator — unset / NaN / 0 / negative all coerce to default 3.
       logonResetFallbackEnabled: process.env.FIX_LOGON_RESET_FALLBACK !== 'false',
-      logonResetThreshold: (() => {
-        const n = parseInt(process.env.FIX_LOGON_RESET_THRESHOLD || '', 10);
-        return Number.isInteger(n) && n > 0 ? n : undefined;
-      })(),
+      logonResetThreshold: parseInt(process.env.FIX_LOGON_RESET_THRESHOLD, 10),
     });
 
     this.inventoryManager = options.inventoryManager || new InventoryManager({
