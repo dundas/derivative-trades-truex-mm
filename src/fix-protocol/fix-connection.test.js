@@ -81,6 +81,22 @@ describe('FIXConnection', () => {
       expect(connection.msgSeqNum).toBe(1);
       expect(connection.expectedSeqNum).toBe(1);
     });
+
+    it('should default logon-reset fallback to enabled with threshold 3', () => {
+      expect(connection._logonResetFallbackEnabled).toBe(true);
+      expect(connection._logonResetThreshold).toBe(3);
+      expect(connection._consecutiveLogonTimeouts).toBe(0);
+    });
+
+    it('should honor logon-reset fallback overrides', () => {
+      const c = new FIXConnection({
+        host: 'h', port: 1, targetCompID: 'T', apiKey: 'k', apiSecret: 's',
+        logonResetFallbackEnabled: false,
+        logonResetThreshold: 7,
+      });
+      expect(c._logonResetFallbackEnabled).toBe(false);
+      expect(c._logonResetThreshold).toBe(7);
+    });
   });
   
   describe('connect()', () => {
@@ -264,6 +280,28 @@ describe('FIXConnection', () => {
       expect(sentMessage).toContain('1137=FIX.5.0SP2');
     });
     
+    it('should NOT include 141=Y when sendLogon(true) is called (preserve seqnums on resume)', async () => {
+      await connection.sendLogon(true);
+      const sentMessage = mockSocketInstance.write.mock.calls[0][0];
+      expect(sentMessage).not.toContain('141=Y');
+    });
+
+    it('should include 141=Y when sendLogon(false) is called (fresh session)', async () => {
+      await connection.sendLogon(false);
+      const sentMessage = mockSocketInstance.write.mock.calls[0][0];
+      expect(sentMessage).toContain('141=Y');
+    });
+
+    it('resetSequenceNumbers() clears state so the next logon is treated as fresh', async () => {
+      connection.msgSeqNum = 144247;
+      connection.expectedSeqNum = 144247;
+      connection.hasConnectedBefore = true;
+      await connection.resetSequenceNumbers();
+      expect(connection.msgSeqNum).toBe(1);
+      expect(connection.expectedSeqNum).toBe(1);
+      expect(connection.hasConnectedBefore).toBe(false);
+    });
+
     it('should generate valid HMAC-SHA256 signature', async () => {
       await connection.sendLogon();
       

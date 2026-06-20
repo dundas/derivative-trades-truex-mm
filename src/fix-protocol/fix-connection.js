@@ -85,6 +85,15 @@ export class FIXConnection extends EventEmitter {
     this._resendAttempts = 0;    // Consecutive resend attempts for same gap
     this._maxResendAttempts = options.maxResendAttempts || 3; // Max before forcing reset
 
+    // Logon-timeout fallback: after N consecutive logon timeouts (server accepts
+    // TCP but never sends Logon Ack — observed when the counterparty restarts
+    // their FIX gateway while we have a persisted session), retry once with
+    // ResetSeqNumFlag=Y so both sides reset to seq 1. Converts multi-hour
+    // session-resume loops into a single recovery cycle.
+    this._consecutiveLogonTimeouts = 0;
+    this._logonResetFallbackEnabled = options.logonResetFallbackEnabled ?? true;
+    this._logonResetThreshold = options.logonResetThreshold || 3;
+
     // Logger
     this.logger = options.logger || console;
     // Optional audit logger
@@ -387,13 +396,36 @@ export class FIXConnection extends EventEmitter {
         // Wait for proxy to establish connection to TrueX (if using proxy)
         // This delay is critical when connecting through a proxy server
         this.logger.info(`[FIXConnection] Waiting for connection setup...`);
-        setupTimer = setTimeout(() => {
+        setupTimer = setTimeout(async () => {
           if (!isCurrentAttempt()) return;
           const firedSetupTimer = setupTimer;
           setupTimer = null;
           if (this._logonSetupTimer === firedSetupTimer) this._logonSetupTimer = null;
+
+          // Logon-timeout fallback: if normal session-resume has failed N times
+          // in a row, force a fresh logon (141=Y, seq=1). This recovers from
+          // counterparty FIX-gateway restarts that leave us looping forever on
+          // GapFill without Logon-Ack. Gate by env flag for safety.
+          let logonIsReconnect = isReconnect;
+          if (this._logonResetFallbackEnabled &&
+              isReconnect &&
+              this._consecutiveLogonTimeouts >= this._logonResetThreshold) {
+            this.logger.warn(
+              `[FIXConnection] ${this._consecutiveLogonTimeouts} consecutive logon timeouts ` +
+              `for ${this.targetCompID} — falling back to ResetSeqNumFlag=Y (force session reset)`
+            );
+            this.emit('logon-reset-fallback', {
+              targetCompID: this.targetCompID,
+              consecutiveTimeouts: this._consecutiveLogonTimeouts,
+              threshold: this._logonResetThreshold,
+            });
+            await this.resetSequenceNumbers();
+            logonIsReconnect = false;
+            this._consecutiveLogonTimeouts = 0; // give the reset attempt a clean window
+          }
+
           // Send logon message
-          this.sendLogon(isReconnect)
+          this.sendLogon(logonIsReconnect)
             .then(() => {
               if (!isCurrentAttempt()) return;
               this.logger.info(`[FIXConnection] Logon message sent to ${this.targetCompID}`);
@@ -401,6 +433,10 @@ export class FIXConnection extends EventEmitter {
               // Wait for logon response
               logonTimeout = setTimeout(() => {
                 if (!isCurrentAttempt()) return;
+                // Track for logon-reset fallback. Increment only on real
+                // no-response timeouts, not on rejects (which go to
+                // rejectHandler) or stale-attempt firings.
+                this._consecutiveLogonTimeouts++;
                 cleanupAttempt(true);
                 if (!settled) {
                   settled = true;
@@ -455,6 +491,8 @@ export class FIXConnection extends EventEmitter {
                 // Clear resend-failure tracking on successful logon
                 this._resendGapStart = null;
                 this._resendAttempts = 0;
+                // Successful logon clears the timeout fallback counter
+                this._consecutiveLogonTimeouts = 0;
                 // Do NOT reset reconnectAttempts immediately — _startStableTimer will
                 // reset it after 60s of stable uptime, preventing a brief drop from
                 // resetting the counter too eagerly.
