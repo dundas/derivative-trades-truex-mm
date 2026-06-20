@@ -97,6 +97,43 @@ describe('FIXConnection', () => {
       expect(c._logonResetFallbackEnabled).toBe(false);
       expect(c._logonResetThreshold).toBe(7);
     });
+
+    it('should reject non-positive / non-integer logonResetThreshold and keep default', () => {
+      const cases = [0, -1, 1.5, NaN, undefined, null, 'abc'];
+      for (const bad of cases) {
+        const c = new FIXConnection({
+          host: 'h', port: 1, targetCompID: 'T', apiKey: 'k', apiSecret: 's',
+          logonResetThreshold: bad,
+        });
+        expect(c._logonResetThreshold).toBe(3);
+      }
+    });
+  });
+
+  describe('logon-reset fallback decision (_shouldUseLogonResetFallback)', () => {
+    it('returns false on first connect even when counter is over threshold', () => {
+      connection._consecutiveLogonTimeouts = 99;
+      expect(connection._shouldUseLogonResetFallback(false)).toBe(false);
+    });
+
+    it('returns false on reconnect when counter is below threshold', () => {
+      connection._consecutiveLogonTimeouts = 2;
+      expect(connection._shouldUseLogonResetFallback(true)).toBe(false);
+    });
+
+    it('returns true on reconnect when counter has reached the threshold', () => {
+      connection._consecutiveLogonTimeouts = 3;
+      expect(connection._shouldUseLogonResetFallback(true)).toBe(true);
+    });
+
+    it('returns false when the fallback is disabled even if all other conditions hold', () => {
+      const c = new FIXConnection({
+        host: 'h', port: 1, targetCompID: 'T', apiKey: 'k', apiSecret: 's',
+        logonResetFallbackEnabled: false,
+      });
+      c._consecutiveLogonTimeouts = 99;
+      expect(c._shouldUseLogonResetFallback(true)).toBe(false);
+    });
   });
   
   describe('connect()', () => {

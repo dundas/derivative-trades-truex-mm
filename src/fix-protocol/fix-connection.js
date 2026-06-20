@@ -92,7 +92,12 @@ export class FIXConnection extends EventEmitter {
     // session-resume loops into a single recovery cycle.
     this._consecutiveLogonTimeouts = 0;
     this._logonResetFallbackEnabled = options.logonResetFallbackEnabled ?? true;
-    this._logonResetThreshold = options.logonResetThreshold || 3;
+    // Reject 0 / negative / NaN explicitly (preserve the documented default)
+    // so an env-misconfig doesn't silently fall back to seq-reset on every retry.
+    const rawThreshold = options.logonResetThreshold;
+    this._logonResetThreshold = Number.isInteger(rawThreshold) && rawThreshold > 0
+      ? rawThreshold
+      : 3;
 
     // Logger
     this.logger = options.logger || console;
@@ -407,9 +412,7 @@ export class FIXConnection extends EventEmitter {
           // counterparty FIX-gateway restarts that leave us looping forever on
           // GapFill without Logon-Ack. Gate by env flag for safety.
           let logonIsReconnect = isReconnect;
-          if (this._logonResetFallbackEnabled &&
-              isReconnect &&
-              this._consecutiveLogonTimeouts >= this._logonResetThreshold) {
+          if (this._shouldUseLogonResetFallback(isReconnect)) {
             this.logger.warn(
               `[FIXConnection] ${this._consecutiveLogonTimeouts} consecutive logon timeouts ` +
               `for ${this.targetCompID} — falling back to ResetSeqNumFlag=Y (force session reset)`
@@ -419,7 +422,22 @@ export class FIXConnection extends EventEmitter {
               consecutiveTimeouts: this._consecutiveLogonTimeouts,
               threshold: this._logonResetThreshold,
             });
-            await this.resetSequenceNumbers();
+            try {
+              await this.resetSequenceNumbers();
+            } catch (resetErr) {
+              this.logger.error(
+                `[FIXConnection] resetSequenceNumbers failed during logon-reset fallback: ${resetErr.message}`
+              );
+              cleanupAttempt(true);
+              if (!settled) {
+                settled = true;
+                reject(resetErr);
+              }
+              return;
+            }
+            // The await above is a suspension point — re-check the attempt
+            // generation to avoid racing a superseded reconnect attempt.
+            if (!isCurrentAttempt()) return;
             logonIsReconnect = false;
             this._consecutiveLogonTimeouts = 0; // give the reset attempt a clean window
           }
@@ -538,6 +556,21 @@ export class FIXConnection extends EventEmitter {
     });
   }
   
+  /**
+   * Decide whether the next reconnect attempt should force a session reset
+   * (ResetSeqNumFlag=Y, seq=1) instead of a normal resume. Returns true only
+   * when the fallback is enabled, we are mid-reconnect, and consecutive
+   * post-Logon timeouts have hit the configured threshold.
+   * @param {boolean} isReconnect - true for resume attempts (not first connect)
+   */
+  _shouldUseLogonResetFallback(isReconnect) {
+    return (
+      this._logonResetFallbackEnabled &&
+      isReconnect &&
+      this._consecutiveLogonTimeouts >= this._logonResetThreshold
+    );
+  }
+
   /**
    * Send FIX Logon message with HMAC-SHA256 authentication
    * @param {boolean} isReconnect - true when reconnecting to preserve seqnums
