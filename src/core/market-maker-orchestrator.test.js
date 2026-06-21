@@ -633,6 +633,46 @@ describe('AlertManager integration in Orchestrator', () => {
     };
   }
 
+  it('alerts at warn level when FIX emits logon-reset-fallback', async () => {
+    const mockAlertManager = makeAlertManager();
+    const orch = makeOrch({ alertManager: mockAlertManager });
+    orch._wireEvents(); // listeners only attached in start() — wire directly for unit test
+
+    orch.fixOE.emit('logon-reset-fallback', {
+      targetCompID: 'TRUEX_PROD_OE',
+      consecutiveTimeouts: 3,
+      threshold: 3,
+      fallbackAttempt: 1,
+      maxFallbacks: 3,
+    });
+    await Promise.resolve();
+
+    expect(mockAlertManager.sendAlert).toHaveBeenCalledTimes(1);
+    const [arg] = mockAlertManager.sendAlert.mock.calls[0];
+    expect(arg.reason).toBe('FIX logon-reset fallback fired');
+    expect(arg.level).toBe('warn');
+    expect(arg.details.targetCompID).toBe('TRUEX_PROD_OE');
+    expect(arg.details.fallbackAttempt).toBe(1);
+  });
+
+  it('alerts at error level when FIX emits logon-reset-fallback-exhausted', async () => {
+    const mockAlertManager = makeAlertManager();
+    const orch = makeOrch({ alertManager: mockAlertManager });
+    orch._wireEvents();
+
+    orch.fixOE.emit('logon-reset-fallback-exhausted', {
+      targetCompID: 'TRUEX_PROD_OE',
+      attempts: 3,
+    });
+    await Promise.resolve();
+
+    expect(mockAlertManager.sendAlert).toHaveBeenCalledTimes(1);
+    const [arg] = mockAlertManager.sendAlert.mock.calls[0];
+    expect(arg.reason).toBe('FIX logon-reset fallback exhausted');
+    expect(arg.level).toBe('error');
+    expect(arg.details.attempts).toBe(3);
+  });
+
   it('calls alertManager.sendAlert when watchdog detects a failure', async () => {
     const mockAlertManager = makeAlertManager();
     const orch = makeOrch({ alertManager: mockAlertManager });

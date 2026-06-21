@@ -590,6 +590,42 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this.fixOE.on('disconnect', this._onOEDisconnect);
     this.fixOE.on('logout', this._onOEDisconnect);
 
+    // OE logon-reset fallback fired (informational) — log + alert at info level
+    // so ops can correlate with TrueX-side restarts.
+    this.fixOE.on('logon-reset-fallback', (info) => {
+      this.logger.warn(
+        `[Orchestrator] FIX logon-reset fallback fired for ${info.targetCompID} ` +
+        `(${info.fallbackAttempt}/${info.maxFallbacks}, after ${info.consecutiveTimeouts} timeouts)`
+      );
+      this.alertManager.sendAlert({
+        reason: 'FIX logon-reset fallback fired',
+        level: 'warn',
+        details: {
+          targetCompID: info.targetCompID,
+          fallbackAttempt: info.fallbackAttempt,
+          maxFallbacks: info.maxFallbacks,
+          consecutiveTimeouts: info.consecutiveTimeouts,
+        },
+      });
+    });
+
+    // OE logon-reset fallback exhausted — loop guard tripped. Real cause is
+    // elsewhere (creds, TrueX outage, network). Escalate hard.
+    this.fixOE.on('logon-reset-fallback-exhausted', (info) => {
+      this.logger.error(
+        `[Orchestrator] FIX logon-reset fallback exhausted for ${info.targetCompID} ` +
+        `after ${info.attempts} attempts — manual intervention likely required`
+      );
+      this.alertManager.sendAlert({
+        reason: 'FIX logon-reset fallback exhausted',
+        level: 'error',
+        details: {
+          targetCompID: info.targetCompID,
+          attempts: info.attempts,
+        },
+      });
+    });
+
     // QuoteEngine fills → Inventory + PnL
     this.quoteEngine.on('fill', this._onQuoteFill);
 
