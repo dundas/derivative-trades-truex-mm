@@ -44,6 +44,13 @@ export class MarketMakerOrchestrator extends EventEmitter {
       heartbeatInterval: options.heartbeatInterval || 30,
       logger: this.logger,
       redisClient: this.redis,
+      // Default ON: after 3 consecutive logon timeouts, fall back to
+      // ResetSeqNumFlag=Y so a counterparty FIX-gateway restart doesn't
+      // wedge us in a multi-hour session-resume loop. FIXConnection is the
+      // sole validator — unset / NaN / 0 / negative all coerce to defaults.
+      logonResetFallbackEnabled: process.env.FIX_LOGON_RESET_FALLBACK !== 'false',
+      logonResetThreshold: parseInt(process.env.FIX_LOGON_RESET_THRESHOLD, 10),
+      maxConsecutiveResetFallbacks: parseInt(process.env.FIX_MAX_LOGON_RESET_FALLBACKS, 10),
     });
 
     this.inventoryManager = options.inventoryManager || new InventoryManager({
