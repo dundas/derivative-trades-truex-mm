@@ -175,6 +175,7 @@ describe('FIX Message Builder', () => {
       expect(orderMessage.fields['55']).toBe('BTC-PYUSD'); // Symbol
       expect(orderMessage.fields['54']).toBe('1'); // Side
       expect(orderMessage.fields['38']).toBe('0.01'); // OrderQty
+      expect(orderMessage.fields['2964']).toBe('0'); // SelfMatchPreventionInstruction
     });
     
     test('should include party ID fields in correct order', () => {
@@ -186,6 +187,36 @@ describe('FIX Message Builder', () => {
       expect(orderMessage.fields['453']).toBe('1'); // NoPartyIDs
       expect(orderMessage.fields['448']).toBeDefined(); // PartyID
       expect(orderMessage.fields['452']).toBe('3'); // PartyRole
+    });
+
+    test('should preserve numeric 0 self-match prevention instruction', () => {
+      const orderMessage = buildNewOrderSingle(
+        testApiKey,
+        testApiSecret,
+        { ...testOrderData, selfMatchPreventionInstruction: 0 },
+        '3'
+      );
+
+      expect(orderMessage.fields['2964']).toBe('0');
+      expect(orderMessage.message).toContain('\x012964=0\x01');
+      const bodyLength = Number(orderMessage.message.match(/\x019=(\d+)\x01/)?.[1]);
+      const bodyStart = orderMessage.message.indexOf('\x01', orderMessage.message.indexOf('\x019=') + 1) + 1;
+      const checksumStart = orderMessage.message.indexOf('\x0110=');
+      expect(bodyLength).toBe(checksumStart - bodyStart + 1);
+    });
+
+    test('should omit self-match prevention instruction for disabled aliases', () => {
+      for (const disabledValue of ['none', 'off', 'false', '', ' None ', false]) {
+        const orderMessage = buildNewOrderSingle(
+          testApiKey,
+          testApiSecret,
+          { ...testOrderData, selfMatchPreventionInstruction: disabledValue },
+          '3'
+        );
+
+        expect(orderMessage.fields['2964']).toBeUndefined();
+        expect(orderMessage.message).not.toContain('\x012964=');
+      }
     });
     
     test('should handle market orders (no price)', () => {
@@ -314,6 +345,3 @@ describe('FIX Message Builder', () => {
     });
   });
 });
-
-
-

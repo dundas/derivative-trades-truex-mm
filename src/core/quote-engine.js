@@ -1,5 +1,14 @@
 import { EventEmitter } from 'events';
 
+function normalizeSelfMatchPreventionInstruction(value) {
+  if (value === undefined || value === null) return '0';
+  const normalized = String(value).trim();
+  if (!normalized || ['none', 'off', 'false'].includes(normalized.toLowerCase())) {
+    return null;
+  }
+  return normalized;
+}
+
 /**
  * QuoteEngine - Dynamic quote management for TrueX market making.
  *
@@ -52,6 +61,7 @@ export class QuoteEngine extends EventEmitter {
       senderCompID: options.senderCompID || 'CLI_CLIENT',
       targetCompID: options.targetCompID || 'TRUEX_UAT_OE',
       clientId: options.clientId || null, // TrueX PartyID (tag 448) — required for order entry
+      selfMatchPreventionInstruction: normalizeSelfMatchPreventionInstruction(options.selfMatchPreventionInstruction),
       truexBookStaleThresholdMs: options.truexBookStaleThresholdMs || 10000,
       pyusdUsdStaleThresholdMs: options.pyusdUsdStaleThresholdMs || 15000,
       marketablePostOnlyAction: options.marketablePostOnlyAction || 'skip',
@@ -59,6 +69,8 @@ export class QuoteEngine extends EventEmitter {
       minActiveLevelsPerSide: options.minActiveLevelsPerSide ?? 0,
       maxReplacementsPerSidePerCycle: options.maxReplacementsPerSidePerCycle ?? Number.POSITIVE_INFINITY,
       pendingReplacementTimeoutMs: options.pendingReplacementTimeoutMs || 5000,
+      pendingSelfCrossGuardMs: options.pendingSelfCrossGuardMs ?? 5000,
+      cancellingSelfCrossGuardMs: options.cancellingSelfCrossGuardMs ?? 5000,
       allowTakerOrders: options.allowTakerOrders || false,
       truexTakerFeeBps: options.truexTakerFeeBps ?? 0,
       minTakeEdgeBps: options.minTakeEdgeBps ?? 1,
@@ -601,6 +613,10 @@ export class QuoteEngine extends EventEmitter {
     if (prepared.postOnly !== false) {
       fields['18'] = '6';  // ExecInst: Add Liquidity Only (maker-only)
     }
+    if (this.config.selfMatchPreventionInstruction !== null &&
+        this.config.selfMatchPreventionInstruction !== undefined) {
+      fields['2964'] = String(this.config.selfMatchPreventionInstruction);
+    }
 
     // TrueX Party ID block — required for order entry
     if (this.config.clientId) {
@@ -654,6 +670,7 @@ export class QuoteEngine extends EventEmitter {
     const activeOrder = this.activeOrders.get(origClOrdID);
     if (activeOrder) {
       activeOrder.status = 'cancelling';
+      activeOrder.cancellingAt = Date.now();
     }
 
     // Track cancel ClOrdID → original ClOrdID for exec report matching
@@ -1455,6 +1472,9 @@ export class QuoteEngine extends EventEmitter {
     if (reason === 'marketable-post-only') {
       this.lastMarketableAloSkip = value;
     }
+    if (reason === 'self-cross-tracked-order') {
+      this.deferredRepriceNeeded = true;
+    }
     this.logger.warn(`[QuoteEngine] Suppressed ${quote.side} L${quote.level}: ${reason}`);
   }
 
@@ -1470,23 +1490,54 @@ export class QuoteEngine extends EventEmitter {
     }
 
     if (!this._isMarketablePostOnly(prepared)) {
-      return prepared;
+      if (!this._wouldSelfCrossTrackedOrder(prepared)) {
+        return prepared;
+      }
+      this._recordSuppression(prepared, 'self-cross-tracked-order');
+      return null;
     }
 
     if (this.config.marketablePostOnlyAction === 'slide') {
       const book = this._getTrueXBook();
       if (prepared.side === 'buy' && book?.bestAsk !== null && book?.bestAsk !== undefined) {
         prepared.price = this.snapToTick(book.bestAsk - this.config.tickSize);
+        if (this._wouldSelfCrossTrackedOrder(prepared)) {
+          this._recordSuppression(prepared, 'self-cross-tracked-order');
+          return null;
+        }
         return prepared;
       }
       if (prepared.side === 'sell' && book?.bestBid !== null && book?.bestBid !== undefined) {
         prepared.price = this.snapToTick(book.bestBid + this.config.tickSize);
+        if (this._wouldSelfCrossTrackedOrder(prepared)) {
+          this._recordSuppression(prepared, 'self-cross-tracked-order');
+          return null;
+        }
         return prepared;
       }
     }
 
     this._recordSuppression(prepared, 'marketable-post-only');
     return null;
+  }
+
+  _wouldSelfCrossTrackedOrder(quote) {
+    if (!quote || quote.postOnly === false) return false;
+    const now = Date.now();
+    for (const order of this.activeOrders.values()) {
+      if (!order || order.side === quote.side) continue;
+      const isFreshPending = order.status === 'pending' &&
+        order.placedAt &&
+        (now - order.placedAt) <= this.config.pendingSelfCrossGuardMs;
+      const cancellingStartedAt = order.cancellingAt ?? order.placedAt;
+      const isFreshCancelling = order.status === 'cancelling' &&
+        cancellingStartedAt &&
+        (now - cancellingStartedAt) <= this.config.cancellingSelfCrossGuardMs;
+      if (order.status !== 'active' && !isFreshPending && !isFreshCancelling) continue;
+      if (quote.side === 'buy' && quote.price >= order.price) return true;
+      if (quote.side === 'sell' && quote.price <= order.price) return true;
+    }
+    return false;
   }
 
   _prepareTakerQuote(quote) {

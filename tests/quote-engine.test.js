@@ -1037,15 +1037,130 @@ describe('QuoteEngine', () => {
       expect(engine.getQuoteStatus().lastMarketableAloSkip.reason).toBe('marketable-post-only');
     });
 
+    it('should include TrueX self-match prevention on maker orders by default', () => {
+      const fixMock = createMockFix();
+      const engine = createEngine({ fixConnection: fixMock });
+
+      engine._sendNewOrder({ side: 'buy', price: 99, size: 0.1, level: 1 });
+
+      expect(fixMock.sendMessage).toHaveBeenCalledTimes(1);
+      expect(fixMock.sendMessage.mock.calls[0][0]['18']).toBe('6');
+      expect(fixMock.sendMessage.mock.calls[0][0]['2964']).toBe('0');
+    });
+
+    it('should omit self-match prevention when explicitly disabled', () => {
+      const fixMock = createMockFix();
+      const engine = createEngine({
+        fixConnection: fixMock,
+        selfMatchPreventionInstruction: 'none',
+      });
+
+      engine._sendNewOrder({ side: 'sell', price: 101, size: 0.1, level: 1 });
+
+      expect(fixMock.sendMessage).toHaveBeenCalledTimes(1);
+      expect(fixMock.sendMessage.mock.calls[0][0]['2964']).toBeUndefined();
+    });
+
+    it('should preserve numeric 0 self-match prevention config', () => {
+      const fixMock = createMockFix();
+      const engine = createEngine({
+        fixConnection: fixMock,
+        selfMatchPreventionInstruction: 0,
+      });
+
+      engine._sendNewOrder({ side: 'buy', price: 99, size: 0.1, level: 1 });
+
+      expect(fixMock.sendMessage).toHaveBeenCalledTimes(1);
+      expect(fixMock.sendMessage.mock.calls[0][0]['2964']).toBe('0');
+    });
+
+    it('should suppress post-only quotes that would cross tracked contra orders', () => {
+      const fixMock = createMockFix();
+      const engine = createEngine({ fixConnection: fixMock });
+      engine.activeOrders.set('ASK001', {
+        side: 'sell',
+        price: 100,
+        size: 0.1,
+        level: 1,
+        status: 'cancelling',
+        placedAt: Date.now(),
+      });
+
+      const result = engine._sendNewOrder({ side: 'buy', price: 100, size: 0.1, level: 1 });
+
+      expect(result).toBeNull();
+      expect(fixMock.sendMessage).not.toHaveBeenCalled();
+      expect(engine.getQuoteStatus().suppressed.at(-1).reason).toBe('self-cross-tracked-order');
+    });
+
+    it('should not suppress against stale cancelling contra orders', () => {
+      const fixMock = createMockFix();
+      const engine = createEngine({ fixConnection: fixMock });
+      engine.activeOrders.set('ASK001', {
+        side: 'sell',
+        price: 100,
+        size: 0.1,
+        level: 1,
+        status: 'cancelling',
+        placedAt: Date.now() - 60000,
+        cancellingAt: Date.now() - 60000,
+      });
+
+      const result = engine._sendNewOrder({ side: 'buy', price: 100, size: 0.1, level: 1 });
+
+      expect(result).not.toBeNull();
+      expect(fixMock.sendMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it('should suppress against fresh pending contra orders', () => {
+      const fixMock = createMockFix();
+      const engine = createEngine({ fixConnection: fixMock });
+      engine.activeOrders.set('ASK001', {
+        side: 'sell',
+        price: 100,
+        size: 0.1,
+        level: 1,
+        status: 'pending',
+        placedAt: Date.now(),
+      });
+
+      const result = engine._sendNewOrder({ side: 'buy', price: 100, size: 0.1, level: 1 });
+
+      expect(result).toBeNull();
+      expect(fixMock.sendMessage).not.toHaveBeenCalled();
+      expect(engine.getQuoteStatus().suppressed.at(-1).reason).toBe('self-cross-tracked-order');
+    });
+
+    it('should not suppress against stale pending contra orders', () => {
+      const fixMock = createMockFix();
+      const engine = createEngine({ fixConnection: fixMock });
+      engine.activeOrders.set('ASK001', {
+        side: 'sell',
+        price: 100,
+        size: 0.1,
+        level: 1,
+        status: 'pending',
+        placedAt: Date.now() - 60000,
+      });
+
+      const result = engine._sendNewOrder({ side: 'buy', price: 100, size: 0.1, level: 1 });
+
+      expect(result).not.toBeNull();
+      expect(fixMock.sendMessage).toHaveBeenCalledTimes(1);
+    });
+
     it('should send ALO orders when TrueX book is missing or stale because marketability is unknown', () => {
       const fixMock = createMockFix();
       const engine = createEngine({ fixConnection: fixMock, truexBookStaleThresholdMs: 10 });
 
       expect(engine._sendNewOrder({ side: 'buy', price: 100, size: 0.1, level: 1 })).not.toBeNull();
 
-      engine.updateTrueXBook({ bestBid: 99, bestAsk: 100, timestamp: Date.now() - 1000 });
-      expect(engine._sendNewOrder({ side: 'sell', price: 99, size: 0.1, level: 1 })).not.toBeNull();
-      expect(fixMock.sendMessage).toHaveBeenCalledTimes(2);
+      const staleBookFixMock = createMockFix();
+      const staleBookEngine = createEngine({ fixConnection: staleBookFixMock, truexBookStaleThresholdMs: 10 });
+      staleBookEngine.updateTrueXBook({ bestBid: 99, bestAsk: 100, timestamp: Date.now() - 1000 });
+      expect(staleBookEngine._sendNewOrder({ side: 'sell', price: 99, size: 0.1, level: 1 })).not.toBeNull();
+      expect(fixMock.sendMessage).toHaveBeenCalledTimes(1);
+      expect(staleBookFixMock.sendMessage).toHaveBeenCalledTimes(1);
     });
 
     it('stores truexEbbo separately from truexBook and reports freshness independently', () => {
@@ -1190,6 +1305,36 @@ describe('QuoteEngine', () => {
 
       expect(fixMock.sendMessage).toHaveBeenCalledTimes(1);
       expect(engine.getQuoteStatus().lastMarketableAloSkip.reason).toBe('marketable-post-only');
+    });
+
+    it('should defer reprice when pending replacement is suppressed by tracked self-cross risk', () => {
+      const fixMock = createMockFix();
+      const engine = createEngine({ fixConnection: fixMock, maxOrdersPerSecond: 100, levels: 1 });
+      const oldClOrdID = 'OLD001';
+      const oldOrder = { side: 'buy', price: 99, size: 0.1, level: 1, status: 'active', placedAt: Date.now() };
+      engine.activeOrders.set(oldClOrdID, oldOrder);
+      engine.activeOrders.set('ASK001', {
+        side: 'sell',
+        price: 100,
+        size: 0.1,
+        level: 1,
+        status: 'active',
+        placedAt: Date.now(),
+      });
+
+      engine.executeActions({
+        toCancel: [],
+        toPlace: [],
+        toReplace: [{ cancel: oldClOrdID, cancelOrder: oldOrder, place: { side: 'buy', price: 100, size: 0.1, level: 1 } }],
+      });
+
+      expect(fixMock.sendMessage).toHaveBeenCalledTimes(1);
+      const cancelClOrdID = fixMock.sendMessage.mock.calls[0][0]['11'];
+      engine.onExecutionReport({ '11': cancelClOrdID, '39': '4', '54': '1' });
+
+      expect(fixMock.sendMessage).toHaveBeenCalledTimes(1);
+      expect(engine.getQuoteStatus().suppressed.at(-1).reason).toBe('self-cross-tracked-order');
+      expect(engine.deferredRepriceNeeded).toBe(true);
     });
 
     it('should not release pending replacements while quoting is suspended', () => {

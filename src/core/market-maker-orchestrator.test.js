@@ -176,6 +176,16 @@ describe('MarketMakerOrchestrator — anchor config wiring', () => {
     expect(orch.quoteEngine.config.anchorExchange).toBe('kraken');
   });
 
+  it('forwards self-cross guard timing to the engine', () => {
+    const orch = makeRealEngineOrch({
+      pendingSelfCrossGuardMs: 1234,
+      cancellingSelfCrossGuardMs: 2345,
+    });
+
+    expect(orch.quoteEngine.config.pendingSelfCrossGuardMs).toBe(1234);
+    expect(orch.quoteEngine.config.cancellingSelfCrossGuardMs).toBe(2345);
+  });
+
   it('defaults to mid mode / coinbase anchor when unset', () => {
     const orch = makeRealEngineOrch({});
     expect(orch.quoteEngine.config.quoteAnchorMode).toBe('mid');
