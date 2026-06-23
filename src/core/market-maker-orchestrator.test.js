@@ -186,6 +186,23 @@ describe('MarketMakerOrchestrator — anchor config wiring', () => {
     expect(orch.quoteEngine.config.cancellingSelfCrossGuardMs).toBe(2345);
   });
 
+  it('forwards self-match prevention instruction from env when option is unset', () => {
+    const previousValue = process.env.TRUEX_SELF_MATCH_PREVENTION_INSTRUCTION;
+    process.env.TRUEX_SELF_MATCH_PREVENTION_INSTRUCTION = '1';
+
+    try {
+      const orch = makeRealEngineOrch({});
+
+      expect(orch.quoteEngine.config.selfMatchPreventionInstruction).toBe('1');
+    } finally {
+      if (previousValue === undefined) {
+        delete process.env.TRUEX_SELF_MATCH_PREVENTION_INSTRUCTION;
+      } else {
+        process.env.TRUEX_SELF_MATCH_PREVENTION_INSTRUCTION = previousValue;
+      }
+    }
+  });
+
   it('defaults to mid mode / coinbase anchor when unset', () => {
     const orch = makeRealEngineOrch({});
     expect(orch.quoteEngine.config.quoteAnchorMode).toBe('mid');

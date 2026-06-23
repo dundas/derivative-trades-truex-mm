@@ -1,5 +1,7 @@
 import { EventEmitter } from 'events';
 
+// Intentionally duplicated from the CJS FIX builder across the CJS/ESM boundary.
+// Numeric 0 means send 2964=0; boolean/string false disables the tag here via null.
 function normalizeSelfMatchPreventionInstruction(value) {
   if (value === undefined || value === null) return '0';
   const normalized = String(value).trim();
@@ -1522,6 +1524,7 @@ export class QuoteEngine extends EventEmitter {
   }
 
   _wouldSelfCrossTrackedOrder(quote) {
+    // Taker quotes are covered by exchange-level 2964; this local guard is for maker-only quotes.
     if (!quote || quote.postOnly === false) return false;
     const now = Date.now();
     for (const order of this.activeOrders.values()) {

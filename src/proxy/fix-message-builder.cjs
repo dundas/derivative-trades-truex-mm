@@ -11,6 +11,8 @@ const BODY_FIELD_ORDER = ['35', '49', '56', '34', '52', '98', '108', '141', '553
 // Party ID fields: NoPartyIDs(453) FIRST -> PartyID(448) SECOND -> PartyRole(452) THIRD
 const ORDER_FIELD_ORDER = ['35', '49', '56', '34', '52', '11', '18', '2964', '55', '54', '38', '40', '44', '59', '453', '448', '452'];
 
+// Intentionally duplicated from QuoteEngine across the CJS/ESM boundary.
+// Numeric 0 means send 2964=0; boolean/string false disables the tag here via undefined.
 function normalizeSelfMatchPreventionInstruction(value) {
   if (value === undefined || value === null) return '0';
   const normalized = String(value).trim();

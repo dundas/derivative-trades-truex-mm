@@ -1131,6 +1131,31 @@ describe('QuoteEngine', () => {
       expect(engine.getQuoteStatus().suppressed.at(-1).reason).toBe('self-cross-tracked-order');
     });
 
+    it('should suppress slide-adjusted post-only quotes that would cross tracked contra orders', () => {
+      const fixMock = createMockFix();
+      const engine = createEngine({
+        fixConnection: fixMock,
+        marketablePostOnlyAction: 'slide',
+        tickSize: 0.5,
+      });
+      engine.updateTrueXBook({ bestBid: 99, bestAsk: 100, timestamp: Date.now() });
+      engine.activeOrders.set('ASK001', {
+        side: 'sell',
+        price: 99.5,
+        size: 0.1,
+        level: 1,
+        status: 'active',
+        placedAt: Date.now(),
+      });
+
+      const result = engine._sendNewOrder({ side: 'buy', price: 100, size: 0.1, level: 1 });
+
+      expect(result).toBeNull();
+      expect(fixMock.sendMessage).not.toHaveBeenCalled();
+      expect(engine.getQuoteStatus().suppressed.at(-1).reason).toBe('self-cross-tracked-order');
+      expect(engine.deferredRepriceNeeded).toBe(true);
+    });
+
     it('should not suppress against stale pending contra orders', () => {
       const fixMock = createMockFix();
       const engine = createEngine({ fixConnection: fixMock });
