@@ -557,6 +557,27 @@ describe('FIXConnection', () => {
       expect(sentMessage).toContain('55=BTC/USD');
       expect(sentMessage).toContain('10='); // CheckSum
     });
+
+    it('should serialize self-match prevention before order body fields', async () => {
+      await connection.sendMessage({
+        '35': 'D',
+        '49': 'CLI_CLIENT',
+        '56': 'TRUEX_UAT_OE',
+        '11': 'ORDER123',
+        '18': '6',
+        '2964': 0,
+        '55': 'BTC-PYUSD',
+        '54': '1',
+        '38': '0.01',
+        '40': '2',
+        '44': '100000.00',
+        '59': '1',
+      });
+
+      const sentMessage = mockSocketInstance.write.mock.calls[0][0];
+      expect(sentMessage.indexOf('\x0118=6\x01')).toBeLessThan(sentMessage.indexOf('\x012964=0\x01'));
+      expect(sentMessage.indexOf('\x012964=0\x01')).toBeLessThan(sentMessage.indexOf('\x0138=0.01\x01'));
+    });
     
     it('should increment message sequence number', async () => {
       const initialSeqNum = connection.msgSeqNum;

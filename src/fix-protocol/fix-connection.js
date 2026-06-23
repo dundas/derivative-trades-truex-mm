@@ -659,7 +659,7 @@ export class FIXConnection extends EventEmitter {
     // Define strict field order per FIX protocol
     // Header fields (8,9,34,35,49,56,52) MUST come first, then body fields
     const headerFieldOrder = ['35', '49', '56', '34', '52'];  // Order after 8 and 9
-    const commonBodyFields = ['11', '18', '41', '38', '40', '44', '54', '55', '59', '453', '448', '452'];  // Body fields + Party ID in order: 453→448→452
+    const commonBodyFields = ['11', '18', '2964', '41', '38', '40', '44', '54', '55', '59', '453', '448', '452'];  // Body fields + Party ID in order: 453→448→452
     
     // Build message body with STRICT field ordering
     let body = '';
@@ -673,7 +673,7 @@ export class FIXConnection extends EventEmitter {
     
     // 2. Add common body fields (in order)
     for (const tag of commonBodyFields) {
-      if (completeFields[tag]) {
+      if (completeFields[tag] !== undefined && completeFields[tag] !== null) {
         body += `${tag}=${completeFields[tag]}${this.SOH}`;
       }
     }

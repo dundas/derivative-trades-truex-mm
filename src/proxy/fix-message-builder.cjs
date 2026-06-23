@@ -9,7 +9,16 @@ const BODY_FIELD_ORDER = ['35', '49', '56', '34', '52', '98', '108', '141', '553
 
 // Specific field order for New Order Single (35=D) messages per Spencer's correction
 // Party ID fields: NoPartyIDs(453) FIRST -> PartyID(448) SECOND -> PartyRole(452) THIRD
-const ORDER_FIELD_ORDER = ['35', '49', '56', '34', '52', '11', '18', '55', '54', '38', '40', '44', '59', '453', '448', '452'];
+const ORDER_FIELD_ORDER = ['35', '49', '56', '34', '52', '11', '18', '2964', '55', '54', '38', '40', '44', '59', '453', '448', '452'];
+
+function normalizeSelfMatchPreventionInstruction(value) {
+  if (value === undefined || value === null) return '0';
+  const normalized = String(value).trim();
+  if (!normalized || ['none', 'off', 'false'].includes(normalized.toLowerCase())) {
+    return undefined;
+  }
+  return normalized;
+}
 
 /**
  * Calculate FIX checksum
@@ -96,7 +105,7 @@ function createOrderMessage(fields) {
   
   // Add order fields in the EXACT order specified by Spencer
   for (const tag of ORDER_FIELD_ORDER) {
-    if (fields[tag]) {
+    if (fields[tag] !== undefined && fields[tag] !== null) {
       msg += `${tag}=${fields[tag]}${SOH}`;
     }
   }
@@ -361,6 +370,9 @@ function buildNewOrderSingle(apiKey, apiSecret, orderData, msgSeqNum, partyID = 
     price,             // Required for limit orders
     timeInForce = '1'  // '1'=GTC, '3'=IOC, '4'=FOK
   } = orderData || {};
+  const selfMatchPreventionInstruction = normalizeSelfMatchPreventionInstruction(
+    orderData?.selfMatchPreventionInstruction
+  );
   
   const now = new Date();
   const year = now.getUTCFullYear();
@@ -386,6 +398,7 @@ function buildNewOrderSingle(apiKey, apiSecret, orderData, msgSeqNum, partyID = 
     // Order fields
     11: clOrdID,                          // ClOrdID - Client Order ID
     18: '6',                              // ExecInst - Add Liquidity Only (ALO) for market making
+    2964: selfMatchPreventionInstruction, // SelfMatchPreventionInstruction
     55: symbol,                           // Symbol
     54: side,                             // Side
     38: String(orderQty),                 // OrderQty (safe default)
@@ -409,7 +422,7 @@ function buildNewOrderSingle(apiKey, apiSecret, orderData, msgSeqNum, partyID = 
   // Calculate body length using the same field order as createOrderMessage
   let body = '';
   for (const tag of ORDER_FIELD_ORDER) {
-    if (orderFields[tag]) {
+    if (orderFields[tag] !== undefined && orderFields[tag] !== null) {
       body += `${tag}=${orderFields[tag]}${SOH}`;
     }
   }
