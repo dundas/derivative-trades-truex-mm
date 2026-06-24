@@ -22,6 +22,7 @@
 import { createPostgreSQLAPIFromEnv } from '../../lib/postgresql-api/index.js';
 import { readFileSync, existsSync } from 'fs';
 import { handleAnalyticsBalanceSnapshots as _handleBalanceSnapshots } from './analytics-balance-snapshots.js';
+import { handleAnalyticsSpreadPnl as _handleSpreadPnl } from './analytics-spread-pnl.js';
 
 const PORT         = parseInt(process.env.API_PORT || '3100', 10);
 const CORS_ORIGIN  = process.env.CORS_ORIGIN || '*';
@@ -437,6 +438,10 @@ async function handleAnalyticsSpreadCapture(params) {
   }
 
   return jsonOk({ pairs: r.rows, summary }, { count: r.rows.length });
+}
+
+async function handleAnalyticsSpreadPnl(params) {
+  return jsonOk(await _handleSpreadPnl(params, db));
 }
 
 async function handleAnalyticsAdverseSelection(params) {
@@ -936,6 +941,7 @@ Bun.serve({
 
       // Analytics
       if (path === '/api/v1/analytics/pnl')                return await handleAnalyticsPnl(params);
+      if (path === '/api/v1/analytics/spread-pnl')          return await handleAnalyticsSpreadPnl(params);
       if (path === '/api/v1/analytics/fill-rate')           return await handleAnalyticsFillRate(params);
       if (path === '/api/v1/analytics/spread-capture')      return await handleAnalyticsSpreadCapture(params);
       if (path === '/api/v1/analytics/adverse-selection')   return await handleAnalyticsAdverseSelection(params);
