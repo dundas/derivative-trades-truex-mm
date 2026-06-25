@@ -8,7 +8,7 @@
  * Endpoints:
  *   System:    GET /api/v1/health, /api/v1/stats
  *   Data:      GET /api/v1/sessions, /orders, /fills (with pagination & filtering)
- *   Analytics: GET /api/v1/analytics/pnl, /fill-rate, /spread-capture,
+ *   Analytics: GET /api/v1/analytics/pnl, /spread-pnl, /fill-rate, /spread-capture,
  *              /adverse-selection, /inventory, /parameters, /balance-snapshots
  *
  * Environment:

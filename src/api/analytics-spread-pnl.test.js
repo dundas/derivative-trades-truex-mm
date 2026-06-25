@@ -58,6 +58,18 @@ describe('computeSpreadPnlSummary', () => {
     expect(r.tradingCashFlow).toBeCloseTo(10, 9);
   });
 
+  it('composes a NULL-session row and a real session: only the real one matches, both feed cash flow', () => {
+    const r = computeSpreadPnlSummary([
+      { sessionid: null, buy_qty: 1, sell_qty: 1, buy_notional: 50, sell_notional: 70, buy_fees: 0, sell_fees: 0 },
+      { sessionid: 'a',  buy_qty: 1, sell_qty: 1, buy_notional: 100, sell_notional: 110, buy_fees: 0, sell_fees: 0 },
+    ]);
+    expect(r.matchedVolume).toBe(1);                 // only session 'a' matches
+    expect(r.spreadPnl).toBeCloseTo(10, 9);          // 1 * (110 - 100); null row excluded from matching
+    expect(r.avgBuyPrice).toBeCloseTo(100, 9);       // from session 'a' only
+    expect(r.avgSellPrice).toBeCloseTo(110, 9);
+    expect(r.tradingCashFlow).toBeCloseTo(30, 9);    // (70-50) + (110-100), both rows counted
+  });
+
   it('reports zero for a one-sided session', () => {
     const r = computeSpreadPnlSummary([
       { sessionid: 'a', buy_qty: 0, sell_qty: 3, buy_notional: 0, sell_notional: 330, buy_fees: 0, sell_fees: 0 },
@@ -111,6 +123,23 @@ describe('handleAnalyticsSpreadPnl (query construction)', () => {
     const [sql, values] = db.query.mock.calls[0];
     expect(sql).toContain('timestamp >= $1');
     expect(values).toEqual([0]);
+  });
+
+  it('applies the to bound, including epoch-0', async () => {
+    const db = makeDb([]);
+    await handleAnalyticsSpreadPnl(params({ to: '0' }), db);
+    const [sql, values] = db.query.mock.calls[0];
+    expect(sql).toContain('timestamp <= $1');
+    expect(values).toEqual([0]);
+  });
+
+  it('applies both from and to bounds together', async () => {
+    const db = makeDb([]);
+    await handleAnalyticsSpreadPnl(params({ from: '1000', to: '2000' }), db);
+    const [sql, values] = db.query.mock.calls[0];
+    expect(sql).toContain('timestamp >= $1');
+    expect(sql).toContain('timestamp <= $2');
+    expect(values).toEqual([1000, 2000]);
   });
 
   it('drops a malformed (NaN) time bound instead of sending it to SQL', async () => {
