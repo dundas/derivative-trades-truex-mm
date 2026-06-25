@@ -18,8 +18,12 @@ interface StatusData {
 }
 
 interface PnlData {
-  totalRealizedPnl?: number;
   fillCount?: number;
+  spreadPnl?: number;
+  matchedVolume?: number;
+  avgBuyPrice?: number;
+  avgSellPrice?: number;
+  tradingCashFlow?: number;
   [key: string]: unknown;
 }
 
@@ -92,7 +96,7 @@ export default function Dashboard({ user, onLogout }: { user: User; onLogout: ()
     const [h, s, p, f, l] = await Promise.allSettled([
       api.health(),
       api.status(),
-      api.pnl('?limit=1'),
+      api.pnl(),
       api.fills('?limit=10'),
       api.logsTail(20),
     ]);
@@ -148,8 +152,8 @@ export default function Dashboard({ user, onLogout }: { user: User; onLogout: ()
 
   const quotingColor = status?.quoting ? '#3fb950' : '#f85149';
   const healthColor = health?.status === 'ok' || health?.status === 'healthy' ? '#3fb950' : '#f85149';
-  const pnlValue = pnl?.totalRealizedPnl ?? 0;
-  const pnlColor = pnlValue >= 0 ? '#3fb950' : '#f85149';
+  const cashFlow = pnl?.tradingCashFlow ?? 0;
+  const cashFlowColor = cashFlow >= 0 ? '#3fb950' : '#f85149';
 
   return (
     <div style={{ minHeight: '100vh', background: '#0d1117', padding: 24 }}>
@@ -203,10 +207,22 @@ export default function Dashboard({ user, onLogout }: { user: User; onLogout: ()
         <div style={cardStyle}>
           <div style={headingStyle}>P&amp;L Summary</div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-              <span style={labelStyle}>Realized PnL</span>
-              <span style={{ ...valueStyle, color: pnlColor, fontSize: 18, fontWeight: 600 }}>
-                {pnl ? `${pnlValue >= 0 ? '+' : ''}${pnlValue.toFixed(4)}` : '—'}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+              <span style={labelStyle}>
+                Spread P&amp;L
+                <span style={{ display: 'block', fontSize: 10, color: '#6e7681' }}>(matched round-trips)</span>
+              </span>
+              <span style={{ ...valueStyle, color: (pnl?.spreadPnl ?? 0) >= 0 ? '#3fb950' : '#f85149', fontSize: 16, fontWeight: 600 }}>
+                {pnl !== null ? `${(pnl?.spreadPnl ?? 0) >= 0 ? '+' : ''}$${(pnl?.spreadPnl ?? 0).toFixed(4)}` : '—'}
+              </span>
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+              <span style={labelStyle}>
+                Trading Cash Flow
+                <span style={{ display: 'block', fontSize: 10, color: '#6e7681' }}>(sell proceeds − buy costs)</span>
+              </span>
+              <span style={{ ...valueStyle, color: cashFlowColor, fontSize: 16, fontWeight: 600 }}>
+                {pnl !== null ? `${cashFlow >= 0 ? '+' : ''}$${cashFlow.toFixed(2)}` : '—'}
               </span>
             </div>
             <div style={{ display: 'flex', justifyContent: 'space-between' }}>

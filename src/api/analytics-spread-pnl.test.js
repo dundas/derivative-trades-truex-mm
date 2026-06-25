@@ -94,7 +94,16 @@ describe('computeSpreadPnlSummary', () => {
 
   it('returns zeros for no rows', () => {
     const r = computeSpreadPnlSummary([]);
-    expect(r).toEqual({ spreadPnl: 0, matchedVolume: 0, avgBuyPrice: 0, avgSellPrice: 0, tradingCashFlow: 0 });
+    expect(r).toEqual({ spreadPnl: 0, matchedVolume: 0, avgBuyPrice: 0, avgSellPrice: 0, tradingCashFlow: 0, fillCount: 0 });
+  });
+
+  it('sums fillCount across all rows including the NULL-session group', () => {
+    const r = computeSpreadPnlSummary([
+      { sessionid: null, buy_qty: 0, sell_qty: 1, buy_notional: 0, sell_notional: 70, fill_count: 3 },
+      { sessionid: 'a',  buy_qty: 1, sell_qty: 1, buy_notional: 100, sell_notional: 110, fill_count: 4 },
+    ]);
+    expect(r.fillCount).toBe(7); // 3 (null group) + 4 (session a) — counts every fill
+    expect(r.matchedVolume).toBe(1); // only session 'a' contributes matched volume
   });
 });
 

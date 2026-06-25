@@ -16,7 +16,7 @@ export default function App() {
         clearTimeout(timeout);
         if (r.status === 401) return setUser(null);
         if (!r.ok) return setUser(null); // 5xx — treat as logged out rather than hang
-        return r.json().then((d: { user?: User }) => setUser(d.user ?? null));
+        return (r.json() as Promise<{ user?: User }>).then((d) => setUser(d.user ?? null));
       })
       .catch(() => { clearTimeout(timeout); setUser(null); });
   }, []);

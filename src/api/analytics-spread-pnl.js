@@ -10,6 +10,7 @@
  *   - avgBuyPrice     — matched-volume-weighted average buy price (consistent with spreadPnl)
  *   - avgSellPrice    — matched-volume-weighted average sell price
  *   - tradingCashFlow — raw cash flow over all fills (sell proceeds − buy costs)
+ *   - fillCount       — total fills in range (so the dashboard need not download bucket history)
  *
  * Spread P&L uses a per-session VWAP round-trip model rather than nth-buy↔nth-sell pairing:
  * per session, spreadPnl = matchedVolume × (avgSell − avgBuy) − matched fees, summed across
@@ -42,13 +43,14 @@ function addTimeFilterLocal(conditions, values, idx, col, from, to) {
 
 /**
  * Pure aggregation over per-session fill rows. Each row is one session's totals:
- *   { sessionid, buy_qty, sell_qty, buy_notional, sell_notional, buy_fees, sell_fees }
+ *   { sessionid, buy_qty, sell_qty, buy_notional, sell_notional, buy_fees, sell_fees, fill_count }
  * Exported separately so the matching/fee/null-session logic is unit-testable without a db.
  */
 export function computeSpreadPnlSummary(rows) {
   let spreadPnl = 0, matchedVolume = 0;
   let matchedBuyNotional = 0, matchedSellNotional = 0;
   let totalBuyNotional = 0, totalSellNotional = 0;
+  let fillCount = 0;
 
   for (const row of rows) {
     const buyQty = row.buy_qty ?? 0;
@@ -56,10 +58,11 @@ export function computeSpreadPnlSummary(rows) {
     const buyNotional = row.buy_notional ?? 0;
     const sellNotional = row.sell_notional ?? 0;
 
-    // tradingCashFlow is raw cash and session-independent, so it counts every fill —
+    // tradingCashFlow and fillCount are session-independent, so they count every fill —
     // including the collapsed NULL-sessionid group.
     totalBuyNotional += buyNotional;
     totalSellNotional += sellNotional;
+    fillCount += row.fill_count ?? 0;
 
     // NULL sessionid fills (orphaned/history with no session) all collapse into one GROUP
     // under GROUP BY; they are not a real session, so they are non-matchable — skip matching.
@@ -89,6 +92,7 @@ export function computeSpreadPnlSummary(rows) {
     avgBuyPrice: matchedVolume > 0 ? matchedBuyNotional / matchedVolume : 0,
     avgSellPrice: matchedVolume > 0 ? matchedSellNotional / matchedVolume : 0,
     tradingCashFlow: totalSellNotional - totalBuyNotional,
+    fillCount,
   };
 }
 
@@ -117,7 +121,8 @@ export async function handleAnalyticsSpreadPnl(params, db) {
       COALESCE(SUM(CASE WHEN side = 'buy'  THEN COALESCE(size, amount, 0)::numeric * price::numeric END), 0)::float AS buy_notional,
       COALESCE(SUM(CASE WHEN side = 'sell' THEN COALESCE(size, amount, 0)::numeric * price::numeric END), 0)::float AS sell_notional,
       COALESCE(SUM(CASE WHEN side = 'buy'  THEN COALESCE(feeamount, 0)::numeric END), 0)::float                     AS buy_fees,
-      COALESCE(SUM(CASE WHEN side = 'sell' THEN COALESCE(feeamount, 0)::numeric END), 0)::float                     AS sell_fees
+      COALESCE(SUM(CASE WHEN side = 'sell' THEN COALESCE(feeamount, 0)::numeric END), 0)::float                     AS sell_fees,
+      COUNT(*)::int                                                                                                 AS fill_count
     FROM fills WHERE 1=1 ${where}
     GROUP BY sessionid
   `, values);
