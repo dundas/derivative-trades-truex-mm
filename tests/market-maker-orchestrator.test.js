@@ -1923,3 +1923,48 @@ describe('MarketMakerOrchestrator', () => {
     });
   });
 });
+
+describe('MarketMakerOrchestrator._getTruexTapeContext — EBBO last_trade fallback', () => {
+  test('returns null when neither the trade-tape poll nor the EBBO has a trade', () => {
+    const { orchestrator } = createOrchestrator();
+    expect(orchestrator._truexTradeTape.latestTradeTs).toBeNull();
+    expect(orchestrator._getTruexTapeContext()).toBeNull();
+  });
+
+  test('falls back to the EBBO last_trade when the trade-tape poll is empty', () => {
+    const { orchestrator, mocks } = createOrchestrator();
+    // trade-tape poll stays empty (default after construction)
+    const ts = Date.now() - 10_000;
+    mocks.quoteEngine.truexEbbo = {
+      lastTradePrice: 101.2,
+      lastTradeQty: 0.25,
+      lastTradeTs: ts,
+    };
+    const ctx = orchestrator._getTruexTapeContext();
+    expect(ctx).not.toBeNull();
+    expect(ctx.latestTradePrice).toBe(101.2);
+    expect(ctx.latestTradeQty).toBe(0.25);
+    expect(ctx.latestTradeTs).toBe(ts);
+    expect(ctx.ageS).toBeGreaterThan(9);
+  });
+
+  test('prefers the dedicated trade-tape poll over the EBBO fallback', () => {
+    const { orchestrator, mocks } = createOrchestrator();
+    const tapeTs = Date.now() - 3_000;
+    orchestrator._truexTradeTape = {
+      latestTradePrice: 102.5,
+      latestTradeQty: 0.1,
+      latestTradeTs: tapeTs,
+      fetchedAt: Date.now(),
+      inFlight: false,
+    };
+    mocks.quoteEngine.truexEbbo = {
+      lastTradePrice: 101.2,
+      lastTradeQty: 0.25,
+      lastTradeTs: Date.now() - 10_000,
+    };
+    const ctx = orchestrator._getTruexTapeContext();
+    expect(ctx.latestTradePrice).toBe(102.5);
+    expect(ctx.latestTradeTs).toBe(tapeTs);
+  });
+});

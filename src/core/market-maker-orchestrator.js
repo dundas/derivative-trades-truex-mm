@@ -122,6 +122,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       shadowTakeQtyDecayTolerancePct: options.shadowTakeQtyDecayTolerancePct ?? 0.1,
       shadowAttributionMaxAgeMs: options.shadowAttributionMaxAgeMs ?? 5000,
       truexTapeMaxAgeMs: options.truexTapeMaxAgeMs ?? 5000,
+      shadowDetectionTapeMaxAgeMs: options.shadowDetectionTapeMaxAgeMs ?? 30000,
       truexTapeOutlierThresholdBps: options.truexTapeOutlierThresholdBps ?? 50,
       marketDataProvider: () => this.marketDataFeed?.getBestBidAsk?.(),
       logger: this.logger,
@@ -1073,15 +1074,30 @@ export class MarketMakerOrchestrator extends EventEmitter {
   }
 
   _getTruexTapeContext() {
-    if (!this._truexTradeTape.latestTradeTs || !this._truexTradeTape.latestTradePrice) {
-      return null;
+    // Prefer the dedicated trade-tape poll (getMarketTrades) — an independent
+    // recent-trades source. Fall back to the EBBO's last_trade (always present on
+    // a successful EBBO poll) when the trade-tape poll is empty, so detection
+    // isn't blocked purely because no recent trades were returned on a quiet
+    // book. The tape-outlier check and the shadowDetectionTapeMaxAgeMs gate in
+    // evaluateShadowTake still filter stale/phantom tapes downstream.
+    if (this._truexTradeTape.latestTradeTs && this._truexTradeTape.latestTradePrice) {
+      return {
+        latestTradePrice: this._truexTradeTape.latestTradePrice,
+        latestTradeQty: this._truexTradeTape.latestTradeQty,
+        latestTradeTs: this._truexTradeTape.latestTradeTs,
+        ageS: (Date.now() - this._truexTradeTape.latestTradeTs) / 1000,
+      };
     }
-    return {
-      latestTradePrice: this._truexTradeTape.latestTradePrice,
-      latestTradeQty: this._truexTradeTape.latestTradeQty,
-      latestTradeTs: this._truexTradeTape.latestTradeTs,
-      ageS: (Date.now() - this._truexTradeTape.latestTradeTs) / 1000,
-    };
+    const ebbo = this.quoteEngine?.truexEbbo;
+    if (ebbo?.lastTradeTs && ebbo?.lastTradePrice) {
+      return {
+        latestTradePrice: ebbo.lastTradePrice,
+        latestTradeQty: ebbo.lastTradeQty ?? null,
+        latestTradeTs: ebbo.lastTradeTs,
+        ageS: (Date.now() - ebbo.lastTradeTs) / 1000,
+      };
+    }
+    return null;
   }
 
   _rollShadowMetricsWindow(now = Date.now()) {
