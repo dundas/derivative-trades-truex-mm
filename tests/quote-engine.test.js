@@ -1672,6 +1672,45 @@ describe('QuoteEngine', () => {
       expect(fixMock.sendMessage).not.toHaveBeenCalled();
     });
 
+    it('does not suppress detection on a tape aged between the send and detection gates', () => {
+      // Detection gate (shadowDetectionTapeMaxAgeMs, default 30s) is intentionally looser than
+      // the send gate (truexTapeMaxAgeMs, 5s). A 10s-old tape must NOT be suppressed as
+      // `truex-tape-stale` at detection time — otherwise the Phase-2 analyzer starves on
+      // illiquid books (BTC-PYUSD trades print < every 5s), which is the regression this split
+      // fixes. With a qualifying edge + size, a would-take is logged on a 10s-old tape.
+      const fixMock = createMockFix();
+      const engine = createEngine({
+        fixConnection: fixMock,
+        inventoryManager: {
+          getSkew: mock(() => ({ bidSkewTicks: 0, askSkewTicks: 0 })),
+          canQuote: mock(() => true),
+          getPositionSummary: mock(() => ({ netPosition: 0.4 })),
+          getAvailableForSide: mock(() => 0.4),
+        },
+        shadowTakeMode: true,
+        shadowPersistenceRequiredPolls: 1,
+        minTakeEdgeBps: 10,
+        maxTakeNotionalPerOrder: 1000,
+      });
+      seedFreshShadowInputs(engine);
+      const truexTape = makeShadowTape({ price: 101.2, ts: Date.now() - 10_000 });
+
+      const result = engine.evaluateShadowTake({
+        aggregatedPrice: makeShadowPrice({ coinbaseBid: 100 }),
+        truexTape,
+        now: Date.now(),
+        trigger: 'loose-tape-gate',
+      });
+
+      expect(result.evaluation.suppressReason).not.toBe('truex-tape-stale');
+      expect(result.logs).toHaveLength(1);
+      expect(result.logs[0]).toEqual(expect.objectContaining({
+        type: 'would-take',
+        wouldTake: true,
+      }));
+      expect(fixMock.sendMessage).not.toHaveBeenCalled();
+    });
+
     it('applies basis-adjusted edge math without modifying computeTakeEdgeBps', () => {
       const engine = createEngine({
         inventoryManager: {

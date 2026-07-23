@@ -122,6 +122,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       shadowTakeQtyDecayTolerancePct: options.shadowTakeQtyDecayTolerancePct ?? 0.1,
       shadowAttributionMaxAgeMs: options.shadowAttributionMaxAgeMs ?? 5000,
       truexTapeMaxAgeMs: options.truexTapeMaxAgeMs ?? 5000,
+      shadowDetectionTapeMaxAgeMs: options.shadowDetectionTapeMaxAgeMs ?? 30000,
       truexTapeOutlierThresholdBps: options.truexTapeOutlierThresholdBps ?? 50,
       marketDataProvider: () => this.marketDataFeed?.getBestBidAsk?.(),
       logger: this.logger,

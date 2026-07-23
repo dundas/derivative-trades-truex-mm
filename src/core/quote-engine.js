@@ -88,7 +88,14 @@ export class QuoteEngine extends EventEmitter {
       maxTakeNotionalPerOrder: options.maxTakeNotionalPerOrder ?? 1000,
       shadowTakeQtyDecayTolerancePct: options.shadowTakeQtyDecayTolerancePct ?? 0.1,
       shadowAttributionMaxAgeMs: options.shadowAttributionMaxAgeMs ?? 5000,
+      // Tape-freshness gates — split detection vs send.
+      //   truexTapeMaxAgeMs: strict gate reserved for the taker send-path re-check
+      //     (enforced when allowTakerOrders is enabled, before a take is dispatched).
+      //   shadowDetectionTapeMaxAgeMs: looser gate used by evaluateShadowTake so it logs
+      //     edge-quality data on illiquid books where trades print less often than every 5s
+      //     (e.g. BTC-PYUSD). Keeps the Phase-2 analyzer from starving on `truex-tape-stale`.
       truexTapeMaxAgeMs: options.truexTapeMaxAgeMs ?? 5000,
+      shadowDetectionTapeMaxAgeMs: options.shadowDetectionTapeMaxAgeMs ?? 30000,
       truexTapeOutlierThresholdBps: options.truexTapeOutlierThresholdBps ?? 50,
       marketDataProvider: options.marketDataProvider || null,
     };
@@ -1274,7 +1281,7 @@ export class QuoteEngine extends EventEmitter {
       };
     }
 
-    if ((now - truexTape.latestTradeTs) > this.config.truexTapeMaxAgeMs) {
+    if ((now - truexTape.latestTradeTs) > this.config.shadowDetectionTapeMaxAgeMs) {
       this._resetShadowCandidate();
       return {
         logs,

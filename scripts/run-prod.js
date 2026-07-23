@@ -175,6 +175,11 @@ const config = {
   shadowZeroDetectionAlertThresholdMs: parseInt(process.env.SHADOW_ZERO_DETECTION_ALERT_THRESHOLD_MS || '300000', 10),
   shadowSuppressionAlertThreshold: parseInt(process.env.SHADOW_SUPPRESSION_ALERT_THRESHOLD || '5', 10),
   shadowEdgeCeilingAlertThreshold: parseInt(process.env.SHADOW_EDGE_CEILING_ALERT_THRESHOLD || '3', 10),
+  // Tape-freshness gates — split detection vs send. Detection uses a looser window so shadow
+  // logs edge-quality data on illiquid books (BTC-PYUSD trades print < every 5s); the strict
+  // send-side gate is reserved for the taker send-path re-check when allowTakerOrders is enabled.
+  shadowDetectionTapeMaxAgeMs: parseInt(process.env.SHADOW_DETECTION_TAPE_MAX_AGE_MS || '30000', 10),
+  truexTapeMaxAgeMs: parseInt(process.env.SHADOW_SEND_TAPE_MAX_AGE_MS || '5000', 10),
   shadowPhase2Criteria,
 };
 
@@ -490,6 +495,8 @@ async function main() {
     shadowZeroDetectionAlertThresholdMs: config.shadowZeroDetectionAlertThresholdMs,
     shadowSuppressionAlertThreshold: config.shadowSuppressionAlertThreshold,
     shadowEdgeCeilingAlertThreshold: config.shadowEdgeCeilingAlertThreshold,
+    shadowDetectionTapeMaxAgeMs: config.shadowDetectionTapeMaxAgeMs,
+    truexTapeMaxAgeMs: config.truexTapeMaxAgeMs,
 
     // No hedging initially
     krakenClient: null,
