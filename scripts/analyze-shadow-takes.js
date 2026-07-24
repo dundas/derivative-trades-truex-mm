@@ -150,6 +150,7 @@ function buildSummary({ wouldTakes, attributions, basisSamples, suppressions }, 
     'coinbase-low-confidence',
     'truex-ebbo-stale',
     'truex-tape-stale',
+    'truex-tape-missing',
   ]);
   const timestamps = wouldTakes.map((entry) => Number(entry.timestamp)).filter(Number.isFinite);
   const basisAdjEdges = wouldTakes.map((entry) => Number(entry.basisAdjEdgeBps)).filter(Number.isFinite);

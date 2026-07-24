@@ -1276,7 +1276,7 @@ export class QuoteEngine extends EventEmitter {
           size: null,
           truexTapeAgeS,
           dedupKey,
-          suppressReason: 'truex-tape-stale',
+          suppressReason: 'truex-tape-missing',
         }),
       };
     }

@@ -1158,6 +1158,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       'coinbase-low-confidence',
       'truex-ebbo-stale',
       'truex-tape-stale',
+      'truex-tape-missing',
       'basis-stale',
     ]);
     const zeroDetectionEligible = !zeroDetectionEligibleSuppressReasons.has(result.evaluation.suppressReason);
