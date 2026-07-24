@@ -1711,6 +1711,79 @@ describe('QuoteEngine', () => {
       expect(fixMock.sendMessage).not.toHaveBeenCalled();
     });
 
+    it('suppresses with a distinct reason when the trade tape is missing (null/latestTradeTs null)', () => {
+      // The nullity path (quote-engine.js ~line 1265: `!latestTradePrice || !latestTradeTs
+      // || ageS === null`) and the age path (~line 1284: `now - latestTradeTs > gate`) both
+      // previously emitted `truex-tape-stale`, which made production logs ambiguous — a fix
+      // to the age gate looked complete while the nullity path silently dominated on a
+      // quiet book. This test pins the split: a missing tape must emit `truex-tape-missing`,
+      // distinct from an old-but-present tape's `truex-tape-stale`, so downstream
+      // analyzers/alerts can tell the two conditions apart.
+      const fixMock = createMockFix();
+      const engine = createEngine({
+        fixConnection: fixMock,
+        inventoryManager: {
+          getSkew: mock(() => ({ bidSkewTicks: 0, askSkewTicks: 0 })),
+          canQuote: mock(() => true),
+          getPositionSummary: mock(() => ({ netPosition: 0.4 })),
+          getAvailableForSide: mock(() => 0.4),
+        },
+        shadowTakeMode: true,
+        shadowPersistenceRequiredPolls: 1,
+        minTakeEdgeBps: 10,
+        maxTakeNotionalPerOrder: 1000,
+      });
+      seedFreshShadowInputs(engine);
+
+      const result = engine.evaluateShadowTake({
+        aggregatedPrice: makeShadowPrice({ coinbaseBid: 100 }),
+        truexTape: null,
+        now: Date.now(),
+        trigger: 'null-tape',
+      });
+
+      expect(result.evaluation.suppressReason).toBe('truex-tape-missing');
+      expect(result.evaluation.wouldTake).toBe(false);
+      expect(result.logs).toHaveLength(0);
+      expect(fixMock.sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('suppresses with truex-tape-stale (not -missing) when the tape is present but too old', () => {
+      // Counterpart to the null-tape test: a tape older than shadowDetectionTapeMaxAgeMs
+      // must emit `truex-tape-stale` — NOT `truex-tape-missing` — because the tape exists,
+      // it's just aged out. This is the age path (~line 1284), reachable only after the
+      // nullity path passes, and must remain distinguishable from the nullity path.
+      const fixMock = createMockFix();
+      const engine = createEngine({
+        fixConnection: fixMock,
+        inventoryManager: {
+          getSkew: mock(() => ({ bidSkewTicks: 0, askSkewTicks: 0 })),
+          canQuote: mock(() => true),
+          getPositionSummary: mock(() => ({ netPosition: 0.4 })),
+          getAvailableForSide: mock(() => 0.4),
+        },
+        shadowTakeMode: true,
+        shadowPersistenceRequiredPolls: 1,
+        minTakeEdgeBps: 10,
+        maxTakeNotionalPerOrder: 1000,
+      });
+      seedFreshShadowInputs(engine);
+      const truexTape = makeShadowTape({ price: 101.2, ts: Date.now() - 60_000 });
+
+      const result = engine.evaluateShadowTake({
+        aggregatedPrice: makeShadowPrice({ coinbaseBid: 100 }),
+        truexTape,
+        now: Date.now(),
+        trigger: 'old-tape',
+      });
+
+      expect(result.evaluation.suppressReason).toBe('truex-tape-stale');
+      expect(result.evaluation.suppressReason).not.toBe('truex-tape-missing');
+      expect(result.evaluation.wouldTake).toBe(false);
+      expect(result.logs).toHaveLength(0);
+      expect(fixMock.sendMessage).not.toHaveBeenCalled();
+    });
+
     it('applies basis-adjusted edge math without modifying computeTakeEdgeBps', () => {
       const engine = createEngine({
         inventoryManager: {
