@@ -13,7 +13,8 @@
  *
  * Exit codes: 0 = no orders remain; 1 = cancel failures or residuals;
  *             2 = configuration or pre-flight connectivity error;
- *             3 = sweep ran but verification failed (aftermath unconfirmed).
+ *             3 = unclear outcome — sweep failed mid-run or verification failed
+ *                 (check the venue).
  *
  * No process-kill side effects: stopping the market maker itself is the
  * MM API's /api/v1/emergency-stop endpoint (cancel + SIGTERM) or the
@@ -75,14 +76,25 @@ export async function runKillSwitch(client, opts = {}) {
   if (dryRun) {
     const before = await client.getActiveOrders();
     const listed = before.map((o) => TrueXRESTClient.parseOrder(o));
-    return { dryRun: true, listed, canceled: [], failed: [], residual: listed, verificationFailed: false };
+    return { dryRun: true, listed, canceled: [], failed: [], residual: listed, verificationFailed: false, sweepFailed: false };
   }
 
   // Live path: the sweep result is the single source of truth for what was
   // canceled (cancelAllOrders iterates its OWN snapshot internally). A separate
   // pre-fetch would diverge from the swept set if orders are placed/filled in
   // between — and this report is what an operator relies on during an incident.
-  const result = await client.cancelAllOrders();
+  let result;
+  try {
+    result = await client.cancelAllOrders();
+  } catch (err) {
+    // Mid-sweep failure: some cancels may have gone through. This is an
+    // unclear outcome (check the venue), not a pre-flight config error.
+    return {
+      dryRun: false, listed: [], canceled: [], failed: [], residual: [],
+      verificationFailed: false, sweepFailed: true,
+      sweepError: err instanceof Error ? err.message : String(err),
+    };
+  }
 
   // Verification pass: what is still live after the sweep? Distinct failure
   // mode from pre-flight errors: the sweep already ran, we just couldn't
@@ -98,11 +110,11 @@ export async function runKillSwitch(client, opts = {}) {
     verificationError = err instanceof Error ? err.message : String(err);
   }
 
-  return { dryRun: false, listed: [], canceled: result.canceled, failed: result.failed, residual, verificationFailed, verificationError };
+  return { dryRun: false, listed: [], canceled: result.canceled, failed: result.failed, residual, verificationFailed, verificationError, sweepFailed: false };
 }
 
 export function decideExit(result) {
-  if (result.verificationFailed) return 3; // canceled, but aftermath unverified
+  if (result.sweepFailed || result.verificationFailed) return 3; // unclear outcome — check the venue
   if (result.failed.length > 0 || result.residual.length > 0) return 1;
   return 0;
 }
@@ -125,7 +137,9 @@ export function renderText(result, config) {
   } else {
     L.push(`Canceled: ${result.canceled.length}  Failed: ${result.failed.length}`);
     for (const f of result.failed.slice(0, 10)) L.push(`  FAILED ${f.id}: ${f.error}`);
-    if (result.verificationFailed) {
+    if (result.sweepFailed) {
+      L.push(`!! SWEEP FAILED — some cancels may have completed; check the venue: ${result.sweepError}`);
+    } else if (result.verificationFailed) {
       L.push(`!! VERIFICATION FAILED — sweep ran but the aftermath could not be confirmed: ${result.verificationError}`);
     } else {
       L.push(`Residual after verification: ${result.residual.length}`);

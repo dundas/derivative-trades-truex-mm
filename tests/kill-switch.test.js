@@ -110,6 +110,17 @@ describe('runKillSwitch (AC2, AC4)', () => {
     expect(result.failed.length).toBe(0);
   });
 
+  it('cancelAllOrders throwing is an unclear outcome, not a config error (roborev round 2)', async () => {
+    const client = {
+      getActiveOrders: mock(async () => []),
+      cancelAllOrders: mock(async () => { throw new Error('socket hang up mid-sweep'); }),
+    };
+    const result = await runKillSwitch(client, {});
+    expect(result.sweepFailed).toBe(true);
+    expect(result.sweepError).toContain('socket hang up');
+    expect(decideExit(result)).toBe(3); // distinguishable from config error (2)
+  });
+
   it('verification failure is reported distinctly (roborev round 1)', async () => {
     let calls = 0;
     const client = {
