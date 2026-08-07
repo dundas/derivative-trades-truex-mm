@@ -1849,10 +1849,14 @@ export class QuoteEngine extends EventEmitter {
     if (actions.toPlace.length || actions.toCancel.length || actions.toReplace.length) {
       this.deferredRepriceNeeded = false;
       const dispatched = this.executeActions(actions);
-      if (dispatched && !this.heldPlacementsPending) {
+      if (dispatched) {
+        // Stamp on ANY dispatched cycle (matches onPriceUpdate semantics):
+        // - lastRepricedMid must track every dispatched reprice, else the
+        //   momentum trigger retriggers too early during hold windows.
+        // - lastRepriceAt debounces ordinary ticks after real work went out;
+        //   completion retries are exempt via heldPlacementsPending in the
+        //   staleness check above, so gating the stamp is unnecessary.
         this.lastRepriceAt = Date.now();
-        // Keep the momentum reference in sync with ANY dispatched reprice —
-        // a stale reference would retrigger the bypass too early (churn).
         this.lastRepricedMid = this.lastMid;
       }
       return !this.deferredRepriceNeeded;
