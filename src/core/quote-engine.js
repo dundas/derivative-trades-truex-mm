@@ -130,6 +130,10 @@ export class QuoteEngine extends EventEmitter {
     this.lastMarketableAloSkip = null;
     // Balance-safety gate: pure placements skipped while same-side cancels in flight
     this.placementsDeferredForCancels = 0;
+    // True while a gated placement awaits its cancel confirm; completion retries
+    // bypass the minRepriceInterval debounce (they finish an interrupted cycle,
+    // they don't start a new one).
+    this.heldPlacementsPending = false;
     this.truexBook = null;
     this.truexEbbo = null;
     this.pyusdUsd = null;
@@ -199,6 +203,7 @@ export class QuoteEngine extends EventEmitter {
   invalidateQueuedWork(reprice = false) {
     this.actionQueue = [];
     this.deferredRepriceNeeded = reprice;
+    this.heldPlacementsPending = false;
   }
 
   clearPendingReplacement(origClOrdID) {
@@ -252,7 +257,8 @@ export class QuoteEngine extends EventEmitter {
     }
     if (this.config.minRepriceIntervalMs > 0 &&
         this.lastRepriceAt &&
-        (now - this.lastRepriceAt) < this.config.minRepriceIntervalMs) {
+        (now - this.lastRepriceAt) < this.config.minRepriceIntervalMs &&
+        !this.heldPlacementsPending) {
       return;
     }
 
@@ -280,7 +286,10 @@ export class QuoteEngine extends EventEmitter {
     const dispatched = this.executeActions(actions);
 
     this.isQuoting = true;
-    if (dispatched) {
+    // Only a cycle that dispatched AND left nothing held counts as a full
+    // reprice for debounce purposes — a gated cycle's completion retry must
+    // not be debounced behind minRepriceIntervalMs.
+    if (dispatched && !this.heldPlacementsPending) {
       this.lastRepriceAt = Date.now();
     }
     this.emit('quote-update', {
@@ -574,6 +583,7 @@ export class QuoteEngine extends EventEmitter {
         continue;
       }
 
+
       if (this.actionsThisSecond >= this.config.maxOrdersPerSecond) {
         if (action.type === 'replacement-cancel') {
           this.deferredRepriceNeeded = true;
@@ -599,9 +609,13 @@ export class QuoteEngine extends EventEmitter {
       dispatched = true;
     }
     if (deferredThisCycle > 0) {
+      this.heldPlacementsPending = true;
       this.logger.info(
         `[QuoteEngine] Deferred ${deferredThisCycle} placement(s) pending same-side cancel confirms (lifetime=${this.placementsDeferredForCancels})`
       );
+    } else {
+      // Nothing held this cycle — any previously pending hold is resolved
+      this.heldPlacementsPending = false;
     }
     return dispatched;
   }
@@ -1069,6 +1083,7 @@ export class QuoteEngine extends EventEmitter {
       if (this._shouldHoldPlacement(action)) {
         this.placementsDeferredForCancels++;
         droppedStalePlacements++;
+        this.heldPlacementsPending = true;
         continue;
       }
       this._dispatchAction(action);
@@ -1783,7 +1798,8 @@ export class QuoteEngine extends EventEmitter {
     }
     if (this.config.minRepriceIntervalMs > 0 &&
         this.lastRepriceAt &&
-        (now - this.lastRepriceAt) < this.config.minRepriceIntervalMs) {
+        (now - this.lastRepriceAt) < this.config.minRepriceIntervalMs &&
+        !this.heldPlacementsPending) {
       this.deferredRepriceNeeded = true;
       return false;
     }
@@ -1797,7 +1813,7 @@ export class QuoteEngine extends EventEmitter {
     if (actions.toPlace.length || actions.toCancel.length || actions.toReplace.length) {
       this.deferredRepriceNeeded = false;
       const dispatched = this.executeActions(actions);
-      if (dispatched) {
+      if (dispatched && !this.heldPlacementsPending) {
         this.lastRepriceAt = Date.now();
       }
       return !this.deferredRepriceNeeded;

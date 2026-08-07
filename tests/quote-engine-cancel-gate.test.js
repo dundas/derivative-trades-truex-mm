@@ -207,3 +207,37 @@ describe('_runDeferredReprice — gate interaction', () => {
     expect(fixConnection.sendMessage.mock.calls.length).toBeGreaterThan(sendsAfterFirst);
   });
 });
+
+describe('minRepriceInterval debounce — gate interaction', () => {
+  it('completion retry after a gated cycle bypasses the minRepriceInterval debounce', () => {
+    const { engine, fixConnection } = createEngine({ minRepriceIntervalMs: 60000 });
+    engine.lastMid = 100000;
+    engine.lastRepriceAt = 1; // aged out — first cycle passes the debounce
+    engine.activeOrders.set('B1', { side: 'buy', price: 90000, size: 0.001, level: 1, status: 'active', placedAt: Date.now() });
+
+    const ran = engine._runDeferredReprice();
+    expect(ran).toBe(false);
+    expect(engine.heldPlacementsPending).toBe(true);
+    const stampedAt = Date.now();
+    expect(engine.lastRepriceAt).toBeLessThan(stampedAt); // gated cycle did not re-stamp
+
+    // Cancel confirm arrives, then a fresh debounce stamp lands (would block for 60s)
+    engine.activeOrders.delete('B1');
+    engine.lastRepriceAt = Date.now();
+
+    // Completion retry must not be debounced behind it
+    const ranAgain = engine._runDeferredReprice();
+    expect(ranAgain).toBe(true);
+    expect(engine.heldPlacementsPending).toBe(false);
+    expect(fixConnection.sendMessage).toHaveBeenCalled();
+  });
+
+  it('ordinary debouncing still applies when nothing is held', () => {
+    const { engine } = createEngine({ minRepriceIntervalMs: 60000 });
+    engine.lastMid = 100000;
+    engine.lastRepriceAt = Date.now();
+    engine.deferredRepriceNeeded = false;
+
+    expect(engine._runDeferredReprice()).toBe(false);
+  });
+});
