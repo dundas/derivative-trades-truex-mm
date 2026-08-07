@@ -275,21 +275,23 @@ export class QuoteEngine extends EventEmitter {
       // are exposed to lead-lag pick-off — reprice now instead of waiting out
       // the interval. Each dispatched reprice re-baselines lastRepricedMid, so
       // this fires per N bps of movement, not per tick.
+      // heldPlacementsPending deliberately does NOT bypass here: completion
+      // retries flow through drainQueue → _runDeferredReprice (which carries
+      // the hold exemption). A global bypass would churn unrelated
+      // cancels/replaces on every tick during the hold window.
       const moveBps = this.lastRepricedMid > 0
         ? Math.abs(mid - this.lastRepricedMid) / this.lastRepricedMid * 1e4
         : 0;
       const momentumBypass = this.config.momentumRepriceBps > 0 &&
         this.lastRepricedMid > 0 &&
         moveBps >= this.config.momentumRepriceBps;
-      if (!momentumBypass && !this.heldPlacementsPending) {
+      if (!momentumBypass) {
         return;
       }
-      if (momentumBypass) {
-        this.momentumReprices++;
-        this.logger.info(
-          `[QuoteEngine] Momentum reprice: move ${moveBps.toFixed(1)}bps >= ${this.config.momentumRepriceBps}bps since last reprice (lifetime=${this.momentumReprices})`
-        );
-      }
+      this.momentumReprices++;
+      this.logger.info(
+        `[QuoteEngine] Momentum reprice: move ${moveBps.toFixed(1)}bps >= ${this.config.momentumRepriceBps}bps since last reprice (lifetime=${this.momentumReprices})`
+      );
     }
 
     // Get inventory skew

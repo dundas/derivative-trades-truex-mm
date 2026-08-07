@@ -132,3 +132,25 @@ describe('momentum reference sync (roborev round 1)', () => {
     expect(engine.lastRepriceAt).toBeGreaterThan(1);
   });
 });
+
+describe('debounce scoping (roborev round 2)', () => {
+  it('heldPlacementsPending does NOT bypass the ordinary onPriceUpdate debounce', () => {
+    const { engine, fixConnection } = createEngine();
+    engine.lastRepriceAt = 1;
+    engine.onPriceUpdate(price(100000));
+    for (const [, o] of engine.activeOrders) o.status = 'active';
+    engine.lastActionByClOrdID.clear();
+
+    // Arm a hold and stamp the debounce fresh
+    engine.heldPlacementsPending = true;
+    engine.lastRepriceAt = Date.now();
+    engine.lastRepricedMid = 100000;
+
+    const sendsBefore = fixConnection.sendMessage.mock.calls.length;
+    // Small move (below momentum threshold) while a hold is pending:
+    // ordinary path must stay debounced (completion retries go through
+    // drainQueue → _runDeferredReprice, which carries the hold exemption).
+    engine.onPriceUpdate(price(100030));
+    expect(fixConnection.sendMessage.mock.calls.length).toBe(sendsBefore);
+  });
+});
