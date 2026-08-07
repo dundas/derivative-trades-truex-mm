@@ -1,0 +1,149 @@
+import { describe, it, expect, mock } from 'bun:test';
+import { resolveConfig, runKillSwitch, decideExit, renderText } from '../scripts/kill-switch.js';
+
+// --- AC1: fail-safe venue selection ---
+
+describe('resolveConfig (AC1, AC3)', () => {
+  it('bare invocation targets UAT with defaults, never prod', () => {
+    const cfg = resolveConfig({ TRUEX_API_KEY: 'k', TRUEX_SECRET_KEY: 's' }, 'uat');
+    expect(cfg.mode).toBe('uat');
+    expect(cfg.baseURL).toContain('38.32.101.229:9742');
+    expect(cfg.clientId).toBe('78972918929686546');
+    expect(cfg.usedLegacyClientId).toBe(true);
+  });
+
+  it('prod requires explicit keys + client id', () => {
+    const cfg = resolveConfig(
+      { TRUEX_PROD_API_KEY: 'pk', TRUEX_PROD_SECRET_KEY: 'ps', TRUEX_CLIENT_ID: 'cid' },
+      'prod'
+    );
+    expect(cfg.mode).toBe('prod');
+    expect(cfg.baseURL).toContain('178.156.230.110:3006');
+    expect(cfg.clientId).toBe('cid');
+  });
+
+  it('missing prod keys → error (exit 2 path)', () => {
+    const cfg = resolveConfig({}, 'prod');
+    expect(cfg.error).toContain('TRUEX_PROD_API_KEY');
+  });
+
+  it('missing uat keys → error (exit 2 path)', () => {
+    expect(resolveConfig({}, 'uat').error).toContain('TRUEX_API_KEY');
+  });
+
+  it('env overrides win for URLs and UAT client id', () => {
+    const cfg = resolveConfig(
+      { TRUEX_API_KEY: 'k', TRUEX_SECRET_KEY: 's', TRUEX_UAT_REST_URL: 'http://x:1', TRUEX_CLIENT_ID_UAT: 'u2' },
+      'uat'
+    );
+    expect(cfg.baseURL).toBe('http://x:1/api/v1');
+    expect(cfg.clientId).toBe('u2');
+    expect(cfg.usedLegacyClientId).toBe(false);
+  });
+});
+
+// --- Mock client harness ---
+
+// TrueX REST order shape: nested order_info (see TrueXRESTClient.parseOrder)
+function mockOrder(id, side = 'sell', price = 64000, qty = 0.001) {
+  return {
+    id,
+    external_id: `ext-${id}`,
+    status: 'LIVE',
+    order_info: { side, type: 'LIMIT', instrument_id: 'BTC-PYUSD', price: String(price), qty: String(qty) },
+    pending_qty: '0',
+    leaves_qty: String(qty),
+    exeuted_qty: '0',
+    executed_vwap: '0',
+    timestamp: String(Date.now() * 1e6),
+    update_timestamp: String(Date.now() * 1e6),
+  };
+}
+
+function mockClient({ active = [], cancelAll = null, afterCancel = [] } = {}) {
+  let calls = 0;
+  return {
+    // First call = before sweep; second call = verification pass
+    getActiveOrders: mock(async () => (calls++ === 0 ? active : afterCancel)),
+    cancelAllOrders: mock(async () => cancelAll ?? { success: true, canceled: active.map((o) => o.id), failed: [] }),
+  };
+}
+
+// --- AC2/AC4: flow behavior ---
+
+describe('runKillSwitch (AC2, AC4)', () => {
+  it('dry-run lists orders and performs zero cancel calls', async () => {
+    const client = mockClient({ active: [mockOrder('A'), mockOrder('B', 'buy')] });
+    const result = await runKillSwitch(client, { dryRun: true });
+    expect(result.dryRun).toBe(true);
+    expect(result.listed.length).toBe(2);
+    expect(client.cancelAllOrders).not.toHaveBeenCalled();
+  });
+
+  it('cancel path sweeps, verifies, and reports residuals', async () => {
+    const stuck = mockOrder('STUCK');
+    const client = mockClient({
+      active: [mockOrder('A'), mockOrder('STUCK')],
+      cancelAll: { success: false, canceled: ['A'], failed: [{ id: 'STUCK', error: 'too late' }] },
+      afterCancel: [stuck],
+    });
+    const result = await runKillSwitch(client, {});
+    expect(result.canceled).toEqual(['A']);
+    expect(result.failed.length).toBe(1);
+    expect(result.residual.length).toBe(1);
+    expect(result.residual[0].id).toBe('STUCK');
+    expect(client.getActiveOrders).toHaveBeenCalledTimes(2); // before + verification
+  });
+
+  it('clean sweep leaves no residuals', async () => {
+    const client = mockClient({ active: [mockOrder('A')] });
+    const result = await runKillSwitch(client, {});
+    expect(result.residual.length).toBe(0);
+    expect(result.failed.length).toBe(0);
+  });
+});
+
+// --- AC3: exit code decision ---
+
+describe('decideExit (AC3)', () => {
+  it('clean sweep → 0', () => {
+    expect(decideExit({ failed: [], residual: [] })).toBe(0);
+  });
+  it('any failure → 1', () => {
+    expect(decideExit({ failed: [{ id: 'x', error: 'e' }], residual: [] })).toBe(1);
+  });
+  it('any residual → 1', () => {
+    expect(decideExit({ failed: [], residual: [{ id: 'x' }] })).toBe(1);
+  });
+});
+
+// --- Reporting ---
+
+describe('renderText', () => {
+  it('renders dry-run header and order lines', () => {
+    const result = {
+      dryRun: true,
+      listed: [{ id: 'A1', side: 'sell', qty: 0.001, price: 64000, status: 'LIVE', createdAt: new Date() }],
+      canceled: [], failed: [], residual: [],
+    };
+    const text = renderText(result, { mode: 'prod', baseURL: 'http://x/api/v1', clientId: 'cid' });
+    expect(text).toContain('venue=prod');
+    expect(text).toContain('[DRY RUN]');
+    expect(text).toContain('A1');
+    expect(text).toContain('sell');
+  });
+
+  it('renders failures and residuals after a live sweep', () => {
+    const result = {
+      dryRun: false,
+      listed: [],
+      canceled: ['A'],
+      failed: [{ id: 'B', error: 'too late' }],
+      residual: [{ id: 'B', side: 'buy', qty: 0.001, price: 64000, status: 'LIVE', createdAt: new Date() }],
+    };
+    const text = renderText(result, { mode: 'uat', baseURL: 'http://x/api/v1', clientId: 'cid' });
+    expect(text).toContain('Canceled: 1  Failed: 1');
+    expect(text).toContain('FAILED B: too late');
+    expect(text).toContain('Residual after verification: 1');
+  });
+});
