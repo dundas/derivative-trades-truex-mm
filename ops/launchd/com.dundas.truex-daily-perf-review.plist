@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.dundas.truex-daily-perf-review</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>{{CODE_ROOT}}/scripts/daily-perf-review-job.sh</string>
+    </array>
+
+    <!-- Daily at 19:15 local (CDT) = 00:15Z, just after the UTC day closes.
+         If the machine is asleep at fire time, launchd runs it at next wake. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>19</integer>
+        <key>Minute</key>
+        <integer>15</integer>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>{{CODE_ROOT}}</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{{BUN_DIR}}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>TRUEX_PERF_BUN</key>
+        <string>{{BUN_BIN}}</string>
+        <key>TRUEX_PERF_CODE_ROOT</key>
+        <string>{{CODE_ROOT}}</string>
+        <key>TRUEX_PERF_DATA_ROOT</key>
+        <string>{{DATA_ROOT}}</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>{{DATA_ROOT}}/logs/daily-perf-review/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>{{DATA_ROOT}}/logs/daily-perf-review/launchd.err.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
