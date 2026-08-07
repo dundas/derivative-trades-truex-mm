@@ -46,6 +46,10 @@ Phase 2) has a continuous before/after baseline.
 - **roborev round 1 Medium**: installer creates `logs/daily-perf-review/` before
   bootstrap (launchd opens stdout/stderr files before the job script runs); DRY_RUN=1
   mode for pre-merge smoke.
+- **roborev round 2 High**: brain-msg resolved from DATA_ROOT (untracked `.claude/`
+  tooling lives in the canonical repo, NOT in clean git worktrees); runtime check added.
+- **roborev round 2 Medium**: rendered plist exports TRUEX_PERF_CODE_ROOT/DATA_ROOT in
+  EnvironmentVariables so non-default installs don't fall back to hardcoded paths.
 
 ## SO-13 note
 

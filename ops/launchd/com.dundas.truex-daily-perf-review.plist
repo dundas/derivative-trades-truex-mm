@@ -28,6 +28,10 @@
     <dict>
         <key>PATH</key>
         <string>/Users/kefentse/.bun/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>TRUEX_PERF_CODE_ROOT</key>
+        <string>{{CODE_ROOT}}</string>
+        <key>TRUEX_PERF_DATA_ROOT</key>
+        <string>{{DATA_ROOT}}</string>
     </dict>
 
     <key>StandardOutPath</key>

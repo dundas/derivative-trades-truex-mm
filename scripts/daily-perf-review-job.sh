@@ -16,7 +16,9 @@ set -uo pipefail
 CODE_ROOT="${TRUEX_PERF_CODE_ROOT:-/Users/kefentse/dev_env/true_markets_mm-ops}"
 DATA_ROOT="${TRUEX_PERF_DATA_ROOT:-/Users/kefentse/dev_env/true_markets_mm}"
 BUN="/Users/kefentse/.bun/bin/bun"
-BRAIN_MSG="$CODE_ROOT/.claude/skills/cross-brain-message/brain-msg.ts"
+# brain-msg lives in the canonical repo's untracked .claude/ tooling — NOT in
+# clean git worktrees — so it is resolved from DATA_ROOT, not CODE_ROOT.
+BRAIN_MSG="$DATA_ROOT/.claude/skills/cross-brain-message/brain-msg.ts"
 
 # Operational scoping for the funded prod account (see docs/DAILY_PERF_REVIEW.md)
 ERA_SINCE="2026-06-26"
@@ -62,6 +64,10 @@ fi
 # --- Alerting ----------------------------------------------------------------
 send_alert() {
   local subject="$1" body="$2"
+  if [ ! -f "$BRAIN_MSG" ]; then
+    echo "WARN: brain-msg not found at $BRAIN_MSG — alert not sent (subject: $subject)"
+    return
+  fi
   "$BUN" "$BRAIN_MSG" send --to decisive --body "$body" >/dev/null 2>&1 \
     || echo "WARN: alert send failed (subject: $subject)"
 }
