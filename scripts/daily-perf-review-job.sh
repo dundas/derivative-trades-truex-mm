@@ -82,4 +82,18 @@ elif [ "$RC" -ge 2 ]; then
     "TrueX MM daily perf review job FAILED (exit $RC) for $DATE_UTC. Last output: $(tail -c 300 "$REPORT" | tr '\n' ' ')"
 fi
 
+# --- Email digest (task 0011) ---------------------------------------------
+# Summary + reviewable page link. Skips silently when DAILY_REPORT_EMAIL is
+# unset. Failure does not change the job exit code (the review outcome
+# dominates) — it is logged instead.
+if [ "$RC" -le 1 ]; then
+  if [ -n "${DAILY_REPORT_EMAIL:-}" ]; then
+    "$BUN" scripts/daily-perf-email.ts --date "$DATE_UTC" --send \
+      >> "$LOG_DIR/email.log" 2>&1 \
+      || echo "WARN: email digest failed (see $LOG_DIR/email.log)"
+  else
+    echo "INFO: DAILY_REPORT_EMAIL not set — email digest skipped"
+  fi
+fi
+
 exit "$RC"
