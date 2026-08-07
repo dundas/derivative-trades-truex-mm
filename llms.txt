@@ -239,6 +239,10 @@ Emergency: abs(netPosition) >= emergencyLimitBTC → cancel all quotes.
 
 ## Kill Switch
 `bun scripts/kill-switch.js [--prod|--uat]`
+
+Note: `deploy-hetzner.sh` graceful stop treats the kill switch exit code as boolean and
+discards stderr — run manually with `--json` when the 1-vs-3 distinction matters
+(residuals vs unclear outcome).
 Cancels all orders via REST API. Works independently of FIX connection.
 Auto-detects environment from TRUEX_PROD_API_KEY presence.
 Steps: fetch active orders → cancelAllOrders() → verify none remain.
