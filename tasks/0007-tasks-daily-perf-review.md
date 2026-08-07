@@ -1,6 +1,6 @@
 # Task 0007 — Daily Performance Review Script
 
-**Status**: in-progress
+**Status**: done — merged (PR #54), scheduled + emailing live since 2026-08-07
 **Branch**: feat/daily-perf-review
 **Date**: 2026-08-06
 **Context**: Production equity reconciliation (2026-08-06) showed -$298 realized trading loss

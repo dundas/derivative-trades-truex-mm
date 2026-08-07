@@ -1,6 +1,6 @@
 # Task 0011 — Daily Email Digest with Reviewable Report Page
 
-**Status**: in-progress
+**Status**: done — merged (PR #61), recipient configured + delivery confirmed 2026-08-07
 **Branch**: feat/daily-perf-email
 **Date**: 2026-08-08
 **Context**: Tasks 0007/0008 built the daily perf review + scheduled run, but outputs land

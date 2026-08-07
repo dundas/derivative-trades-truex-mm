@@ -44,9 +44,13 @@ Driver metrics (in causal order):
 4. **Rejection count** — hygiene; target 0 (achieved 2026-08-07).
 
 Guardrails (hard limits, alert on breach):
-- WARN if daily realized < **-$50** or adverse mark-out > **25bps** (task 0008 thresholds)
+- WARN if daily realized < **-$50** or adverse mark-out > **25bps** (thresholds set in
+  task 0007, alerting wired by task 0008)
 - No over-commit: placements held while cancels in flight (task 0009)
-- Position limits + kill switch (`scripts/kill-switch.js`, `MOMENTUM_REPRICE_BPS=0` rollback)
+- Position limits + stop tools: `MOMENTUM_REPRICE_BPS=0` rollback, REST cancel-all
+  (`scripts/rest-cancel-all.js`), graceful container stop (cancels first).
+  Gap: the `scripts/kill-switch.js` referenced by deploy tooling does not exist in the
+  repo yet — tracked under known gaps
 
 ## 4. How we trace progress
 
@@ -100,7 +104,10 @@ isn't working → escalate to the next phase lever.
 | Architecture | `docs/ARCHITECTURE.md` |
 | Daily review usage | `docs/DAILY_PERF_REVIEW.md` |
 | Operational gotchas | `memory/MEMORY.md` |
-| Session history + baselines | `memory/daily/` (esp. 2026-08-06/07) |
+| Session history + baselines | `memory/daily/` (esp. 2026-08-06/07)* |
 | Feature specs 0007-0011 | `tasks/00xx-*.md` |
 | Infra readiness | `memory/production-readiness.md` |
 | Live reports | https://truex-mm-reports.pages.dev/ |
+
+\* `memory/` is intentionally untracked — it lives in the brain's runtime worktree
+(`$DATA_ROOT`), not in git.

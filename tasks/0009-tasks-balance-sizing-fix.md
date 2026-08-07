@@ -1,6 +1,6 @@
 # Task 0009 — Balance-Aware Sizing Fix (cancel/place race gate)
 
-**Status**: in-progress
+**Status**: done — merged (PR #58), **deployed to prod 2026-08-07** (rejections 323/hr → 0)
 **Branch**: fix/balance-aware-sizing
 **Date**: 2026-08-07
 **Context**: 2026-08-06 prod observation: **323 `Insufficient balance` rejections/hour**;
