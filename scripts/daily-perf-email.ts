@@ -233,9 +233,12 @@ function writeSiteFiles(day: DayReport, trend: DayReport[]): string {
 
 async function deployPages(): Promise<void> {
   const localWrangler = join(REPO_ROOT, 'node_modules', '.bin', 'wrangler');
+  // --branch main pins the deployment to the PRODUCTION environment —
+  // without it wrangler infers the current git branch (worktrees deploy to
+  // Preview and the canonical URL 404s).
   const cmd = existsSync(localWrangler)
-    ? [localWrangler, 'pages', 'deploy', SITE_DIR, '--project-name', PAGES_PROJECT]
-    : ['bunx', 'wrangler', 'pages', 'deploy', SITE_DIR, '--project-name', PAGES_PROJECT];
+    ? [localWrangler, 'pages', 'deploy', SITE_DIR, '--project-name', PAGES_PROJECT, '--branch', 'main']
+    : ['bunx', 'wrangler', 'pages', 'deploy', SITE_DIR, '--project-name', PAGES_PROJECT, '--branch', 'main'];
   const proc = Bun.spawn(cmd, { stdout: 'pipe', stderr: 'pipe', cwd: REPO_ROOT });
   const exit = await proc.exited;
   if (exit !== 0) {
