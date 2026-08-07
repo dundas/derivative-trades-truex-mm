@@ -1,6 +1,6 @@
 # TrueX Market Maker — Strategy & Progress Tracker
 
-**Last updated**: 2026-08-08 · **Owner**: true-markets brain · **Status**: live, optimizing
+**Last updated**: 2026-08-07 · **Owner**: true-markets brain · **Status**: live, optimizing
 
 This is the single source of truth for *what we're doing, why, what we're optimizing, and
 how we trace progress*. Architecture lives in `docs/ARCHITECTURE.md`; operational gotchas
@@ -14,7 +14,7 @@ Make markets profitably on **BTC-PYUSD on TrueX**, pricing off Coinbase BTC-USD,
 from a small funded account and compounding through superior quoting — not directional bets.
 
 **Capital**: funded 2026-06-26 with 0.01812 BTC + 4,815.27 PYUSD (≈ $6,000 @ BTC ≈ $65,383).
-**Current equity**: ~$5,700 (2026-08-08). Drawdown to date: **-$298 realized trading loss**;
+**Current equity**: ~$5,700 (2026-08-07). Drawdown to date: **-$298 realized trading loss**;
 only -$16 of it was BTC price movement. **The bleed is our quoting, not the market.**
 
 ## 2. The core problem: adverse selection
