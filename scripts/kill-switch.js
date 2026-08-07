@@ -77,9 +77,14 @@ export async function runKillSwitch(client, opts = {}) {
   const { dryRun = false } = opts;
 
   if (dryRun) {
-    const before = await client.getActiveOrders();
-    const listed = before.map((o) => TrueXRESTClient.parseOrder(o));
-    return { dryRun: true, listed, canceled: [], failed: [], residual: listed, verificationFailed: false, sweepFailed: false };
+    try {
+      const before = await client.getActiveOrders();
+      const listed = before.map((o) => TrueXRESTClient.parseOrder(o));
+      return { dryRun: true, listed, canceled: [], failed: [], residual: listed, verificationFailed: false, sweepFailed: false };
+    } catch (err) {
+      // Distinguishable from config errors at a glance for on-call responders
+      throw new Error(`dry-run inspection failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   // Live path: the sweep result is the single source of truth for what was

@@ -16,6 +16,17 @@ describe('decideCliExit (exit-code contract)', () => {
 
 // --- CLI argument safety (roborev round 3) ---
 
+describe('dry-run inspection failure (roborev round 5)', () => {
+  it('dry-run fetch failure is distinguishable from config errors', async () => {
+    const client = {
+      getActiveOrders: mock(async () => { throw new Error('connection reset'); }),
+      cancelAllOrders: mock(async () => ({ canceled: [], failed: [] })),
+    };
+    expect(runKillSwitch(client, { dryRun: true })).rejects.toThrow('dry-run inspection failed: connection reset');
+    expect(client.cancelAllOrders).not.toHaveBeenCalled();
+  });
+});
+
 describe('parseArgs (typo safety)', () => {
   it('rejects unknown flags instead of silently ignoring them', () => {
     expect(parseArgs(['--dry-rnu']).error).toContain('--dry-rnu');
