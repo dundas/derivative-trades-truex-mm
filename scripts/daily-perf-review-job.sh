@@ -15,6 +15,11 @@ set -uo pipefail
 
 CODE_ROOT="${TRUEX_PERF_CODE_ROOT:-/Users/kefentse/dev_env/true_markets_mm-ops}"
 DATA_ROOT="${TRUEX_PERF_DATA_ROOT:-/Users/kefentse/dev_env/true_markets_mm}"
+# Export for child processes (daily-perf-email.ts resolves its persistent
+# archive from TRUEX_PERF_DATA_ROOT — without this, manual runs from a
+# worktree would fall back to the checkout-local archive and a Pages
+# deploy could wipe previously published reports).
+export TRUEX_PERF_DATA_ROOT="$DATA_ROOT"
 # Bun resolution order: TRUEX_PERF_BUN (rendered into the plist by the
 # installer) → PATH → the conventional per-user location.
 BUN="${TRUEX_PERF_BUN:-$(command -v bun || echo "$HOME/.bun/bin/bun")}"
@@ -80,6 +85,18 @@ if [ "$RC" -eq 1 ]; then
 elif [ "$RC" -ge 2 ]; then
   send_alert "daily-perf ERROR $DATE_UTC" \
     "TrueX MM daily perf review job FAILED (exit $RC) for $DATE_UTC. Last output: $(tail -c 300 "$REPORT" | tr '\n' ' ')"
+fi
+
+# --- Email digest (task 0011) ---------------------------------------------
+# Summary + reviewable page link. Recipient comes from --to or
+# DAILY_REPORT_EMAIL — resolved INSIDE the Bun process (which auto-loads
+# CODE_ROOT/.env), so the shell must not gate on the variable here. The
+# script skips silently (exit 0) when no recipient is configured. Failure
+# does not change the job exit code (the review outcome dominates).
+if [ "$RC" -le 1 ]; then
+  "$BUN" scripts/daily-perf-email.ts --date "$DATE_UTC" --send \
+    >> "$LOG_DIR/email.log" 2>&1 \
+    || echo "WARN: email digest failed (see $LOG_DIR/email.log)"
 fi
 
 exit "$RC"
