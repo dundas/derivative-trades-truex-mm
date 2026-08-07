@@ -1820,6 +1820,10 @@ export class QuoteEngine extends EventEmitter {
       return !this.deferredRepriceNeeded;
     }
     this.deferredRepriceNeeded = false;
+    // Nothing left to place — any pending hold is resolved (e.g. the cancel
+    // was rejected and the restored order already matches, or quoting became
+    // impossible). Clear so later deferred reprices respect the debounce.
+    this.heldPlacementsPending = false;
     return true;
   }
 }

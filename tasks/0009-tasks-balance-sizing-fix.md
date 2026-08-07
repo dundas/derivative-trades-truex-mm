@@ -65,6 +65,16 @@ measurable via rejection logs after deploy.
   re-queueing them — held quotes would be stale by the time the cancel clears;
   `deferredRepriceNeeded` re-derives fresh quotes (same guarantee as the dispatch skip).
   Drain tests updated to drop-semantics + fresh-rebuild-after-confirm.
+- **roborev round 2 Medium**: a gated cycle no longer re-stamps `lastRepriceAt`; while
+  `heldPlacementsPending`, the completion retry bypasses `minRepriceIntervalMs` (prod runs
+  1500ms) — otherwise the follow-up reprice that replaces held placements gets debounced.
+- **roborev round 3 Medium**: debounce bypass scoped to `_runDeferredReprice` (the
+  completion-retry path) only; ordinary `onPriceUpdate` stays debounced during slow
+  cancel-ack windows (no global bypass, no extra churn). Regression test added.
+- **roborev round 4 Low**: `heldPlacementsPending` cleared on the no-actions completion
+  branch of `_runDeferredReprice` so a resolved hold can't leave the bypass stuck.
+- **roborev loop concluded after round 4** (past the 3-fix-round cap; every round produced
+  real, fixed findings). Remaining merge gate: PR-level review per `.ai/code-reviewers.json`.
 
 ## SO-13 note
 
