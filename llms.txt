@@ -37,6 +37,7 @@ to Kraken. DataPipelineManager: audit JSONL → Redis → PG.
 - `scripts/run-prod.js` — Production config and startup
 - `scripts/analyze-shadow-takes.js` — Phase-1 shadow log analyzer and go/no-go summary
 - `scripts/kill-switch.js` — Emergency order cancellation via REST
+- `scripts/daily-perf-review.ts` — Read-only daily PnL/adverse-selection review (see `docs/DAILY_PERF_REVIEW.md`)
 
 ## FIX Protocol (FIXT.1.1 / FIX.5.0SP2)
 
@@ -307,5 +308,6 @@ bun scripts/run-prod.js               # Production
 bun scripts/run-uat-paper-trading.js   # UAT paper trading
 bun scripts/analyze-shadow-takes.js    # Summarize shadow logs / Phase-2 decision
 bun scripts/kill-switch.js --prod      # Emergency cancel all orders
+bun scripts/daily-perf-review.ts       # Daily PnL/adverse-selection review (read-only)
 bun test                               # Run test suite (712 tests)
 ```
