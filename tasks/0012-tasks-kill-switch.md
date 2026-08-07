@@ -1,6 +1,6 @@
 # Task 0012 — Kill Switch CLI (the missing emergency stop tool)
 
-**Status**: in-progress
+**Status**: ready for review
 **Branch**: feat/kill-switch
 **Date**: 2026-08-07
 **Context**: `scripts/kill-switch.js` is referenced by `deploy-hetzner.sh` (graceful stop
@@ -40,6 +40,7 @@ injected), `decideExit(result)` are pure/injectable; the CLI main wires env + re
   verification failure after a successful sweep → exit 3 (unit).
 - AC4: verification pass re-lists and reports residuals (unit).
 - AC5: smoke — `--dry-run --prod` against live prod REST via the proxy (read-only).
+  **PASS 2026-08-07**: listed 3 live buy quotes via the socat proxy, exit 0.
 - AC6: full suite green.
 
 ## SO-13 note
