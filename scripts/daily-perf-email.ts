@@ -20,6 +20,7 @@
 import { fetchReportData, buildReport } from './daily-perf-review';
 import { mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // Operational era scoping — keep in sync with scripts/daily-perf-review-job.sh
 const ERA_SINCE_MS = Date.parse('2026-06-26T00:00:00Z');
@@ -33,7 +34,8 @@ const PAGES_BASE = `https://${PAGES_PROJECT}.pages.dev`;
 const SENDER_EMAIL = 'truex-mm@derivative.email';
 const SENDER_NAME = 'TrueX MM';
 
-const REPO_ROOT = join(dirname(new URL(import.meta.url).pathname), '..');
+// fileURLToPath decodes URL-encoded characters (paths with spaces/non-ASCII)
+const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 // Archive lives in the persistent DATA_ROOT (the canonical repo the scheduled
 // job points at), NOT the checkout the script runs from — a fresh/ephemeral
 // worktree with an empty archive would otherwise overwrite the cumulative
