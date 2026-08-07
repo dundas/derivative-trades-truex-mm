@@ -75,6 +75,15 @@ measurable via rejection logs after deploy.
   branch of `_runDeferredReprice` so a resolved hold can't leave the bypass stuck.
 - **roborev loop concluded after round 4** (past the 3-fix-round cap; every round produced
   real, fixed findings). Remaining merge gate: PR-level review per `.ai/code-reviewers.json`.
+- **PR #58 Claude review (substantive)**: gating the `lastRepriceAt` stamp on
+  `heldPlacementsPending` left the timestamp stale during intra-cycle holds (a same-side
+  replacement-cancel marks its order 'cancelling' before later same-side placements are
+  evaluated in the same pass), implicitly disabling the ordinary-path debounce for every
+  tick until a hold cleared. Fix: `onPriceUpdate` stamps on any dispatched cycle
+  unconditionally; the completion-retry exemption lives solely in `_runDeferredReprice`'s
+  `heldPlacementsPending` check. Faithful repro test added (intra-cycle replacement +
+  gated placement, second tick within interval must stay debounced). Double-blank-line nit
+  fixed.
 
 ## SO-13 note
 

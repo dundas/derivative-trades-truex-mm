@@ -243,21 +243,27 @@ describe('minRepriceInterval debounce — gate interaction', () => {
 });
 
 describe('debounce bypass is scoped to the completion-retry path (roborev round 3)', () => {
-  it('ordinary onPriceUpdate stays debounced while a hold is pending', () => {
-    const { engine, fixConnection } = createEngine({ minRepriceIntervalMs: 60000 });
-    engine.lastMid = 100000;
-    engine.lastRepriceAt = 1;
+  it('an intra-cycle hold does not silently disable the ordinary onPriceUpdate debounce (PR#58 review repro)', () => {
+    // A cycle that dispatches a same-side replacement-cancel and gates a
+    // same-side placement must still stamp lastRepriceAt — otherwise every
+    // subsequent tick sees a stale stamp and skips the debounce entirely.
+    const { engine, fixConnection } = createEngine({ minRepriceIntervalMs: 60000, levels: 2 });
+    engine.lastRepriceAt = 1; // stale — first cycle passes the debounce
+    // Active buy L1 far from the incoming desired price → becomes a replacement
     engine.activeOrders.set('B1', { side: 'buy', price: 90000, size: 0.001, level: 1, status: 'active', placedAt: Date.now() });
 
-    // Gated deferred cycle arms the hold
-    expect(engine._runDeferredReprice()).toBe(false);
+    // Cycle 1: replacement-cancel for B1 dispatched (B1 → 'cancelling'), the
+    // same-side L2 placement behind it is gated.
+    engine.onPriceUpdate({ confidence: 1.0, weightedMidpoint: 100000, sources: [] });
     expect(engine.heldPlacementsPending).toBe(true);
+    expect(engine.placementsDeferredForCancels).toBeGreaterThan(0);
+    // The cycle dispatched real work → it stamped lastRepriceAt even though a
+    // placement is held (this is the fix).
+    expect(engine.lastRepriceAt).toBeGreaterThan(1);
 
-    // Fresh debounce stamp: ordinary price updates must stay debounced
-    engine.lastRepriceAt = Date.now();
-    const sendsBefore = fixConnection.sendMessage.mock.calls.length;
-    engine.onPriceUpdate({ confidence: 1.0, weightedMidpoint: 100010, sources: [] });
-    expect(fixConnection.sendMessage.mock.calls.length).toBe(sendsBefore);
-    expect(engine.heldPlacementsPending).toBe(true); // still pending, no churn
+    // Cycle 2 within minRepriceIntervalMs: debounced — no new sends
+    const sendsAfterFirst = fixConnection.sendMessage.mock.calls.length;
+    engine.onPriceUpdate({ confidence: 1.0, weightedMidpoint: 100050, sources: [] });
+    expect(fixConnection.sendMessage.mock.calls.length).toBe(sendsAfterFirst);
   });
 });

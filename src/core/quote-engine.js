@@ -287,10 +287,14 @@ export class QuoteEngine extends EventEmitter {
     const dispatched = this.executeActions(actions);
 
     this.isQuoting = true;
-    // Only a cycle that dispatched AND left nothing held counts as a full
-    // reprice for debounce purposes — a gated cycle's completion retry must
-    // not be debounced behind minRepriceIntervalMs.
-    if (dispatched && !this.heldPlacementsPending) {
+    // Stamp on any cycle that dispatched, regardless of held placements. Gating
+    // the stamp on heldPlacementsPending would leave lastRepriceAt stale during
+    // intra-cycle holds (a same-side replacement-cancel marks its order
+    // 'cancelling' before later same-side placements are evaluated), which
+    // implicitly disables this debounce for every tick until a hold clears.
+    // The completion-retry exemption lives solely in _runDeferredReprice's
+    // heldPlacementsPending check.
+    if (dispatched) {
       this.lastRepriceAt = Date.now();
     }
     this.emit('quote-update', {
@@ -583,7 +587,6 @@ export class QuoteEngine extends EventEmitter {
         this.deferredRepriceNeeded = true;
         continue;
       }
-
 
       if (this.actionsThisSecond >= this.config.maxOrdersPerSecond) {
         if (action.type === 'replacement-cancel') {
