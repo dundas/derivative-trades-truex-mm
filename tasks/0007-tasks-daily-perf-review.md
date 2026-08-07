@@ -45,6 +45,14 @@ Read-only guarantee: SELECT only, no writes (asserted by a test scanning the scr
 - balance_snapshots writer (equity curve)
 - Cron/heartbeat scheduling of this script (separate change)
 
+## Review Fixes
+
+- **roborev (codex gpt-5.4, 2026-08-06) High**: added explicit scope filters — `--symbol`
+  (default BTC-PYUSD) on sessions/orders/fills, optional `--trading-mode` (fills scoped via
+  session membership). Prevents mixing UAT/other-symbol data into the report.
+- **roborev Medium**: numeric flags (`--markout-window-min`, `--max-daily-loss`,
+  `--max-adverse-bps`) validated via `parseNumericFlag` (unit-tested); invalid → exit 2.
+
 ## SO-13 note
 
 Touches `scripts/` → docs-generator mandatory; docs PR opened before merge.

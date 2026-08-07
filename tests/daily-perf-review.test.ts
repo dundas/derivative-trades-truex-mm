@@ -8,6 +8,7 @@ import {
   evaluateVerdict,
   hourlyHistogram,
   buildReport,
+  parseNumericFlag,
   type Fill,
 } from '../scripts/daily-perf-review';
 
@@ -234,6 +235,26 @@ describe('buildReport end-to-end on fixture data (AC5 shape)', () => {
     const round = JSON.parse(JSON.stringify(r));
     expect(round.pnl.dayRealized).toBeCloseTo(10, 9);
     expect(round.sessions[0].id).toBe('prod-1');
+  });
+});
+
+describe('parseNumericFlag (roborev finding: NaN propagation)', () => {
+  test('returns default when unset', () => {
+    expect(parseNumericFlag({}, 'max-daily-loss', 50)).toBe(50);
+  });
+  test('parses valid value', () => {
+    expect(parseNumericFlag({ 'max-daily-loss': '25.5' }, 'max-daily-loss', 50)).toBe(25.5);
+  });
+  test('rejects non-numeric input', () => {
+    expect(parseNumericFlag({ 'max-daily-loss': 'abc' }, 'max-daily-loss', 50)).toBeNull();
+    expect(parseNumericFlag({ 'max-adverse-bps': '' }, 'max-adverse-bps', 10)).toBeNull();
+  });
+  test('rejects non-positive when positivity required', () => {
+    expect(parseNumericFlag({ 'markout-window-min': '0' }, 'markout-window-min', 5, true)).toBeNull();
+    expect(parseNumericFlag({ 'markout-window-min': '-3' }, 'markout-window-min', 5, true)).toBeNull();
+  });
+  test('allows zero when positivity not required', () => {
+    expect(parseNumericFlag({ 'max-daily-loss': '0' }, 'max-daily-loss', 50)).toBe(0);
   });
 });
 

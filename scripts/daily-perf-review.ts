@@ -17,6 +17,11 @@
  *   bun scripts/daily-perf-review.ts [--date YYYY-MM-DD] [--json]
  *       [--seed-btc N --seed-price P] [--markout-window-min N]
  *       [--max-daily-loss USD] [--max-adverse-bps BPS]
+ *       [--symbol SYM] [--trading-mode MODE]
+ *
+ * Scope: sessions/orders/fills are filtered by --symbol (default BTC-PYUSD);
+ * --trading-mode additionally restricts to sessions/orders of that mode
+ * (fills are restricted via their session). Unset mode = all modes.
  */
 import pg from 'pg';
 
@@ -175,7 +180,13 @@ interface SessionRow {
   en: string | null;
 }
 
-export async function fetchReportData(dbUrl: string, dayStart: number, dayEnd: number) {
+export async function fetchReportData(
+  dbUrl: string,
+  dayStart: number,
+  dayEnd: number,
+  symbol: string,
+  tradingMode?: string
+) {
   const pool = new pg.Pool({ connectionString: dbUrl, connectionTimeoutMillis: 10000, statement_timeout: 60000 });
   try {
     const q = async (text: string, params: unknown[] = []) => (await pool.query(text, params)).rows;
@@ -188,26 +199,39 @@ export async function fetchReportData(dbUrl: string, dayStart: number, dayEnd: n
        where coalesce(startedat, starttimestamp, addedat) < $2
          and (coalesce(endedat, completedat, lastupdated) is null
               or coalesce(endedat, completedat, lastupdated) >= $1)
+         and symbol = $3
+         and ($4::text is null or tradingmode = $4)
        order by st`,
-      [dayStart, dayEnd]
+      [dayStart, dayEnd, symbol, tradingMode ?? null]
     );
 
     const orderRows = await q(
-      `select timestamp from orders where timestamp >= $1 and timestamp < $2`,
-      [dayStart, dayEnd]
+      `select timestamp from orders
+       where timestamp >= $1 and timestamp < $2 and symbol = $3
+         and ($4::text is null or tradingmode = $4)`,
+      [dayStart, dayEnd, symbol, tradingMode ?? null]
     );
 
     const orderCountByStatus = await q(
-      `select status, count(*)::int as n from orders where timestamp >= $1 and timestamp < $2 group by status order by n desc`,
-      [dayStart, dayEnd]
+      `select status, count(*)::int as n
+       from orders
+       where timestamp >= $1 and timestamp < $2 and symbol = $3
+         and ($4::text is null or tradingmode = $4)
+       group by status order by n desc`,
+      [dayStart, dayEnd, symbol, tradingMode ?? null]
     );
 
-    // Lifetime fills up to dayEnd (bounded scan via idx_fills_timestamp)
+    // Lifetime fills up to dayEnd (bounded scan via idx_fills_timestamp).
+    // fills has no tradingmode column — when a mode filter is requested,
+    // constrain to sessions carrying that mode.
     const fillRows = await q(
       `select timestamp, side, coalesce(size, quantity, amount) as qty, price,
               coalesce(fee, feeamount, 0) as fee
-       from fills where timestamp < $1 order by timestamp`,
-      [dayEnd]
+       from fills
+       where timestamp < $1 and symbol = $2
+         and ($3::text is null or sessionid in (select sessionid from sessions where tradingmode = $3))
+       order by timestamp`,
+      [dayEnd, symbol, tradingMode ?? null]
     );
 
     return { sessions, orderRows, orderCountByStatus, fillRows };
@@ -374,6 +398,25 @@ function parseArgs(argv: string[]): Record<string, string> {
   return args;
 }
 
+/**
+ * Parse an optional numeric CLI flag. Returns the default when unset,
+ * or null when set but not a finite number (or not positive when required).
+ */
+export function parseNumericFlag(
+  args: Record<string, string>,
+  name: string,
+  def: number,
+  requirePositive = false
+): number | null {
+  const raw = args[name];
+  if (raw === undefined) return def;
+  if (raw.trim() === '') return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return null;
+  if (requirePositive && n <= 0) return null;
+  return n;
+}
+
 export async function main(argv: string[]): Promise<number> {
   const args = parseArgs(argv);
   if (args.help) {
@@ -406,8 +449,19 @@ export async function main(argv: string[]): Promise<number> {
     return 2;
   }
 
+  const markoutWindowMin = parseNumericFlag(args, 'markout-window-min', 5, true);
+  const maxDailyLoss = parseNumericFlag(args, 'max-daily-loss', 50);
+  const maxAdverseBps = parseNumericFlag(args, 'max-adverse-bps', 10);
+  if (markoutWindowMin === null || maxDailyLoss === null || maxAdverseBps === null) {
+    console.error('ERROR: --markout-window-min / --max-daily-loss / --max-adverse-bps must be finite numbers (window > 0)');
+    return 2;
+  }
+
+  const symbol = args.symbol ?? 'BTC-PYUSD';
+  const tradingMode = args['trading-mode'];
+
   try {
-    const data = await fetchReportData(dbUrl, dayStart, dayStart + 86400000);
+    const data = await fetchReportData(dbUrl, dayStart, dayStart + 86400000, symbol, tradingMode);
     const report = buildReport({
       date,
       sessions: data.sessions,
@@ -415,9 +469,9 @@ export async function main(argv: string[]): Promise<number> {
       orderCountByStatus: data.orderCountByStatus,
       fillRows: data.fillRows,
       seed: seedQty !== undefined ? { qty: seedQty, price: seedPrice as number } : undefined,
-      markoutWindowMin: Number(args['markout-window-min'] ?? 5),
-      maxDailyLoss: Number(args['max-daily-loss'] ?? 50),
-      maxAdverseBps: Number(args['max-adverse-bps'] ?? 10),
+      markoutWindowMin,
+      maxDailyLoss,
+      maxAdverseBps,
     });
     if (args.json) console.log(JSON.stringify(report, null, 2));
     else console.log(renderText(report));
