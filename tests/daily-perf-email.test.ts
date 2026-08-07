@@ -127,3 +127,11 @@ describe('roborev round 1 fixes', () => {
     expect(rc).toBe(2);
   });
 });
+
+describe('wrapper env propagation (roborev round 2)', () => {
+  it('wrapper exports TRUEX_PERF_DATA_ROOT for the email child process', async () => {
+    const { readFileSync } = await import('node:fs');
+    const src = readFileSync(new URL('../scripts/daily-perf-review-job.sh', import.meta.url), 'utf8');
+    expect(src).toContain('export TRUEX_PERF_DATA_ROOT="$DATA_ROOT"');
+  });
+});

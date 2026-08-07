@@ -15,6 +15,11 @@ set -uo pipefail
 
 CODE_ROOT="${TRUEX_PERF_CODE_ROOT:-/Users/kefentse/dev_env/true_markets_mm-ops}"
 DATA_ROOT="${TRUEX_PERF_DATA_ROOT:-/Users/kefentse/dev_env/true_markets_mm}"
+# Export for child processes (daily-perf-email.ts resolves its persistent
+# archive from TRUEX_PERF_DATA_ROOT — without this, manual runs from a
+# worktree would fall back to the checkout-local archive and a Pages
+# deploy could wipe previously published reports).
+export TRUEX_PERF_DATA_ROOT="$DATA_ROOT"
 # Bun resolution order: TRUEX_PERF_BUN (rendered into the plist by the
 # installer) → PATH → the conventional per-user location.
 BUN="${TRUEX_PERF_BUN:-$(command -v bun || echo "$HOME/.bun/bin/bun")}"
