@@ -52,6 +52,13 @@ Read-only guarantee: SELECT only, no writes (asserted by a test scanning the scr
   session membership). Prevents mixing UAT/other-symbol data into the report.
 - **roborev Medium**: numeric flags (`--markout-window-min`, `--max-daily-loss`,
   `--max-adverse-bps`) validated via `parseNumericFlag` (unit-tested); invalid → exit 2.
+- **roborev round 2 High**: PnL engine was average-cost, not FIFO — replaced with true
+  FIFO lot tracking (oldest lot closes first, long and short); added the reviewer's
+  `buy1@100, buy1@200, sell1@150 → +50` test and its short mirror.
+- **roborev round 2 Medium**: session end signal now `coalesce(endedat, completedat)` only;
+  `lastupdated` is diagnostics-only (was wrongly usable as an end time).
+- **roborev round 2 Medium**: thresholds reject negative values (`nonNegative` constraint);
+  zero allowed (disables that breach path). `--seed-btc` must be positive (long seed lot).
 
 ## SO-13 note
 

@@ -70,6 +70,22 @@ describe('computeFifo (AC2)', () => {
     expect(r.position).toBeCloseTo(4, 9);
   });
 
+  test('true FIFO: oldest long lot closes first (roborev finding)', () => {
+    // buy 1 @ 100, buy 1 @ 200, sell 1 @ 150 → closes the 100 lot: +50
+    const r = computeFifo([F(1, 'buy', 1, 100), F(2, 'buy', 1, 200), F(3, 'sell', 1, 150)]);
+    expect(r.realized).toBeCloseTo(50, 9);
+    expect(r.position).toBeCloseTo(1, 9);
+    expect(r.avgCost).toBeCloseTo(200, 9); // remaining lot is the 200 one
+  });
+
+  test('true FIFO: oldest short lot closes first', () => {
+    // sell 1 @ 200, sell 1 @ 100, buy 1 @ 150 → closes the 200 short: +50
+    const r = computeFifo([F(1, 'sell', 1, 200), F(2, 'sell', 1, 100), F(3, 'buy', 1, 150)]);
+    expect(r.realized).toBeCloseTo(50, 9);
+    expect(r.position).toBeCloseTo(-1, 9);
+    expect(r.avgCost).toBeCloseTo(100, 9);
+  });
+
   test('cumAfter aligned with fills', () => {
     const r = computeFifo([F(1, 'buy', 1, 100), F(2, 'sell', 1, 110), F(3, 'buy', 1, 105)]);
     expect(r.cumAfter).toHaveLength(3);
@@ -191,7 +207,7 @@ describe('buildReport end-to-end on fixture data (AC5 shape)', () => {
 
   const input = {
     date,
-    sessions: [{ sessionid: 'prod-1', status: 'running', st: String(dayStart - 1000), en: null }],
+    sessions: [{ sessionid: 'prod-1', status: 'running', st: String(dayStart - 1000), en: null, lu: String(dayStart + 500000) }],
     orderTimestamps: [dayStart + 1000],
     orderCountByStatus: [{ status: 'pending_new', n: 1 }],
     fillRows: [
@@ -250,11 +266,15 @@ describe('parseNumericFlag (roborev finding: NaN propagation)', () => {
     expect(parseNumericFlag({ 'max-adverse-bps': '' }, 'max-adverse-bps', 10)).toBeNull();
   });
   test('rejects non-positive when positivity required', () => {
-    expect(parseNumericFlag({ 'markout-window-min': '0' }, 'markout-window-min', 5, true)).toBeNull();
-    expect(parseNumericFlag({ 'markout-window-min': '-3' }, 'markout-window-min', 5, true)).toBeNull();
+    expect(parseNumericFlag({ 'markout-window-min': '0' }, 'markout-window-min', 5, { positive: true })).toBeNull();
+    expect(parseNumericFlag({ 'markout-window-min': '-3' }, 'markout-window-min', 5, { positive: true })).toBeNull();
   });
-  test('allows zero when positivity not required', () => {
-    expect(parseNumericFlag({ 'max-daily-loss': '0' }, 'max-daily-loss', 50)).toBe(0);
+  test('rejects negative thresholds (roborev finding: sign inversion)', () => {
+    expect(parseNumericFlag({ 'max-daily-loss': '-1' }, 'max-daily-loss', 50, { nonNegative: true })).toBeNull();
+    expect(parseNumericFlag({ 'max-adverse-bps': '-0.5' }, 'max-adverse-bps', 10, { nonNegative: true })).toBeNull();
+  });
+  test('allows zero when non-negative (zero disables the threshold breach path)', () => {
+    expect(parseNumericFlag({ 'max-daily-loss': '0' }, 'max-daily-loss', 50, { nonNegative: true })).toBe(0);
   });
 });
 

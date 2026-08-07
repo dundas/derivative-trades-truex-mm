@@ -59,43 +59,61 @@ export interface Verdict {
 // ---------------------------------------------------------------------------
 
 /**
- * FIFO realized PnL over chronologically ordered fills.
- * Optional seed inventory (e.g. funded BTC) at a given cost basis.
- * Positions may go short; short avg cost tracks the opening sell price.
+ * True FIFO realized PnL over chronologically ordered fills: the oldest open
+ * lot is always closed first, for both long and short inventory. Positions may
+ * flip through zero. Optional seed inventory (e.g. funded BTC) enters as an
+ * initial long lot at the given cost basis.
  */
 export function computeFifo(fills: Fill[], seed?: { qty: number; price: number }): FifoResult {
-  let pos = seed?.qty ?? 0;
-  let avg = seed?.price ?? 0;
+  interface Lot {
+    qty: number;
+    price: number;
+  }
+  const lots: Lot[] = [];
+  let sign = 0; // +1 long, -1 short, 0 flat
   let realized = 0;
   const cumAfter: number[] = [];
   const EPS = 1e-9;
 
-  for (const f of fills) {
-    const q = f.qty;
-    const p = f.price;
-    const signed = f.side === 'buy' ? q : -q;
+  if (seed && seed.qty > 0) {
+    lots.push({ qty: seed.qty, price: seed.price });
+    sign = 1;
+  }
 
-    if (pos === 0 || Math.sign(pos) === Math.sign(signed)) {
-      // Extending (or opening) position
-      avg = pos === 0 ? p : (avg * Math.abs(pos) + q * p) / (Math.abs(pos) + q);
-      pos += signed;
+  for (const f of fills) {
+    const dir = f.side === 'buy' ? 1 : -1;
+    let qty = f.qty;
+
+    if (sign === 0 || dir === sign) {
+      // Flat or extending: open a new lot
+      lots.push({ qty, price: f.price });
+      sign = dir;
     } else {
-      // Reducing or flipping
-      const closing = Math.min(q, Math.abs(pos));
-      realized += f.side === 'sell' ? closing * (p - avg) : closing * (avg - p);
-      const remainder = q - closing;
-      pos += signed;
-      if (Math.abs(pos) < EPS) {
-        pos = 0;
-        avg = 0;
-      } else if (remainder > 0) {
-        // Flipped through zero: new position opens at this fill's price
-        avg = p;
+      // Reducing/flipping: close oldest lots first (FIFO)
+      while (qty > EPS && lots.length) {
+        const lot = lots[0];
+        const closing = Math.min(qty, lot.qty);
+        realized += sign === 1 ? closing * (f.price - lot.price) : closing * (lot.price - f.price);
+        lot.qty -= closing;
+        qty -= closing;
+        if (lot.qty <= EPS) lots.shift();
+      }
+      if (lots.length === 0) {
+        sign = 0;
+        if (qty > EPS) {
+          // Flipped through flat: remainder opens a position at this fill's price
+          lots.push({ qty, price: f.price });
+          sign = dir;
+        }
       }
     }
     cumAfter.push(realized);
   }
-  return { realized, position: pos, avgCost: avg, cumAfter };
+
+  const openQty = lots.reduce((s, l) => s + l.qty, 0);
+  const position = sign * openQty;
+  const avgCost = openQty > EPS ? lots.reduce((s, l) => s + l.qty * l.price, 0) / openQty : 0;
+  return { realized, position, avgCost, cumAfter };
 }
 
 /**
@@ -178,6 +196,7 @@ interface SessionRow {
   status: string;
   st: string;
   en: string | null;
+  lu: string | null; // lastupdated — diagnostics only, never an end signal
 }
 
 export async function fetchReportData(
@@ -191,14 +210,18 @@ export async function fetchReportData(
   try {
     const q = async (text: string, params: unknown[] = []) => (await pool.query(text, params)).rows;
 
+    // Only endedat/completedat are true end signals. lastupdated is a
+    // heartbeat and must not be treated as an end time (it would wrongly
+    // age out running sessions).
     const sessions: SessionRow[] = await q(
       `select sessionid, status,
               coalesce(startedat, starttimestamp, addedat) as st,
-              coalesce(endedat, completedat, lastupdated) as en
+              coalesce(endedat, completedat) as en,
+              lastupdated as lu
        from sessions
        where coalesce(startedat, starttimestamp, addedat) < $2
-         and (coalesce(endedat, completedat, lastupdated) is null
-              or coalesce(endedat, completedat, lastupdated) >= $1)
+         and (coalesce(endedat, completedat) is null
+              or coalesce(endedat, completedat) >= $1)
          and symbol = $3
          and ($4::text is null or tradingmode = $4)
        order by st`,
@@ -307,6 +330,7 @@ export function buildReport(input: ReportInput) {
       status: s.status,
       start: s.st ? new Date(Number(s.st)).toISOString() : null,
       end: s.en ? new Date(Number(s.en)).toISOString() : null,
+      lastActivity: s.lu ? new Date(Number(s.lu)).toISOString() : null,
     })),
     orders: {
       total: input.orderTimestamps.length,
@@ -344,7 +368,8 @@ export function renderText(r: ReturnType<typeof buildReport>): string {
   L.push(`=== Daily Performance Review — ${r.date} (UTC) ===`);
   L.push('');
   L.push(`Sessions (${r.sessions.length}):`);
-  for (const s of r.sessions) L.push(`  - ${s.id} [${s.status}] ${s.start} → ${s.end ?? 'running'}`);
+  for (const s of r.sessions)
+    L.push(`  - ${s.id} [${s.status}] ${s.start} → ${s.end ?? `running (last activity ${s.lastActivity})`}`);
   L.push('');
   L.push(`Orders: ${r.orders.total}`);
   for (const b of r.orders.byStatus) L.push(`  ${b.status}: ${b.n}`);
@@ -400,20 +425,22 @@ function parseArgs(argv: string[]): Record<string, string> {
 
 /**
  * Parse an optional numeric CLI flag. Returns the default when unset,
- * or null when set but not a finite number (or not positive when required).
+ * or null when set but invalid (not finite, empty, or violating the
+ * positivity constraint).
  */
 export function parseNumericFlag(
   args: Record<string, string>,
   name: string,
   def: number,
-  requirePositive = false
+  opts: { positive?: boolean; nonNegative?: boolean } = {}
 ): number | null {
   const raw = args[name];
   if (raw === undefined) return def;
   if (raw.trim() === '') return null;
   const n = Number(raw);
   if (!Number.isFinite(n)) return null;
-  if (requirePositive && n <= 0) return null;
+  if (opts.positive && n <= 0) return null;
+  if (opts.nonNegative && n < 0) return null;
   return n;
 }
 
@@ -448,12 +475,18 @@ export async function main(argv: string[]): Promise<number> {
     console.error('ERROR: seed values must be numeric');
     return 2;
   }
+  if (seedQty !== undefined && seedQty <= 0) {
+    console.error('ERROR: --seed-btc must be positive (seed enters as a long lot)');
+    return 2;
+  }
 
-  const markoutWindowMin = parseNumericFlag(args, 'markout-window-min', 5, true);
-  const maxDailyLoss = parseNumericFlag(args, 'max-daily-loss', 50);
-  const maxAdverseBps = parseNumericFlag(args, 'max-adverse-bps', 10);
+  const markoutWindowMin = parseNumericFlag(args, 'markout-window-min', 5, { positive: true });
+  const maxDailyLoss = parseNumericFlag(args, 'max-daily-loss', 50, { nonNegative: true });
+  const maxAdverseBps = parseNumericFlag(args, 'max-adverse-bps', 10, { nonNegative: true });
   if (markoutWindowMin === null || maxDailyLoss === null || maxAdverseBps === null) {
-    console.error('ERROR: --markout-window-min / --max-daily-loss / --max-adverse-bps must be finite numbers (window > 0)');
+    console.error(
+      'ERROR: --markout-window-min must be a finite number > 0; --max-daily-loss / --max-adverse-bps must be finite numbers >= 0'
+    );
     return 2;
   }
 
