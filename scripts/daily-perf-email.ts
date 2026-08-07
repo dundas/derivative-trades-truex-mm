@@ -34,7 +34,12 @@ const SENDER_EMAIL = 'truex-mm@derivative.email';
 const SENDER_NAME = 'TrueX MM';
 
 const REPO_ROOT = join(dirname(new URL(import.meta.url).pathname), '..');
-const SITE_DIR = join(REPO_ROOT, 'logs', 'reports-site');
+// Archive lives in the persistent DATA_ROOT (the canonical repo the scheduled
+// job points at), NOT the checkout the script runs from — a fresh/ephemeral
+// worktree with an empty archive would otherwise overwrite the cumulative
+// Pages site and drop previously published reports.
+const DATA_ROOT = process.env.TRUEX_PERF_DATA_ROOT ?? REPO_ROOT;
+const SITE_DIR = join(DATA_ROOT, 'logs', 'reports-site');
 
 // ---------------------------------------------------------------------------
 // Report building (pure-ish; DB reads through task-0007 exports)
@@ -79,12 +84,19 @@ export async function buildTrend(dbUrl: string, endDate: string, days = 7): Prom
 const money = (x: number) => `${x < 0 ? '-' : ''}$${Math.abs(x).toFixed(2)}`;
 const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
+// Round-trip wrong-way is only meaningful when both sides matched volume;
+// buildReport returns 0 in that case, which would read as 'neutral execution'
+// rather than 'no data' — render n/a instead.
+const wrongWay = (day: DayReport): string | null =>
+  day.fills.matchedQty > 0 ? `${money(day.fills.roundTripAdversePerBtc)}/BTC` : null;
+
 export function subjectLine(day: DayReport): string {
   const v = day.verdict.status;
   const bps = day.markout.avgAdverseBps;
+  const ww = wrongWay(day);
   return `[TrueX MM] ${day.date} — ${v}: ${money(day.pnl.dayRealized)} realized` +
     (bps !== null ? ` · ${bps.toFixed(1)}bps adverse` : '') +
-    ` · ${money(day.fills.roundTripAdversePerBtc)}/BTC wrong-way`;
+    (ww ? ` · ${ww} wrong-way` : '');
 }
 
 function verdictBadge(status: string): string {
@@ -110,7 +122,7 @@ export function renderHtml(day: DayReport, trend: DayReport[]): string {
       <td style="padding:6px 10px;border-bottom:1px solid #f3f4f6">${verdictBadge(t.verdict.status)}</td>
       <td style="padding:6px 10px;border-bottom:1px solid #f3f4f6;color:${pnlColor};font-weight:600">${money(t.pnl.dayRealized)}</td>
       <td style="padding:6px 10px;border-bottom:1px solid #f3f4f6">${tbps !== null ? tbps.toFixed(1) + 'bps' : '—'}</td>
-      <td style="padding:6px 10px;border-bottom:1px solid #f3f4f6">${money(t.fills.roundTripAdversePerBtc)}/BTC</td>
+      <td style="padding:6px 10px;border-bottom:1px solid #f3f4f6">${wrongWay(t) ?? 'n/a'}</td>
       <td style="padding:6px 10px;border-bottom:1px solid #f3f4f6">${t.fills.total}</td>
     </tr>`;
   }).join('\n');
@@ -134,7 +146,7 @@ export function renderHtml(day: DayReport, trend: DayReport[]): string {
   <div style="display:flex;flex-wrap:wrap;gap:12px;margin-top:16px">
     ${metricCard('Day realized PnL', money(day.pnl.dayRealized), `lifetime ${money(day.pnl.lifetimeRealized)}`)}
     ${metricCard('Mark-out adverse', bps !== null ? bps.toFixed(1) + 'bps' : '—', `${day.markout.pairs} pairs · ${MARKOUT_WINDOW_MIN}m window`)}
-    ${metricCard('Round-trip wrong-way', money(day.fills.roundTripAdversePerBtc) + '/BTC', `${day.fills.matchedQty.toFixed(6)} BTC matched`)}
+    ${metricCard('Round-trip wrong-way', wrongWay(day) ?? 'n/a', `${day.fills.matchedQty.toFixed(6)} BTC matched`)}
     ${metricCard('Fills', String(day.fills.total), `${day.fills.buys.n} buys / ${day.fills.sells.n} sells`)}
     ${metricCard('Orders', String(day.orders.total), day.orders.gapHours.length ? `gaps: ${day.orders.gapHours.length}h` : 'no zero-order hours')}
     ${metricCard('Open position', day.pnl.position.toFixed(6), `@ ${money(day.pnl.positionAvgCost)} avg`)}
@@ -188,7 +200,7 @@ export function emailText(day: DayReport, url: string): string {
     `Verdict: ${day.verdict.status}`,
     `Day realized PnL: ${money(day.pnl.dayRealized)} (lifetime ${money(day.pnl.lifetimeRealized)})`,
     `Mark-out adverse: ${bps !== null ? bps.toFixed(1) + 'bps' : 'n/a'} (${day.markout.pairs} pairs)`,
-    `Round-trip wrong-way: ${money(day.fills.roundTripAdversePerBtc)}/BTC (${day.fills.matchedQty.toFixed(6)} BTC matched)`,
+    `Round-trip wrong-way: ${wrongWay(day) ?? 'n/a'} (${day.fills.matchedQty.toFixed(6)} BTC matched)`,
     `Fills: ${day.fills.total} (${day.fills.buys.n} buys / ${day.fills.sells.n} sells) · Orders: ${day.orders.total}`,
     ...(day.verdict.reasons.length ? [`WARN reasons: ${day.verdict.reasons.join('; ')}`] : []),
     '',
@@ -283,6 +295,10 @@ function parseArgs(argv: string[]): Record<string, string> {
 
 export async function main(argv: string[]): Promise<number> {
   const args = parseArgs(argv);
+  if (args.send && args['skip-deploy']) {
+    console.error('ERROR: --send with --skip-deploy would email an unpublished link');
+    return 2;
+  }
   const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
   const date = args.date ?? yesterday;
 

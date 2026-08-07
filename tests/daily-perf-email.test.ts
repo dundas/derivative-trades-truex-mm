@@ -108,3 +108,22 @@ describe('emailText', () => {
     expect(text).toContain('Fills: 41');
   });
 });
+
+describe('roborev round 1 fixes', () => {
+  it('round-trip metric renders n/a when no volume matched (subject, html, text)', () => {
+    const day = fixtureDay({
+      fills: { total: 5, buys: { n: 5, qty: 0.005, vwap: 64000 }, sells: { n: 0, qty: 0, vwap: 0 }, fees: 0, matchedQty: 0, roundTripAdversePerBtc: 0 },
+    });
+    expect(subjectLine(day)).not.toContain('wrong-way');
+    expect(subjectLine(day)).not.toContain('$0.00/BTC');
+    const html = renderHtml(day, [day]);
+    expect(html).toContain('n/a');
+    expect(emailText(day, 'https://x/1.html')).toContain('Round-trip wrong-way: n/a');
+  });
+
+  it('main rejects --send with --skip-deploy before any env requirement', async () => {
+    const { main } = await import('../scripts/daily-perf-email');
+    const rc = await main(['--send', '--skip-deploy']);
+    expect(rc).toBe(2);
+  });
+});
