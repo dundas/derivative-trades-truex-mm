@@ -1,5 +1,18 @@
 import { describe, it, expect, mock } from 'bun:test';
-import { resolveConfig, runKillSwitch, decideExit, renderText, parseArgs } from '../scripts/kill-switch.js';
+import { resolveConfig, runKillSwitch, decideExit, renderText, parseArgs, decideCliExit } from '../scripts/kill-switch.js';
+
+// --- Exit-code contract (roborev round 4) ---
+
+describe('decideCliExit (exit-code contract)', () => {
+  it('dry-run exits 0 even with orders present — presence is not failure', () => {
+    expect(decideCliExit({ dryRun: true, listed: [{ id: 'x' }], residual: [{ id: 'x' }], canceled: [], failed: [] })).toBe(0);
+  });
+  it('live clean sweep → 0; residuals → 1; unclear → 3', () => {
+    expect(decideCliExit({ dryRun: false, residual: [], failed: [], canceled: ['a'] })).toBe(0);
+    expect(decideCliExit({ dryRun: false, residual: [{ id: 'x' }], failed: [], canceled: [] })).toBe(1);
+    expect(decideCliExit({ dryRun: false, residual: [], failed: [], sweepFailed: true })).toBe(3);
+  });
+});
 
 // --- CLI argument safety (roborev round 3) ---
 

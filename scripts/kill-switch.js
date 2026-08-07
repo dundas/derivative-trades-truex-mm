@@ -11,10 +11,13 @@
  *   --dry-run         list active orders, cancel nothing
  *   --json            machine-readable output
  *
- * Exit codes: 0 = no orders remain; 1 = cancel failures or residuals;
- *             2 = configuration or pre-flight connectivity error;
- *             3 = unclear outcome — sweep failed mid-run or verification failed
- *                 (check the venue).
+ * Exit codes:
+ *   live   : 0 = no orders remain; 1 = cancel failures or residuals;
+ *            3 = unclear outcome (sweep failed mid-run or verification failed —
+ *                check the venue)
+ *   dry-run: 0 = inspection completed — regardless of whether orders exist
+ *            (a running market maker NORMALLY has orders; presence is not failure)
+ *   both   : 2 = configuration or pre-flight connectivity error
  *
  * No process-kill side effects: stopping the market maker itself is the
  * MM API's /api/v1/emergency-stop endpoint (cancel + SIGTERM) or the
@@ -119,6 +122,14 @@ export function decideExit(result) {
   return 0;
 }
 
+// CLI-level decision: dry-run is pure inspection — exit 0 means "inspection
+// completed", NOT "no orders exist" (orders existing is the normal state of a
+// running market maker; treating presence as failure would false-alarm scripts).
+export function decideCliExit(result) {
+  if (result.dryRun) return 0;
+  return decideExit(result);
+}
+
 // ---------------------------------------------------------------------------
 // Reporting
 // ---------------------------------------------------------------------------
@@ -205,7 +216,7 @@ async function main() {
     } else {
       console.log(renderText(result, config));
     }
-    process.exit(args.dryRun ? 0 : decideExit(result));
+    process.exit(decideCliExit(result));
   } catch (err) {
     console.error(`ERROR: ${err.message}`);
     process.exit(2);
