@@ -128,6 +128,8 @@ export class QuoteEngine extends EventEmitter {
     this.lastReplacementLevelBySide = new Map();
     this.deferredRepriceNeeded = false;
     this.lastMarketableAloSkip = null;
+    // Balance-safety gate: pure placements skipped while same-side cancels in flight
+    this.placementsDeferredForCancels = 0;
     this.truexBook = null;
     this.truexEbbo = null;
     this.pyusdUsd = null;
@@ -557,7 +559,21 @@ export class QuoteEngine extends EventEmitter {
     }
 
     let dispatched = false;
+    let deferredThisCycle = 0;
     for (const action of orderedActions) {
+      // Balance-safety gate: a pure placement must not go out while a same-side
+      // cancel is still in flight — the venue holds those funds until the cancel
+      // is processed, so the new order could exceed available balance and be
+      // rejected (Insufficient balance). Skipped placements are re-derived by the
+      // next reprice with fresh prices. Replacement placements are unaffected
+      // (they flush only after cancel confirm via pendingReplacements).
+      if (this._shouldHoldPlacement(action)) {
+        this.placementsDeferredForCancels++;
+        deferredThisCycle++;
+        this.deferredRepriceNeeded = true;
+        continue;
+      }
+
       if (this.actionsThisSecond >= this.config.maxOrdersPerSecond) {
         if (action.type === 'replacement-cancel') {
           this.deferredRepriceNeeded = true;
@@ -582,6 +598,11 @@ export class QuoteEngine extends EventEmitter {
       this.actionsThisSecond++;
       dispatched = true;
     }
+    if (deferredThisCycle > 0) {
+      this.logger.info(
+        `[QuoteEngine] Deferred ${deferredThisCycle} placement(s) pending same-side cancel confirms (lifetime=${this.placementsDeferredForCancels})`
+      );
+    }
     return dispatched;
   }
 
@@ -599,6 +620,28 @@ export class QuoteEngine extends EventEmitter {
     } else if (action.type === 'place') {
       this._sendNewOrder(action.quote);
     }
+  }
+
+  /**
+   * Balance-safety gate: true when a pure placement must wait because a
+   * same-side cancel is still in flight ('cancelling' in activeOrders).
+   * Derived from order state on purpose — no separate counters to leak when
+   * acks are lost; existing cancel-timeout/orphan recovery heals the state.
+   * Bypassed in place-before-cancel mode (that mode intentionally places first).
+   */
+  _shouldHoldPlacement(action) {
+    if (action.type !== 'place') return false;
+    if (this.config.replaceMode === 'place-before-cancel') return false;
+    const side = action.quote?.side;
+    if (!side) return false;
+    return this._hasInflightCancels(side);
+  }
+
+  _hasInflightCancels(side) {
+    for (const [, order] of this.activeOrders) {
+      if (order.side === side && order.status === 'cancelling') return true;
+    }
+    return false;
   }
 
   /**
@@ -1016,10 +1059,22 @@ export class QuoteEngine extends EventEmitter {
       this.lastActionReset = now;
     }
 
+    const held = [];
     while (this.actionQueue.length > 0 && this.actionsThisSecond < this.config.maxOrdersPerSecond) {
       const action = this.actionQueue.shift();
+      // Same balance-safety gate as the dispatch loop: placements queued under
+      // rate limiting must not bypass the in-flight-cancel hold.
+      if (this._shouldHoldPlacement(action)) {
+        this.placementsDeferredForCancels++;
+        held.push(action);
+        continue;
+      }
       this._dispatchAction(action);
       this.actionsThisSecond++;
+    }
+    if (held.length > 0) {
+      this.actionQueue.unshift(...held);
+      this.deferredRepriceNeeded = true;
     }
 
     if (this.deferredRepriceNeeded && this.actionsThisSecond < this.config.maxOrdersPerSecond) {

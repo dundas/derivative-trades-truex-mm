@@ -906,7 +906,10 @@ describe('QuoteEngine', () => {
       const engine = createEngine();
       engine.lastMid = 100000;
       engine.lastRepriceAt = 1;
-      engine.activeOrders.set('B1', { side: 'buy', price: 99000, size: 0.1, level: 1, status: 'active', placedAt: Date.now() });
+      // No resting orders: the deferred reprice places a fresh ladder with no
+      // same-side cancels in flight, so nothing is held by the balance-safety gate.
+      // (With a resting order present the cycle defers its placements pending the
+      // cancel confirm — covered in tests/quote-engine-cancel-gate.test.js.)
 
       const before = Date.now();
       const ran = engine._runDeferredReprice();
