@@ -12,7 +12,8 @@
  *   --json            machine-readable output
  *
  * Exit codes: 0 = no orders remain; 1 = cancel failures or residuals;
- *             2 = configuration or connectivity error.
+ *             2 = configuration or pre-flight connectivity error;
+ *             3 = sweep ran but verification failed (aftermath unconfirmed).
  *
  * No process-kill side effects: stopping the market maker itself is the
  * MM API's /api/v1/emergency-stop endpoint (cancel + SIGTERM) or the
@@ -71,23 +72,37 @@ export function resolveConfig(env, mode) {
 export async function runKillSwitch(client, opts = {}) {
   const { dryRun = false } = opts;
 
-  const before = await client.getActiveOrders();
-  const listed = before.map((o) => TrueXRESTClient.parseOrder(o));
-
   if (dryRun) {
-    return { dryRun: true, listed, canceled: [], failed: [], residual: listed };
+    const before = await client.getActiveOrders();
+    const listed = before.map((o) => TrueXRESTClient.parseOrder(o));
+    return { dryRun: true, listed, canceled: [], failed: [], residual: listed, verificationFailed: false };
   }
 
+  // Live path: the sweep result is the single source of truth for what was
+  // canceled (cancelAllOrders iterates its OWN snapshot internally). A separate
+  // pre-fetch would diverge from the swept set if orders are placed/filled in
+  // between — and this report is what an operator relies on during an incident.
   const result = await client.cancelAllOrders();
 
-  // Verification pass: what is still live after the sweep?
-  const after = await client.getActiveOrders();
-  const residual = after.map((o) => TrueXRESTClient.parseOrder(o));
+  // Verification pass: what is still live after the sweep? Distinct failure
+  // mode from pre-flight errors: the sweep already ran, we just couldn't
+  // confirm the aftermath.
+  let residual = [];
+  let verificationFailed = false;
+  let verificationError = null;
+  try {
+    const after = await client.getActiveOrders();
+    residual = after.map((o) => TrueXRESTClient.parseOrder(o));
+  } catch (err) {
+    verificationFailed = true;
+    verificationError = err instanceof Error ? err.message : String(err);
+  }
 
-  return { dryRun: false, listed, canceled: result.canceled, failed: result.failed, residual };
+  return { dryRun: false, listed: [], canceled: result.canceled, failed: result.failed, residual, verificationFailed, verificationError };
 }
 
 export function decideExit(result) {
+  if (result.verificationFailed) return 3; // canceled, but aftermath unverified
   if (result.failed.length > 0 || result.residual.length > 0) return 1;
   return 0;
 }
@@ -104,13 +119,18 @@ function fmtOrder(p) {
 export function renderText(result, config) {
   const L = [];
   L.push(`Kill switch — venue=${config.mode} url=${config.baseURL} client=${config.clientId}${result.dryRun ? ' [DRY RUN]' : ''}`);
-  L.push(`Active orders found: ${result.listed.length}`);
-  for (const p of result.listed) L.push(fmtOrder(p));
-  if (!result.dryRun) {
+  if (result.dryRun) {
+    L.push(`Active orders found: ${result.listed.length}`);
+    for (const p of result.listed) L.push(fmtOrder(p));
+  } else {
     L.push(`Canceled: ${result.canceled.length}  Failed: ${result.failed.length}`);
     for (const f of result.failed.slice(0, 10)) L.push(`  FAILED ${f.id}: ${f.error}`);
-    L.push(`Residual after verification: ${result.residual.length}`);
-    for (const p of result.residual.slice(0, 10)) L.push(fmtOrder(p));
+    if (result.verificationFailed) {
+      L.push(`!! VERIFICATION FAILED — sweep ran but the aftermath could not be confirmed: ${result.verificationError}`);
+    } else {
+      L.push(`Residual after verification: ${result.residual.length}`);
+      for (const p of result.residual.slice(0, 10)) L.push(fmtOrder(p));
+    }
   }
   return L.join('\n');
 }

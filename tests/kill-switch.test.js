@@ -60,11 +60,15 @@ function mockOrder(id, side = 'sell', price = 64000, qty = 0.001) {
   };
 }
 
-function mockClient({ active = [], cancelAll = null, afterCancel = [] } = {}) {
+// live=false (dry-run): first/only fetch returns `active`.
+// live=true (sweep): cancelAllOrders owns its own snapshot; the single
+// getActiveOrders fetch is the verification pass → returns `afterCancel`.
+function mockClient({ active = [], cancelAll = null, afterCancel = [], live = false } = {}) {
+  const first = live ? afterCancel : active;
+  const second = live ? [] : afterCancel;
   let calls = 0;
   return {
-    // First call = before sweep; second call = verification pass
-    getActiveOrders: mock(async () => (calls++ === 0 ? active : afterCancel)),
+    getActiveOrders: mock(async () => (calls++ === 0 ? first : second)),
     cancelAllOrders: mock(async () => cancelAll ?? { success: true, canceled: active.map((o) => o.id), failed: [] }),
   };
 }
@@ -77,6 +81,7 @@ describe('runKillSwitch (AC2, AC4)', () => {
     const result = await runKillSwitch(client, { dryRun: true });
     expect(result.dryRun).toBe(true);
     expect(result.listed.length).toBe(2);
+    expect(result.verificationFailed).toBe(false);
     expect(client.cancelAllOrders).not.toHaveBeenCalled();
   });
 
@@ -86,20 +91,40 @@ describe('runKillSwitch (AC2, AC4)', () => {
       active: [mockOrder('A'), mockOrder('STUCK')],
       cancelAll: { success: false, canceled: ['A'], failed: [{ id: 'STUCK', error: 'too late' }] },
       afterCancel: [stuck],
+      live: true,
     });
     const result = await runKillSwitch(client, {});
     expect(result.canceled).toEqual(['A']);
     expect(result.failed.length).toBe(1);
     expect(result.residual.length).toBe(1);
     expect(result.residual[0].id).toBe('STUCK');
-    expect(client.getActiveOrders).toHaveBeenCalledTimes(2); // before + verification
+    // Live path: verification pass only (no separate pre-fetch to diverge)
+    expect(client.getActiveOrders).toHaveBeenCalledTimes(1);
+    expect(result.listed).toEqual([]);
   });
 
   it('clean sweep leaves no residuals', async () => {
-    const client = mockClient({ active: [mockOrder('A')] });
+    const client = mockClient({ active: [mockOrder('A')], live: true });
     const result = await runKillSwitch(client, {});
     expect(result.residual.length).toBe(0);
     expect(result.failed.length).toBe(0);
+  });
+
+  it('verification failure is reported distinctly (roborev round 1)', async () => {
+    let calls = 0;
+    const client = {
+      getActiveOrders: mock(async () => {
+        calls++;
+        if (calls === 1) throw new Error('connection reset during verification');
+        return [];
+      }),
+      cancelAllOrders: mock(async () => ({ success: true, canceled: ['A'], failed: [] })),
+    };
+    const result = await runKillSwitch(client, {});
+    expect(result.verificationFailed).toBe(true);
+    expect(result.verificationError).toContain('connection reset');
+    expect(result.canceled).toEqual(['A']); // the sweep itself succeeded
+    expect(decideExit(result)).toBe(3); // distinct from config error (2)
   });
 });
 

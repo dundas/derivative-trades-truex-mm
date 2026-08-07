@@ -20,7 +20,8 @@ dry-run and verification.
 - `--json` — machine-readable output
 - Flow: resolve config → list active orders → (dry-run stops here) → `cancelAllOrders()`
   → **verification pass** (re-list; report residuals)
-- Exit codes: 0 = no orders remain; 1 = cancel failures or residuals; 2 = config/connectivity error
+- Exit codes: 0 = no orders remain; 1 = cancel failures or residuals;
+  2 = configuration/pre-flight error; 3 = sweep ran but verification failed
 - No process-kill side effects — that is the `emergency-stop` endpoint's job; deploy
   tooling stops the container separately. Documented in the header.
 
@@ -35,7 +36,8 @@ injected), `decideExit(result)` are pure/injectable; the CLI main wires env + re
 
 - AC1: bare invocation targets UAT, never prod (unit: resolveConfig default).
 - AC2: dry-run performs zero cancel calls (unit with mock client).
-- AC3: cancel failures/residuals → exit 1; clean sweep → exit 0; missing keys → exit 2 (unit).
+- AC3: cancel failures/residuals → exit 1; clean sweep → exit 0; missing keys → exit 2;
+  verification failure after a successful sweep → exit 3 (unit).
 - AC4: verification pass re-lists and reports residuals (unit).
 - AC5: smoke — `--dry-run --prod` against live prod REST via the proxy (read-only).
 - AC6: full suite green.
