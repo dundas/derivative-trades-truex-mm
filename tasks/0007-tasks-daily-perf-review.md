@@ -64,6 +64,10 @@ Read-only guarantee: SELECT only, no writes (asserted by a test scanning the scr
   stays truncated at dayEnd (unit-tested).
 - **roborev round 3 Medium**: zero thresholds now explicitly DISABLE a verdict check
   (`evaluateVerdict`), matching documented semantics (unit-tested).
+- **roborev round 4 Medium**: seed validation extracted to `parseSeedFlags` — both
+  `--seed-btc` and `--seed-price` must be positive (unit-tested).
+- **roborev round 4 Medium**: fill sides normalized (case-insensitive) and unknown values
+  throw instead of coercing to 'sell' (unit-tested).
 
 ## SO-13 note
 

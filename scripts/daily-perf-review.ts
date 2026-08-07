@@ -290,9 +290,13 @@ export function buildReport(input: ReportInput) {
   const fills: Fill[] = [];
   const feesArr: number[] = [];
   for (const r of input.fillRows) {
+    const rawSide = String(r.side).toLowerCase();
+    if (rawSide !== 'buy' && rawSide !== 'sell') {
+      throw new Error(`unknown fill side '${r.side}' at timestamp ${r.timestamp}`);
+    }
     fills.push({
       timestamp: Number(r.timestamp),
-      side: r.side === 'buy' ? 'buy' : 'sell',
+      side: rawSide,
       qty: Number(r.qty),
       price: Number(r.price),
     });
@@ -429,6 +433,29 @@ function parseArgs(argv: string[]): Record<string, string> {
 }
 
 /**
+ * Parse the optional funding-seed flags. Returns a seed (long lot), or an
+ * error string when the flags are inconsistent/invalid.
+ */
+export function parseSeedFlags(args: Record<string, string>): {
+  seed?: { qty: number; price: number };
+  error?: string;
+} {
+  const hasQty = args['seed-btc'] !== undefined;
+  const hasPrice = args['seed-price'] !== undefined;
+  if (hasQty !== hasPrice) return { error: '--seed-btc and --seed-price must be given together' };
+  if (!hasQty) return {};
+  const qty = Number(args['seed-btc']);
+  const price = Number(args['seed-price']);
+  if (!Number.isFinite(qty) || !Number.isFinite(price)) {
+    return { error: 'seed values must be numeric' };
+  }
+  if (qty <= 0 || price <= 0) {
+    return { error: '--seed-btc and --seed-price must be positive (seed enters as a long lot)' };
+  }
+  return { seed: { qty, price } };
+}
+
+/**
  * Parse an optional numeric CLI flag. Returns the default when unset,
  * or null when set but invalid (not finite, empty, or violating the
  * positivity constraint).
@@ -470,18 +497,9 @@ export async function main(argv: string[]): Promise<number> {
     return 2;
   }
 
-  const seedQty = args['seed-btc'] !== undefined ? Number(args['seed-btc']) : undefined;
-  const seedPrice = args['seed-price'] !== undefined ? Number(args['seed-price']) : undefined;
-  if ((seedQty === undefined) !== (seedPrice === undefined)) {
-    console.error('ERROR: --seed-btc and --seed-price must be given together');
-    return 2;
-  }
-  if (seedQty !== undefined && (!Number.isFinite(seedQty) || !Number.isFinite(seedPrice as number))) {
-    console.error('ERROR: seed values must be numeric');
-    return 2;
-  }
-  if (seedQty !== undefined && seedQty <= 0) {
-    console.error('ERROR: --seed-btc must be positive (seed enters as a long lot)');
+  const seedFlags = parseSeedFlags(args);
+  if (seedFlags.error) {
+    console.error(`ERROR: ${seedFlags.error}`);
     return 2;
   }
 
@@ -513,7 +531,7 @@ export async function main(argv: string[]): Promise<number> {
       orderTimestamps: data.orderRows.map((r) => Number(r.timestamp)),
       orderCountByStatus: data.orderCountByStatus,
       fillRows: data.fillRows,
-      seed: seedQty !== undefined ? { qty: seedQty, price: seedPrice as number } : undefined,
+      seed: seedFlags.seed,
       markoutWindowMin,
       maxDailyLoss,
       maxAdverseBps,

@@ -9,6 +9,7 @@ import {
   hourlyHistogram,
   buildReport,
   parseNumericFlag,
+  parseSeedFlags,
   type Fill,
 } from '../scripts/daily-perf-review';
 
@@ -316,6 +317,65 @@ describe('evaluateVerdict zero-threshold semantics (roborev round 3)', () => {
   test('zero thresholds disable the checks, not invert them', () => {
     expect(evaluateVerdict(-60, 25, 0, 0).status).toBe('OK');
     expect(evaluateVerdict(-60, 25, 0, 0).reasons).toHaveLength(0);
+  });
+});
+
+describe('parseSeedFlags (roborev round 4)', () => {
+  test('no flags → no seed, no error', () => {
+    expect(parseSeedFlags({})).toEqual({});
+  });
+  test('flags must be given together', () => {
+    expect(parseSeedFlags({ 'seed-btc': '0.044' }).error).toMatch(/together/);
+    expect(parseSeedFlags({ 'seed-price': '65000' }).error).toMatch(/together/);
+  });
+  test('rejects non-numeric', () => {
+    expect(parseSeedFlags({ 'seed-btc': 'x', 'seed-price': '65000' }).error).toMatch(/numeric/);
+  });
+  test('rejects zero or negative seed price or qty', () => {
+    expect(parseSeedFlags({ 'seed-btc': '0.044', 'seed-price': '0' }).error).toMatch(/positive/);
+    expect(parseSeedFlags({ 'seed-btc': '0.044', 'seed-price': '-1' }).error).toMatch(/positive/);
+    expect(parseSeedFlags({ 'seed-btc': '0', 'seed-price': '65000' }).error).toMatch(/positive/);
+  });
+  test('valid pair returns seed', () => {
+    expect(parseSeedFlags({ 'seed-btc': '0.044', 'seed-price': '65000' })).toEqual({
+      seed: { qty: 0.044, price: 65000 },
+    });
+  });
+});
+
+describe('buildReport rejects unknown fill sides (roborev round 4)', () => {
+  const dayStart = Date.parse('2026-08-05T00:00:00Z');
+  test('unknown side throws instead of coercing to sell', () => {
+    const input = {
+      date: '2026-08-05',
+      sessions: [],
+      orderTimestamps: [],
+      orderCountByStatus: [],
+      fillRows: [{ timestamp: String(dayStart + 1000), side: 'HOLD', qty: '1', price: '100', fee: '0' }],
+      markoutWindowMin: 5,
+      maxDailyLoss: 50,
+      maxAdverseBps: 10,
+    };
+    expect(() => buildReport(input)).toThrow(/unknown fill side/);
+  });
+  test('uppercase sides are normalized', () => {
+    const input = {
+      date: '2026-08-05',
+      sessions: [],
+      orderTimestamps: [],
+      orderCountByStatus: [],
+      fillRows: [
+        { timestamp: String(dayStart + 1000), side: 'BUY', qty: '1', price: '100', fee: '0' },
+        { timestamp: String(dayStart + 2000), side: 'SELL', qty: '1', price: '110', fee: '0' },
+      ],
+      markoutWindowMin: 5,
+      maxDailyLoss: 50,
+      maxAdverseBps: 10,
+    };
+    const r = buildReport(input);
+    expect(r.fills.buys.n).toBe(1);
+    expect(r.fills.sells.n).toBe(1);
+    expect(r.pnl.dayRealized).toBeCloseTo(10, 9);
   });
 });
 
