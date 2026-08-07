@@ -29,6 +29,7 @@ accurate for sell-heavy/inventory-liquidation accounts). HedgeExecutor offloads
 to Kraken. DataPipelineManager: audit JSONL → Redis → PG.
 
 ### Key Files
+- `docs/STRATEGY.md` — Strategy & progress tracker: mission, the adverse-selection problem, metric hierarchy, phase plan with decision rules, risk posture. START HERE for current status/goals.
 - `src/core/market-maker-orchestrator.js` — Lifecycle, event wiring, reconciliation
 - `src/core/quote-engine.js` — Quote computation, order placement/cancel
 - `src/core/inventory-manager.js` — Position tracking, skew, balance gating
