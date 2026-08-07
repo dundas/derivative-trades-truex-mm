@@ -278,6 +278,47 @@ describe('parseNumericFlag (roborev finding: NaN propagation)', () => {
   });
 });
 
+describe('buildReport end-of-day mark-out horizon (roborev round 3)', () => {
+  const date = '2026-08-05';
+  const dayStart = Date.parse(`${date}T00:00:00Z`);
+  const dayEnd = dayStart + 86400000;
+
+  const input = {
+    date,
+    sessions: [],
+    orderTimestamps: [],
+    orderCountByStatus: [],
+    fillRows: [
+      { timestamp: String(dayEnd - 60000), side: 'buy', qty: '1', price: '100', fee: '0' },
+      { timestamp: String(dayEnd + 120000), side: 'sell', qty: '1', price: '99', fee: '0' },
+    ],
+    markoutWindowMin: 5,
+    maxDailyLoss: 50,
+    maxAdverseBps: 200,
+  };
+
+  const r = buildReport(input);
+
+  test('post-midnight opposite fill pairs as mark-out target', () => {
+    expect(r.markout.pairs).toBe(1);
+    expect(r.markout.avgAdverseBps!).toBeCloseTo(100, 9);
+  });
+
+  test('post-midnight fill is excluded from PnL and position', () => {
+    expect(r.pnl.dayRealized).toBe(0);
+    expect(r.pnl.lifetimeRealized).toBe(0);
+    expect(r.pnl.position).toBeCloseTo(1, 9);
+    expect(r.pnl.positionAvgCost).toBeCloseTo(100, 9);
+  });
+});
+
+describe('evaluateVerdict zero-threshold semantics (roborev round 3)', () => {
+  test('zero thresholds disable the checks, not invert them', () => {
+    expect(evaluateVerdict(-60, 25, 0, 0).status).toBe('OK');
+    expect(evaluateVerdict(-60, 25, 0, 0).reasons).toHaveLength(0);
+  });
+});
+
 describe('read-only guarantee (AC4)', () => {
   test('script source contains no write SQL', () => {
     const src = readFileSync(join(import.meta.dir, '..', 'scripts', 'daily-perf-review.ts'), 'utf8');

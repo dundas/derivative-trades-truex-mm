@@ -177,11 +177,12 @@ export function evaluateVerdict(
   maxDailyLoss: number,
   maxAdverseBps: number
 ): Verdict {
+  // A threshold of 0 disables that check (documented semantics).
   const reasons: string[] = [];
-  if (dailyPnl < -maxDailyLoss) {
+  if (maxDailyLoss > 0 && dailyPnl < -maxDailyLoss) {
     reasons.push(`daily realized $${dailyPnl.toFixed(2)} worse than -$${maxDailyLoss.toFixed(2)}`);
   }
-  if (adverseBps !== null && adverseBps > maxAdverseBps) {
+  if (maxAdverseBps > 0 && adverseBps !== null && adverseBps > maxAdverseBps) {
     reasons.push(`avg adverse mark-out ${adverseBps.toFixed(2)}bps above ${maxAdverseBps}bps`);
   }
   return { status: reasons.length ? 'WARN' : 'OK', reasons };
@@ -204,7 +205,8 @@ export async function fetchReportData(
   dayStart: number,
   dayEnd: number,
   symbol: string,
-  tradingMode?: string
+  tradingMode?: string,
+  markoutHorizonMs = 0
 ) {
   const pool = new pg.Pool({ connectionString: dbUrl, connectionTimeoutMillis: 10000, statement_timeout: 60000 });
   try {
@@ -244,9 +246,10 @@ export async function fetchReportData(
       [dayStart, dayEnd, symbol, tradingMode ?? null]
     );
 
-    // Lifetime fills up to dayEnd (bounded scan via idx_fills_timestamp).
-    // fills has no tradingmode column — when a mode filter is requested,
-    // constrain to sessions carrying that mode.
+    // Lifetime fills up to dayEnd + mark-out horizon (bounded scan via
+    // idx_fills_timestamp). Fills between dayEnd and the horizon serve only
+    // as look-ahead targets for end-of-day mark-outs; PnL accounting in
+    // buildReport truncates at dayEnd.
     const fillRows = await q(
       `select timestamp, side, coalesce(size, quantity, amount) as qty, price,
               coalesce(fee, feeamount, 0) as fee
@@ -254,7 +257,7 @@ export async function fetchReportData(
        where timestamp < $1 and symbol = $2
          and ($3::text is null or sessionid in (select sessionid from sessions where tradingmode = $3))
        order by timestamp`,
-      [dayEnd, symbol, tradingMode ?? null]
+      [dayEnd + markoutHorizonMs, symbol, tradingMode ?? null]
     );
 
     return { sessions, orderRows, orderCountByStatus, fillRows };
@@ -295,15 +298,17 @@ export function buildReport(input: ReportInput) {
     });
     feesArr.push(Number(r.fee));
   }
-
-  const fifo = computeFifo(fills, input.seed);
-  const dayPnl = dailyRealized(fills, fifo.cumAfter, dayStart, dayEnd);
+  // PnL/position accounting is truncated at dayEnd; fills fetched beyond it
+  // exist only as mark-out look-ahead targets.
+  const fillsToDayEnd = fills.filter((f) => f.timestamp < dayEnd);
+  const fifo = computeFifo(fillsToDayEnd, input.seed);
+  const dayPnl = dailyRealized(fillsToDayEnd, fifo.cumAfter, dayStart, dayEnd);
 
   const dayIdx: number[] = [];
-  for (let i = 0; i < fills.length; i++) {
-    if (fills[i].timestamp >= dayStart && fills[i].timestamp < dayEnd) dayIdx.push(i);
+  for (let i = 0; i < fillsToDayEnd.length; i++) {
+    if (fillsToDayEnd[i].timestamp >= dayStart) dayIdx.push(i);
   }
-  const dayFills = dayIdx.map((i) => fills[i]);
+  const dayFills = dayIdx.map((i) => fillsToDayEnd[i]);
   const buys = dayFills.filter((f) => f.side === 'buy');
   const sells = dayFills.filter((f) => f.side === 'sell');
   const sum = (a: Fill[], fn: (f: Fill) => number) => a.reduce((s, f) => s + fn(f), 0);
@@ -494,7 +499,14 @@ export async function main(argv: string[]): Promise<number> {
   const tradingMode = args['trading-mode'];
 
   try {
-    const data = await fetchReportData(dbUrl, dayStart, dayStart + 86400000, symbol, tradingMode);
+    const data = await fetchReportData(
+      dbUrl,
+      dayStart,
+      dayStart + 86400000,
+      symbol,
+      tradingMode,
+      markoutWindowMin * 60000
+    );
     const report = buildReport({
       date,
       sessions: data.sessions,

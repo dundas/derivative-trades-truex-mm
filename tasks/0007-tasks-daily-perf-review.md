@@ -59,6 +59,11 @@ Read-only guarantee: SELECT only, no writes (asserted by a test scanning the scr
   `lastupdated` is diagnostics-only (was wrongly usable as an end time).
 - **roborev round 2 Medium**: thresholds reject negative values (`nonNegative` constraint);
   zero allowed (disables that breach path). `--seed-btc` must be positive (long seed lot).
+- **roborev round 3 Medium**: fills now fetched through `dayEnd + markout window` so
+  end-of-day fills can pair against post-midnight opposite fills; PnL/position accounting
+  stays truncated at dayEnd (unit-tested).
+- **roborev round 3 Medium**: zero thresholds now explicitly DISABLE a verdict check
+  (`evaluateVerdict`), matching documented semantics (unit-tested).
 
 ## SO-13 note
 
