@@ -1,6 +1,6 @@
 # Task 0008 — Schedule + Alerting for Daily Performance Review
 
-**Status**: in-progress
+**Status**: done — merged (PR #56), LaunchAgent installed + verified 2026-08-07
 **Branch**: feat/daily-perf-schedule
 **Date**: 2026-08-06
 **Context**: Task 0007 shipped `scripts/daily-perf-review.ts` (PR #54, docs #55) but it is
