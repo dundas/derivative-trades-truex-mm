@@ -241,3 +241,23 @@ describe('minRepriceInterval debounce — gate interaction', () => {
     expect(engine._runDeferredReprice()).toBe(false);
   });
 });
+
+describe('debounce bypass is scoped to the completion-retry path (roborev round 3)', () => {
+  it('ordinary onPriceUpdate stays debounced while a hold is pending', () => {
+    const { engine, fixConnection } = createEngine({ minRepriceIntervalMs: 60000 });
+    engine.lastMid = 100000;
+    engine.lastRepriceAt = 1;
+    engine.activeOrders.set('B1', { side: 'buy', price: 90000, size: 0.001, level: 1, status: 'active', placedAt: Date.now() });
+
+    // Gated deferred cycle arms the hold
+    expect(engine._runDeferredReprice()).toBe(false);
+    expect(engine.heldPlacementsPending).toBe(true);
+
+    // Fresh debounce stamp: ordinary price updates must stay debounced
+    engine.lastRepriceAt = Date.now();
+    const sendsBefore = fixConnection.sendMessage.mock.calls.length;
+    engine.onPriceUpdate({ confidence: 1.0, weightedMidpoint: 100010, sources: [] });
+    expect(fixConnection.sendMessage.mock.calls.length).toBe(sendsBefore);
+    expect(engine.heldPlacementsPending).toBe(true); // still pending, no churn
+  });
+});

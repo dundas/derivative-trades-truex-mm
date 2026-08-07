@@ -130,9 +130,11 @@ export class QuoteEngine extends EventEmitter {
     this.lastMarketableAloSkip = null;
     // Balance-safety gate: pure placements skipped while same-side cancels in flight
     this.placementsDeferredForCancels = 0;
-    // True while a gated placement awaits its cancel confirm; completion retries
-    // bypass the minRepriceInterval debounce (they finish an interrupted cycle,
-    // they don't start a new one).
+    // True while a gated placement awaits its cancel confirm. Completion
+    // retries go through _runDeferredReprice, where the flag exempts that one
+    // path from the minRepriceInterval debounce; the ordinary onPriceUpdate
+    // path stays debounced (no global bypass, no extra churn while the cancel
+    // ack is slow).
     this.heldPlacementsPending = false;
     this.truexBook = null;
     this.truexEbbo = null;
@@ -257,8 +259,7 @@ export class QuoteEngine extends EventEmitter {
     }
     if (this.config.minRepriceIntervalMs > 0 &&
         this.lastRepriceAt &&
-        (now - this.lastRepriceAt) < this.config.minRepriceIntervalMs &&
-        !this.heldPlacementsPending) {
+        (now - this.lastRepriceAt) < this.config.minRepriceIntervalMs) {
       return;
     }
 
