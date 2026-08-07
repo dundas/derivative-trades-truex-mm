@@ -250,12 +250,16 @@ export async function fetchReportData(
     // idx_fills_timestamp). Fills between dayEnd and the horizon serve only
     // as look-ahead targets for end-of-day mark-outs; PnL accounting in
     // buildReport truncates at dayEnd.
+    // fills.sessionid carries the sessions.sessionid value; the mode-filter
+    // subquery is keyed on sessionid and symbol-constrained to avoid
+    // cross-symbol sessionid collisions.
     const fillRows = await q(
       `select timestamp, side, coalesce(size, quantity, amount) as qty, price,
               coalesce(fee, feeamount, 0) as fee
        from fills
        where timestamp < $1 and symbol = $2
-         and ($3::text is null or sessionid in (select sessionid from sessions where tradingmode = $3))
+         and ($3::text is null or sessionid in
+              (select sessionid from sessions where tradingmode = $3 and symbol = $2))
        order by timestamp`,
       [dayEnd + markoutHorizonMs, symbol, tradingMode ?? null]
     );
@@ -275,7 +279,7 @@ export interface ReportInput {
   sessions: SessionRow[];
   orderTimestamps: number[];
   orderCountByStatus: { status: string; n: number }[];
-  fillRows: { timestamp: string; side: string; qty: string; price: string; fee: string }[];
+  fillRows: { timestamp: string; side: string; qty: string; price: string; fee: string | null }[];
   seed?: { qty: number; price: number };
   markoutWindowMin: number;
   maxDailyLoss: number;
@@ -294,13 +298,23 @@ export function buildReport(input: ReportInput) {
     if (rawSide !== 'buy' && rawSide !== 'sell') {
       throw new Error(`unknown fill side '${r.side}' at timestamp ${r.timestamp}`);
     }
-    fills.push({
-      timestamp: Number(r.timestamp),
-      side: rawSide,
-      qty: Number(r.qty),
-      price: Number(r.price),
-    });
-    feesArr.push(Number(r.fee));
+    const missing = (v: string | null | undefined) => v === null || v === undefined || String(v).trim() === '';
+    if (missing(r.timestamp) || missing(r.qty) || missing(r.price)) {
+      throw new Error(
+        `invalid fill row at timestamp=${r.timestamp} (qty=${r.qty} price=${r.price} fee=${r.fee})`
+      );
+    }
+    const timestamp = Number(r.timestamp);
+    const qty = Number(r.qty);
+    const price = Number(r.price);
+    const fee = r.fee === null || r.fee === undefined ? 0 : Number(r.fee);
+    if (!Number.isFinite(timestamp) || !Number.isFinite(qty) || !Number.isFinite(price) || !Number.isFinite(fee)) {
+      throw new Error(
+        `invalid fill row at timestamp=${r.timestamp} (qty=${r.qty} price=${r.price} fee=${r.fee})`
+      );
+    }
+    fills.push({ timestamp, side: rawSide, qty, price });
+    feesArr.push(fee);
   }
   // PnL/position accounting is truncated at dayEnd; fills fetched beyond it
   // exist only as mark-out look-ahead targets.

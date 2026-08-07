@@ -379,6 +379,31 @@ describe('buildReport rejects unknown fill sides (roborev round 4)', () => {
   });
 });
 
+describe('buildReport rejects invalid numeric rows (roborev round 5)', () => {
+  const dayStart = Date.parse('2026-08-05T00:00:00Z');
+  const base = {
+    date: '2026-08-05',
+    sessions: [],
+    orderTimestamps: [],
+    orderCountByStatus: [],
+    markoutWindowMin: 5,
+    maxDailyLoss: 50,
+    maxAdverseBps: 10,
+  };
+  test('non-numeric price throws', () => {
+    const input = { ...base, fillRows: [{ timestamp: String(dayStart + 1000), side: 'buy', qty: '1', price: 'abc', fee: '0' }] };
+    expect(() => buildReport(input)).toThrow(/invalid fill row/);
+  });
+  test('null qty throws', () => {
+    const input = { ...base, fillRows: [{ timestamp: String(dayStart + 1000), side: 'buy', qty: null as unknown as string, price: '100', fee: '0' }] };
+    expect(() => buildReport(input)).toThrow(/invalid fill row/);
+  });
+  test('null fee is treated as zero', () => {
+    const input = { ...base, fillRows: [{ timestamp: String(dayStart + 1000), side: 'buy', qty: '1', price: '100', fee: null }] };
+    expect(buildReport(input).fills.fees).toBe(0);
+  });
+});
+
 describe('read-only guarantee (AC4)', () => {
   test('script source contains no write SQL', () => {
     const src = readFileSync(join(import.meta.dir, '..', 'scripts', 'daily-perf-review.ts'), 'utf8');

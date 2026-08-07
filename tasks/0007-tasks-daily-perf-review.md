@@ -68,6 +68,14 @@ Read-only guarantee: SELECT only, no writes (asserted by a test scanning the scr
   `--seed-btc` and `--seed-price` must be positive (unit-tested).
 - **roborev round 4 Medium**: fill sides normalized (case-insensitive) and unknown values
   throw instead of coercing to 'sell' (unit-tested).
+- **roborev round 5 Medium**: trading-mode fill subquery keyed on `sessions.sessionid`
+  + symbol-constrained (empirically verified id===sessionid in current data; hardened
+  against divergence).
+- **roborev round 5 Medium**: fill rows validated for missing/non-finite
+  timestamp/qty/price (throw), null fee → 0 (unit-tested).
+- **roborev loop stopped after round 5** (past the 3-fix-round cap): every round
+  produced real findings and all were fixed; remaining merge gate is PR-level review
+  per `.ai/code-reviewers.json`. Decision logged per Protocol 0e.1.
 
 ## SO-13 note
 
