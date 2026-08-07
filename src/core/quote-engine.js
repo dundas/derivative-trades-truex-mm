@@ -262,6 +262,8 @@ export class QuoteEngine extends EventEmitter {
     this.lastAnchorBook = this._extractAnchorBook(aggregatedPrice);
 
     const now = Date.now();
+    let momentumBypass = false;
+    let momentumMoveBps = 0;
 
     // Rejection backoff: pause quoting after consecutive rejects
     if (this.rejectBackoffUntil > now) {
@@ -282,16 +284,16 @@ export class QuoteEngine extends EventEmitter {
       const moveBps = this.lastRepricedMid > 0
         ? Math.abs(mid - this.lastRepricedMid) / this.lastRepricedMid * 1e4
         : 0;
-      const momentumBypass = this.config.momentumRepriceBps > 0 &&
+      momentumBypass = this.config.momentumRepriceBps > 0 &&
         this.lastRepricedMid > 0 &&
         moveBps >= this.config.momentumRepriceBps;
       if (!momentumBypass) {
         return;
       }
-      this.momentumReprices++;
-      this.logger.info(
-        `[QuoteEngine] Momentum reprice: move ${moveBps.toFixed(1)}bps >= ${this.config.momentumRepriceBps}bps since last reprice (lifetime=${this.momentumReprices})`
-      );
+      // Count/log only after a successful dispatch (below): a bypassed cycle
+      // that dispatches nothing must not inflate the counter or re-log on
+      // every tick while the reference stays unchanged.
+      momentumMoveBps = moveBps;
     }
 
     // Get inventory skew
@@ -328,6 +330,12 @@ export class QuoteEngine extends EventEmitter {
     if (dispatched) {
       this.lastRepriceAt = Date.now();
       this.lastRepricedMid = mid;
+      if (momentumBypass) {
+        this.momentumReprices++;
+        this.logger.info(
+          `[QuoteEngine] Momentum reprice: move ${momentumMoveBps.toFixed(1)}bps >= ${this.config.momentumRepriceBps}bps since last reprice (lifetime=${this.momentumReprices})`
+        );
+      }
     }
     this.emit('quote-update', {
       bidLevels: desired.filter(q => q.side === 'buy').length,

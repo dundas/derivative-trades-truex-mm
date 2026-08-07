@@ -154,3 +154,22 @@ describe('debounce scoping (roborev round 2)', () => {
     expect(fixConnection.sendMessage.mock.calls.length).toBe(sendsBefore);
   });
 });
+
+describe('momentum counter hygiene (roborev round 4)', () => {
+  it('a bypassed cycle that dispatches nothing does not count or re-log', () => {
+    const { engine, logger } = createEngine({ maxOrdersPerSecond: 2 });
+    engine.lastRepriceAt = 1;
+    engine.onPriceUpdate(price(100000)); // dispatches 2, queues 2 (budget 2)
+    for (const [, o] of engine.activeOrders) o.status = 'active';
+    engine.lastActionByClOrdID.clear();
+    // Fresh stamp, then an 11bps move within the window — but the budget is
+    // exhausted in this second, so the bypassed cycle dispatches nothing.
+    engine.lastRepriceAt = Date.now();
+    const momentumLogsBefore = logger.info.mock.calls.filter((c) => String(c[0]).includes('Momentum reprice')).length;
+    engine.onPriceUpdate(price(100110));
+    expect(engine.momentumReprices).toBe(0);
+    const momentumLogsAfter = logger.info.mock.calls.filter((c) => String(c[0]).includes('Momentum reprice')).length;
+    expect(momentumLogsAfter).toBe(momentumLogsBefore); // no re-log on a no-dispatch bypass
+    expect(engine.lastRepricedMid).toBe(100000); // reference unchanged
+  });
+});
