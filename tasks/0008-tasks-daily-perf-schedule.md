@@ -61,6 +61,8 @@ Phase 2) has a continuous before/after baseline.
   (never install stale code for scheduled runs); `ALLOW_STALE=1` is the explicit override.
 - **roborev loop concluded after round 4** (fix-round cap): remaining merge gate is
   PR-level review per `.ai/code-reviewers.json`. Decision logged per Protocol 0e.1.
+  Round-5 residual Mediums (LaunchAgents mkdir, deps refresh after pull) applied as
+  obvious one-line hardening without reopening the loop.
 
 ## SO-13 note
 

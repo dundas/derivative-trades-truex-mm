@@ -51,10 +51,9 @@ if [ ! -e "$CODE_ROOT/.env" ]; then
   echo "==> Symlinking .env from DATA_ROOT"
   ln -s "$DATA_ROOT/.env" "$CODE_ROOT/.env"
 fi
-if [ ! -d "$CODE_ROOT/node_modules" ]; then
-  echo "==> Installing dependencies in CODE_ROOT"
-  (cd "$CODE_ROOT" && "$BUN_BIN" install --frozen-lockfile)
-fi
+# Always refresh deps after advancing CODE_ROOT (lockfile may have changed);
+# --frozen-lockfile is a fast no-op when nothing moved.
+(cd "$CODE_ROOT" && "$BUN_BIN" install --frozen-lockfile)
 [ -f "$CODE_ROOT/scripts/daily-perf-review.ts" ] \
   || { echo "FATAL: CODE_ROOT lacks scripts/daily-perf-review.ts (is main merged?)"; exit 1; }
 
@@ -78,6 +77,7 @@ if [ "${DRY_RUN:-0}" = "1" ]; then
 fi
 
 launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
+mkdir -p "$HOME/Library/LaunchAgents"
 cp "$TMP_PLIST" "$PLIST_DST"
 launchctl bootstrap "gui/$UID" "$PLIST_DST"
 launchctl print "gui/$UID/$LABEL" | head -4
