@@ -8,7 +8,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>/Users/kefentse/dev_env/true_markets_mm/scripts/daily-perf-review-job.sh</string>
+        <string>{{CODE_ROOT}}/scripts/daily-perf-review-job.sh</string>
     </array>
 
     <!-- Daily at 19:15 local (CDT) = 00:15Z, just after the UTC day closes.
@@ -22,7 +22,7 @@
     </dict>
 
     <key>WorkingDirectory</key>
-    <string>/Users/kefentse/dev_env/true_markets_mm-ops</string>
+    <string>{{CODE_ROOT}}</string>
 
     <key>EnvironmentVariables</key>
     <dict>
@@ -31,9 +31,9 @@
     </dict>
 
     <key>StandardOutPath</key>
-    <string>/Users/kefentse/dev_env/true_markets_mm/logs/daily-perf-review/launchd.out.log</string>
+    <string>{{DATA_ROOT}}/logs/daily-perf-review/launchd.out.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/kefentse/dev_env/true_markets_mm/logs/daily-perf-review/launchd.err.log</string>
+    <string>{{DATA_ROOT}}/logs/daily-perf-review/launchd.err.log</string>
 
     <key>RunAtLoad</key>
     <false/>

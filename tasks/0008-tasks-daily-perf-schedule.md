@@ -38,6 +38,15 @@ Phase 2) has a continuous before/after baseline.
 - NTP fix on prod host (recorded gotcha)
 - Engine tuning (Phase 2 of task 0007)
 
+## Review Fixes
+
+- **roborev round 1 High**: plist no longer hardcodes deployment paths — template uses
+  `{{CODE_ROOT}}/{{DATA_ROOT}}` placeholders rendered by the new installer
+  (`ops/launchd/install-daily-perf-review.sh`); wrapper roots are env-overridable.
+- **roborev round 1 Medium**: installer creates `logs/daily-perf-review/` before
+  bootstrap (launchd opens stdout/stderr files before the job script runs); DRY_RUN=1
+  mode for pre-merge smoke.
+
 ## SO-13 note
 
 Touches `scripts/` → docs-generator mandatory; docs PR opened before merge.

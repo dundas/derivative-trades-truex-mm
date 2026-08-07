@@ -5,7 +5,7 @@
 # archives the report, appends a summary to the daily memory log, and alerts
 # `decisive` via ADMP on WARN (exit 1) or ERROR (exit >= 2) outcomes.
 #
-# Layout (two roots, kept separate on purpose):
+# Layout (two roots, kept separate on purpose; env-overridable at install time):
 #   CODE_ROOT — clean checkout of `main` with node_modules + .env (runs the script)
 #   DATA_ROOT — canonical repo holding memory/ and logs/ (where results land)
 #
@@ -13,8 +13,8 @@
 #
 set -uo pipefail
 
-CODE_ROOT="/Users/kefentse/dev_env/true_markets_mm-ops"
-DATA_ROOT="/Users/kefentse/dev_env/true_markets_mm"
+CODE_ROOT="${TRUEX_PERF_CODE_ROOT:-/Users/kefentse/dev_env/true_markets_mm-ops}"
+DATA_ROOT="${TRUEX_PERF_DATA_ROOT:-/Users/kefentse/dev_env/true_markets_mm}"
 BUN="/Users/kefentse/.bun/bin/bun"
 BRAIN_MSG="$CODE_ROOT/.claude/skills/cross-brain-message/brain-msg.ts"
 
