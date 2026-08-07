@@ -139,8 +139,10 @@ export function decideCliExit(result) {
 // Reporting
 // ---------------------------------------------------------------------------
 
-// Fall back to the raw string if the venue ever returns an unparsable
-// numeric — NaN in an incident report would obscure real order sizes.
+// Defensive rendering guard. Note: parseOrder already parseFloat's upstream,
+// so an unparsable venue value arrives here as the JS number NaN (the raw
+// string is gone); this guard keeps such values visible as-is instead of
+// crashing a toFixed call, and covers any future caller passing raw strings.
 function fmtNum(v, places) {
   const n = Number(v);
   return Number.isNaN(n) ? String(v) : n.toFixed(places);
