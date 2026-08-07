@@ -83,14 +83,15 @@ bun scripts/daily-perf-review.ts \
 - `fills.liquidityind` is unpopulated, so maker/taker attribution is unavailable.
 - `balance_snapshots` is empty; the equity curve is reconstructed from fills,
   not balances.
-- Not yet scheduled — run manually or wire into heartbeat/cron as a follow-up.
 
 ## Scheduling & alerting (task 0008, PR #56)
 
 The review runs automatically every day and alerts on bad outcomes:
 
 - **When**: daily at 19:15 local (CDT) = 00:15Z — right after the UTC day
-  closes. If the machine is asleep, launchd fires at next wake.
+  closes. If the machine is asleep, launchd fires at next wake. Note: the
+  trigger is local wall-clock; under winter time (CST) the same 19:15 fires
+  at 01:15Z — the report still covers the full prior UTC day.
 - **Wrapper**: `scripts/daily-perf-review-job.sh` runs the review with the
   operational scoping above, archives the full report to
   `logs/daily-perf-review/<UTC-date>.txt`, and appends a summary section to
