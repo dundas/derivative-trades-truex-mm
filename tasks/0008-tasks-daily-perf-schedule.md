@@ -55,6 +55,12 @@ Phase 2) has a continuous before/after baseline.
   checked out elsewhere.
 - **roborev round 3 Medium**: DRY_RUN guard moved before `launchctl bootout` — dry runs
   never mutate launchd state.
+- **roborev round 4 High**: bun resolved at runtime (`TRUEX_PERF_BUN` rendered into the
+  plist → PATH → `$HOME/.bun/bin`); plist PATH/dir rendered from the installer's bun.
+- **roborev round 4 Medium**: `pull --ff-only` failure is now FATAL by default
+  (never install stale code for scheduled runs); `ALLOW_STALE=1` is the explicit override.
+- **roborev loop concluded after round 4** (fix-round cap): remaining merge gate is
+  PR-level review per `.ai/code-reviewers.json`. Decision logged per Protocol 0e.1.
 
 ## SO-13 note
 

@@ -15,7 +15,9 @@ set -uo pipefail
 
 CODE_ROOT="${TRUEX_PERF_CODE_ROOT:-/Users/kefentse/dev_env/true_markets_mm-ops}"
 DATA_ROOT="${TRUEX_PERF_DATA_ROOT:-/Users/kefentse/dev_env/true_markets_mm}"
-BUN="/Users/kefentse/.bun/bin/bun"
+# Bun resolution order: TRUEX_PERF_BUN (rendered into the plist by the
+# installer) → PATH → the conventional per-user location.
+BUN="${TRUEX_PERF_BUN:-$(command -v bun || echo "$HOME/.bun/bin/bun")}"
 # brain-msg lives in the canonical repo's untracked .claude/ tooling — NOT in
 # clean git worktrees — so it is resolved from DATA_ROOT, not CODE_ROOT.
 BRAIN_MSG="$DATA_ROOT/.claude/skills/cross-brain-message/brain-msg.ts"

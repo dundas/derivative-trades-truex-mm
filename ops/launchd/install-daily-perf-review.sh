@@ -20,9 +20,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DATA_ROOT_DEFAULT="$(cd "$SCRIPT_DIR/../.." && pwd)" # repo root of this checkout
 DATA_ROOT="${TRUEX_PERF_DATA_ROOT:-$DATA_ROOT_DEFAULT}"
 CODE_ROOT="${TRUEX_PERF_CODE_ROOT:-$DATA_ROOT-ops}"
+BUN_BIN="${BUN_BIN:-$(command -v bun || echo "$HOME/.bun/bin/bun")}"
+BUN_DIR="$(dirname "$BUN_BIN")"
 PLIST_SRC="$SCRIPT_DIR/$LABEL.plist"
 PLIST_DST="$HOME/Library/LaunchAgents/$LABEL.plist"
-BUN="${BUN_BIN:-/Users/kefentse/.bun/bin/bun}"
 
 echo "==> DATA_ROOT: $DATA_ROOT"
 echo "==> CODE_ROOT: $CODE_ROOT"
@@ -35,8 +36,16 @@ if [ ! -e "$CODE_ROOT/.git" ]; then
   # elsewhere; the scheduled job later advances it with pull --ff-only.
   git -C "$DATA_ROOT" worktree add -B ops/daily-perf-review "$CODE_ROOT" origin/main
 fi
-git -C "$CODE_ROOT" pull --ff-only origin main \
-  || echo "WARN: CODE_ROOT not fast-forwardable to origin/main; using as-is"
+if ! git -C "$CODE_ROOT" pull --ff-only origin main; then
+  if [ "${ALLOW_STALE:-0}" = "1" ]; then
+    echo "WARN: CODE_ROOT not fast-forwardable to origin/main; proceeding (ALLOW_STALE=1)"
+  else
+    echo "FATAL: CODE_ROOT is not fast-forwardable to origin/main — refusing to"
+    echo "       install stale/divergent code for scheduled runs. Resolve the branch"
+    echo "       state, or set ALLOW_STALE=1 to proceed anyway."
+    exit 1
+  fi
+fi
 
 if [ ! -e "$CODE_ROOT/.env" ]; then
   echo "==> Symlinking .env from DATA_ROOT"
@@ -44,7 +53,7 @@ if [ ! -e "$CODE_ROOT/.env" ]; then
 fi
 if [ ! -d "$CODE_ROOT/node_modules" ]; then
   echo "==> Installing dependencies in CODE_ROOT"
-  (cd "$CODE_ROOT" && "$BUN" install --frozen-lockfile)
+  (cd "$CODE_ROOT" && "$BUN_BIN" install --frozen-lockfile)
 fi
 [ -f "$CODE_ROOT/scripts/daily-perf-review.ts" ] \
   || { echo "FATAL: CODE_ROOT lacks scripts/daily-perf-review.ts (is main merged?)"; exit 1; }
@@ -55,7 +64,10 @@ mkdir -p "$DATA_ROOT/logs/daily-perf-review"
 # --- 3. Render, lint, install, bootstrap -------------------------------------
 TMP_PLIST="$(mktemp)"
 trap 'rm -f "$TMP_PLIST"' EXIT
-sed -e "s|{{CODE_ROOT}}|$CODE_ROOT|g" -e "s|{{DATA_ROOT}}|$DATA_ROOT|g" \
+sed -e "s|{{CODE_ROOT}}|$CODE_ROOT|g" \
+    -e "s|{{DATA_ROOT}}|$DATA_ROOT|g" \
+    -e "s|{{BUN_BIN}}|$BUN_BIN|g" \
+    -e "s|{{BUN_DIR}}|$BUN_DIR|g" \
   "$PLIST_SRC" > "$TMP_PLIST"
 plutil -lint "$TMP_PLIST"
 
