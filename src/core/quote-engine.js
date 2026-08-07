@@ -128,6 +128,14 @@ export class QuoteEngine extends EventEmitter {
     this.lastReplacementLevelBySide = new Map();
     this.deferredRepriceNeeded = false;
     this.lastMarketableAloSkip = null;
+    // Balance-safety gate: pure placements skipped while same-side cancels in flight
+    this.placementsDeferredForCancels = 0;
+    // True while a gated placement awaits its cancel confirm. Completion
+    // retries go through _runDeferredReprice, where the flag exempts that one
+    // path from the minRepriceInterval debounce; the ordinary onPriceUpdate
+    // path stays debounced (no global bypass, no extra churn while the cancel
+    // ack is slow).
+    this.heldPlacementsPending = false;
     this.truexBook = null;
     this.truexEbbo = null;
     this.pyusdUsd = null;
@@ -197,6 +205,7 @@ export class QuoteEngine extends EventEmitter {
   invalidateQueuedWork(reprice = false) {
     this.actionQueue = [];
     this.deferredRepriceNeeded = reprice;
+    this.heldPlacementsPending = false;
   }
 
   clearPendingReplacement(origClOrdID) {
@@ -278,6 +287,13 @@ export class QuoteEngine extends EventEmitter {
     const dispatched = this.executeActions(actions);
 
     this.isQuoting = true;
+    // Stamp on any cycle that dispatched, regardless of held placements. Gating
+    // the stamp on heldPlacementsPending would leave lastRepriceAt stale during
+    // intra-cycle holds (a same-side replacement-cancel marks its order
+    // 'cancelling' before later same-side placements are evaluated), which
+    // implicitly disables this debounce for every tick until a hold clears.
+    // The completion-retry exemption lives solely in _runDeferredReprice's
+    // heldPlacementsPending check.
     if (dispatched) {
       this.lastRepriceAt = Date.now();
     }
@@ -557,7 +573,21 @@ export class QuoteEngine extends EventEmitter {
     }
 
     let dispatched = false;
+    let deferredThisCycle = 0;
     for (const action of orderedActions) {
+      // Balance-safety gate: a pure placement must not go out while a same-side
+      // cancel is still in flight — the venue holds those funds until the cancel
+      // is processed, so the new order could exceed available balance and be
+      // rejected (Insufficient balance). Skipped placements are re-derived by the
+      // next reprice with fresh prices. Replacement placements are unaffected
+      // (they flush only after cancel confirm via pendingReplacements).
+      if (this._shouldHoldPlacement(action)) {
+        this.placementsDeferredForCancels++;
+        deferredThisCycle++;
+        this.deferredRepriceNeeded = true;
+        continue;
+      }
+
       if (this.actionsThisSecond >= this.config.maxOrdersPerSecond) {
         if (action.type === 'replacement-cancel') {
           this.deferredRepriceNeeded = true;
@@ -582,6 +612,15 @@ export class QuoteEngine extends EventEmitter {
       this.actionsThisSecond++;
       dispatched = true;
     }
+    if (deferredThisCycle > 0) {
+      this.heldPlacementsPending = true;
+      this.logger.info(
+        `[QuoteEngine] Deferred ${deferredThisCycle} placement(s) pending same-side cancel confirms (lifetime=${this.placementsDeferredForCancels})`
+      );
+    } else {
+      // Nothing held this cycle — any previously pending hold is resolved
+      this.heldPlacementsPending = false;
+    }
     return dispatched;
   }
 
@@ -599,6 +638,28 @@ export class QuoteEngine extends EventEmitter {
     } else if (action.type === 'place') {
       this._sendNewOrder(action.quote);
     }
+  }
+
+  /**
+   * Balance-safety gate: true when a pure placement must wait because a
+   * same-side cancel is still in flight ('cancelling' in activeOrders).
+   * Derived from order state on purpose — no separate counters to leak when
+   * acks are lost; existing cancel-timeout/orphan recovery heals the state.
+   * Bypassed in place-before-cancel mode (that mode intentionally places first).
+   */
+  _shouldHoldPlacement(action) {
+    if (action.type !== 'place') return false;
+    if (this.config.replaceMode === 'place-before-cancel') return false;
+    const side = action.quote?.side;
+    if (!side) return false;
+    return this._hasInflightCancels(side);
+  }
+
+  _hasInflightCancels(side) {
+    for (const [, order] of this.activeOrders) {
+      if (order.side === side && order.status === 'cancelling') return true;
+    }
+    return false;
   }
 
   /**
@@ -1016,10 +1077,27 @@ export class QuoteEngine extends EventEmitter {
       this.lastActionReset = now;
     }
 
+    let droppedStalePlacements = 0;
     while (this.actionQueue.length > 0 && this.actionsThisSecond < this.config.maxOrdersPerSecond) {
       const action = this.actionQueue.shift();
+      // Same balance-safety gate as the dispatch loop: gated placements are
+      // DROPPED, not held — they were built in an earlier cycle and would be
+      // stale by the time the cancel clears. deferredRepriceNeeded re-derives
+      // fresh quotes on the next cycle, same guarantee as the dispatch skip.
+      if (this._shouldHoldPlacement(action)) {
+        this.placementsDeferredForCancels++;
+        droppedStalePlacements++;
+        this.heldPlacementsPending = true;
+        continue;
+      }
       this._dispatchAction(action);
       this.actionsThisSecond++;
+    }
+    if (droppedStalePlacements > 0) {
+      this.deferredRepriceNeeded = true;
+      this.logger.info(
+        `[QuoteEngine] Dropped ${droppedStalePlacements} stale queued placement(s) pending same-side cancel confirms (re-deriving next cycle)`
+      );
     }
 
     if (this.deferredRepriceNeeded && this.actionsThisSecond < this.config.maxOrdersPerSecond) {
@@ -1724,7 +1802,8 @@ export class QuoteEngine extends EventEmitter {
     }
     if (this.config.minRepriceIntervalMs > 0 &&
         this.lastRepriceAt &&
-        (now - this.lastRepriceAt) < this.config.minRepriceIntervalMs) {
+        (now - this.lastRepriceAt) < this.config.minRepriceIntervalMs &&
+        !this.heldPlacementsPending) {
       this.deferredRepriceNeeded = true;
       return false;
     }
@@ -1738,12 +1817,16 @@ export class QuoteEngine extends EventEmitter {
     if (actions.toPlace.length || actions.toCancel.length || actions.toReplace.length) {
       this.deferredRepriceNeeded = false;
       const dispatched = this.executeActions(actions);
-      if (dispatched) {
+      if (dispatched && !this.heldPlacementsPending) {
         this.lastRepriceAt = Date.now();
       }
       return !this.deferredRepriceNeeded;
     }
     this.deferredRepriceNeeded = false;
+    // Nothing left to place — any pending hold is resolved (e.g. the cancel
+    // was rejected and the restored order already matches, or quoting became
+    // impossible). Clear so later deferred reprices respect the debounce.
+    this.heldPlacementsPending = false;
     return true;
   }
 }
