@@ -139,9 +139,16 @@ export function decideCliExit(result) {
 // Reporting
 // ---------------------------------------------------------------------------
 
+// Fall back to the raw string if the venue ever returns an unparsable
+// numeric — NaN in an incident report would obscure real order sizes.
+function fmtNum(v, places) {
+  const n = Number(v);
+  return Number.isNaN(n) ? String(v) : n.toFixed(places);
+}
+
 function fmtOrder(p) {
   const age = p.createdAt ? `${Math.max(0, Math.round((Date.now() - p.createdAt.getTime()) / 1000))}s` : '-';
-  return `  ${String(p.id).padEnd(20)} ${p.side.padEnd(4)} ${Number(p.qty).toFixed(6).padStart(10)} @ ${Number(p.price).toFixed(2).padStart(10)} ${String(p.status).padEnd(12)} age=${age}`;
+  return `  ${String(p.id).padEnd(20)} ${p.side.padEnd(4)} ${fmtNum(p.qty, 6).padStart(10)} @ ${fmtNum(p.price, 2).padStart(10)} ${String(p.status).padEnd(12)} age=${age}`;
 }
 
 export function renderText(result, config) {
