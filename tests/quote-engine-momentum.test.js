@@ -119,3 +119,16 @@ describe('momentum reprice — debounce bypass (task 0010)', () => {
     expect(engine.lastRepricedMid).toBe(100000);
   });
 });
+
+describe('momentum reference sync (roborev round 1)', () => {
+  it('deferred reprice stamps lastRepricedMid alongside lastRepriceAt', () => {
+    const { engine } = createEngine();
+    engine.lastMid = 100000;
+    engine.lastRepriceAt = 1;
+    // No active orders → deferred reprice places a fresh ladder (dispatches)
+    const ran = engine._runDeferredReprice();
+    expect(ran).toBe(true);
+    expect(engine.lastRepricedMid).toBe(100000);
+    expect(engine.lastRepriceAt).toBeGreaterThan(1);
+  });
+});

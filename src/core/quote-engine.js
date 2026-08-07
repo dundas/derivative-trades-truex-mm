@@ -57,6 +57,8 @@ export class QuoteEngine extends EventEmitter {
       // Momentum reprice (task 0010): bypass the minRepriceInterval debounce when
       // the mid has moved >= this many bps since the last dispatched reprice.
       // 0 disables. Withdrawal itself reuses reconcile + passive-safe machinery.
+      // Deliberately fail-closed: default 0 (off) at the engine/orchestrator level;
+      // only run-prod.js enables it (MOMENTUM_REPRICE_BPS, default 10).
       momentumRepriceBps: options.momentumRepriceBps ?? 0,
       sizeDecimalPlaces: options.sizeDecimalPlaces || 8, // Decimal places for quantity rounding
       tickSize: options.tickSize || 0.50,
@@ -1847,6 +1849,9 @@ export class QuoteEngine extends EventEmitter {
       const dispatched = this.executeActions(actions);
       if (dispatched && !this.heldPlacementsPending) {
         this.lastRepriceAt = Date.now();
+        // Keep the momentum reference in sync with ANY dispatched reprice —
+        // a stale reference would retrigger the bypass too early (churn).
+        this.lastRepricedMid = this.lastMid;
       }
       return !this.deferredRepriceNeeded;
     }
