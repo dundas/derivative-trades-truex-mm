@@ -17,11 +17,15 @@
  *   bun scripts/daily-perf-review.ts [--date YYYY-MM-DD] [--json]
  *       [--seed-btc N --seed-price P] [--markout-window-min N]
  *       [--max-daily-loss USD] [--max-adverse-bps BPS]
- *       [--symbol SYM] [--trading-mode MODE]
+ *       [--symbol SYM] [--trading-mode MODE] [--since YYYY-MM-DD]
  *
  * Scope: sessions/orders/fills are filtered by --symbol (default BTC-PYUSD);
  * --trading-mode additionally restricts to sessions/orders of that mode
  * (fills are restricted via their session). Unset mode = all modes.
+ * --since bounds the FIFO/mark-out horizon to the current account era
+ * (the analytics store can contain fills from earlier/UAT eras).
+ * Defaults: mark-out window 60 min (fills are sparse on the current tape),
+ * verdict thresholds $50 daily loss / 25bps adverse (0 disables a check).
  */
 import pg from 'pg';
 
@@ -206,7 +210,8 @@ export async function fetchReportData(
   dayEnd: number,
   symbol: string,
   tradingMode?: string,
-  markoutHorizonMs = 0
+  markoutHorizonMs = 0,
+  sinceMs?: number
 ) {
   const pool = new pg.Pool({ connectionString: dbUrl, connectionTimeoutMillis: 10000, statement_timeout: 60000 });
   try {
@@ -249,7 +254,9 @@ export async function fetchReportData(
     // Lifetime fills up to dayEnd + mark-out horizon (bounded scan via
     // idx_fills_timestamp). Fills between dayEnd and the horizon serve only
     // as look-ahead targets for end-of-day mark-outs; PnL accounting in
-    // buildReport truncates at dayEnd.
+    // buildReport truncates at dayEnd. Optional lower bound (--since) scopes
+    // the FIFO horizon to the current account era (the store can contain
+    // fills from earlier/UAT eras of the same tables).
     // fills.sessionid carries the sessions.sessionid value; the mode-filter
     // subquery is keyed on sessionid and symbol-constrained to avoid
     // cross-symbol sessionid collisions.
@@ -257,11 +264,11 @@ export async function fetchReportData(
       `select timestamp, side, coalesce(size, quantity, amount) as qty, price,
               coalesce(fee, feeamount, 0) as fee
        from fills
-       where timestamp < $1 and symbol = $2
+       where timestamp < $1 and timestamp >= $4 and symbol = $2
          and ($3::text is null or sessionid in
               (select sessionid from sessions where tradingmode = $3 and symbol = $2))
        order by timestamp`,
-      [dayEnd + markoutHorizonMs, symbol, tradingMode ?? null]
+      [dayEnd + markoutHorizonMs, symbol, tradingMode ?? null, sinceMs ?? 0]
     );
 
     return { sessions, orderRows, orderCountByStatus, fillRows };
@@ -354,6 +361,9 @@ export function buildReport(input: ReportInput) {
       start: s.st ? new Date(Number(s.st)).toISOString() : null,
       end: s.en ? new Date(Number(s.en)).toISOString() : null,
       lastActivity: s.lu ? new Date(Number(s.lu)).toISOString() : null,
+      // 'running' rows whose last activity predates the reviewed day are
+      // stale (never closed cleanly); surfaced, not silently counted as live.
+      stale: s.status === 'running' && !s.en && s.lu !== null && Number(s.lu) < dayStart,
     })),
     orders: {
       total: input.orderTimestamps.length,
@@ -391,8 +401,14 @@ export function renderText(r: ReturnType<typeof buildReport>): string {
   L.push(`=== Daily Performance Review — ${r.date} (UTC) ===`);
   L.push('');
   L.push(`Sessions (${r.sessions.length}):`);
-  for (const s of r.sessions)
-    L.push(`  - ${s.id} [${s.status}] ${s.start} → ${s.end ?? `running (last activity ${s.lastActivity})`}`);
+  for (const s of r.sessions) {
+    const tail = s.end
+      ? s.end
+      : s.stale
+        ? `STALE (no end signal; last activity ${s.lastActivity})`
+        : `running (last activity ${s.lastActivity})`;
+    L.push(`  - ${s.id} [${s.status}] ${s.start} → ${tail}`);
+  }
   L.push('');
   L.push(`Orders: ${r.orders.total}`);
   for (const b of r.orders.byStatus) L.push(`  ${b.status}: ${b.n}`);
@@ -517,9 +533,9 @@ export async function main(argv: string[]): Promise<number> {
     return 2;
   }
 
-  const markoutWindowMin = parseNumericFlag(args, 'markout-window-min', 5, { positive: true });
+  const markoutWindowMin = parseNumericFlag(args, 'markout-window-min', 60, { positive: true });
   const maxDailyLoss = parseNumericFlag(args, 'max-daily-loss', 50, { nonNegative: true });
-  const maxAdverseBps = parseNumericFlag(args, 'max-adverse-bps', 10, { nonNegative: true });
+  const maxAdverseBps = parseNumericFlag(args, 'max-adverse-bps', 25, { nonNegative: true });
   if (markoutWindowMin === null || maxDailyLoss === null || maxAdverseBps === null) {
     console.error(
       'ERROR: --markout-window-min must be a finite number > 0; --max-daily-loss / --max-adverse-bps must be finite numbers >= 0'
@@ -530,6 +546,19 @@ export async function main(argv: string[]): Promise<number> {
   const symbol = args.symbol ?? 'BTC-PYUSD';
   const tradingMode = args['trading-mode'];
 
+  let sinceMs: number | undefined;
+  if (args.since !== undefined) {
+    sinceMs = Date.parse(`${args.since}T00:00:00Z`);
+    if (Number.isNaN(sinceMs)) {
+      console.error(`ERROR: invalid --since '${args.since}' (expected YYYY-MM-DD)`);
+      return 2;
+    }
+    if (sinceMs > dayStart) {
+      console.error('ERROR: --since must not be after the reviewed day');
+      return 2;
+    }
+  }
+
   try {
     const data = await fetchReportData(
       dbUrl,
@@ -537,7 +566,8 @@ export async function main(argv: string[]): Promise<number> {
       dayStart + 86400000,
       symbol,
       tradingMode,
-      markoutWindowMin * 60000
+      markoutWindowMin * 60000,
+      sinceMs
     );
     const report = buildReport({
       date,

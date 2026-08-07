@@ -404,6 +404,40 @@ describe('buildReport rejects invalid numeric rows (roborev round 5)', () => {
   });
 });
 
+describe('buildReport session staleness labeling (smoke finding)', () => {
+  const dayStart = Date.parse('2026-08-05T00:00:00Z');
+  const base = {
+    date: '2026-08-05',
+    orderTimestamps: [],
+    orderCountByStatus: [],
+    fillRows: [],
+    markoutWindowMin: 5,
+    maxDailyLoss: 50,
+    maxAdverseBps: 10,
+  };
+  test('running session with old last activity is stale', () => {
+    const r = buildReport({
+      ...base,
+      sessions: [{ sessionid: 'old-1', status: 'running', st: String(dayStart - 90 * 86400000), en: null, lu: String(dayStart - 80 * 86400000) }],
+    });
+    expect(r.sessions[0].stale).toBe(true);
+  });
+  test('running session with recent activity is not stale', () => {
+    const r = buildReport({
+      ...base,
+      sessions: [{ sessionid: 'live-1', status: 'running', st: String(dayStart - 86400000), en: null, lu: String(dayStart + 3600000) }],
+    });
+    expect(r.sessions[0].stale).toBe(false);
+  });
+  test('stopped session is never stale', () => {
+    const r = buildReport({
+      ...base,
+      sessions: [{ sessionid: 'done-1', status: 'stopped', st: String(dayStart - 86400000), en: String(dayStart + 1000), lu: String(dayStart - 80 * 86400000) }],
+    });
+    expect(r.sessions[0].stale).toBe(false);
+  });
+});
+
 describe('read-only guarantee (AC4)', () => {
   test('script source contains no write SQL', () => {
     const src = readFileSync(join(import.meta.dir, '..', 'scripts', 'daily-perf-review.ts'), 'utf8');

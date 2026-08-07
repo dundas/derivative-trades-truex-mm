@@ -77,6 +77,17 @@ Read-only guarantee: SELECT only, no writes (asserted by a test scanning the scr
   produced real findings and all were fixed; remaining merge gate is PR-level review
   per `.ai/code-reviewers.json`. Decision logged per Protocol 0e.1.
 
+## Smoke-Derived Product Fixes (2026-08-06, live prod run)
+
+- `--since YYYY-MM-DD`: FIFO/mark-out horizon lower bound. Needed because the analytics
+  store mixes account eras (March UAT fills in the same tables); operational use:
+  `--since 2026-06-26 --seed-btc 0.01812 --seed-price 65383` for the funded account.
+- Stale session labeling: `running` rows with no end signal and last activity before the
+  reviewed day render as `STALE` (unit-tested) instead of counting as live.
+- Default mark-out window 5m → **60m** (at ~40 fills/day the 5m window produced zero
+  pairs; 120m smoke produced 30 pairs @ 17.46bps adverse).
+- Default `--max-adverse-bps` 10 → **25** (~2× first measured value; recalibrate with data).
+
 ## SO-13 note
 
 Touches `scripts/` → docs-generator mandatory; docs PR opened before merge.
