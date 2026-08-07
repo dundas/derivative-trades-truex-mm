@@ -9,7 +9,8 @@ adverse-selection evidence, session continuity, and quoting gaps.
 ## Why it exists
 
 The 2026-08-06 equity reconciliation showed **-$298 realized trading loss**
-since funding versus only -$16 attributable to BTC price decline. The loss was
+(-$298.16 exact) since funding versus only -$16 attributable to BTC price
+decline. The loss was
 adverse selection: resting quotes were picked off on Coinbase lead-lag
 (~-$41/BTC wrong-way on ~$430k of round-trip volume). Before this script there
 was no daily measurement of that bleed.
