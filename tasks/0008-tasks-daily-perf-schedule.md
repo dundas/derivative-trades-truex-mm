@@ -50,6 +50,11 @@ Phase 2) has a continuous before/after baseline.
   tooling lives in the canonical repo, NOT in clean git worktrees); runtime check added.
 - **roborev round 2 Medium**: rendered plist exports TRUEX_PERF_CODE_ROOT/DATA_ROOT in
   EnvironmentVariables so non-default installs don't fall back to hardcoded paths.
+- **roborev round 3 High**: worktree bootstrap uses a dedicated branch
+  (`git worktree add -B ops/daily-perf-review`) — works whether or not `main` is
+  checked out elsewhere.
+- **roborev round 3 Medium**: DRY_RUN guard moved before `launchctl bootout` — dry runs
+  never mutate launchd state.
 
 ## SO-13 note
 

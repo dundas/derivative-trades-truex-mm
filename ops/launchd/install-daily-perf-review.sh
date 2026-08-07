@@ -29,10 +29,11 @@ echo "==> CODE_ROOT: $CODE_ROOT"
 
 # --- 1. Code root: clean worktree at main with deps + .env -------------------
 if [ ! -e "$CODE_ROOT/.git" ]; then
-  echo "==> Creating worktree at main: $CODE_ROOT"
+  echo "==> Creating worktree (branch ops/daily-perf-review) at origin/main: $CODE_ROOT"
   git -C "$DATA_ROOT" fetch origin
-  git -C "$DATA_ROOT" worktree add "$CODE_ROOT" main 2>/dev/null \
-    || git -C "$DATA_ROOT" worktree add -b main "$CODE_ROOT" origin/main
+  # -B owns a dedicated branch: works whether or not `main` is checked out
+  # elsewhere; the scheduled job later advances it with pull --ff-only.
+  git -C "$DATA_ROOT" worktree add -B ops/daily-perf-review "$CODE_ROOT" origin/main
 fi
 git -C "$CODE_ROOT" pull --ff-only origin main \
   || echo "WARN: CODE_ROOT not fast-forwardable to origin/main; using as-is"
@@ -58,12 +59,13 @@ sed -e "s|{{CODE_ROOT}}|$CODE_ROOT|g" -e "s|{{DATA_ROOT}}|$DATA_ROOT|g" \
   "$PLIST_SRC" > "$TMP_PLIST"
 plutil -lint "$TMP_PLIST"
 
-launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
 if [ "${DRY_RUN:-0}" = "1" ]; then
-  echo "==> DRY_RUN=1: rendered plist linted; skipping install/bootstrap"
-  cat "$TMP_PLIST" | head -12
+  echo "==> DRY_RUN=1: rendered plist linted; skipping bootout/install/bootstrap"
+  head -12 "$TMP_PLIST"
   exit 0
 fi
+
+launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
 cp "$TMP_PLIST" "$PLIST_DST"
 launchctl bootstrap "gui/$UID" "$PLIST_DST"
 launchctl print "gui/$UID/$LABEL" | head -4
