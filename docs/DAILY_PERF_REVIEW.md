@@ -83,4 +83,45 @@ bun scripts/daily-perf-review.ts \
 - `fills.liquidityind` is unpopulated, so maker/taker attribution is unavailable.
 - `balance_snapshots` is empty; the equity curve is reconstructed from fills,
   not balances.
-- Not yet scheduled — run manually or wire into heartbeat/cron as a follow-up.
+
+## Scheduling & alerting (task 0008, PR #56)
+
+The review runs automatically every day and alerts on bad outcomes:
+
+- **When**: daily at 19:15 local (CDT) = 00:15Z — right after the UTC day
+  closes. If the machine is asleep, launchd fires at next wake. Note: the
+  trigger is local wall-clock; under winter time (CST) the same 19:15 fires
+  at 01:15Z — the report still covers the full prior UTC day.
+- **Wrapper**: `scripts/daily-perf-review-job.sh` runs the review with the
+  operational scoping above, archives the full report to
+  `logs/daily-perf-review/<UTC-date>.txt`, and appends a summary section to
+  `memory/daily/<date>.md`.
+- **Alerts (ADMP → `decisive`)**: exit 1 (WARN verdict) sends the verdict +
+  key figures; exit ≥ 2 (job failure) sends the error tail. Alert-send
+  failure is logged and never masks the exit code. OK days are silent.
+- **Layout**: the job runs from a dedicated clean worktree of `main`
+  (CODE_ROOT, default `<repo>-ops`, branch `ops/daily-perf-review`) so it
+  never depends on the dirty daily worktree; reports/memory land in the
+  canonical repo (DATA_ROOT). `brain-msg` is resolved from DATA_ROOT because
+  `.claude/` tooling is untracked and absent from clean worktrees.
+
+### Install / operate
+
+```bash
+# One-shot idempotent install (worktree + .env + deps + log dir + LaunchAgent)
+bash ops/launchd/install-daily-perf-review.sh
+
+# Verify / force a run now
+launchctl kickstart -k gui/$UID/com.dundas.truex-daily-perf-review
+cat logs/daily-perf-review/launchd.out.log
+
+# Pre-merge / pre-install dry run (never touches launchd)
+DRY_RUN=1 bash ops/launchd/install-daily-perf-review.sh
+```
+
+Overrides: `TRUEX_PERF_CODE_ROOT`, `TRUEX_PERF_DATA_ROOT`, `BUN_BIN`
+(installer renders them into the plist; the wrapper consumes them).
+The installer refuses a non-fast-forwardable CODE_ROOT unless `ALLOW_STALE=1`
+— scheduled runs should never execute stale code.
+
+To disable: `launchctl bootout gui/$UID/com.dundas.truex-daily-perf-review`.
