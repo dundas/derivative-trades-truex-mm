@@ -1,5 +1,22 @@
 import { describe, it, expect, mock } from 'bun:test';
-import { resolveConfig, runKillSwitch, decideExit, renderText } from '../scripts/kill-switch.js';
+import { resolveConfig, runKillSwitch, decideExit, renderText, parseArgs } from '../scripts/kill-switch.js';
+
+// --- CLI argument safety (roborev round 3) ---
+
+describe('parseArgs (typo safety)', () => {
+  it('rejects unknown flags instead of silently ignoring them', () => {
+    expect(parseArgs(['--dry-rnu']).error).toContain('--dry-rnu');
+    expect(parseArgs(['--dryrun']).error).toContain('refusing to guess');
+    expect(parseArgs(['--prod', '--json', '--typo']).error).toContain('--typo');
+  });
+  it('rejects --prod --uat conflict', () => {
+    expect(parseArgs(['--prod', '--uat']).error).toContain('only one');
+  });
+  it('accepts known flags and defaults to UAT', () => {
+    expect(parseArgs([])).toMatchObject({ prod: false, uat: false, dryRun: false, json: false });
+    expect(parseArgs(['--dry-run', '--prod', '--json'])).toMatchObject({ dryRun: true, prod: true, json: true });
+  });
+});
 
 // --- AC1: fail-safe venue selection ---
 

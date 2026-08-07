@@ -153,21 +153,31 @@ export function renderText(result, config) {
 // CLI
 // ---------------------------------------------------------------------------
 
-function parseArgs(argv) {
+const KNOWN_FLAGS = ['--prod', '--uat', '--dry-run', '--json'];
+
+// Fail loud on unknown arguments: a typo'd --dry-run must NEVER silently
+// escalate into a live cancel-all.
+export function parseArgs(argv) {
   const args = { prod: false, uat: false, dryRun: false, json: false };
   for (const a of argv) {
+    if (!KNOWN_FLAGS.includes(a)) {
+      return { error: `unknown argument '${a}' — refusing to guess (known: ${KNOWN_FLAGS.join(', ')})` };
+    }
     if (a === '--prod') args.prod = true;
     else if (a === '--uat') args.uat = true;
     else if (a === '--dry-run') args.dryRun = true;
     else if (a === '--json') args.json = true;
+  }
+  if (args.prod && args.uat) {
+    return { error: 'pass only one of --prod / --uat' };
   }
   return args;
 }
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  if (args.prod && args.uat) {
-    console.error('ERROR: pass only one of --prod / --uat');
+  if (args.error) {
+    console.error(`ERROR: ${args.error}`);
     process.exit(2);
   }
   const mode = args.prod ? 'prod' : 'uat'; // default UAT: fail-safe
