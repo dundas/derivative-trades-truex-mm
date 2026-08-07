@@ -69,6 +69,11 @@ If reason=1, remove from local tracking. Otherwise restore to 'active'.
 - reconcileOrders skips 'pending' AND 'cancelling' status orders
 - Current production `minRepriceIntervalMs=1500` limits reprice churn; the engine default
   remains higher in older configs and UAT-style scripts.
+- Momentum reprice (task 0010): if the mid moves >= `momentumRepriceBps` (prod default 10,
+  env `MOMENTUM_REPRICE_BPS`, 0 disables) since the last dispatched reprice, the debounce
+  is bypassed and the engine reprices on the next price tick — defense against Coinbase
+  lead-lag pick-off. Reference (`lastRepricedMid`) re-baselines on every dispatched
+  reprice (ordinary and deferred); counter/log fire only after a successful dispatch.
 - 3+ consecutive rejects trigger 5s backoff (rejectBackoffUntil)
 - cancelToOrigMap tracks cancel clOrdID → original clOrdID for ack matching
 - 50 open order limit per client ID on UAT
@@ -117,7 +122,8 @@ Note: API has typo `exeuted_qty` (not `executed_qty`).
 ### Production (run-prod.js)
 levels=2, quoteAnchorMode=coinbase-mirror, coinbaseAnchorBufferTicks=1,
 baseSpreadBps=30 (fallback only), baseSizeBTC=0.01, maxPositionBTC=0.05,
-emergencyLimitBTC=0.06, minRepriceIntervalMs=1500, maxOrdersPerSecond=6,
+emergencyLimitBTC=0.06, minRepriceIntervalMs=1500, momentumRepriceBps=10 (env MOMENTUM_REPRICE_BPS),
+maxOrdersPerSecond=6,
 repriceThresholdTicks=1, tickSize=0.50, priceBandPct=2.5, heartbeatInterval=30s.
 reconcileIntervalMs=300000 (5min), balanceRefreshIntervalMs=60000 (1min).
 PYUSD/USD poll: 5000ms interval, 1000ms timeout, 15000ms stale threshold.
