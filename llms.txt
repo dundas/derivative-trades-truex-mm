@@ -37,7 +37,7 @@ to Kraken. DataPipelineManager: audit JSONL → Redis → PG.
 - `src/fix-protocol/fix-connection.js` — FIX 5.0 SP2 over FIXT.1.1
 - `scripts/run-prod.js` — Production config and startup
 - `scripts/analyze-shadow-takes.js` — Phase-1 shadow log analyzer and go/no-go summary
-- `scripts/kill-switch.js` — Emergency order cancellation via REST
+- `scripts/kill-switch.js` — Emergency cancel-all via REST with post-sweep verification. Fail-safe: bare invocation targets UAT, `--prod` needs an explicit flag; unknown flags exit 2 (typos never escalate to live cancels). `--dry-run` inspects without cancelling. Exit codes: 0 clean / 1 failures-or-residuals / 2 config / 3 unclear outcome (check venue).
 - `scripts/daily-perf-review.ts` — Read-only daily PnL/adverse-selection review (see `docs/DAILY_PERF_REVIEW.md`)
 - `scripts/daily-perf-review-job.sh` — Scheduled wrapper: archives report, appends daily log, ADMP-alerts on WARN/ERROR, chains the email digest
 - `scripts/daily-perf-email.ts` — Daily email digest: HTML report + 7-day trend published to Cloudflare Pages (truex-mm-reports.pages.dev), summary emailed via CircleInbox from truex-mm@derivative.email to DAILY_REPORT_EMAIL (flags: --date --to --send --skip-deploy --dry-run; archive persists in TRUEX_PERF_DATA_ROOT/logs/reports-site)

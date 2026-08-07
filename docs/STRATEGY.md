@@ -49,8 +49,8 @@ Guardrails (hard limits, alert on breach):
 - No over-commit: placements held while cancels in flight (task 0009)
 - Position limits + stop tools: `MOMENTUM_REPRICE_BPS=0` rollback, REST cancel-all
   (`scripts/rest-cancel-all.js`), graceful container stop (cancels first).
-  Gap: the `scripts/kill-switch.js` referenced by deploy tooling does not exist in the
-  repo yet — tracked under known gaps
+  `scripts/kill-switch.js` (task 0012) — cancel-all with verification, fail-safe
+  UAT default, dry-run, distinct exit codes
 
 ## 4. How we trace progress
 
