@@ -59,6 +59,13 @@ measurable via rejection logs after deploy.
   exchange-`available` cap (stale between 60s polls → under-quoting); reprice slowing
   (masks, doesn't fix).
 
+## Review Fixes
+
+- **roborev round 1 Medium**: queue-drain gate now DROPS gated placements instead of
+  re-queueing them — held quotes would be stale by the time the cancel clears;
+  `deferredRepriceNeeded` re-derives fresh quotes (same guarantee as the dispatch skip).
+  Drain tests updated to drop-semantics + fresh-rebuild-after-confirm.
+
 ## SO-13 note
 
 Touches `src/` only (not `scripts/`, `docs/`, content pipeline) → docs-generator not

@@ -1059,22 +1059,26 @@ export class QuoteEngine extends EventEmitter {
       this.lastActionReset = now;
     }
 
-    const held = [];
+    let droppedStalePlacements = 0;
     while (this.actionQueue.length > 0 && this.actionsThisSecond < this.config.maxOrdersPerSecond) {
       const action = this.actionQueue.shift();
-      // Same balance-safety gate as the dispatch loop: placements queued under
-      // rate limiting must not bypass the in-flight-cancel hold.
+      // Same balance-safety gate as the dispatch loop: gated placements are
+      // DROPPED, not held — they were built in an earlier cycle and would be
+      // stale by the time the cancel clears. deferredRepriceNeeded re-derives
+      // fresh quotes on the next cycle, same guarantee as the dispatch skip.
       if (this._shouldHoldPlacement(action)) {
         this.placementsDeferredForCancels++;
-        held.push(action);
+        droppedStalePlacements++;
         continue;
       }
       this._dispatchAction(action);
       this.actionsThisSecond++;
     }
-    if (held.length > 0) {
-      this.actionQueue.unshift(...held);
+    if (droppedStalePlacements > 0) {
       this.deferredRepriceNeeded = true;
+      this.logger.info(
+        `[QuoteEngine] Dropped ${droppedStalePlacements} stale queued placement(s) pending same-side cancel confirms (re-deriving next cycle)`
+      );
     }
 
     if (this.deferredRepriceNeeded && this.actionsThisSecond < this.config.maxOrdersPerSecond) {

@@ -148,35 +148,35 @@ describe('executeActions — placement gating', () => {
 // --- Queue drain gating (AC4) ---
 
 describe('drainQueue — placement gating', () => {
-  it('holds gated placements at the front; dispatches non-gated actions (AC4)', () => {
+  it('drops gated stale placements; dispatches non-gated actions (AC4)', () => {
     const { engine, fixConnection } = createEngine();
     seedCancellingOrder(engine, 'sell');
     engine.actionQueue.push({ type: 'place', quote: sellQuote() }, { type: 'place', quote: buyQuote() });
 
     engine.drainQueue();
 
-    // Buy dispatched; gated sell held back at the front of the queue
+    // Buy dispatched; gated sell dropped (stale — re-derived next cycle)
     expect(fixConnection.sendMessage).toHaveBeenCalledTimes(1);
-    expect(engine.actionQueue.length).toBe(1);
-    expect(engine.actionQueue[0].quote.side).toBe('sell');
+    expect(engine.actionQueue.length).toBe(0);
     expect(engine.placementsDeferredForCancels).toBe(1);
     expect(engine.deferredRepriceNeeded).toBe(true);
   });
 
-  it('releases held placements once the cancel is confirmed (order removed)', () => {
+  it('dropped placements come back fresh via deferred reprice after the cancel clears', () => {
     const { engine, fixConnection } = createEngine();
+    engine.lastMid = 100000;
     seedCancellingOrder(engine, 'sell');
     engine.actionQueue.push({ type: 'place', quote: sellQuote() });
 
     engine.drainQueue();
     expect(fixConnection.sendMessage).not.toHaveBeenCalled();
+    expect(engine.deferredRepriceNeeded).toBe(true);
 
-    // Cancel confirm arrives: engine removes the order from activeOrders
+    // Cancel confirm arrives (order removed) → deferred reprice rebuilds fresh
     engine.activeOrders.delete('orig-1');
-    engine.drainQueue();
-
-    expect(fixConnection.sendMessage).toHaveBeenCalledTimes(1);
-    expect(engine.actionQueue.length).toBe(0);
+    const ran = engine._runDeferredReprice();
+    expect(ran).toBe(true);
+    expect(fixConnection.sendMessage).toHaveBeenCalled();
   });
 });
 
