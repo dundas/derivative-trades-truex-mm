@@ -74,7 +74,7 @@ isn't working → escalate to the next phase lever.
 |---|---|---|---|
 | 0 — Measure | Daily review + scheduling + email/pages | ✅ Done (tasks 0007-0008) | Reports arriving daily |
 | 1a — Hygiene | Balance-aware sizing (no over-commit) | ✅ Deployed 2026-08-07 (task 0009) | Rejections → 0 ✓ |
-| 1b — Defense | Momentum reprice: bypass 1.5s debounce on ≥10bps moves | ✅ Deployed 2026-08-08 (task 0010) | 3-day adverse avg < 10bps without fill collapse |
+| 1b — Defense | Momentum reprice: bypass 1.5s debounce on ≥10bps moves | ✅ Deployed 2026-08-07 (task 0010) | 3-day adverse avg < 10bps without fill collapse |
 | 2 — Defense+ | **Vol-adaptive spread floor**: widen when vol spikes beyond what momentum can outrun | ⏳ Next, gated on Phase 1b data | 3-day wrong-way ≤ $50/BTC |
 | 3 — Offense | Taker side (cross-venue opportunistic takes) | 🔒 Blocked on shadow evidence | Task 0006 analyzer: GO criteria in its spec |
 | 4 — Scale | Size/levels up, second symbol | 🔒 Gated on sustained profitability | ≥ 2 weeks net-positive realized |

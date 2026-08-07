@@ -1,6 +1,6 @@
 # Task 0010 — Momentum Reprice (Coinbase lead-lag defense, v1)
 
-**Status**: done — merged (PR #59), **deployed to prod 2026-08-08** (first-day adverse 4.4bps)
+**Status**: done — merged (PR #59), **deployed to prod 2026-08-07** (first-day adverse 4.4bps)
 **Branch**: feat/momentum-reprice
 **Date**: 2026-08-07
 **Context**: Baseline established 2026-08-03→06 (pre-change): round-trip adverse
