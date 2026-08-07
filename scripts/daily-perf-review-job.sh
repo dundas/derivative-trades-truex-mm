@@ -88,17 +88,15 @@ elif [ "$RC" -ge 2 ]; then
 fi
 
 # --- Email digest (task 0011) ---------------------------------------------
-# Summary + reviewable page link. Skips silently when DAILY_REPORT_EMAIL is
-# unset. Failure does not change the job exit code (the review outcome
-# dominates) — it is logged instead.
+# Summary + reviewable page link. Recipient comes from --to or
+# DAILY_REPORT_EMAIL — resolved INSIDE the Bun process (which auto-loads
+# CODE_ROOT/.env), so the shell must not gate on the variable here. The
+# script skips silently (exit 0) when no recipient is configured. Failure
+# does not change the job exit code (the review outcome dominates).
 if [ "$RC" -le 1 ]; then
-  if [ -n "${DAILY_REPORT_EMAIL:-}" ]; then
-    "$BUN" scripts/daily-perf-email.ts --date "$DATE_UTC" --send \
-      >> "$LOG_DIR/email.log" 2>&1 \
-      || echo "WARN: email digest failed (see $LOG_DIR/email.log)"
-  else
-    echo "INFO: DAILY_REPORT_EMAIL not set — email digest skipped"
-  fi
+  "$BUN" scripts/daily-perf-email.ts --date "$DATE_UTC" --send \
+    >> "$LOG_DIR/email.log" 2>&1 \
+    || echo "WARN: email digest failed (see $LOG_DIR/email.log)"
 fi
 
 exit "$RC"
