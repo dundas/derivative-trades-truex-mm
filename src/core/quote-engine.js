@@ -54,6 +54,12 @@ export class QuoteEngine extends EventEmitter {
       maxOrdersPerSecond: options.maxOrdersPerSecond || 8,
       dupGuardMs: options.dupGuardMs || 500,
       minRepriceIntervalMs: options.minRepriceIntervalMs || 0, // Min ms between reprices (0 = no debounce)
+      // Momentum reprice (task 0010): bypass the minRepriceInterval debounce when
+      // the mid has moved >= this many bps since the last dispatched reprice.
+      // 0 disables. Withdrawal itself reuses reconcile + passive-safe machinery.
+      // Deliberately fail-closed: default 0 (off) at the engine/orchestrator level;
+      // only run-prod.js enables it (MOMENTUM_REPRICE_BPS, default 10).
+      momentumRepriceBps: options.momentumRepriceBps ?? 0,
       sizeDecimalPlaces: options.sizeDecimalPlaces || 8, // Decimal places for quantity rounding
       tickSize: options.tickSize || 0.50,
       minNotional: options.minNotional || 1.0,
@@ -130,6 +136,10 @@ export class QuoteEngine extends EventEmitter {
     this.lastMarketableAloSkip = null;
     // Balance-safety gate: pure placements skipped while same-side cancels in flight
     this.placementsDeferredForCancels = 0;
+    // Momentum reprice (task 0010): mid at the last dispatched reprice — reference
+    // for the debounce-bypass trigger; count of momentum-triggered bypasses.
+    this.lastRepricedMid = 0;
+    this.momentumReprices = 0;
     // True while a gated placement awaits its cancel confirm. Completion
     // retries go through _runDeferredReprice, where the flag exempts that one
     // path from the minRepriceInterval debounce; the ordinary onPriceUpdate
@@ -252,6 +262,8 @@ export class QuoteEngine extends EventEmitter {
     this.lastAnchorBook = this._extractAnchorBook(aggregatedPrice);
 
     const now = Date.now();
+    let momentumBypass = false;
+    let momentumMoveBps = 0;
 
     // Rejection backoff: pause quoting after consecutive rejects
     if (this.rejectBackoffUntil > now) {
@@ -260,7 +272,28 @@ export class QuoteEngine extends EventEmitter {
     if (this.config.minRepriceIntervalMs > 0 &&
         this.lastRepriceAt &&
         (now - this.lastRepriceAt) < this.config.minRepriceIntervalMs) {
-      return;
+      // Inside the debounce window. Momentum bypass: if the mid has moved
+      // >= momentumRepriceBps since the last dispatched reprice, stale quotes
+      // are exposed to lead-lag pick-off — reprice now instead of waiting out
+      // the interval. Each dispatched reprice re-baselines lastRepricedMid, so
+      // this fires per N bps of movement, not per tick.
+      // heldPlacementsPending deliberately does NOT bypass here: completion
+      // retries flow through drainQueue → _runDeferredReprice (which carries
+      // the hold exemption). A global bypass would churn unrelated
+      // cancels/replaces on every tick during the hold window.
+      const moveBps = this.lastRepricedMid > 0
+        ? Math.abs(mid - this.lastRepricedMid) / this.lastRepricedMid * 1e4
+        : 0;
+      momentumBypass = this.config.momentumRepriceBps > 0 &&
+        this.lastRepricedMid > 0 &&
+        moveBps >= this.config.momentumRepriceBps;
+      if (!momentumBypass) {
+        return;
+      }
+      // Count/log only after a successful dispatch (below): a bypassed cycle
+      // that dispatches nothing must not inflate the counter or re-log on
+      // every tick while the reference stays unchanged.
+      momentumMoveBps = moveBps;
     }
 
     // Get inventory skew
@@ -296,6 +329,13 @@ export class QuoteEngine extends EventEmitter {
     // heldPlacementsPending check.
     if (dispatched) {
       this.lastRepriceAt = Date.now();
+      this.lastRepricedMid = mid;
+      if (momentumBypass) {
+        this.momentumReprices++;
+        this.logger.info(
+          `[QuoteEngine] Momentum reprice: move ${momentumMoveBps.toFixed(1)}bps >= ${this.config.momentumRepriceBps}bps since last reprice (lifetime=${this.momentumReprices})`
+        );
+      }
     }
     this.emit('quote-update', {
       bidLevels: desired.filter(q => q.side === 'buy').length,
@@ -1817,8 +1857,15 @@ export class QuoteEngine extends EventEmitter {
     if (actions.toPlace.length || actions.toCancel.length || actions.toReplace.length) {
       this.deferredRepriceNeeded = false;
       const dispatched = this.executeActions(actions);
-      if (dispatched && !this.heldPlacementsPending) {
+      if (dispatched) {
+        // Stamp on ANY dispatched cycle (matches onPriceUpdate semantics):
+        // - lastRepricedMid must track every dispatched reprice, else the
+        //   momentum trigger retriggers too early during hold windows.
+        // - lastRepriceAt debounces ordinary ticks after real work went out;
+        //   completion retries are exempt via heldPlacementsPending in the
+        //   staleness check above, so gating the stamp is unnecessary.
         this.lastRepriceAt = Date.now();
+        this.lastRepricedMid = this.lastMid;
       }
       return !this.deferredRepriceNeeded;
     }
