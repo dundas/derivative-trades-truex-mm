@@ -90,6 +90,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       sizeDecimalPlaces: options.sizeDecimalPlaces || 8,
       maxOrdersPerSecond: options.maxOrdersPerSecond || 8,
       minRepriceIntervalMs: options.minRepriceIntervalMs || 0,
+      momentumRepriceBps: options.momentumRepriceBps ?? 0,
       tickSize: options.tickSize || 0.50,
       minNotional: options.minNotional || 1.0,
       priceBandPct: options.priceBandPct || 2.5,

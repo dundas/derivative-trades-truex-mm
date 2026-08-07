@@ -130,6 +130,7 @@ const config = {
   // At 6 msg/s that's ~1.3s — within the 1.5s min reprice interval and under TrueX's ~10 msg/s.
   maxOrdersPerSecond: 6,
   minRepriceIntervalMs: 1500,  // 1.5s minimum between reprices (was 5s)
+  momentumRepriceBps: parseNumber('MOMENTUM_REPRICE_BPS', 10),  // task 0010: bypass debounce on moves >= N bps (0 disables)
   tickSize: 0.50,              // TrueX minimum increment
   minNotional: 1.0,            // TrueX minimum
   priceBandPct: 2.5,           // TrueX ±2.5% band
@@ -453,6 +454,7 @@ async function main() {
     sizeDecimalPlaces: config.sizeDecimalPlaces,
     maxOrdersPerSecond: config.maxOrdersPerSecond,
     minRepriceIntervalMs: config.minRepriceIntervalMs,
+    momentumRepriceBps: config.momentumRepriceBps,
     tickSize: config.tickSize,
     minNotional: config.minNotional,
     priceBandPct: config.priceBandPct,
