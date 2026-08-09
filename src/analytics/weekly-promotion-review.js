@@ -4,7 +4,8 @@ export function buildWeeklyPromotionReview({ dailyReports = [], shadowReport = n
   const dates = dailyReports.map(report => report.date).filter(date => typeof date === 'string' && date.length > 0);
   const distinctDays = new Set(dates).size;
   if (distinctDays < requiredDays) blockers.push(`insufficient-distinct-daily-reports:${distinctDays}/${requiredDays}`);
-  if (dailyReports.some(report => report.verdict !== 'OK')) blockers.push('daily-review-missing-warn-or-error');
+  const verdictOf = report => typeof report.verdict === 'string' ? report.verdict : report.verdict?.status;
+  if (dailyReports.some(report => verdictOf(report) !== 'OK')) blockers.push('daily-review-missing-warn-or-error');
   if (!shadowReport) blockers.push('missing-shadow-promotion-report');
   if (shadowReport?.recommendation !== 'PROMOTE_CANDIDATE_FOR_HUMAN_APPROVAL') blockers.push('shadow-report-not-eligible');
   const selectedCandidateId = shadowReport?.selectedCandidateId || null;
