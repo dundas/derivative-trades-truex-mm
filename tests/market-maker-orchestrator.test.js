@@ -230,6 +230,17 @@ describe('MarketMakerOrchestrator', () => {
       expect(orchestrator.sessionId).toMatch(/^mm-\d+$/);
     });
 
+    test('forwards targetInventoryBTC into InventoryManager and exposes it in runtime status', () => {
+      const targetInventoryBTC = 0.4;
+      const { orchestrator } = createOrchestrator({ inventoryManager: undefined, targetInventoryBTC });
+
+      expect(orchestrator.inventoryManager.targetInventoryBTC).toBe(targetInventoryBTC);
+      const inventory = orchestrator.getStatus().inventory;
+      expect(inventory.targetInventoryBTC).toBe(targetInventoryBTC);
+      expect(inventory.inventoryDeviationBTC).toBe(-targetInventoryBTC);
+      expect(inventory.inventoryDeviationSide).toBe('below-target');
+    });
+
     test('uses console as default logger', () => {
       const fix = createMockFIXConnection();
       const inv = createMockInventoryManager();

@@ -1,7 +1,7 @@
 import { EventEmitter } from 'events';
 
 /**
- * InventoryManager - Tracks position, computes quote skew, enforces limits.
+ * InventoryManager - Tracks position, computes target-relative quote skew, enforces limits.
  *
  * Events emitted:
  *   'fill'           - { side, quantity, price, venue, execID, netPosition, avgEntryPrice }
@@ -15,6 +15,12 @@ export class InventoryManager extends EventEmitter {
 
     // Configuration
     this.maxPositionBTC = options.maxPositionBTC || 1.0;
+    // The target is an operating allocation, not a position limit.  It defaults
+    // to zero to preserve the historical neutral target when it is not supplied.
+    // Limits and balance caps deliberately remain based on netPosition.
+    this.targetInventoryBTC = Number.isFinite(options.targetInventoryBTC)
+      ? options.targetInventoryBTC
+      : 0;
     this.hedgeThresholdBTC = options.hedgeThresholdBTC || 0.5;
     this.maxSkewTicks = options.maxSkewTicks || 5;
     this.skewExponent = options.skewExponent || 2;
@@ -157,32 +163,42 @@ export class InventoryManager extends EventEmitter {
   }
 
   /**
-   * Compute bid/ask skew in ticks based on current position vs limit.
+   * Return the inventory deviation from the configured operating target.
+   * A positive value means the maker holds more BTC than its target.
+   */
+  getInventoryDeviationBTC() {
+    return this.netPosition - this.targetInventoryBTC;
+  }
+
+  /**
+   * Compute bid/ask skew in ticks based on inventory deviation from target.
    *
-   * When long: widen asks (positive skew), tighten bids (negative skew)
-   * When short: widen bids (positive skew), tighten asks (negative skew)
+   * Above target: widen bids (positive skew), tighten asks (negative skew) to
+   * reduce BTC inventory. Below target, do the inverse to rebuild inventory.
    *
    * Skew values are in ticks. Positive = widen (less aggressive), negative = tighten (more aggressive).
+   * Position limits and balance caps are intentionally independent from this policy target.
    */
   getSkew() {
     if (this.maxPositionBTC === 0) {
       return { bidSkewTicks: 0, askSkewTicks: 0 };
     }
 
-    const utilizationPct = this._getUtilizationPct();
+    const utilizationPct = this._getDeviationUtilizationPct();
     const rawSkew = Math.pow(utilizationPct, this.skewExponent) * this.maxSkewTicks;
+    const deviationBTC = this.getInventoryDeviationBTC();
 
     let bidSkewTicks = 0;
     let askSkewTicks = 0;
 
-    if (this.netPosition > 0) {
-      // Long: widen asks to encourage sells, tighten bids
-      askSkewTicks = rawSkew;
-      bidSkewTicks = -rawSkew;
-    } else if (this.netPosition < 0) {
-      // Short: widen bids to encourage buys, tighten asks
+    if (deviationBTC > 0) {
+      // Above target: discourage buys and encourage sells.
       bidSkewTicks = rawSkew;
       askSkewTicks = -rawSkew;
+    } else if (deviationBTC < 0) {
+      // Below target: encourage buys and discourage sells.
+      bidSkewTicks = -rawSkew;
+      askSkewTicks = rawSkew;
     }
 
     return { bidSkewTicks, askSkewTicks };
@@ -213,7 +229,8 @@ export class InventoryManager extends EventEmitter {
       `[InventoryManager] Balances initialized: ` +
       `base=${this.baseBalance.available} avail / ${this.baseBalance.total} total, ` +
       `quote=${this.quoteBalance.available} avail / ${this.quoteBalance.total} total, ` +
-      `netPosition=${this.netPosition}`
+      `netPosition=${this.netPosition}, targetInventoryBTC=${this.targetInventoryBTC.toFixed(8)}, ` +
+      `initialDeviationBTC=${this.getInventoryDeviationBTC().toFixed(8)}`
     );
   }
 
@@ -323,10 +340,14 @@ export class InventoryManager extends EventEmitter {
   getPositionSummary() {
     const absPosition = Math.abs(this.netPosition);
     const utilizationPct = this._getUtilizationPct();
+    const inventoryDeviationBTC = this.getInventoryDeviationBTC();
     const skew = this.getSkew();
 
     return {
       netPosition: this.netPosition,
+      targetInventoryBTC: this.targetInventoryBTC,
+      inventoryDeviationBTC,
+      inventoryDeviationSide: inventoryDeviationBTC > 0 ? 'above-target' : inventoryDeviationBTC < 0 ? 'below-target' : 'at-target',
       avgEntryPrice: this.avgEntryPrice,
       totalBought: this.totalBought,
       totalSold: this.totalSold,
@@ -367,6 +388,15 @@ export class InventoryManager extends EventEmitter {
   _getUtilizationPct() {
     if (this.maxPositionBTC === 0) return 0;
     return Math.abs(this.netPosition) / this.maxPositionBTC;
+  }
+
+  _getDeviationUtilizationPct() {
+    if (this.maxPositionBTC === 0) return 0;
+    // The operating target can be non-zero, so its distance from the absolute
+    // position limit is not necessarily maxPositionBTC. Cap utilization here
+    // rather than letting a target-relative deviation grow quote skew beyond
+    // the configured maxSkewTicks safety bound.
+    return Math.min(1, Math.abs(this.getInventoryDeviationBTC()) / this.maxPositionBTC);
   }
 
   /**

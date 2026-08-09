@@ -25,6 +25,7 @@
  *   TRUEX_SENDER_COMP_ID   - SenderCompID (default: DAVID1)
  *   DATABASE_URL            - PostgreSQL (optional)
  *   REDIS_URL               - Redis (optional)
+ *   TARGET_INVENTORY_BTC     - Desired BTC allocation used for inventory skew (default: 0)
  *
  * Usage:
  *   bun scripts/run-prod.js
@@ -137,6 +138,9 @@ const config = {
 
   // Inventory Manager — tight for ~0.044 BTC capital
   maxPositionBTC: 0.05,        // Slightly above starting balance
+  // This is an operating target, not a limit. Leave unset to retain a zero-BTC target.
+  // Do not change the deployed value without shadow evidence and explicit approval.
+  targetInventoryBTC: parseNumber('TARGET_INVENTORY_BTC', 0),
   hedgeThresholdBTC: 0.03,     // Hedge signal at 0.03
   maxSkewTicks: 3,
   skewExponent: 1.5,
@@ -292,6 +296,7 @@ async function main() {
   logger.info(`Base size:     ${config.baseSizeBTC} BTC`);
   logger.info(`Base spread:   ${config.baseSpreadBps} bps`);
   logger.info(`Max position:  ${config.maxPositionBTC} BTC`);
+  logger.info(`Target inventory: ${config.targetInventoryBTC} BTC`);
   logger.info(`Emergency:     ${config.emergencyLimitBTC} BTC`);
   logger.info(`Redis:         ${config.redisUrl ? 'configured' : 'none'}`);
   logger.info(`PostgreSQL:    ${config.pgUrl ? 'configured' : 'none'}`);
@@ -464,6 +469,7 @@ async function main() {
 
     // Inventory manager
     maxPositionBTC: config.maxPositionBTC,
+    targetInventoryBTC: config.targetInventoryBTC,
     hedgeThresholdBTC: config.hedgeThresholdBTC,
     maxSkewTicks: config.maxSkewTicks,
     skewExponent: config.skewExponent,

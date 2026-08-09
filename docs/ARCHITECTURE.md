@@ -193,7 +193,7 @@ Computes bid/ask ladder quotes with inventory skew, manages order lifecycle thro
 - N levels per side (configurable, default 5 for UAT, 2 for prod — per TrueX exchange request)
 - Half-spread from mid: `(baseSpreadBps / 10000) * mid / 2`
 - Level offset: either tick-based (`level * levelSpacingTicks * tickSize`) or randomized bps ladder
-- Inventory skew applied from InventoryManager: widens the accumulating side, tightens the reducing side
+- Inventory skew applied from InventoryManager: widens the side that would move inventory farther from its configured target and tightens the reducing side
 - Balance-aware size capping: each level's size is capped to remaining available balance minus already-committed amounts from prior levels
 - Prices snapped to tick grid (`Math.round(price / tickSize) * tickSize`)
 - Price band filter: reject quotes outside +/- `priceBandPct` from mid
@@ -256,10 +256,11 @@ Tracks net position, computes quote skew, enforces position limits, and manages 
 - Negative balance clamped to 0 with warning (corrected on next refresh)
 
 **Skew computation:**
-- `utilizationPct = |netPosition| / maxPositionBTC`
-- `rawSkew = utilizationPct^skewExponent * maxSkewTicks`
-- Long: widen asks (positive skew), tighten bids (negative skew)
-- Short: widen bids (positive skew), tighten asks (negative skew)
+- `targetInventoryBTC` is the BTC operating allocation, not a position limit. It defaults to `0`, preserving the historical neutral target when omitted.
+- `inventoryDeviationBTC = netPosition - targetInventoryBTC`. Positive deviation (above target) widens bids and tightens asks, encouraging inventory reduction. Negative deviation (below target) tightens bids and widens asks, encouraging inventory rebuilding.
+- `deviationUtilizationPct = min(1, |inventoryDeviationBTC| / maxPositionBTC)` and `rawSkew = deviationUtilizationPct^skewExponent * maxSkewTicks`. The clamp makes `maxSkewTicks` a true cap even when a nonzero target makes deviation exceed the absolute position band.
+- Absolute position limits, emergency checks, hedge thresholds, and balance caps remain based on `netPosition`; changing the target does not change those guards.
+- Startup balance initialization logs the configured target and initial deviation. Runtime status exposes `targetInventoryBTC`, `inventoryDeviationBTC`, and whether position is above, below, or at target. Persistent quote lifecycle telemetry is deferred to Task 2.
 
 **Events emitted:** `fill`, `limit-warning` (at 80% utilization), `emergency` (at emergencyLimitBTC), `hedge-signal`
 

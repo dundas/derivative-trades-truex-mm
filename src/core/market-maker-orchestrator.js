@@ -55,6 +55,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
 
     this.inventoryManager = options.inventoryManager || new InventoryManager({
       maxPositionBTC: options.maxPositionBTC || 5.0,
+      targetInventoryBTC: options.targetInventoryBTC,
       hedgeThresholdBTC: options.hedgeThresholdBTC || 2.0,
       maxSkewTicks: options.maxSkewTicks || 3,
       skewExponent: options.skewExponent || 1.5,

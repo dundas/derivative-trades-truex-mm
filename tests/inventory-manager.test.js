@@ -111,38 +111,38 @@ describe('InventoryManager', () => {
       expect(skew.askSkewTicks).toBe(0);
     });
 
-    it('should compute correct skew at 50% utilization (long)', () => {
+    it('should compute correct target-relative skew when above the zero target', () => {
       im.onFill({ side: 'buy', quantity: 0.5, price: 100000, venue: 'truex', execID: 'E1' });
       const skew = im.getSkew();
       // utilization = 0.5, rawSkew = (0.5)^2 * 5 = 1.25
-      // long: ask positive, bid negative
-      expect(skew.askSkewTicks).toBeCloseTo(1.25, 10);
-      expect(skew.bidSkewTicks).toBeCloseTo(-1.25, 10);
+      // above target: bid widens and ask tightens to reduce inventory
+      expect(skew.bidSkewTicks).toBeCloseTo(1.25, 10);
+      expect(skew.askSkewTicks).toBeCloseTo(-1.25, 10);
     });
 
-    it('should compute correct skew at 50% utilization (short)', () => {
+    it('should compute correct target-relative skew when below the zero target', () => {
       im.onFill({ side: 'sell', quantity: 0.5, price: 100000, venue: 'truex', execID: 'E1' });
       const skew = im.getSkew();
       // utilization = 0.5, rawSkew = (0.5)^2 * 5 = 1.25
-      // short: bid positive, ask negative
-      expect(skew.bidSkewTicks).toBeCloseTo(1.25, 10);
-      expect(skew.askSkewTicks).toBeCloseTo(-1.25, 10);
+      // below target: bid tightens and ask widens to rebuild inventory
+      expect(skew.bidSkewTicks).toBeCloseTo(-1.25, 10);
+      expect(skew.askSkewTicks).toBeCloseTo(1.25, 10);
     });
 
     it('should compute maxSkewTicks at 100% utilization', () => {
       im.onFill({ side: 'buy', quantity: 1.0, price: 100000, venue: 'truex', execID: 'E1' });
       const skew = im.getSkew();
       // utilization = 1.0, rawSkew = (1.0)^2 * 5 = 5
-      expect(skew.askSkewTicks).toBeCloseTo(5, 10);
-      expect(skew.bidSkewTicks).toBeCloseTo(-5, 10);
+      expect(skew.bidSkewTicks).toBeCloseTo(5, 10);
+      expect(skew.askSkewTicks).toBeCloseTo(-5, 10);
     });
 
     it('should scale quadratically with skewExponent=2', () => {
       // At 25% utilization: rawSkew = (0.25)^2 * 5 = 0.3125
       im.onFill({ side: 'buy', quantity: 0.25, price: 100000, venue: 'truex', execID: 'E1' });
       const skew = im.getSkew();
-      expect(skew.askSkewTicks).toBeCloseTo(0.3125, 10);
-      expect(skew.bidSkewTicks).toBeCloseTo(-0.3125, 10);
+      expect(skew.bidSkewTicks).toBeCloseTo(0.3125, 10);
+      expect(skew.askSkewTicks).toBeCloseTo(-0.3125, 10);
     });
 
     it('should respect custom skewExponent', () => {
@@ -155,7 +155,61 @@ describe('InventoryManager', () => {
       im3.onFill({ side: 'buy', quantity: 0.5, price: 100000, venue: 'truex', execID: 'E1' });
       const skew = im3.getSkew();
       // rawSkew = (0.5)^3 * 10 = 1.25
-      expect(skew.askSkewTicks).toBeCloseTo(1.25, 10);
+      expect(skew.bidSkewTicks).toBeCloseTo(1.25, 10);
+    });
+
+    it('returns zero skew at an explicit non-zero inventory target', () => {
+      const target = new InventoryManager({
+        maxPositionBTC: 1.0,
+        maxSkewTicks: 5,
+        skewExponent: 2,
+        targetInventoryBTC: 0.4,
+        logger,
+      });
+      target.onFill({ side: 'buy', quantity: 0.4, price: 100000, venue: 'truex', execID: 'E1' });
+
+      expect(target.getInventoryDeviationBTC()).toBeCloseTo(0, 10);
+      expect(target.getSkew()).toEqual({ bidSkewTicks: 0, askSkewTicks: 0 });
+    });
+
+    it('changes skew direction as fills cross a non-zero target', () => {
+      const target = new InventoryManager({
+        maxPositionBTC: 1.0,
+        maxSkewTicks: 5,
+        skewExponent: 1,
+        targetInventoryBTC: 0.4,
+        logger,
+      });
+
+      target.onFill({ side: 'buy', quantity: 0.2, price: 100000, venue: 'truex', execID: 'E1' });
+      expect(target.getSkew().bidSkewTicks).toBeCloseTo(-1, 10);
+      expect(target.getSkew().askSkewTicks).toBeCloseTo(1, 10);
+
+      target.onFill({ side: 'buy', quantity: 0.2, price: 100000, venue: 'truex', execID: 'E2' });
+      expect(target.getSkew()).toEqual({ bidSkewTicks: 0, askSkewTicks: 0 });
+
+      target.onFill({ side: 'buy', quantity: 0.2, price: 100000, venue: 'truex', execID: 'E3' });
+      expect(target.getSkew().bidSkewTicks).toBeCloseTo(1, 10);
+      expect(target.getSkew().askSkewTicks).toBeCloseTo(-1, 10);
+    });
+
+    it('caps skew at maxSkewTicks for a non-zero target when deviation exceeds the position band', () => {
+      const target = new InventoryManager({
+        maxPositionBTC: 1.0,
+        maxSkewTicks: 5,
+        skewExponent: 2,
+        targetInventoryBTC: 0.8,
+        logger,
+      });
+
+      // netPosition=0 is 0.8 BTC below target; after the fill it is 1.2 BTC
+      // above target. Both deviations must respect the same configured cap.
+      expect(target.getSkew().bidSkewTicks).toBeCloseTo(-3.2, 10);
+      expect(target.getSkew().askSkewTicks).toBeCloseTo(3.2, 10);
+      target.onFill({ side: 'buy', quantity: 2, price: 100000, venue: 'truex', execID: 'E1' });
+      expect(target.getInventoryDeviationBTC()).toBeCloseTo(1.2, 10);
+      expect(target.getSkew().bidSkewTicks).toBeCloseTo(5, 10);
+      expect(target.getSkew().askSkewTicks).toBeCloseTo(-5, 10);
     });
   });
 
@@ -194,6 +248,19 @@ describe('InventoryManager', () => {
     it('should block buy when exactly at limit', () => {
       im.onFill({ side: 'buy', quantity: 1.0, price: 100000, venue: 'truex', execID: 'E1' });
       expect(im.canQuote('buy')).toBe(false);
+    });
+
+    it('keeps absolute position limits independent of the inventory target', () => {
+      const target = new InventoryManager({
+        maxPositionBTC: 0.5,
+        targetInventoryBTC: 0.4,
+        logger,
+      });
+      target.onFill({ side: 'buy', quantity: 0.5, price: 100000, venue: 'truex', execID: 'E1' });
+
+      expect(target.getInventoryDeviationBTC()).toBeCloseTo(0.1, 10);
+      expect(target.canQuote('buy')).toBe(false);
+      expect(target.canQuote('sell')).toBe(true);
     });
   });
 
@@ -334,8 +401,18 @@ describe('InventoryManager', () => {
     it('should include skew in summary', () => {
       im.onFill({ side: 'buy', quantity: 0.5, price: 100000, venue: 'truex', execID: 'E1' });
       const summary = im.getPositionSummary();
-      expect(summary.bidSkewTicks).toBeCloseTo(-1.25, 10);
-      expect(summary.askSkewTicks).toBeCloseTo(1.25, 10);
+      expect(summary.bidSkewTicks).toBeCloseTo(1.25, 10);
+      expect(summary.askSkewTicks).toBeCloseTo(-1.25, 10);
+    });
+
+    it('surfaces configured target and deviation in the position summary', () => {
+      const target = new InventoryManager({ maxPositionBTC: 1, targetInventoryBTC: 0.4, logger });
+      target.onFill({ side: 'buy', quantity: 0.6, price: 100000, venue: 'truex', execID: 'E1' });
+
+      const summary = target.getPositionSummary();
+      expect(summary.targetInventoryBTC).toBe(0.4);
+      expect(summary.inventoryDeviationBTC).toBeCloseTo(0.2, 10);
+      expect(summary.inventoryDeviationSide).toBe('above-target');
     });
   });
 
@@ -430,10 +507,10 @@ describe('InventoryManager', () => {
       im.onFill({ side: 'sell', quantity: 1.0, price: 100200, venue: 'truex', execID: 'E2' });
       expect(im.netPosition).toBeCloseTo(-0.5, 10);
 
-      // Should now reflect short side for skew
+      // Below the zero target, asks widen and bids tighten to rebuild inventory.
       const skew = im.getSkew();
-      expect(skew.bidSkewTicks).toBeGreaterThan(0);
-      expect(skew.askSkewTicks).toBeLessThan(0);
+      expect(skew.bidSkewTicks).toBeLessThan(0);
+      expect(skew.askSkewTicks).toBeGreaterThan(0);
     });
 
     it('should emit limit-warning for short side at 80%', () => {
@@ -466,6 +543,17 @@ describe('InventoryManager', () => {
       expect(im.netPosition).toBe(0.044);
       expect(im.baseBalance.available).toBe(0.044);
       expect(im.quoteBalance.available).toBe(0);
+    });
+
+    it('logs the configured target and initial deviation when balances initialize', () => {
+      const target = new InventoryManager({ maxPositionBTC: 1, targetInventoryBTC: 0.04, logger });
+      target.initializeFromBalances({
+        baseBalance: { available: 0.044, held: 0, total: 0.044 },
+        quoteBalance: { available: 0, held: 0, total: 0 },
+      });
+
+      expect(logger.info).toHaveBeenCalledWith(expect.stringContaining('targetInventoryBTC=0.04000000'));
+      expect(logger.info).toHaveBeenCalledWith(expect.stringContaining('initialDeviationBTC=0.00400000'));
     });
 
     it('should block bids when no quote balance (PYUSD)', () => {
