@@ -45,4 +45,13 @@ describe('QuoteLifecycleTelemetry', () => {
     expect(first.eventId).not.toBe(second.eventId);
     expect(writer.recordQuoteLifecycleEvent).toHaveBeenCalledTimes(2);
   });
+
+  test('bounds in-process duplicate tracking for long-running sessions', async () => {
+    const telemetry = new QuoteLifecycleTelemetry({ now: () => 5000, maxDedupeEventIds: 2 });
+    await telemetry.record({ eventType: 'create', quoteId: 'Q-5', eventId: 'event-1' });
+    await telemetry.record({ eventType: 'create', quoteId: 'Q-6', eventId: 'event-2' });
+    await telemetry.record({ eventType: 'create', quoteId: 'Q-7', eventId: 'event-3' });
+    expect(telemetry.recordedEventIds.size).toBe(2);
+    expect(telemetry.recordedEventIds.has('event-1')).toBe(false);
+  });
 });

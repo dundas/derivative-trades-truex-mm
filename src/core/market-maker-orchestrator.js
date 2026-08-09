@@ -864,12 +864,11 @@ export class MarketMakerOrchestrator extends EventEmitter {
       sessionId: this.sessionId,
       symbol: this.symbol,
       targetInventoryBTC: summary.targetInventoryBTC ?? this.inventoryManager.targetInventoryBTC,
-      inventoryDeviationBTC: summary.deviationFromTarget ?? summary.inventoryDeviationBTC,
+      inventoryDeviationBTC: summary.inventoryDeviationBTC,
       committedExposureBTC,
       context: {
         coinbase: coinbase ? {
-          bestBid: coinbase.bestBid, bestAsk: coinbase.bestAsk, bestBidSize: coinbase.bestBidSize,
-          bestAskSize: coinbase.bestAskSize, timestamp: coinbase.timestamp,
+          bestBid: coinbase.bid, bestAsk: coinbase.ask, timestamp: market.timestamp,
         } : null,
         truexEbbo: quoteStatus.truexEbbo || null,
         fairValue: market.weightedMidpoint ?? quoteStatus.lastMid ?? null,
