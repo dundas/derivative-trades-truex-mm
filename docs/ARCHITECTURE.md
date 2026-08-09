@@ -349,6 +349,24 @@ FIX 5.0 SP2 over FIXT.1.1 transport layer.
 - Redis: `127.0.0.1:6379` (local to `truex-mm-prod`)
 - PostgreSQL: `178.156.247.87:5432/truex_analytics` (Hetzner `truex-pg-analytics` server)
 
+### Quote lifecycle telemetry (`src/data-pipeline/quote-lifecycle-telemetry.js`)
+
+The quote engine emits an immutable, versioned event for create/replace, cancel,
+reject, partial fill, and full fill lifecycle transitions. Each event has a stable
+quote ID; replacement creates use a new quote ID with `replacesQuoteId` pointing to
+the prior quote. The orchestrator enriches events at decision time with policy ID,
+target and deviation, committed exposure, and available Coinbase/TrueX EBBO,
+fair-value, freshness, and volatility context. Unavailable values are explicit
+`null`; credentials and account identifiers are allowlist-redacted.
+
+When the optional data pipeline has initialized PostgreSQL, telemetry writes
+append-only rows to `quote_lifecycle_events`. The table is additive (it does not
+alter historical orders or fills), has time/session/quote indexes, bounded query
+helpers, and an explicit prune helper for retention operations. A write failure is
+non-fatal and releases the in-process dedupe marker for retry. This records inputs
+for later markout, fill-probability, and P&L evaluation; it does not calculate or
+change a live policy.
+
 ### TrueXRESTClient (`src/exchanges/truex/TrueXRESTClient.ts`)
 
 REST API client for TrueX with HMAC-SHA256 authentication.

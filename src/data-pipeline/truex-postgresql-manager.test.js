@@ -33,6 +33,7 @@ const mockDb = {
 };
 
 mock.module('../../lib/postgresql-api/index.js', () => ({
+  PostgreSQLAPI: class PostgreSQLAPI { constructor() { return mockDb; } },
   createPostgreSQLAPIFromEnv: jest.fn(() => mockDb)
 }));
 
@@ -95,6 +96,14 @@ describe('TrueXPostgreSQLManager', () => {
       expect(mockDb.initialize).toHaveBeenCalled();
       expect(mockDb.query).toHaveBeenCalled(); // Schema setup queries
     });
+
+    it('adds immutable quote lifecycle storage without altering orders or fills', async () => {
+      await pgManager.initialize();
+      const sql = mockDb.query.mock.calls.map(([query]) => String(query)).join('\n');
+      expect(sql).toContain('CREATE TABLE IF NOT EXISTS quote_lifecycle_events');
+      expect(sql).toContain('idx_quote_lifecycle_quote_ts');
+      expect(sql).not.toContain('ALTER TABLE fills ADD COLUMN');
+    });
     
     it('should create TrueX-specific schema', async () => {
       await pgManager.initialize();
@@ -111,6 +120,30 @@ describe('TrueXPostgreSQLManager', () => {
       mockDb.initialize.mockRejectedValueOnce(new Error('Connection failed'));
       
       await expect(pgManager.initialize()).rejects.toThrow('Connection failed');
+    });
+  });
+
+  describe('quote lifecycle persistence', () => {
+    const event = {
+      eventId: 'event-1', schemaVersion: '1.0', eventType: 'create', timestamp: 1000,
+      decisionTimestamp: 999, sessionId: 's-1', quoteId: 'Q-1', orderId: 'Q-1',
+      symbol: 'BTC-PYUSD', side: 'buy', price: 100, size: 0.1, level: 1,
+      action: 'place', policyId: 'default', context: { fairValue: 101 },
+    };
+
+    it('persists events append-only and offers bounded query/prune helpers', async () => {
+      await pgManager.recordQuoteLifecycleEvent(event);
+      expect(mockDb.query).toHaveBeenCalledWith(expect.stringContaining('INSERT INTO quote_lifecycle_events'), expect.arrayContaining(['event-1', '1.0']));
+      await pgManager.getQuoteLifecycleEvents({ sessionId: 's-1', quoteId: 'Q-1', limit: 10 });
+      expect(mockDb.query).toHaveBeenCalledWith(expect.stringContaining('SELECT * FROM quote_lifecycle_events'), ['s-1', 'Q-1', 10]);
+      await pgManager.pruneQuoteLifecycleEventsBefore(500);
+      expect(mockDb.query).toHaveBeenCalledWith('DELETE FROM quote_lifecycle_events WHERE event_timestamp < $1', [500]);
+    });
+
+    it('surfaces persistence errors for the telemetry caller to handle', async () => {
+      mockDb.query.mockRejectedValueOnce(new Error('isolated db unavailable'));
+      await expect(pgManager.recordQuoteLifecycleEvent(event)).rejects.toThrow('isolated db unavailable');
+      expect(mockLogger.warn).toHaveBeenCalledWith(expect.stringContaining('quote telemetry write failed'));
     });
   });
   

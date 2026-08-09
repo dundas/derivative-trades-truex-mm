@@ -1690,6 +1690,36 @@ describe('MarketMakerOrchestrator', () => {
       await orchestrator.stop();
     });
 
+    test('binds the initialized pipeline PostgreSQL manager as the telemetry writer', async () => {
+      const pgManager = { recordQuoteLifecycleEvent: jest.fn(async () => {}) };
+      const dataPipeline = createMockDataPipeline();
+      dataPipeline.pgManager = pgManager;
+      const { orchestrator } = createOrchestrator({ dataPipeline });
+
+      expect(orchestrator.quoteTelemetry.writer).toBeNull();
+      await orchestrator.start();
+      expect(orchestrator.quoteTelemetry.writer).toBe(pgManager);
+      await orchestrator.stop();
+    });
+
+    test('enriches lifecycle telemetry with available Coinbase book context', () => {
+      const quoteTelemetry = { writer: null, record: jest.fn(() => Promise.resolve()) };
+      const { orchestrator } = createOrchestrator({ quoteTelemetry });
+      orchestrator.lastAggregatedPrice = {
+        timestamp: 1000,
+        weightedMidpoint: 100,
+        sources: [{ exchange: 'coinbase', bid: 99.5, ask: 100.5 }],
+      };
+
+      orchestrator._onQuoteLifecycle({ eventType: 'create', quoteId: 'Q-telemetry', side: 'buy' });
+
+      expect(quoteTelemetry.record).toHaveBeenCalledWith(expect.objectContaining({
+        context: expect.objectContaining({
+          coinbase: expect.objectContaining({ bestBid: 99.5, bestAsk: 100.5, timestamp: 1000 }),
+        }),
+      }));
+    });
+
     test('calls dataPipeline.stop() on stop', async () => {
       const dataPipeline = createMockDataPipeline();
       const { orchestrator } = createOrchestrator({ dataPipeline });

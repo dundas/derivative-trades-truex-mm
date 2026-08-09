@@ -213,6 +213,19 @@ Position, hedge, emergency, and balance-cap guards remain based on `netPosition`
 Hedge signal: emitted when abs(netPosition) >= hedgeThresholdBTC.
 Emergency: abs(netPosition) >= emergencyLimitBTC → cancel all quotes.
 
+## Quote Lifecycle Telemetry
+
+`QuoteLifecycleTelemetry` records schema `1.0` append-only events for create,
+replace, cancel, reject, partial_fill, and full_fill. New replacement quote IDs link
+to their predecessor through `replacesQuoteId`. The event allowlist includes quote
+fields, policy/target/deviation/exposure, and available Coinbase/TrueX/fair-value/
+freshness/volatility context; unavailable context is `null`, and credentials or
+account identifiers are never recorded. After `DataPipelineManager.start()`, its
+initialized PostgreSQL manager is the optional writer for additive
+`quote_lifecycle_events` storage. Query and prune helpers are bounded; write failure
+is non-fatal and remains retryable. Telemetry is observation only: markouts,
+fill-probability, and P&L scoring belong to the offline evaluator.
+
 ## REST Reconciliation (every 5 min)
 
 1. Fetch active orders from exchange via getActiveOrders()

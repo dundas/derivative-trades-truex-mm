@@ -9,6 +9,7 @@ import { HedgeExecutor } from './hedge-executor.js';
 import { TrueXMarketDataFeed } from './truex-market-data.js';
 import { TrueXRESTClient } from '../exchanges/truex/TrueXRESTClient.js';
 import { AlertManager, normalizeAlertReason } from '../alerts/alert-manager.js';
+import { QuoteLifecycleTelemetry } from '../data-pipeline/quote-lifecycle-telemetry.js';
 
 /**
  * MarketMakerOrchestrator - Wires all components and manages lifecycle.
@@ -154,6 +155,11 @@ export class MarketMakerOrchestrator extends EventEmitter {
 
     // PostgreSQL manager (optional) — used for balance snapshots
     this.postgresManager = options.postgresManager || null;
+    this.quoteTelemetry = options.quoteTelemetry || new QuoteLifecycleTelemetry({
+      writer: this.postgresManager,
+      logger: this.logger,
+      policyId: options.policyId || 'default',
+    });
 
     // REST client for order reconciliation (optional)
     this.restClient = null;
@@ -272,6 +278,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this._onPriceUpdate = this._onPriceUpdate.bind(this);
     this._onFIXMessage = this._onFIXMessage.bind(this);
     this._onQuoteFill = this._onQuoteFill.bind(this);
+    this._onQuoteLifecycle = this._onQuoteLifecycle.bind(this);
     this._onHedgeSignal = this._onHedgeSignal.bind(this);
     this._onHedgeFill = this._onHedgeFill.bind(this);
     this._onEmergency = this._onEmergency.bind(this);
@@ -320,6 +327,11 @@ export class MarketMakerOrchestrator extends EventEmitter {
     if (this.dataPipeline) {
       try {
         await this.dataPipeline.start();
+        // The pipeline initializes its PostgreSQL manager lazily. Bind it only
+        // after a successful start so telemetry degrades gracefully with no DB.
+        if (!this.quoteTelemetry.writer && this.dataPipeline.pgManager) {
+          this.quoteTelemetry.writer = this.dataPipeline.pgManager;
+        }
         this.logger.info('[Orchestrator] Data pipeline started');
       } catch (err) {
         this.logger.warn(`[Orchestrator] Data pipeline start failed (non-fatal): ${err.message}`);
@@ -634,6 +646,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
 
     // QuoteEngine fills → Inventory + PnL
     this.quoteEngine.on('fill', this._onQuoteFill);
+    this.quoteEngine.on('quote-lifecycle', this._onQuoteLifecycle);
 
     // Inventory hedge signal → HedgeExecutor
     this.inventoryManager.on('hedge-signal', this._onHedgeSignal);
@@ -653,6 +666,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this.fixOE.removeListener('disconnect', this._onOEDisconnect);
     this.fixOE.removeListener('logout', this._onOEDisconnect);
     this.quoteEngine.removeListener('fill', this._onQuoteFill);
+    this.quoteEngine.removeListener('quote-lifecycle', this._onQuoteLifecycle);
     this.inventoryManager.removeListener('hedge-signal', this._onHedgeSignal);
     this.hedgeExecutor.removeListener('hedge-filled', this._onHedgeFill);
     this.inventoryManager.removeListener('emergency', this._onEmergency);
@@ -828,6 +842,41 @@ export class MarketMakerOrchestrator extends EventEmitter {
     }
 
     this.emit('fill', { side, price, size, clOrdID, execID, venue: 'truex', orderIntent, liquidityRoleExpected, isMaker });
+  }
+
+  _onQuoteLifecycle(event) {
+    const summary = this.inventoryManager.getPositionSummary?.() || {};
+    const activeOrders = this.quoteEngine.activeOrders || new Map();
+    let committedExposureBTC = 0;
+    for (const order of activeOrders.values()) {
+      if (order.status === 'active' || order.status === 'pending') {
+        committedExposureBTC += (order.side === 'buy' ? 1 : -1) * (Number(order.size) || 0);
+      }
+    }
+    const quoteStatus = this.quoteEngine.getQuoteStatus?.() || {};
+    const market = this.lastAggregatedPrice || {};
+    const now = Date.now();
+    const coinbase = Array.isArray(market.sources)
+      ? market.sources.find(source => source?.exchange === 'coinbase') || null
+      : null;
+    this.quoteTelemetry.record({
+      ...event,
+      sessionId: this.sessionId,
+      symbol: this.symbol,
+      targetInventoryBTC: summary.targetInventoryBTC ?? this.inventoryManager.targetInventoryBTC,
+      inventoryDeviationBTC: summary.inventoryDeviationBTC,
+      committedExposureBTC,
+      context: {
+        coinbase: coinbase ? {
+          bestBid: coinbase.bid, bestAsk: coinbase.ask, timestamp: market.timestamp,
+        } : null,
+        truexEbbo: quoteStatus.truexEbbo || null,
+        fairValue: market.weightedMidpoint ?? quoteStatus.lastMid ?? null,
+        feedAgeMs: market.timestamp ? Math.max(0, now - market.timestamp) : null,
+        volatility: market.volatility ?? null,
+        marketState: market.marketState ?? null,
+      },
+    }).catch(err => this.logger.warn(`[Orchestrator] Quote telemetry failed: ${err.message}`));
   }
 
   _addPipelineFillOnce(pipeline, fill) {

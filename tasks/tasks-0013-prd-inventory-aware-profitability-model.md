@@ -34,17 +34,17 @@
 
 ## Tasks
 
-- [ ] 1.0 Implement explicit target-relative inventory semantics
-  - [ ] 1.1 Add a configurable `targetInventoryBTC`; document its units, default behavior, and startup status visibility.
-  - [ ] 1.2 Calculate skew from `netPosition - targetInventoryBTC`; make positive deviation widen bids/tighten asks and negative deviation tighten bids/widen asks.
-  - [ ] 1.3 Preserve existing position-limit and balance-cap behavior; do not change a live target value in this task.
-  - [ ] 1.4 Add unit tests for zero deviation, positive/negative deviation, target-relative transitions, limits, and quote price direction.
-  - [ ] 1.5 Update architecture documentation with target-relative semantics.
-  - [ ] 1.6 Run `/adversarial-reviewer` on necessity/scope.
-  - [ ] 1.7 Run `/pre-push-review`; triage every finding.
-  - [ ] 1.8 Run focused unit tests plus a `NO_SERVER_SURFACE` smoke declaration.
-  - [ ] 1.9 Create a focused code PR; after each push solicit configured review and run `/pr-review-loop`.
-  - [ ] 1.10 Run `/docs-generator`, open/update the required docs PR, and send it through review.
+- [x] 1.0 Implement explicit target-relative inventory semantics
+  - [x] 1.1 Add a configurable `targetInventoryBTC`; document its units, default behavior, and startup status visibility.
+  - [x] 1.2 Calculate skew from `netPosition - targetInventoryBTC`; make positive deviation widen bids/tighten asks and negative deviation tighten bids/widen asks.
+  - [x] 1.3 Preserve existing position-limit and balance-cap behavior; do not change a live target value in this task.
+  - [x] 1.4 Add unit tests for zero deviation, positive/negative deviation, target-relative transitions, limits, and quote price direction.
+  - [x] 1.5 Update architecture documentation with target-relative semantics.
+  - [x] 1.6 Run `/adversarial-reviewer` on necessity/scope.
+  - [x] 1.7 Run `/pre-push-review`; triage every finding.
+  - [x] 1.8 Run focused unit tests plus a `NO_SERVER_SURFACE` smoke declaration.
+  - [x] 1.9 Create a focused code PR; after each push solicit configured review and run `/pr-review-loop`.
+  - [x] 1.10 Run `/docs-generator`, open/update the required docs PR, and send it through review.
 
 - [ ] 2.0 Add append-only quote lifecycle and market-context telemetry
   - [ ] 2.1 Define a versioned quote-event schema for create, replace, cancel, reject, partial fill, and full fill events.

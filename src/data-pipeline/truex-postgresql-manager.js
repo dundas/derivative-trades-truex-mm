@@ -138,6 +138,39 @@ export class TrueXPostgreSQLManager {
           ON balance_snapshots(timestamp DESC)
         `);
 
+        // Immutable quote decision/lifecycle evidence. This is intentionally
+        // additive: historical orders and fills remain unchanged.
+        await this.db.query(`
+          CREATE TABLE IF NOT EXISTS quote_lifecycle_events (
+            event_id TEXT PRIMARY KEY,
+            schema_version TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            event_timestamp BIGINT NOT NULL,
+            decision_timestamp BIGINT NOT NULL,
+            session_id TEXT,
+            quote_id TEXT,
+            order_id TEXT,
+            replaces_quote_id TEXT,
+            execution_id TEXT,
+            symbol TEXT,
+            side TEXT,
+            price NUMERIC,
+            size NUMERIC,
+            level INTEGER,
+            action TEXT,
+            reason TEXT,
+            policy_id TEXT,
+            target_inventory_btc NUMERIC,
+            inventory_deviation_btc NUMERIC,
+            committed_exposure_btc NUMERIC,
+            context JSONB NOT NULL DEFAULT '{}'::jsonb,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+          )
+        `);
+        await this.db.query(`CREATE INDEX IF NOT EXISTS idx_quote_lifecycle_session_ts ON quote_lifecycle_events(session_id, event_timestamp DESC)`);
+        await this.db.query(`CREATE INDEX IF NOT EXISTS idx_quote_lifecycle_quote_ts ON quote_lifecycle_events(quote_id, event_timestamp ASC)`);
+        await this.db.query(`CREATE INDEX IF NOT EXISTS idx_quote_lifecycle_type_ts ON quote_lifecycle_events(event_type, event_timestamp DESC)`);
+
         // Create index on exec_id for fills deduplication
         await this.db.query(`
           CREATE INDEX IF NOT EXISTS idx_fills_execid 
@@ -151,6 +184,46 @@ export class TrueXPostgreSQLManager {
         throw error;
       }
     }, { timeoutMs: 30000 });
+  }
+
+  async recordQuoteLifecycleEvent(event) {
+    const sql = `INSERT INTO quote_lifecycle_events (
+      event_id, schema_version, event_type, event_timestamp, decision_timestamp,
+      session_id, quote_id, order_id, replaces_quote_id, execution_id, symbol, side,
+      price, size, level, action, reason, policy_id, target_inventory_btc,
+      inventory_deviation_btc, committed_exposure_btc, context
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+    ON CONFLICT (event_id) DO NOTHING`;
+    try {
+      await this.db.query(sql, [
+        event.eventId, event.schemaVersion, event.eventType, event.timestamp, event.decisionTimestamp,
+        event.sessionId, event.quoteId, event.orderId, event.replacesQuoteId, event.executionId,
+        event.symbol, event.side, event.price, event.size, event.level, event.action, event.reason,
+        event.policyId, event.targetInventoryBTC, event.inventoryDeviationBTC,
+        event.committedExposureBTC, JSON.stringify(event.context || {}),
+      ]);
+      return true;
+    } catch (error) {
+      this.logger.warn(`[TrueXPostgreSQLManager] quote telemetry write failed: ${error.message}`);
+      throw error;
+    }
+  }
+
+  async getQuoteLifecycleEvents({ sessionId, quoteId, fromTimestamp, toTimestamp, limit = 1000 } = {}) {
+    const where = [];
+    const params = [];
+    const add = (clause, value) => { params.push(value); where.push(`${clause} $${params.length}`); };
+    if (sessionId) add('session_id =', sessionId);
+    if (quoteId) add('quote_id =', quoteId);
+    if (Number.isFinite(fromTimestamp)) add('event_timestamp >=', fromTimestamp);
+    if (Number.isFinite(toTimestamp)) add('event_timestamp <=', toTimestamp);
+    params.push(Math.max(1, Math.min(Number(limit) || 1000, 10000)));
+    return this.db.query(`SELECT * FROM quote_lifecycle_events${where.length ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY event_timestamp ASC LIMIT $${params.length}`, params);
+  }
+
+  async pruneQuoteLifecycleEventsBefore(cutoffTimestamp) {
+    if (!Number.isFinite(cutoffTimestamp)) throw new Error('cutoffTimestamp must be a finite epoch millisecond value');
+    return this.db.query('DELETE FROM quote_lifecycle_events WHERE event_timestamp < $1', [cutoffTimestamp]);
   }
   
   /**
