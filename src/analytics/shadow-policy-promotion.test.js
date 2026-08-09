@@ -40,4 +40,11 @@ describe('shadow policy promotion', () => {
     expect(report.reports[0].blockers.some(x => x.startsWith('insufficient-observation-window:10/100'))).toBe(true);
     expect(sends).toBe(0);
   });
+
+  test('enforces a stricter promotion coverage threshold than the evaluator', () => {
+    const coverageEvents = [...events, { eventType: 'cancel', eventId: 'c', timestamp: 130, quoteId: 'q', context: { fairValue: 101 } }, { eventType: 'reject', eventId: 'r', timestamp: 140, quoteId: 'other' }];
+    const report = buildShadowPromotionReport({ events: coverageEvents, candidates: [{ id: 'candidate', policy }], evaluator: { split, assumptions: { minContextCoverage: 0.7 }, referencePrices: [{ timestamp: 60120, price: 101 }, { timestamp: 300120, price: 101 }, { timestamp: 3600120, price: 101 }] }, criteria: { minObservationEvents: 2, minContextCoverage: 0.8, maxInventoryRangeBTC: 1 } });
+    expect(report.reports[0].evaluation.coverage.context).toBe(0.75);
+    expect(report.reports[0].blockers).toContain('insufficient-context-coverage:0.750');
+  });
 });
