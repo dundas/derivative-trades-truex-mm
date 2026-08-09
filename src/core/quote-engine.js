@@ -548,7 +548,7 @@ export class QuoteEngine extends EventEmitter {
 
     if (this.config.replaceMode === 'place-before-cancel') {
       for (const r of actions.toReplace) {
-        orderedActions.push({ type: 'place', quote: r.place });
+        orderedActions.push({ type: 'place', quote: { ...r.place, replacesQuoteId: r.cancel } });
         orderedActions.push({ type: 'cancel', clOrdID: r.cancel, order: r.cancelOrder });
       }
     } else {
@@ -671,7 +671,9 @@ export class QuoteEngine extends EventEmitter {
     if (action.type === 'cancel') {
       this._sendCancel(action.clOrdID, action.order);
     } else if (action.type === 'replacement-cancel') {
-      this.pendingReplacements.set(action.clOrdID, { quote: action.quote, createdAt: Date.now() });
+      this.pendingReplacements.set(action.clOrdID, {
+        quote: { ...action.quote, replacesQuoteId: action.clOrdID }, createdAt: Date.now(),
+      });
       this.lastReplacementSide = action.order?.side || null;
       this.lastReplacementLevelBySide.set(action.order?.side, action.order?.level || 0);
       this._sendCancel(action.clOrdID, action.order);
@@ -745,6 +747,11 @@ export class QuoteEngine extends EventEmitter {
       orderIntent: prepared.orderIntent || (prepared.postOnly === false ? 'taker_opportunity' : 'maker_quote'),
       liquidityRoleExpected: prepared.postOnly === false ? 'taker' : 'maker',
     });
+    this.emit('quote-lifecycle', {
+      eventType: prepared.replacesQuoteId ? 'replace' : 'create', quoteId: clOrdID,
+      replacesQuoteId: prepared.replacesQuoteId || null, side: prepared.side, price: prepared.price,
+      size: prepared.size, level: prepared.level, action: prepared.replacesQuoteId ? 'replace' : 'place',
+    });
 
     this.lastActionByClOrdID.set(clOrdID, Date.now());
 
@@ -787,6 +794,11 @@ export class QuoteEngine extends EventEmitter {
     this.cancelToOrigMap.set(newClOrdID, origClOrdID);
 
     this.lastActionByClOrdID.set(origClOrdID, Date.now());
+    this.emit('quote-lifecycle', {
+      eventType: 'cancel', quoteId: origClOrdID, orderId: newClOrdID,
+      side: order?.side, price: order?.price, size: order?.size, level: order?.level,
+      action: 'cancel', reason: 'reprice_or_cancel',
+    });
 
     if (this.fixConnection) {
       this.fixConnection.sendMessage(fields);
@@ -836,7 +848,12 @@ export class QuoteEngine extends EventEmitter {
       case '1': // Partially Filled — record the partial, keep the order live (reduced)
         this.consecutiveRejects = 0; // a fill means the order pipeline is healthy
         if (lastQty && lastQty > 0) {
+          // The generic fill event is rewritten below so consumers receive an explicit lifecycle type.
           const tracked = this._emitFillEvent(resolvedClOrdID, side, lastPx, lastQty, execID);
+          this.emit('quote-lifecycle', {
+            eventType: 'partial_fill', quoteId: resolvedClOrdID, executionId: execID, side,
+            price: lastPx, size: lastQty, level: tracked?.level, action: 'partial_fill',
+          });
           if (tracked) {
             // Remaining size = LeavesQty (tag 151) when it is a strictly-numeric value, else
             // subtract LastQty. Strict Number() (not parseFloat) rejects partial garbage like
@@ -855,18 +872,24 @@ export class QuoteEngine extends EventEmitter {
 
       case '2': // Filled — record the fill and remove the order
         this.consecutiveRejects = 0;
-        this._emitFillEvent(resolvedClOrdID, side, lastPx, lastQty, execID);
+        {
+          const tracked = this._emitFillEvent(resolvedClOrdID, side, lastPx, lastQty, execID);
+          this.emit('quote-lifecycle', {
+            eventType: 'full_fill', quoteId: resolvedClOrdID, executionId: execID, side,
+            price: lastPx, size: lastQty, level: tracked?.level, action: 'full_fill',
+          });
+        }
         this.activeOrders.delete(resolvedClOrdID);
         this.cancelToOrigMap.delete(clOrdID);
         break;
 
       case '4': // Cancelled
+        // Distinguish a cancel WE initiated (cancel ack: resolved via cancelToOrigMap, or the
+        // order was marked 'cancelling') from an UNSOLICITED venue cancel (the venue dropped a
+        // resting order we never asked to cancel — e.g. a post-only/ALO order it deemed
+        // marketable). Surface the latter so it stops vanishing silently.
+        const cancelled = this.activeOrders.get(resolvedClOrdID);
         {
-          // Distinguish a cancel WE initiated (cancel ack: resolved via cancelToOrigMap, or the
-          // order was marked 'cancelling') from an UNSOLICITED venue cancel (the venue dropped a
-          // resting order we never asked to cancel — e.g. a post-only/ALO order it deemed
-          // marketable). Surface the latter so it stops vanishing silently.
-          const cancelled = this.activeOrders.get(resolvedClOrdID);
           const selfInitiated = !!origClOrdID || cancelled?.status === 'cancelling';
           if (cancelled && !selfInitiated) {
             const reason = fields['58'] || 'unsolicited';
@@ -880,6 +903,11 @@ export class QuoteEngine extends EventEmitter {
           }
         }
         this.activeOrders.delete(resolvedClOrdID);
+        this.emit('quote-lifecycle', {
+          eventType: 'cancel', quoteId: resolvedClOrdID, side: cancelled?.side,
+          price: cancelled?.price, size: cancelled?.size, level: cancelled?.level,
+          action: 'cancelled', reason: fields['58'] || null,
+        });
         this.cancelToOrigMap.delete(clOrdID);
         this._releasePendingReplacement(resolvedClOrdID);
         break;
@@ -907,6 +935,10 @@ export class QuoteEngine extends EventEmitter {
           const reason = fields['58'] || 'unknown';
           this.recentRejectsByReason.set(reason, (this.recentRejectsByReason.get(reason) || 0) + 1);
           this.logger.error(`[QuoteEngine] Order rejected: clOrdID=${clOrdID}, reason=${reason}, code=${fields['103'] || 'n/a'}`);
+          this.emit('quote-lifecycle', {
+            eventType: 'reject', quoteId: resolvedClOrdID, orderId: clOrdID, side,
+            action: 'reject', reason, executionId: execID,
+          });
         }
         break;
 

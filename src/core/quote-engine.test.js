@@ -137,3 +137,15 @@ describe('QuoteEngine.executeActions — replacement ordering', () => {
     expect(callLog[1]).toBe('F');
   });
 });
+
+describe('QuoteEngine quote lifecycle telemetry', () => {
+  it('emits a replacement with a new quote id linked to the old quote id', () => {
+    const engine = makeQuoteEngine();
+    const events = [];
+    engine.on('quote-lifecycle', event => events.push(event));
+    const newQuoteId = engine._sendNewOrder({ side: 'buy', price: 100, size: 0.01, level: 1, replacesQuoteId: 'Q-old' });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ eventType: 'replace', quoteId: newQuoteId, replacesQuoteId: 'Q-old' });
+    expect(events[0].quoteId).not.toBe(events[0].replacesQuoteId);
+  });
+});

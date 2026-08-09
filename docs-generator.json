@@ -11,6 +11,8 @@
     { "path": "src/exchanges/truex/TrueXRESTClient.ts", "extractor": "rest-api", "provides": "TrueX REST API client — orders, balances, assets, instruments, HMAC-SHA256 auth" },
     { "path": "src/fix-protocol/fix-connection.js", "extractor": "typescript-api", "provides": "FIXT.1.1 / FIX 5.0 SP2 client — logon, heartbeat, new order, cancel, exec reports" },
     { "path": "src/data-pipeline/data-pipeline-manager.js", "extractor": "typescript-api", "provides": "Data pipeline — Memory → Redis → PostgreSQL, session tracking, audit logging" },
+    { "path": "src/data-pipeline/quote-lifecycle-telemetry.js", "extractor": "typescript-api", "provides": "Versioned, append-only quote lifecycle telemetry with redacted market context" },
+    { "path": "src/data-pipeline/truex-postgresql-manager.js", "extractor": "typescript-api", "provides": "Additive PostgreSQL quote-lifecycle storage, bounded query, and retention helpers" },
     { "path": "src/connectors/aggregator/PriceAggregator.ts", "extractor": "typescript-api", "provides": "Price aggregator — weighted mid from multiple exchange feeds" },
     { "path": "docker-compose.yml", "extractor": "architecture", "provides": "Docker services — FIX proxy, MD proxy, REST proxy, market maker" },
     { "path": "Dockerfile", "extractor": "architecture", "provides": "Container build — Bun runtime, Alpine base" },

@@ -1690,6 +1690,18 @@ describe('MarketMakerOrchestrator', () => {
       await orchestrator.stop();
     });
 
+    test('binds the initialized pipeline PostgreSQL manager as the telemetry writer', async () => {
+      const pgManager = { recordQuoteLifecycleEvent: jest.fn(async () => {}) };
+      const dataPipeline = createMockDataPipeline();
+      dataPipeline.pgManager = pgManager;
+      const { orchestrator } = createOrchestrator({ dataPipeline });
+
+      expect(orchestrator.quoteTelemetry.writer).toBeNull();
+      await orchestrator.start();
+      expect(orchestrator.quoteTelemetry.writer).toBe(pgManager);
+      await orchestrator.stop();
+    });
+
     test('calls dataPipeline.stop() on stop', async () => {
       const dataPipeline = createMockDataPipeline();
       const { orchestrator } = createOrchestrator({ dataPipeline });
