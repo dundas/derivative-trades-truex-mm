@@ -160,6 +160,12 @@ export class MarketMakerOrchestrator extends EventEmitter {
       logger: this.logger,
       policyId: options.policyId || 'default',
     });
+    this.policyVector = {
+      targetInventoryBTC: Number(options.targetInventoryBTC ?? 0), maxSkewTicks: Number(options.maxSkewTicks ?? 3),
+      anchorBufferTicks: Number(options.coinbaseAnchorBufferTicks ?? 1), baseSpreadBps: Number(options.baseSpreadBps ?? 50),
+      levelSpacingTicks: Number(options.levelSpacingTicks ?? 1), baseSizeBTC: Number(options.baseSizeBTC ?? 0.1),
+      sizeDecayFactor: Number(options.sizeDecayFactor ?? 0.8), repriceThresholdTicks: Number(options.repriceThresholdTicks ?? 1),
+    };
 
     // REST client for order reconciliation (optional)
     this.restClient = null;
@@ -864,6 +870,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       sessionId: this.sessionId,
       symbol: this.symbol,
       targetInventoryBTC: summary.targetInventoryBTC ?? this.inventoryManager.targetInventoryBTC,
+      policyVector: this.policyVector,
       inventoryDeviationBTC: summary.inventoryDeviationBTC,
       committedExposureBTC,
       context: {

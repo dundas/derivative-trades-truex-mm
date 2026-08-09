@@ -160,6 +160,7 @@ export class TrueXPostgreSQLManager {
             action TEXT,
             reason TEXT,
             policy_id TEXT,
+            policy_vector JSONB,
             target_inventory_btc NUMERIC,
             inventory_deviation_btc NUMERIC,
             committed_exposure_btc NUMERIC,
@@ -170,6 +171,7 @@ export class TrueXPostgreSQLManager {
         await this.db.query(`CREATE INDEX IF NOT EXISTS idx_quote_lifecycle_session_ts ON quote_lifecycle_events(session_id, event_timestamp DESC)`);
         await this.db.query(`CREATE INDEX IF NOT EXISTS idx_quote_lifecycle_quote_ts ON quote_lifecycle_events(quote_id, event_timestamp ASC)`);
         await this.db.query(`CREATE INDEX IF NOT EXISTS idx_quote_lifecycle_type_ts ON quote_lifecycle_events(event_type, event_timestamp DESC)`);
+        await this.db.query(`ALTER TABLE quote_lifecycle_events ADD COLUMN IF NOT EXISTS policy_vector JSONB`);
 
         // Create index on exec_id for fills deduplication
         await this.db.query(`
@@ -190,16 +192,16 @@ export class TrueXPostgreSQLManager {
     const sql = `INSERT INTO quote_lifecycle_events (
       event_id, schema_version, event_type, event_timestamp, decision_timestamp,
       session_id, quote_id, order_id, replaces_quote_id, execution_id, symbol, side,
-      price, size, level, action, reason, policy_id, target_inventory_btc,
+      price, size, level, action, reason, policy_id, policy_vector, target_inventory_btc,
       inventory_deviation_btc, committed_exposure_btc, context
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
     ON CONFLICT (event_id) DO NOTHING`;
     try {
       await this.db.query(sql, [
         event.eventId, event.schemaVersion, event.eventType, event.timestamp, event.decisionTimestamp,
         event.sessionId, event.quoteId, event.orderId, event.replacesQuoteId, event.executionId,
         event.symbol, event.side, event.price, event.size, event.level, event.action, event.reason,
-        event.policyId, event.targetInventoryBTC, event.inventoryDeviationBTC,
+        event.policyId, JSON.stringify(event.policyVector), event.targetInventoryBTC, event.inventoryDeviationBTC,
         event.committedExposureBTC, JSON.stringify(event.context || {}),
       ]);
       return true;

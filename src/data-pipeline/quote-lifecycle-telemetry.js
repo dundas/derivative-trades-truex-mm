@@ -61,6 +61,7 @@ export class QuoteLifecycleTelemetry {
       price: numberOrNull(input.price), size: numberOrNull(input.size), level: numberOrNull(input.level),
       action: input.action || input.eventType || null, reason: input.reason || null,
       policyId: input.policyId || this.policyId,
+      policyVector: this._normalizePolicyVector(input.policyVector),
       targetInventoryBTC: numberOrNull(input.targetInventoryBTC),
       inventoryDeviationBTC: numberOrNull(input.inventoryDeviationBTC),
       committedExposureBTC: numberOrNull(input.committedExposureBTC),
@@ -70,5 +71,16 @@ export class QuoteLifecycleTelemetry {
         volatility: numberOrNull(input.context?.volatility), marketState: input.context?.marketState || null,
       },
     };
+  }
+
+  _normalizePolicyVector(vector) {
+    const keys = ['targetInventoryBTC', 'maxSkewTicks', 'anchorBufferTicks', 'baseSpreadBps', 'levelSpacingTicks', 'baseSizeBTC', 'sizeDecayFactor', 'repriceThresholdTicks'];
+    if (!vector || typeof vector !== 'object') return null;
+    const normalized = {};
+    for (const key of keys) {
+      if (!Number.isFinite(Number(vector[key]))) return null;
+      normalized[key] = Number(vector[key]);
+    }
+    return normalized;
   }
 }
