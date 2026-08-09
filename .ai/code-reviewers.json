@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "description": "GitHub mention used for automated PR review solicitation under CLAUDE.md SO-14.",
+  "solicit_review": {
+    "reviewers": [
+      {
+        "id": "coderabbitai",
+        "mention": "@coderabbitai",
+        "command": "review",
+        "notes": "Triggers the repository-standard CodeRabbit review on the latest commit."
+      }
+    ]
+  }
+}
