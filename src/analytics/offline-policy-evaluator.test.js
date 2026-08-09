@@ -31,6 +31,12 @@ describe('offline policy evaluator', () => {
     expect(result.inventory.max).toBe(1);
     expect(result.decomposition.markouts['1m'].unavailable).toBe(1);
   });
+  test('treats null reference prices as unavailable rather than throwing', () => {
+    const result = evaluatePolicy(events, { policy, split, referencePrices: null });
+    expect(Number.isFinite(result.decomposition.netPnl)).toBe(true);
+    expect(result.decomposition.markouts['1m'].unavailable).toBe(1);
+    expect(result.warnings).toContain('markout-unavailable-or-stale');
+  });
   test('rejects duplicate events and invalid policy vectors', () => {
     expect(() => chronologicalSplit([{ eventId: 'x', timestamp: 1 }, { eventId: 'x', timestamp: 2 }], split)).toThrow('Duplicate');
     expect(() => evaluatePolicy(events, { policy: {}, split })).toThrow('Policy vector');
@@ -61,6 +67,7 @@ describe('offline policy evaluator', () => {
     const result = evaluatePolicy([create, fill], { policy, split });
     expect(Number.isFinite(result.decomposition.netPnl)).toBe(true);
     expect(result.warnings.some(w => w.startsWith('missing-policy-vector'))).toBe(false);
+    expect(result.warnings.some(w => w.startsWith('malformed-policy-vector'))).toBe(false);
   });
   test('fails closed on a malformed persisted quote create without NaN metrics', () => {
     const badCreate = { eventType: 'create', quoteId: 'bad-create', timestamp: 110, side: 'buy', price: 100, size: 1, policyVector: { targetInventoryBTC: 0 } , context: { fairValue: 101 } };
