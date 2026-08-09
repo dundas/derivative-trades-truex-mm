@@ -46,6 +46,13 @@ describe('QuoteLifecycleTelemetry', () => {
     expect(writer.recordQuoteLifecycleEvent).toHaveBeenCalledTimes(2);
   });
 
+  test('persists only a complete finite allowlisted policy vector', async () => {
+    const telemetry = new QuoteLifecycleTelemetry({ now: () => 1 });
+    const good = { targetInventoryBTC: 0, maxSkewTicks: 3, anchorBufferTicks: 1, baseSpreadBps: 50, levelSpacingTicks: 1, baseSizeBTC: 0.01, sizeDecayFactor: 0.8, repriceThresholdTicks: 1, secret: 'nope' };
+    expect((await telemetry.record({ eventType: 'create', quoteId: 'policy', policyVector: good })).policyVector).toEqual(expect.objectContaining({ baseSpreadBps: 50 }));
+    expect((await telemetry.record({ eventType: 'create', quoteId: 'bad', policyVector: { ...good, baseSizeBTC: 'bad' } })).policyVector).toBeNull();
+  });
+
   test('bounds in-process duplicate tracking for long-running sessions', async () => {
     const telemetry = new QuoteLifecycleTelemetry({ now: () => 5000, maxDedupeEventIds: 2 });
     await telemetry.record({ eventType: 'create', quoteId: 'Q-5', eventId: 'event-1' });
