@@ -25,7 +25,7 @@ export function buildShadowPromotionReport({ events = [], candidates = [], evalu
     const observationWindowMs = timestamps.length ? Math.max(...timestamps) - Math.min(...timestamps) : 0;
     if (evaluation.coverage.events < limits.minObservationEvents) blockers.push(`insufficient-observation-events:${evaluation.coverage.events}/${limits.minObservationEvents}`);
     if (observationWindowMs < limits.minObservationWindowMs) blockers.push(`insufficient-observation-window:${observationWindowMs}/${limits.minObservationWindowMs}`);
-    if (limits.minContextCoverage !== (evaluator.assumptions?.minContextCoverage ?? 0.8) && evaluation.coverage.context < limits.minContextCoverage) blockers.push(`insufficient-context-coverage:${evaluation.coverage.context.toFixed(3)}`);
+    if (limits.minContextCoverage !== evaluation.assumptions.minContextCoverage && evaluation.coverage.context < limits.minContextCoverage) blockers.push(`insufficient-context-coverage:${evaluation.coverage.context.toFixed(3)}`);
     if (evaluation.decomposition.netPnl < limits.minNetPnl) blockers.push(`net-pnl-below-floor:${evaluation.decomposition.netPnl.toFixed(2)}`);
     if (inventoryRange > limits.maxInventoryRangeBTC) blockers.push(`inventory-range-above-limit:${inventoryRange.toFixed(6)}`);
     if (evaluation.decomposition.markouts['1m'].pnl < -Math.abs(limits.maxAdverseMarkoutLoss)) blockers.push(`adverse-markout-above-limit:${evaluation.decomposition.markouts['1m'].pnl.toFixed(2)}`);
