@@ -1,5 +1,6 @@
 import { describe, it, test, expect, beforeEach, afterEach, mock } from 'bun:test';
 import { QuoteEngine } from '../src/core/quote-engine.js';
+import { InventoryManager } from '../src/core/inventory-manager.js';
 
 // --- Test helpers ---
 
@@ -335,6 +336,31 @@ describe('QuoteEngine', () => {
 
       // Negative bidSkewTicks → bids tighten (move up)
       expect(skewBid.price).toBe(noSkewBid.price + 1.00);
+    });
+
+    it('applies target-relative inventory skew in the intended quote-price direction', () => {
+      const inventoryManager = new InventoryManager({
+        maxPositionBTC: 1,
+        targetInventoryBTC: 0.4,
+        maxSkewTicks: 10,
+        skewExponent: 1,
+        logger: createMockLogger(),
+      });
+      const engine = createEngine({ levels: 1, inventoryManager });
+      const unskewed = engine.computeDesiredQuotes(100000, { bidSkewTicks: 0, askSkewTicks: 0 });
+
+      // 0.6 BTC is 0.2 BTC above target: bids become less aggressive and asks more aggressive.
+      inventoryManager.onFill({ side: 'buy', quantity: 0.6, price: 100000, venue: 'truex', execID: 'E1' });
+      const aboveTarget = engine.computeDesiredQuotes(100000, inventoryManager.getSkew());
+      expect(aboveTarget.find(q => q.side === 'buy').price).toBe(unskewed.find(q => q.side === 'buy').price - 1);
+      expect(aboveTarget.find(q => q.side === 'sell').price).toBe(unskewed.find(q => q.side === 'sell').price - 1);
+
+      // 0.2 BTC is 0.2 BTC below target: bids tighten and asks widen.
+      inventoryManager.reset();
+      inventoryManager.onFill({ side: 'buy', quantity: 0.2, price: 100000, venue: 'truex', execID: 'E2' });
+      const belowTarget = engine.computeDesiredQuotes(100000, inventoryManager.getSkew());
+      expect(belowTarget.find(q => q.side === 'buy').price).toBe(unskewed.find(q => q.side === 'buy').price + 1);
+      expect(belowTarget.find(q => q.side === 'sell').price).toBe(unskewed.find(q => q.side === 'sell').price + 1);
     });
   });
 

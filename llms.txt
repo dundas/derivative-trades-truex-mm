@@ -203,10 +203,13 @@ Priority: cancels first → replacements → new orders. Rate-limited queue.
 ## Inventory & Skew
 
 Position tracking: netPosition starts at BTC total balance. Buys increment, sells decrement.
-Skew: utilizationPct = abs(netPosition)/maxPositionBTC.
-rawSkew = utilizationPct^skewExponent * maxSkewTicks.
-Long: widen asks (+rawSkew), tighten bids (-rawSkew). Encourages selling.
-Short: widen bids (+rawSkew), tighten asks (-rawSkew). Encourages buying.
+`targetInventoryBTC` is the configurable BTC operating allocation (default `0`), not a position limit.
+Skew uses `inventoryDeviationBTC = netPosition - targetInventoryBTC` and
+`deviationUtilizationPct = min(1, abs(inventoryDeviationBTC) / maxPositionBTC)`.
+`rawSkew = deviationUtilizationPct^skewExponent * maxSkewTicks`; the clamp keeps this configured cap absolute.
+Above target: widen bids (+rawSkew), tighten asks (-rawSkew), encouraging inventory reduction.
+Below target: tighten bids (-rawSkew), widen asks (+rawSkew), encouraging inventory rebuilding.
+Position, hedge, emergency, and balance-cap guards remain based on `netPosition`.
 Hedge signal: emitted when abs(netPosition) >= hedgeThresholdBTC.
 Emergency: abs(netPosition) >= emergencyLimitBTC → cancel all quotes.
 

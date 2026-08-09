@@ -29,6 +29,7 @@
  *   REDIS_URL            - Redis connection (optional)
  *   DATABASE_URL         - PostgreSQL connection (optional)
  *   LOG_LEVEL            - info/debug (default: info)
+ *   TARGET_INVENTORY_BTC - Desired BTC allocation used for inventory skew (default: 0)
  *
  * Usage:
  *   bun scripts/run-uat-paper-trading.js
@@ -52,6 +53,13 @@ function parseFee(envVar, defaultVal = 0) {
     return defaultVal;
   }
   return val;
+}
+
+function parseNumber(envVar, defaultVal) {
+  const raw = process.env[envVar];
+  if (raw === undefined || raw === null || raw === '') return defaultVal;
+  const val = Number(raw);
+  return Number.isFinite(val) ? val : defaultVal;
 }
 
 // ---------------------------------------------------------------------------
@@ -93,6 +101,7 @@ const config = {
 
   // Inventory Manager — tight limits for $10k capital
   maxPositionBTC: 0.10,      // ~$10k max exposure
+  targetInventoryBTC: parseNumber('TARGET_INVENTORY_BTC', 0),
   hedgeThresholdBTC: 0.05,   // Hedge at ~$5k
   maxSkewTicks: 3,           // Max 3 ticks ($1.50) skew
   skewExponent: 1.5,
@@ -118,10 +127,10 @@ const logLevel = process.env.LOG_LEVEL || 'info';
 const isDebug = logLevel === 'debug';
 
 const logger = {
-  info: (msg, meta) => console.log(`[INFO]  ${msg}`, meta ? JSON.stringify(meta) : ''),
-  warn: (msg, meta) => console.warn(`[WARN]  ${msg}`, meta ? JSON.stringify(meta) : ''),
-  error: (msg, meta) => console.error(`[ERROR] ${msg}`, meta ? JSON.stringify(meta) : ''),
-  debug: (msg, meta) => { if (isDebug) console.log(`[DEBUG] ${msg}`, meta ? JSON.stringify(meta) : ''); },
+  info: (msg, meta) => console.log('[INFO]  %s', msg, meta ? JSON.stringify(meta) : ''),
+  warn: (msg, meta) => console.warn('[WARN]  %s', msg, meta ? JSON.stringify(meta) : ''),
+  error: (msg, meta) => console.error('[ERROR] %s', msg, meta ? JSON.stringify(meta) : ''),
+  debug: (msg, meta) => { if (isDebug) console.log('[DEBUG] %s', msg, meta ? JSON.stringify(meta) : ''); },
 };
 
 // ---------------------------------------------------------------------------
@@ -161,6 +170,7 @@ async function main() {
   logger.info(`Levels:        ${config.levels} per side`);
   logger.info(`Base size:     ${config.baseSizeBTC} BTC (~$${(config.baseSizeBTC * 100000).toFixed(0)} at $100k)`);
   logger.info(`Max position:  ${config.maxPositionBTC} BTC`);
+  logger.info(`Target inventory: ${config.targetInventoryBTC} BTC`);
   logger.info(`Maker fee:     ${config.truexMakerFeeBps} bps (zero per agreement)`);
   logger.info(`Redis:         ${config.redisUrl ? 'configured' : 'none (memory only)'}`);
   logger.info(`PostgreSQL:    ${config.pgUrl ? 'configured' : 'none'}`);
@@ -301,6 +311,7 @@ async function main() {
 
     // Inventory manager
     maxPositionBTC: config.maxPositionBTC,
+    targetInventoryBTC: config.targetInventoryBTC,
     hedgeThresholdBTC: config.hedgeThresholdBTC,
     maxSkewTicks: config.maxSkewTicks,
     skewExponent: config.skewExponent,
