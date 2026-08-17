@@ -297,6 +297,34 @@ describe('regime strategy validator', () => {
     expect(report.recommendation).toBe('HOLD');
   });
 
+  test('ignores candle diagnostics for a different product or quote currency', () => {
+    const timestamp = Date.UTC(2026, 7, 1, 1);
+    const report = validateRegimeStrategy({
+      fills: [fill(timestamp, { price: 105 })],
+      references: [
+        reference(timestamp, 100, {
+          sourceType: 'candle',
+          product: 'ETH-USD',
+          high: 101,
+          low: 99,
+          intervalStart: timestamp,
+          intervalEnd: timestamp + MINUTE,
+        }),
+        reference(timestamp, 100, {
+          sourceType: 'candle',
+          quoteCurrency: 'EUR',
+          high: 101,
+          low: 99,
+          intervalStart: timestamp,
+          intervalEnd: timestamp + MINUTE,
+        }),
+      ],
+      config: { heldOutDays: 1 },
+    });
+    expect(report.heldOut.clusters[0].candleRangeDiagnostic).toEqual({ status: 'unavailable', promotionGrade: false });
+    expect(report.recommendation).toBe('HOLD');
+  });
+
   test('keeps observed edge separate from labeled same-fill sensitivity', () => {
     const data = evidence({ days: 2, clustersPerDay: 2 });
     const report = validateRegimeStrategy({

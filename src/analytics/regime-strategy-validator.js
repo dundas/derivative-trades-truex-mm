@@ -322,6 +322,8 @@ function scoreClusters(clusters, referenceRecords, config) {
       };
     }
     const candle = referenceRecords.find(record => record.sourceType === 'candle'
+      && record.product === config.sourceQuality.referenceProduct
+      && record.quoteCurrency === config.sourceQuality.quoteCurrency
       && Number.isFinite(record.high) && record.high > 0
       && Number.isFinite(record.low) && record.low > 0 && record.low <= record.high
       && Number.isFinite(record.basisAdjustmentBps) && Math.abs(record.basisAdjustmentBps) <= config.sourceQuality.maxAbsBasisAdjustmentBps
