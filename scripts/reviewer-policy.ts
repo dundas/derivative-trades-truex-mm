@@ -32,7 +32,9 @@ export function reviewerSolicitationLines(value: unknown): string[] {
   return reviewers.map((reviewer, index) => {
     if (!isRecord(reviewer)) fail(`solicit_review.reviewers[${index}] must be an object.`);
     const mention = singleLine(reviewer.mention, `solicit_review.reviewers[${index}].mention`);
-    if (!mention.startsWith("@")) fail(`solicit_review.reviewers[${index}].mention must start with "@".`);
+    if (!/^@[A-Za-z0-9][A-Za-z0-9_-]*$/.test(mention)) {
+      fail(`solicit_review.reviewers[${index}].mention must be exactly one reviewer handle.`);
+    }
     const command = singleLine(reviewer.command, `solicit_review.reviewers[${index}].command`);
     return `${mention} ${command}`;
   });

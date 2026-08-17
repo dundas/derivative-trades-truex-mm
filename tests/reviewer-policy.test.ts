@@ -19,7 +19,8 @@ describe("reviewer policy", () => {
   test.each([
     ["no reviewers", { version: 1, solicit_review: { reviewers: [] } }, "must contain at least one reviewer"],
     ["missing command", { version: 1, solicit_review: { reviewers: [{ mention: "@claude" }] } }, ".command must be a non-empty string"],
-    ["invalid mention", { version: 1, solicit_review: { reviewers: [{ mention: "claude", command: "review" }] } }, ".mention must start with \"@\""],
+    ["invalid mention", { version: 1, solicit_review: { reviewers: [{ mention: "claude", command: "review" }] } }, ".mention must be exactly one reviewer handle"],
+    ["multiple reviewer mentions", { version: 1, solicit_review: { reviewers: [{ mention: "@claude @other-reviewer", command: "review" }] } }, ".mention must be exactly one reviewer handle"],
     ["newline injection", { version: 1, solicit_review: { reviewers: [{ mention: "@claude", command: "review\n@other review" }] } }, "must not contain a newline"],
   ])("rejects %s", (_name, policy, expected) => {
     expect(() => reviewerSolicitationLines(policy)).toThrow(expected);
