@@ -10,6 +10,10 @@
 - `src/data-pipeline/quote-lifecycle-telemetry.js` — quote/fill event storage.
 - `src/analytics/offline-policy-evaluator.js` — held-out policy scoring.
 - `src/analytics/shadow-policy-promotion.js` — approval-gated promotion evidence.
+- `src/analytics/regime-strategy-validator.js` — pure regime scoring, clustered uncertainty, and gates.
+- `src/analytics/regime-strategy-validator.test.js` — no-lookahead, regime, bootstrap, and fail-closed tests.
+- `scripts/validate-regime-strategy.js` — offline JSON evidence/report entry point.
+- `scripts/smoke-regime-strategy.js` — deterministic no-dispatch validation smoke.
 - `tests/` and component `*.test.js` files — unit, integration, and smoke coverage.
 
 ## Task Ordering and Dependencies
@@ -54,9 +58,16 @@ measurement/promotion path after production telemetry is available.
 - [ ] 5.0 Close the profitability iteration loop
   - [ ] 5.1 Deploy/verify quote lifecycle telemetry and its coverage audit.
   - [ ] 5.2 Persist 1/5/60-minute side-specific Coinbase reference mark-outs.
-  - [ ] 5.3 Extend daily/weekly reports with realized spread, uptime, rejects, inventory, and PnL decomposition.
-  - [ ] 5.4 Feed held-out evidence into offline evaluator and approval-gated shadow promotion.
-  - [ ] 5.5 Define canary rollback evidence and prohibit auto-promotion.
+  - [ ] 5.3 Implement a pure regime validator with strict no-lookahead reference joins and configurable
+    clean/directional/high-volatility/stale classification.
+  - [ ] 5.4 Cluster fragmented executions, run chronological held-out evaluation, and calculate
+    deterministic cluster-bootstrap confidence intervals.
+  - [ ] 5.5 Add an offline JSON CLI and smoke that separate observed evidence from same-fill buffer
+    sensitivity and prove zero exchange/FIX dispatch capability.
+  - [ ] 5.6 Gate every result on coverage, independent clusters, observation days, shadow fill-survival
+    evidence, and lower-bound edge; default to `HOLD` and prohibit auto-promotion.
+  - [ ] 5.7 Extend daily/weekly reports with realized spread, uptime, rejects, inventory, and PnL decomposition.
+  - [ ] 5.8 Feed the held-out result into approval-gated shadow promotion and define canary rollback evidence.
 
 ## Required Gate Checklist for Each Code PR
 

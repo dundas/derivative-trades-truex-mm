@@ -96,6 +96,29 @@ inventory controls to improve profitability. It does not authorize taker trading
    inventory distribution, and net PnL decomposition.
 4. A policy candidate may change live configuration only after configured coverage, held-out
    evaluation, shadow evidence, and an explicit operator approval. It must never auto-promote.
+5. Add a pure offline regime-strategy validator that accepts normalized fill/reference evidence
+   and never imports or invokes FIX, exchange-order, or deployment code.
+6. Join each fill only to reference observations available at or before the decision timestamp and
+   to 1/5/60-minute observations at or after the requested horizon within a configured maximum age.
+   Missing, stale, duplicate, or out-of-order evidence must be classified explicitly and must not
+   be scored as neutral or favorable.
+7. Collapse fragmented fills from the same side/price execution burst into configurable independent
+   clusters before calculating coverage, quantiles, confidence intervals, or promotion gates.
+8. Classify clean, directional-risk, high-volatility, and stale-reference regimes from configurable
+   thresholds. Report observed edge separately from same-fill candidate-buffer sensitivity; label
+   the latter as counterfactual and never infer that historical fills would have survived wider quotes.
+9. Evaluate chronological held-out days and deterministic cluster-bootstrap confidence intervals.
+   No random train/test shuffle or look-ahead calibration is permitted.
+10. Default to `HOLD` unless reference coverage, independent cluster count, observation days,
+    shadow fill-survival evidence, and the configured lower confidence bound all pass. The model
+    may recommend a candidate for human review but may never authorize production or auto-promote.
+11. Record reference product, quote currency, source type, timestamp, and any PYUSD/USD basis
+    adjustment. Candle-range evidence may diagnose definite staleness but is not promotion-grade
+    fair value; promotion requires fresh top-of-book or equivalent point-in-time reference evidence.
+12. Conservative default gates are at least 95% promotion-grade reference coverage, 100 independent
+    fill clusters across five UTC days, observed shadow fill-survival evidence, and a 95% cluster-
+    bootstrap lower bound above +2bps at the configured primary horizon. Every default is validated
+    configuration rather than an embedded production-policy authorization.
 
 ## 5. Non-Goals
 
@@ -145,6 +168,8 @@ This program follows `.ai/protocols/STANDARD_DEV_WORKFLOW.md`.
 - 100% of fills have a classified telemetry record; unavailable reference mark-outs are reported
   as unavailable rather than favorable.
 - A policy cannot promote without explicit approval and positive configured held-out/shadow gates.
+- The validator reproduces the August 10–16 evidence as `HOLD`, reports unavailable reference data
+  honestly, and keeps observed and counterfactual results visibly separate.
 
 ## 9. Open Questions
 
