@@ -108,7 +108,7 @@ Execute continuously without being asked:
 12. **(SO-7)** `pr-review-loop` Phase 0 delegates to `/pre-push-review` (not an inline semgrep/roborev block)
 13. **(SO-8)** Smoke test runs after `/pre-push-review` passes, before push. Skip requires explicit category + reason in PR description. Valid skip categories: `DOCS_ONLY`, `CONFIG_ONLY`, `NO_SERVER_SURFACE`, `SMOKE_MISSING (must name follow-up PR)`
 14. **(SO-13)** `/docs-generator` mandatory after PRs touching `scripts/`, `docs/`, or content pipeline files
-15. **(SO-14)** If no review comments after 5 min on a PR, tag `@coderabbitai review`. Never merge on CI-only.
+15. **(SO-14)** After every PR push, use the exact reviewer solicitation lines from `bun scripts/reviewer-policy.ts`; re-post them if no review comments arrive within 5 minutes. Never merge on CI-only.
 
 ## Development Protocol (mandatory for ALL code changes)
 
@@ -123,7 +123,7 @@ Every code change follows this 7-step pipeline. No shortcuts.
    - `4a` `/pre-push-review` — semgrep + roborev (SO-6)
    - `4b` Smoke test (SO-8). Skip categories: `DOCS_ONLY`, `CONFIG_ONLY`, `NO_SERVER_SURFACE`, `SMOKE_MISSING`
    - `4c` `/adversarial-reviewer` — must invoke via Skill tool (SO-9)
-   - `4d` `/pr-review-loop` — tag `@coderabbitai review` if no comments after 5 min (SO-14)
+   - `4d` `/pr-review-loop` — solicit every reviewer from `bun scripts/reviewer-policy.ts` after every push and again after 5 minutes of silence (SO-14)
 5. **`/docs-generator`** — mandatory after PRs touching `scripts/`, `docs/`, or content pipeline (SO-13)
 6. **Docs PR review** — `/pr-review-loop` on the docs PR
 7. **Test locally after merge** — pull main, verify end-to-end
@@ -131,4 +131,3 @@ Every code change follows this 7-step pipeline. No shortcuts.
 **Never merge on CI-only.** At least one code review (automated or human) must complete.
 
 - **Auto-merge criteria**: 0 blocking issues + CI green — formal APPROVED not required
-- **Agent PRs**: Include `@coderabbitai ignore` in PR body at creation to suppress bot noise
