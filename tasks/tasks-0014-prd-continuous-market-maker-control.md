@@ -58,14 +58,16 @@ measurement/promotion path after production telemetry is available.
 - [ ] 5.0 Close the profitability iteration loop
   - [ ] 5.1 Deploy/verify quote lifecycle telemetry and its coverage audit.
   - [ ] 5.2 Persist 1/5/60-minute side-specific Coinbase reference mark-outs.
-  - [ ] 5.3 Implement a pure regime validator with strict no-lookahead reference joins and configurable
-    clean/directional/high-volatility/stale classification.
-  - [ ] 5.4 Cluster fragmented executions, run chronological held-out evaluation, and calculate
-    deterministic cluster-bootstrap confidence intervals.
-  - [ ] 5.5 Add an offline JSON CLI and smoke that separate observed evidence from same-fill buffer
+  - [x] 5.3 Implement a pure regime validator with strict no-lookahead reference joins and configurable
+    clean/directional/high-volatility/stale classification, positive non-crossed market-data checks,
+    bounded basis adjustment, and permanently diagnostic-only candles.
+  - [x] 5.4 Cluster fragmented executions, run chronological held-out evaluation, and calculate
+    deterministic cluster-bootstrap confidence intervals, including interleaved execution fragments.
+  - [x] 5.5 Add an offline JSON CLI and smoke that separate observed evidence from same-fill buffer
     sensitivity and prove zero exchange/FIX dispatch capability.
-  - [ ] 5.6 Gate every result on coverage, independent clusters, observation days, shadow fill-survival
-    evidence, and lower-bound edge; default to `HOLD` and prohibit auto-promotion.
+  - [x] 5.6 Gate every result on coverage, independent clusters, scored observation days, candidate-
+    identity-bound shadow cluster count and fill survival, and lower-bound edge; default to `HOLD`
+    and prohibit auto-promotion.
   - [ ] 5.7 Extend daily/weekly reports with realized spread, uptime, rejects, inventory, and PnL decomposition.
   - [ ] 5.8 Feed the held-out result into approval-gated shadow promotion and define canary rollback evidence.
 
