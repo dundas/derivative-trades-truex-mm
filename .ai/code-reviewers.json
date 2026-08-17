@@ -1,14 +1,32 @@
 {
   "version": 1,
-  "description": "GitHub mention used for automated PR review solicitation under CLAUDE.md SO-14.",
+  "description": "PR-visible reviewers and the mandatory non-approving pre-push gate used by STANDARD_DEV_WORKFLOW.",
   "solicit_review": {
     "reviewers": [
       {
-        "id": "coderabbitai",
-        "mention": "@coderabbitai",
+        "id": "claude",
+        "mention": "@claude",
         "command": "review",
-        "notes": "Triggers the repository-standard CodeRabbit review on the latest commit."
+        "family": "claude",
+        "approval_capable": true,
+        "notes": "Triggers cross-family approval review on the latest commit."
       }
+    ]
+  },
+  "pre_push_review": {
+    "id": "pre-push-review",
+    "family": "codex",
+    "approval_capable": false,
+    "required": true,
+    "invocation": "pre-push-gate"
+  },
+  "manual_approval": {
+    "allowed": true,
+    "named_humans": [
+      "@dundas"
+    ],
+    "required_for": [
+      "reviewer-policy-change"
     ]
   }
 }
