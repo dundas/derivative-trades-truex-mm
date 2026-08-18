@@ -357,6 +357,6 @@ bun scripts/analyze-shadow-takes.js    # Summarize shadow logs / Phase-2 decisio
 bun scripts/kill-switch.js --prod      # Emergency cancel all orders
 bun scripts/daily-perf-review.ts       # Daily PnL/adverse-selection review (read-only)
 bash ops/launchd/install-daily-perf-review.sh # Install scheduled daily review + alerting
-bun test                               # Full configured suite; legacy Node/Bun phase has known baseline failures
+bun run test                           # Full configured suite; legacy Node/Bun phase has known baseline failures
 bun run test:reference-markouts        # Mark-out unit/integration tests plus zero-order smokes
 ```
