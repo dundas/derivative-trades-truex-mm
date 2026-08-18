@@ -340,12 +340,19 @@ export class MarketMakerOrchestrator extends EventEmitter {
       this.logger.warn('[Orchestrator] No REST client — skipping balance initialization (quoting both sides)');
     }
 
-    // 3. Connect FIX OE
+    // 3. Strictly remove exchange orphans before FIX can connect or quoting can start.
+    // This explicit option is the only pre-start reconciliation path; ordinary
+    // periodic/manual calls remain gated on isRunning.
+    if (this.restClient) {
+      await this._restReconcile({ allowPreStart: true, strict: true });
+    }
+
+    // 4. Connect FIX OE
     this.logger.info('[Orchestrator] Connecting FIX OE...');
     await this.fixOE.connect();
     this.logger.info('[Orchestrator] FIX OE connected');
 
-    // 4. Connect market data feed (optional, non-blocking) — TrueX MD FIX or e.g. Coinbase adapter
+    // 5. Connect market data feed (optional, non-blocking) — TrueX MD FIX or e.g. Coinbase adapter
     if (this.marketDataFeed) {
       try {
         this.logger.info('[Orchestrator] Connecting market data feed...');
@@ -357,7 +364,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       }
     }
 
-    // 5. Start data pipeline (optional, non-blocking)
+    // 6. Start data pipeline (optional, non-blocking)
     if (this.dataPipeline) {
       try {
         await this.dataPipeline.start();
@@ -375,25 +382,20 @@ export class MarketMakerOrchestrator extends EventEmitter {
       }
     }
 
-    // 6. Start PnL periodic logging
+    // 7. Start PnL periodic logging
     this.pnlTracker.startPeriodicLogging();
 
-    // 7. Start quote engine drain queue timer
+    // 8. Start quote engine drain queue timer
     this.drainQueueTimer = setInterval(() => {
       this.quoteEngine.drainQueue();
     }, this.drainQueueIntervalMs);
 
-    // 8. Start REST reconciliation timer (if REST client configured)
+    // 9. Start REST reconciliation timer (if REST client configured)
     if (this.restClient) {
-      // Run immediately at startup to cancel any orphaned orders from previous session
-      this._restReconcile().catch(err =>
-        this.logger.warn(`[Orchestrator] Startup reconciliation failed (non-fatal): ${err.message}`)
-      );
-
       this._reconcileTimer = setInterval(() => this._restReconcile(), this.reconcileIntervalMs);
       this.logger.info(`[Orchestrator] REST reconciliation enabled (every ${this.reconcileIntervalMs / 1000}s)`);
 
-      // 9. Start periodic balance refresh (re-syncs tracked balances with exchange)
+      // 10. Start periodic balance refresh (re-syncs tracked balances with exchange)
       this._balanceRefreshTimer = setInterval(() => this._refreshBalances(), this.balanceRefreshIntervalMs);
       this.logger.info(`[Orchestrator] Balance refresh enabled (every ${this.balanceRefreshIntervalMs / 1000}s)`);
     }
@@ -402,7 +404,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this._watchdogTimer = setInterval(() => this._runWatchdog(), 30000);
     this.logger.info('[Orchestrator] Watchdog started (30s interval)');
 
-    // 10. Take immediate balance snapshot and start periodic timer (if postgres available)
+    // 11. Take immediate balance snapshot and start periodic timer (if postgres available)
     if (this.postgresManager) {
       await this._takeBalanceSnapshot();
       this._snapshotTimer = setInterval(() => this._takeBalanceSnapshot(), this._snapshotIntervalMs);
@@ -1947,20 +1949,23 @@ export class MarketMakerOrchestrator extends EventEmitter {
 
   // --- REST-based Order Reconciliation ---
 
-  async _restReconcile() {
-    if (!this.restClient || !this.isRunning) return;
+  async _restReconcile({ allowPreStart = false, strict = false } = {}) {
+    if (!this.restClient || (!this.isRunning && !allowPreStart)) return;
 
     try {
       // 1. Fetch active orders from exchange via REST
-      const exchangeOrders = await this.restClient.getActiveOrders();
+      const rawExchangeOrders = await this.restClient.getActiveOrders();
 
-      // 2. Build lookup of exchange orders by external_id (our clOrdID)
-      const exchangeByClOrdID = new Map();
-      for (const raw of exchangeOrders) {
+      // 2. Parse every non-transitional exchange order. Keep the array so even
+      // duplicate/missing external IDs cannot collapse distinct orphan cancels.
+      const exchangeOrders = [];
+      const exchangeClOrdIDs = new Set();
+      for (const raw of rawExchangeOrders) {
         const parsed = TrueXRESTClient.parseOrder(raw);
         // Skip transitional states
         if (parsed.status === 'NEW_PENDING' || parsed.status === 'CANCEL_PENDING') continue;
-        exchangeByClOrdID.set(parsed.externalId, { ...parsed, rawId: raw.id });
+        exchangeOrders.push({ ...parsed, rawId: raw.id });
+        if (parsed.externalId) exchangeClOrdIDs.add(parsed.externalId);
       }
 
       // 3. Build set of local clOrdIDs (skip in-flight orders)
@@ -1976,7 +1981,8 @@ export class MarketMakerOrchestrator extends EventEmitter {
       let ghostsRemoved = 0;
 
       // Orphans: on exchange but not in local state → cancel via REST
-      for (const [extId, order] of exchangeByClOrdID) {
+      for (const order of exchangeOrders) {
+        const extId = order.externalId;
         if (localClOrdIDs.has(extId) || this.quoteEngine.activeOrders.has(extId)) {
           matched++;
         } else {
@@ -1985,6 +1991,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
             await this.restClient.cancelOrder(order.rawId);
             orphansCancelled++;
           } catch (err) {
+            if (strict) throw err;
             this.logger.warn(`[Reconcile] Failed to cancel orphan ${extId}: ${err.message}`);
           }
         }
@@ -1992,7 +1999,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
 
       // Ghosts: in local state but not on exchange → remove from activeOrders
       for (const clOrdID of localClOrdIDs) {
-        if (!exchangeByClOrdID.has(clOrdID)) {
+        if (!exchangeClOrdIDs.has(clOrdID)) {
           this.logger.warn(`[Reconcile] Ghost in local state: ${clOrdID} — removing`);
           this.quoteEngine.removeStaleOrder(clOrdID);
           ghostsRemoved++;
@@ -2000,7 +2007,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       }
 
       const stats = {
-        exchange: exchangeByClOrdID.size,
+        exchange: exchangeOrders.length,
         local: localClOrdIDs.size,
         matched,
         orphansCancelled,
@@ -2013,9 +2020,17 @@ export class MarketMakerOrchestrator extends EventEmitter {
       );
 
       this.emit('reconcile', stats);
+      return stats;
     } catch (err) {
+      if (strict) throw err;
       this.logger.error(`[Reconcile] REST reconciliation failed: ${err.message}`);
-      this.emit('error', { phase: 'reconcile', error: err });
+      // EventEmitter treats an unhandled `error` event as a throw. Periodic
+      // reconciliation is intentionally nonfatal, while registered observers
+      // still receive the existing event contract.
+      if (this.listenerCount('error') > 0) {
+        this.emit('error', { phase: 'reconcile', error: err });
+      }
+      return undefined;
     }
   }
 }
