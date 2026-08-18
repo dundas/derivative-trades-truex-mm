@@ -89,6 +89,23 @@ describe('CapitalReservationManager', () => {
     expect(capital.reserve({ orderId: 'ask-l1', side: 'sell', price: 100000, size: 0.01, level: 1 }).accepted).toBe(true);
   });
 
+  test('level quote capacity preserves L1 only when no live L1 and includes existing reservations', () => {
+    const capital = new CapitalReservationManager({ l1ReserveBase: 0.01, l1ReserveQuote: 1000 });
+    capital.reconcile({ ...snapshot(), liveOrders: [] });
+    expect(capital.getQuoteCapacityForLevel('sell', 2)).toBeCloseTo(0.00686, 8);
+    expect(capital.getQuoteCapacityForLevel('buy', 2)).toBeCloseTo(1000, 8);
+    // A planned desired L1 consumes the carve-out rather than being subtracted twice.
+    expect(capital.getQuoteCapacityForLevel('sell', 2, 0.01)).toBeCloseTo(0.01686, 8);
+    expect(capital.getQuoteCapacityForLevel('buy', 2, 1000)).toBeCloseTo(2000, 8);
+
+    capital.reserve({ orderId: 'ask-l1-live', side: 'sell', price: 100000, size: 0.01, level: 1 });
+    capital.accept('ask-l1-live');
+    capital.reserve({ orderId: 'bid-l1-live', side: 'buy', price: 100000, size: 0.01, level: 1 });
+    capital.accept('bid-l1-live');
+    expect(capital.getQuoteCapacityForLevel('sell', 2)).toBeCloseTo(0.01686, 8);
+    expect(capital.getQuoteCapacityForLevel('buy', 2)).toBeCloseTo(2000, 8);
+  });
+
   test('failed reconciliation preserves acknowledged L1 but rejects new reservations until coherent recovery', () => {
     const capital = new CapitalReservationManager();
     capital.reconcile({ ...snapshot(), liveOrders: [] });

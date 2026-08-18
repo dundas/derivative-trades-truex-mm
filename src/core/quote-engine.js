@@ -43,6 +43,7 @@ export class QuoteEngine extends EventEmitter {
       throw new Error('maxExecutionIdsPerOrder must be a positive integer');
     }
     this.executionDedupeByOrder = new Map();
+    this.unknownStatusDedupeByOrder = new Map();
     this.terminalExecutionOrders = new Set();
     this.executionEvidenceGap = null;
     this.logger = options.logger || console;
@@ -1328,6 +1329,7 @@ export class QuoteEngine extends EventEmitter {
             });
           }
           this.activeOrders.delete(resolvedClOrdID);
+          this.unknownStatusDedupeByOrder.delete(resolvedClOrdID);
           this.cancelToOrigMap.delete(clOrdID);
           break;
         }
@@ -1435,6 +1437,7 @@ export class QuoteEngine extends EventEmitter {
         if (this.capitalReservationManager.expired(resolvedClOrdID)) {
           const expired = this.activeOrders.get(resolvedClOrdID);
           this.activeOrders.delete(resolvedClOrdID);
+          this.unknownStatusDedupeByOrder.delete(resolvedClOrdID);
           this.emit('quote-lifecycle', {
             eventType: 'cancel', quoteId: resolvedClOrdID, executionId: execID,
             side: expired?.side || side, price: expired?.price, size: expired?.size,
@@ -1451,6 +1454,32 @@ export class QuoteEngine extends EventEmitter {
         break;
 
       default: // Surface anything we don't explicitly handle instead of silently dropping it
+        if (this.capitalReservationManager?.isActionableReservation(resolvedClOrdID)) {
+          const status = ordStatus === undefined || ordStatus === null || ordStatus === ''
+            ? 'missing'
+            : String(ordStatus);
+          const reason = `unmapped-ord-status:${status}`;
+          const identity = this._recordUnknownStatusIdentity(resolvedClOrdID, execID);
+          if (identity === 'capacity' && !this.executionEvidenceGap) {
+            const transitioned = this.capitalReservationManager.failClosedForEvidenceGap(
+              resolvedClOrdID, 'unknown-status-dedupe-capacity-exceeded',
+            );
+            if (transitioned) {
+              this._failClosedExecutionEvidence(
+                resolvedClOrdID, 'unknown-status-dedupe-capacity-exceeded',
+              );
+              this._emitCapitalEvidenceGap(resolvedClOrdID);
+            }
+          } else if (identity === 'new' && !this.executionEvidenceGap) {
+            const newlyFailed = this.capitalReservationManager.failClosedForEvidenceGap(
+              resolvedClOrdID, reason,
+            );
+            if (newlyFailed) {
+              this._failClosedExecutionEvidence(resolvedClOrdID, reason, { authoritative: true });
+              this._emitCapitalEvidenceGap(resolvedClOrdID);
+            }
+          }
+        }
         this.logger.warn(`[QuoteEngine] Unhandled execution report ordStatus=${ordStatus} clOrdID=${clOrdID} execID=${execID}`);
         break;
     }
@@ -1647,11 +1676,9 @@ export class QuoteEngine extends EventEmitter {
    */
   _capSizeToBalance(side, desiredSize, price, alreadyCommitted = 0, level = 1) {
     if (this.capitalReservationManager) {
-      let available = this.capitalReservationManager.getQuoteCapacity(side);
-      if (level > 1 && alreadyCommitted === 0) {
-        const asset = side === 'sell' ? 'base' : 'quote';
-        available = Math.max(0, available - this.capitalReservationManager.l1Reserve[asset]);
-      }
+      const available = this.capitalReservationManager.getQuoteCapacityForLevel(
+        side, level, alreadyCommitted,
+      );
       const remaining = Math.max(0, available - alreadyCommitted);
       const maxSize = side === 'sell' ? remaining : (price > 0 ? remaining / price : 0);
       const factor = Math.pow(10, this.config.sizeDecimalPlaces);
@@ -2226,16 +2253,42 @@ export class QuoteEngine extends EventEmitter {
     if (!orderId) return;
     this.executionDedupeByOrder.delete(orderId);
     this.terminalExecutionOrders.delete(orderId);
+    this.unknownStatusDedupeByOrder.delete(orderId);
   }
 
-  _failClosedExecutionEvidence(orderId, reason) {
+  _recordUnknownStatusIdentity(orderId, execID) {
+    let identity = this.unknownStatusDedupeByOrder.get(orderId);
+    if (!identity) {
+      if (this.unknownStatusDedupeByOrder.size >= this.maxExecutionDedupeOrders) return 'capacity';
+      identity = { execIDs: new Set(), missingExecIDSeen: false };
+      this.unknownStatusDedupeByOrder.set(orderId, identity);
+    }
+    if (!execID) {
+      if (identity.missingExecIDSeen) return 'duplicate';
+      identity.missingExecIDSeen = true;
+      return 'new';
+    }
+    if (identity.execIDs.has(execID)) return 'duplicate';
+    if (identity.execIDs.size >= this.maxExecutionIdsPerOrder) return 'capacity';
+    identity.execIDs.add(execID);
+    return 'new';
+  }
+
+  _failClosedExecutionEvidence(orderId, reason, { authoritative = false } = {}) {
     if (this.executionEvidenceGap) return false;
-    this.executionEvidenceGap = { orderId, reason, executionState: 'unsafe' };
+    this.executionEvidenceGap = { orderId, reason, executionState: 'unsafe', authoritative };
     this.setContinuityState({ executionState: 'unsafe', reasons: ['execution-evidence-gap', reason] });
     this.suspendQuoting();
     this.emit('execution-evidence-gap', { ...this.executionEvidenceGap });
     this.logger.error(`[QuoteEngine] Execution evidence failed closed: orderId=${orderId} reason=${reason}`);
     return false;
+  }
+
+  resolveAuthoritativeExecutionEvidenceGap() {
+    if (!this.executionEvidenceGap?.authoritative) return false;
+    this.executionEvidenceGap = null;
+    this.setContinuityState({ executionState: 'normal', reasons: [] });
+    return true;
   }
 
   _prepareQuoteForSend(quote) {

@@ -2,7 +2,7 @@ import { describe, expect, mock, test } from 'bun:test';
 import { CapitalReservationManager } from './capital-reservation-manager.js';
 import { QuoteEngine } from './quote-engine.js';
 
-function setup(baseAvailable = 0.01686) {
+function setup(baseAvailable = 0.01686, engineOptions = {}) {
   const capital = new CapitalReservationManager();
   capital.reconcile({
     baseBalance: { available: baseAvailable, held: 0, total: baseAvailable },
@@ -10,7 +10,11 @@ function setup(baseAvailable = 0.01686) {
     liveOrders: [],
   });
   const fixConnection = { sendMessage: mock(() => {}) };
-  const engine = new QuoteEngine({ capitalReservationManager: capital, fixConnection, logger: { info() {}, warn() {}, error() {}, debug() {} } });
+  const engine = new QuoteEngine({
+    capitalReservationManager: capital, fixConnection,
+    logger: { info() {}, warn() {}, error() {}, debug() {} },
+    ...engineOptions,
+  });
   return { capital, engine, fixConnection };
 }
 
@@ -25,6 +29,20 @@ describe('QuoteEngine capital reservation binding', () => {
     expect(fixConnection.sendMessage).toHaveBeenCalledTimes(1);
     expect(capital.getReservation(first).state).toBe('pending-new');
     expect(engine.suppressedLevels.get('sell:2').reason).toBe('locally-unfunded');
+  });
+
+  test('delegates level-aware caps to the manager without reading reservation internals', () => {
+    const getQuoteCapacityForLevel = mock(() => 1000);
+    const manager = { getQuoteCapacityForLevel };
+    Object.defineProperty(manager, 'l1Reserve', {
+      get() { throw new Error('private reserve internals must not be read'); },
+    });
+    const engine = new QuoteEngine({
+      capitalReservationManager: manager,
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+    });
+    expect(engine._capSizeToBalance('buy', 0.02, 100000, 500, 2)).toBe(0.005);
+    expect(getQuoteCapacityForLevel).toHaveBeenCalledWith('buy', 2, 500);
   });
 
   test('converts pending reservation to acknowledged-live and preserves it during cancel', () => {
@@ -204,6 +222,176 @@ describe('QuoteEngine capital reservation binding', () => {
     });
     expect(capital.consumedEvents).toHaveLength(1);
     expect(fills).toEqual([]);
+  });
+
+  test('unknown authoritative OrdStatus fails closed once without inventing a terminal or fill', () => {
+    const { capital, engine } = setup(0.01);
+    const resyncs = [];
+    const fills = [];
+    engine.on('capital-resync-required', (event) => resyncs.push(event));
+    engine.on('fill', (event) => fills.push(event));
+    const orderId = engine._sendNewOrder({
+      side: 'sell', price: 100000, size: 0.01, level: 1,
+    });
+    engine.onExecutionReport({ '11': orderId, '39': '0', '54': '2' });
+    const unknown = { '11': orderId, '39': 'Z', '54': '2', '17': 'u1' };
+    const churn = { '11': orderId, '39': 'Y', '54': '2', '17': 'u2' };
+
+    engine.onExecutionReport(unknown);
+    engine.onExecutionReport(churn);
+    expect(capital.getReservation(orderId)).toMatchObject({
+      state: 'active', acknowledgedLive: true, remainingSize: 0.01,
+      evidenceGapReason: 'unmapped-ord-status:Z',
+    });
+    expect(capital.getStatus()).toMatchObject({
+      state: 'degraded', reason: 'unmapped-ord-status:Z', blockedSides: ['sell'],
+    });
+    expect(engine.activeOrders.has(orderId)).toBe(true);
+    expect(engine.quotingSuspended).toBe(true);
+    expect(engine.getContinuityState()).toMatchObject({
+      executionState: 'unsafe', reasons: expect.arrayContaining(['unmapped-ord-status:Z']),
+    });
+    expect(resyncs).toEqual([expect.objectContaining({
+      orderId, side: 'sell', reason: 'unmapped-ord-status:Z',
+    })]);
+    expect(fills).toEqual([]);
+
+    capital.reconcile({
+      baseBalance: { available: 0, held: 0.01, total: 0.01 },
+      quoteBalance: { available: 2000, held: 0, total: 2000 },
+      liveOrders: [{ orderId }], clearBlockedSides: true,
+    });
+    expect(engine.resolveAuthoritativeExecutionEvidenceGap()).toBe(true);
+    expect(engine.executionEvidenceGap).toBeNull();
+    expect(capital.getReservation(orderId)).not.toHaveProperty('evidenceGapReason');
+    expect(capital.getStatus()).toMatchObject({ state: 'normal', blockedSides: [] });
+
+    engine.onExecutionReport(unknown);
+    engine.onExecutionReport(churn);
+    expect(resyncs).toHaveLength(1);
+    expect(capital.getStatus()).toMatchObject({ state: 'normal', blockedSides: [] });
+
+    engine.onExecutionReport({ '11': orderId, '39': 'X', '54': '2', '17': 'u3' });
+    expect(resyncs).toHaveLength(2);
+    expect(resyncs[1]).toMatchObject({ reason: 'unmapped-ord-status:X' });
+    expect(capital.getStatus()).toMatchObject({
+      state: 'degraded', reason: 'unmapped-ord-status:X', blockedSides: ['sell'],
+    });
+  });
+
+  test('missing-ExecID unknown status is conservative one-shot and identities clear at terminal cleanup', () => {
+    const { capital, engine } = setup(0.01);
+    const resyncs = [];
+    engine.on('capital-resync-required', (event) => resyncs.push(event));
+    const orderId = engine._sendNewOrder({ side: 'sell', price: 100000, size: 0.01, level: 1 });
+    engine.onExecutionReport({ '11': orderId, '39': '0', '54': '2' });
+    engine.onExecutionReport({ '11': orderId, '39': 'Z', '54': '2' });
+    engine.onExecutionReport({ '11': orderId, '39': 'Y', '54': '2' });
+    expect(resyncs).toHaveLength(1);
+    expect(resyncs[0]).toMatchObject({ reason: 'unmapped-ord-status:Z' });
+    expect(engine.unknownStatusDedupeByOrder.get(orderId)).toMatchObject({
+      missingExecIDSeen: true,
+    });
+
+    capital.reconcile({
+      baseBalance: { available: 0, held: 0.01, total: 0.01 },
+      quoteBalance: { available: 2000, held: 0, total: 2000 },
+      liveOrders: [{ orderId }], clearBlockedSides: true,
+    });
+    engine.resolveAuthoritativeExecutionEvidenceGap();
+    engine.onExecutionReport({ '11': orderId, '39': 'Z', '54': '2' });
+    expect(resyncs).toHaveLength(1);
+
+    engine.onExecutionReport({ '11': orderId, '39': '4', '54': '2' });
+    expect(engine.unknownStatusDedupeByOrder.has(orderId)).toBe(false);
+  });
+
+  test('late unknown statuses after every terminal path cannot recreate or poison the bounded ledger', () => {
+    const terminalActions = {
+      cancel: (engine, orderId) => engine.onExecutionReport({ '11': orderId, '39': '4', '54': '2' }),
+      reject: (engine, orderId) => engine.onExecutionReport({
+        '11': orderId, '39': '8', '54': '2', '58': 'venue reject',
+      }),
+      expiry: (engine, orderId) => engine.onExecutionReport({ '11': orderId, '39': 'C', '54': '2' }),
+      fullFill: (engine, orderId) => engine.onExecutionReport({
+        '11': orderId, '39': '2', '54': '2', '17': 'fill-terminal',
+        '31': '100000', '32': '0.01', '151': '0',
+      }),
+      restAbsence: (engine, orderId) => engine.removeStaleOrder(orderId),
+    };
+
+    for (const [terminalPath, terminate] of Object.entries(terminalActions)) {
+      const { capital, engine } = setup(0.01, {
+        maxExecutionIdsPerOrder: 1, maxExecutionDedupeOrders: 1,
+      });
+      const resyncs = [];
+      engine.on('capital-resync-required', (event) => resyncs.push(event));
+      const orderId = engine._sendNewOrder({
+        side: 'sell', price: 100000, size: 0.01, level: 1,
+      });
+      engine.onExecutionReport({ '11': orderId, '39': '0', '54': '2' });
+      terminate(engine, orderId);
+      expect(capital.isActionableReservation(orderId)).toBe(false);
+      const stateBeforeLateReports = capital.getStatus();
+
+      engine.onExecutionReport({ '11': orderId, '39': 'Z', '54': '2', '17': 'late-u1' });
+      engine.onExecutionReport({ '11': orderId, '39': 'Y', '54': '2', '17': 'late-u2' });
+      expect(engine.unknownStatusDedupeByOrder.has(orderId)).toBe(false);
+      expect(engine.executionEvidenceGap).toBeNull();
+      expect(engine.quotingSuspended).toBe(false);
+      expect(resyncs).toEqual([]);
+      expect(capital.getStatus()).toMatchObject({
+        state: stateBeforeLateReports.state,
+        reason: stateBeforeLateReports.reason,
+        blockedSides: stateBeforeLateReports.blockedSides,
+      });
+      expect(terminalPath).toBeString();
+    }
+  });
+
+  test('active unknown identity capacity still fails closed instead of evicting replay protection', () => {
+    const { capital, engine } = setup(0.01, { maxExecutionIdsPerOrder: 1 });
+    const resyncs = [];
+    engine.on('capital-resync-required', (event) => resyncs.push(event));
+    const orderId = engine._sendNewOrder({ side: 'sell', price: 100000, size: 0.01, level: 1 });
+    engine.onExecutionReport({ '11': orderId, '39': '0', '54': '2' });
+    engine.onExecutionReport({ '11': orderId, '39': 'Z', '54': '2', '17': 'u1' });
+    capital.reconcile({
+      baseBalance: { available: 0, held: 0.01, total: 0.01 },
+      quoteBalance: { available: 2000, held: 0, total: 2000 },
+      liveOrders: [{ orderId }], clearBlockedSides: true,
+    });
+    engine.resolveAuthoritativeExecutionEvidenceGap();
+
+    engine.onExecutionReport({ '11': orderId, '39': 'Y', '54': '2', '17': 'u2' });
+    expect(engine.executionEvidenceGap).toMatchObject({
+      reason: 'unknown-status-dedupe-capacity-exceeded', authoritative: false,
+    });
+    expect(capital.getStatus()).toMatchObject({
+      state: 'degraded', reason: 'unknown-status-dedupe-capacity-exceeded', blockedSides: ['sell'],
+    });
+    expect(engine.unknownStatusDedupeByOrder.get(orderId).execIDs).toEqual(new Set(['u1']));
+    expect(resyncs).toHaveLength(2);
+  });
+
+  test('unknown OrdStatus remains observational for untracked and legacy orders', () => {
+    const managed = setup();
+    const managedResyncs = [];
+    managed.engine.on('capital-resync-required', (event) => managedResyncs.push(event));
+    managed.engine.onExecutionReport({ '11': 'untracked', '39': 'Z', '54': '2' });
+    expect(managed.engine.quotingSuspended).toBe(false);
+    expect(managedResyncs).toEqual([]);
+
+    const legacy = new QuoteEngine({
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+    });
+    legacy.activeOrders.set('legacy', {
+      side: 'sell', price: 100000, size: 0.01, level: 1,
+      status: 'active', acknowledgedLive: true,
+    });
+    legacy.onExecutionReport({ '11': 'legacy', '39': 'Z', '54': '2' });
+    expect(legacy.activeOrders.has('legacy')).toBe(true);
+    expect(legacy.quotingSuspended).toBe(false);
   });
 
   test('authoritative terminal rejects supplied malformed or nonzero LeavesQty as evidence gaps', () => {

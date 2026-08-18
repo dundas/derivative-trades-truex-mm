@@ -2197,6 +2197,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
         clearBlockedSides,
         generation,
       });
+      if (capitalResult?.state === 'normal' && capitalResult.blockedSides?.length === 0) {
+        this.quoteEngine?.resolveAuthoritativeExecutionEvidenceGap?.();
+      }
       for (const orderId of capitalResult?.promotedOrderIds || []) {
         const local = this.quoteEngine.activeOrders.get(orderId);
         if (local) {

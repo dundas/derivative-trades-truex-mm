@@ -220,6 +220,9 @@ export class CapitalReservationManager {
       this.state = 'degraded';
       this.reason = 'live-order-promotion-evidence-mismatch';
     }
+    if (this.state === 'normal' && this.blockedSides.size === 0) {
+      for (const order of this.reservations.values()) delete order.evidenceGapReason;
+    }
     if (generation) this.lastAppliedReconciliation = generation.id;
     return { ...this.getStatus(), promotedOrderIds, promotionMismatches };
   }
@@ -462,6 +465,20 @@ export class CapitalReservationManager {
     return this.getAvailable(side) + reserved;
   }
 
+  getQuoteCapacityForLevel(side, level, plannedCommitment = 0) {
+    const capacity = this.getQuoteCapacity(side);
+    if (Number(level) <= 1) return capacity;
+    const hasL1Reservation = [...this.reservations.values()].some((order) =>
+      order.side === side && order.level === 1 && !TERMINAL_STATES.has(order.state)
+    );
+    if (hasL1Reservation) return capacity;
+    const asset = side === 'sell' ? 'base' : 'quote';
+    const planned = Number.isFinite(Number(plannedCommitment))
+      ? Math.max(0, Number(plannedCommitment))
+      : 0;
+    return Math.max(0, capacity - Math.max(0, this.l1Reserve[asset] - planned));
+  }
+
   getAvailableForLevel(side, level) {
     const available = this.getAvailable(side);
     if (Number(level) <= 1) return available;
@@ -476,6 +493,11 @@ export class CapitalReservationManager {
   getReservation(orderId) {
     const order = this.reservations.get(orderId);
     return order ? { ...order } : null;
+  }
+
+  isActionableReservation(orderId) {
+    const order = this.reservations.get(orderId);
+    return Boolean(order && !TERMINAL_STATES.has(order.state));
   }
 
   getReservations() {
@@ -528,7 +550,11 @@ export class CapitalReservationManager {
   failClosedForEvidenceGap(orderId, reason) {
     const order = this.reservations.get(orderId);
     if (!order || TERMINAL_STATES.has(order.state)) return false;
-    return this._evidenceGap(order, reason);
+    if (order.evidenceGapReason === reason) return false;
+    order.evidenceGapReason = reason;
+    order.lastMutationSequence = this.eventSequence + 1;
+    this._evidenceGap(order, reason);
+    return true;
   }
 
   terminalEvidenceGap(orderId, reason) {
