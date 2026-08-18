@@ -479,6 +479,8 @@ PostgreSQL-backed analytics server using `Bun.serve()` on port 3100.
 | `TRUEX_REST_URL` | No | `http://10.20.6.11:9742` | TrueX REST URL — derived from `TRUEX_PROD_HOST` by `docker-compose.prod.yml`. Override only when accessing from outside Hetzner (e.g. `http://178.156.230.110:3006` socat tunnel for local development). |
 | `TRUEX_TARGET_COMP_ID` | No | `TRUEX_PROD_OE` | FIX TargetCompID |
 | `TRUEX_SENDER_COMP_ID` | No | `DAVID1` | FIX SenderCompID |
+| `TRUEX_STARTUP_CANCEL_VERIFY_TIMEOUT_MS` | No | `30000` | Maximum positive-integer milliseconds to wait for pre-existing `CANCEL_PENDING` orders to become terminal or disappear before startup fails |
+| `TRUEX_STARTUP_CANCEL_VERIFY_INTERVAL_MS` | No | `500` | Positive-integer REST polling interval during strict startup cancel verification; must not exceed the timeout |
 | `DATABASE_URL` | No | -- | PostgreSQL connection string (Hetzner truex-pg-analytics 178.156.247.87:5432/truex_analytics) |
 | `REDIS_URL` | No | -- | Redis connection string (optional, auto-fallback) |
 | `REFERENCE_MARKOUT_ENABLED` | No | `false` | Explicitly enable restart-safe 1/5/60-minute reference collection; keep false for the inert rollout stage |

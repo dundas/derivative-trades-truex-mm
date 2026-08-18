@@ -55,6 +55,11 @@ function isStableLocalOrder(order) {
   return order && order.status !== 'pending' && order.status !== 'cancelling';
 }
 
+function positiveIntegerOption(value, name) {
+  if (!Number.isInteger(value) || value <= 0) throw new Error(`${name} must be a positive integer`);
+  return value;
+}
+
 /**
  * MarketMakerOrchestrator - Wires all components and manages lifecycle.
  *
@@ -243,6 +248,19 @@ export class MarketMakerOrchestrator extends EventEmitter {
       });
     }
     this.reconcileIntervalMs = options.reconcileIntervalMs || 300000; // 5 min
+    this.startupCancelVerifyTimeoutMs = positiveIntegerOption(
+      options.startupCancelVerifyTimeoutMs ?? 30000,
+      'startupCancelVerifyTimeoutMs',
+    );
+    this.startupCancelVerifyIntervalMs = positiveIntegerOption(
+      options.startupCancelVerifyIntervalMs ?? 500,
+      'startupCancelVerifyIntervalMs',
+    );
+    if (this.startupCancelVerifyIntervalMs > this.startupCancelVerifyTimeoutMs) {
+      throw new Error('startupCancelVerifyIntervalMs must not exceed startupCancelVerifyTimeoutMs');
+    }
+    this._now = options.now || Date.now;
+    this._sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.balanceRefreshIntervalMs = options.balanceRefreshIntervalMs || 60000; // 1 min
     this.truexEbboPollIntervalMs = options.truexEbboPollIntervalMs ?? 1000;
     const configuredTruexEbboPollTimeoutMs =
@@ -2071,6 +2089,47 @@ export class MarketMakerOrchestrator extends EventEmitter {
 
   // --- REST-based Order Reconciliation ---
 
+  async _verifyStartupCancelPending(rawOrders) {
+    let current = rawOrders;
+    const startedAt = this._now();
+    const maxPolls = Math.ceil(
+      this.startupCancelVerifyTimeoutMs / this.startupCancelVerifyIntervalMs
+    );
+    let polls = 0;
+    while (true) {
+      const pending = current.filter((raw) => raw?.status === 'CANCEL_PENDING');
+      if (pending.length === 0) return current;
+
+      const venueIds = new Set();
+      const externalIds = new Set();
+      for (const raw of pending) {
+        const venueId = typeof raw?.id === 'string' ? raw.id.trim() : '';
+        const externalId = typeof raw?.external_id === 'string' ? raw.external_id.trim() : '';
+        if (!venueId || !externalId || venueIds.has(venueId) || externalIds.has(externalId)) {
+          throw new Error('invalid cancel-pending identity during strict startup reconciliation');
+        }
+        venueIds.add(venueId);
+        externalIds.add(externalId);
+      }
+
+      const elapsed = this._now() - startedAt;
+      if (!Number.isFinite(elapsed) || elapsed < 0 ||
+          elapsed >= this.startupCancelVerifyTimeoutMs || polls >= maxPolls) {
+        throw new Error('cancel-pending verification timed out during strict startup reconciliation');
+      }
+      const waitMs = Math.min(
+        this.startupCancelVerifyIntervalMs,
+        this.startupCancelVerifyTimeoutMs - elapsed,
+      );
+      await this._sleep(waitMs);
+      polls++;
+      current = await this.restClient.getActiveOrders();
+      if (!Array.isArray(current)) {
+        throw new Error('invalid active-order response during strict startup reconciliation');
+      }
+    }
+  }
+
   async _restReconcile({ allowPreStart = false, strict = false, _generationFollowup = false } = {}) {
     if (!this.restClient || (!this.isRunning && !allowPreStart)) return;
 
@@ -2085,7 +2144,11 @@ export class MarketMakerOrchestrator extends EventEmitter {
       }
 
       // 1. Fetch active orders from exchange via REST
-      const rawExchangeOrders = await this.restClient.getActiveOrders();
+      let rawExchangeOrders = await this.restClient.getActiveOrders();
+      if (!Array.isArray(rawExchangeOrders)) {
+        throw new Error('invalid active-order response during REST reconciliation');
+      }
+      if (strict) rawExchangeOrders = await this._verifyStartupCancelPending(rawExchangeOrders);
 
       // 2. Parse every non-transitional exchange order. Keep the array so even
       // duplicate/missing external IDs cannot collapse distinct orphan cancels.
@@ -2093,6 +2156,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       const exchangeClOrdIDs = new Set();
       for (const raw of rawExchangeOrders) {
         const parsed = TrueXRESTClient.parseOrder(raw);
+        if (['CANCELED', 'FILLED', 'REJECTED'].includes(parsed.status)) continue;
         // Skip transitional states
         if (parsed.status === 'NEW_PENDING' || parsed.status === 'CANCEL_PENDING') continue;
         exchangeOrders.push({ ...parsed, rawId: raw.id });

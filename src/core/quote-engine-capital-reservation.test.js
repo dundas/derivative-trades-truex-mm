@@ -38,6 +38,63 @@ describe('QuoteEngine capital reservation binding', () => {
     expect(fixConnection.sendMessage).toHaveBeenCalledTimes(2);
   });
 
+  test('synchronous cancel send failure rolls back manager and local lifecycle exactly and permits retry', () => {
+    const { capital, engine, fixConnection } = setup();
+    const orderId = engine._sendNewOrder({ side: 'sell', price: 100000, size: 0.01, level: 1 });
+    engine.onExecutionReport({ '11': orderId, '39': '0', '54': '2' });
+    const cancelLifecycle = [];
+    engine.on('quote-lifecycle', (event) => {
+      if (event.eventType === 'cancel') cancelLifecycle.push(event);
+    });
+    const priorLastAction = engine.lastActionByClOrdID.get(orderId);
+    const pendingReplacement = { quote: { side: 'sell', price: 100001, size: 0.01, level: 1 } };
+    engine.pendingReplacements.set(orderId, pendingReplacement);
+    fixConnection.sendMessage.mockImplementationOnce(() => { throw new Error('socket write failed'); });
+
+    expect(() => engine._sendCancel(orderId, engine.activeOrders.get(orderId)))
+      .toThrow('socket write failed');
+    expect(engine.activeOrders.get(orderId)).toMatchObject({
+      status: 'active', acknowledgedLive: true,
+    });
+    expect(engine.activeOrders.get(orderId)).not.toHaveProperty('cancellingAt');
+    expect(capital.getReservation(orderId)).toMatchObject({ state: 'active', acknowledgedLive: true });
+    expect(engine.cancelToOrigMap.size).toBe(0);
+    expect(engine.pendingReplacements.get(orderId)).toBe(pendingReplacement);
+    expect(engine.lastActionByClOrdID.get(orderId)).toBe(priorLastAction);
+    expect(cancelLifecycle).toEqual([]);
+
+    engine._sendCancel(orderId, engine.activeOrders.get(orderId));
+    expect(engine.activeOrders.get(orderId).status).toBe('cancelling');
+    expect(capital.getReservation(orderId).state).toBe('cancel-in-flight');
+    expect(engine.cancelToOrigMap.size).toBe(1);
+    expect(cancelLifecycle).toHaveLength(1);
+  });
+
+  test('synchronous cancel send failure rolls back legacy local state without false suppression', () => {
+    const fixConnection = { sendMessage: mock(() => { throw new Error('socket write failed'); }) };
+    const engine = new QuoteEngine({
+      fixConnection,
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+    });
+    const orderId = 'legacy-active';
+    const order = {
+      side: 'buy', price: 99999, size: 0.01, level: 1,
+      status: 'active', acknowledgedLive: true,
+    };
+    engine.activeOrders.set(orderId, order);
+
+    expect(() => engine._sendCancel(orderId, order)).toThrow('socket write failed');
+    expect(engine.activeOrders.get(orderId)).toEqual(order);
+    expect(order).toMatchObject({ status: 'active', acknowledgedLive: true });
+    expect(order).not.toHaveProperty('cancellingAt');
+    expect(engine.cancelToOrigMap.size).toBe(0);
+
+    fixConnection.sendMessage.mockImplementation(() => {});
+    engine._sendCancel(orderId, order);
+    expect(order.status).toBe('cancelling');
+    expect(engine.cancelToOrigMap.size).toBe(1);
+  });
+
   test('blocks the rejected side and requests reconciliation after insufficient funds', () => {
     const { capital, engine } = setup();
     const resyncs = [];

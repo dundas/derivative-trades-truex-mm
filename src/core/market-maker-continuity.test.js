@@ -17,7 +17,7 @@ const balances = {
   quoteBalance: { available: 1000, held: 0, total: 1000 },
 };
 
-function makeStartupOrchestrator() {
+function makeStartupOrchestrator(extraOptions = {}) {
   const fixOE = Object.assign(new EventEmitter(), {
     isConnected: false,
     isLoggedOn: false,
@@ -52,6 +52,7 @@ function makeStartupOrchestrator() {
     fixConnection: fixOE, quoteEngine, inventoryManager, pnlTracker, hedgeExecutor,
     marketDataFeed: null,
     logger: { info() {}, warn() {}, error() {}, debug() {} },
+    ...extraOptions,
   });
 }
 
@@ -170,6 +171,24 @@ describe('MarketMakerOrchestrator strict startup reconciliation', () => {
     pending_qty: '0', leaves_qty: '0.01', exeuted_qty: '0', executed_vwap: '0',
   });
 
+  test('strictly validates configurable startup cancel verification bounds', () => {
+    expect(makeStartupOrchestrator({
+      startupCancelVerifyTimeoutMs: 20,
+      startupCancelVerifyIntervalMs: 10,
+    })).toMatchObject({
+      startupCancelVerifyTimeoutMs: 20,
+      startupCancelVerifyIntervalMs: 10,
+    });
+    for (const options of [
+      { startupCancelVerifyTimeoutMs: 0 },
+      { startupCancelVerifyTimeoutMs: 1.5 },
+      { startupCancelVerifyIntervalMs: -1 },
+      { startupCancelVerifyTimeoutMs: 10, startupCancelVerifyIntervalMs: 20 },
+    ]) {
+      expect(() => makeStartupOrchestrator(options)).toThrow();
+    }
+  });
+
   test('awaits strict pre-start reconciliation before FIX connection or quoting eligibility', async () => {
     const orchestrator = makeStartupOrchestrator();
     orchestrator.restClient = {};
@@ -207,6 +226,58 @@ describe('MarketMakerOrchestrator strict startup reconciliation', () => {
     expect(orchestrator.restClient.cancelOrder).toHaveBeenCalledWith('venue-1');
     expect(orchestrator.fixOE.connect).not.toHaveBeenCalled();
     expect(orchestrator.isRunning).toBe(false);
+  });
+
+  test('strict startup waits for cancel-pending orders to become terminal', async () => {
+    let now = 0;
+    const getActiveOrders = mock()
+      .mockResolvedValueOnce([rawOrder('venue-pending', 'prior-session', 'CANCEL_PENDING')])
+      .mockResolvedValueOnce([rawOrder('venue-pending', 'prior-session', 'CANCELED')]);
+    const orchestrator = makeStartupOrchestrator();
+    orchestrator.restClient = { getActiveOrders, cancelOrder: mock(async () => {}) };
+    orchestrator.startupCancelVerifyTimeoutMs = 100;
+    orchestrator.startupCancelVerifyIntervalMs = 10;
+    orchestrator._now = () => now;
+    orchestrator._sleep = mock(async (ms) => { now += ms; });
+
+    const stats = await orchestrator._restReconcile({ allowPreStart: true, strict: true });
+    expect(getActiveOrders).toHaveBeenCalledTimes(2);
+    expect(orchestrator._sleep).toHaveBeenCalledWith(10);
+    expect(orchestrator.restClient.cancelOrder).not.toHaveBeenCalled();
+    expect(stats).toMatchObject({ exchange: 0, orphansCancelled: 0, ghostsRemoved: 0 });
+  });
+
+  test('strict startup aborts after the configured cancel-pending verification bound', async () => {
+    let now = 0;
+    const orchestrator = makeStartupOrchestrator();
+    orchestrator.restClient = {
+      getActiveOrders: mock(async () => [rawOrder('venue-pending', 'prior-session', 'CANCEL_PENDING')]),
+      cancelOrder: mock(async () => {}),
+    };
+    orchestrator.startupCancelVerifyTimeoutMs = 20;
+    orchestrator.startupCancelVerifyIntervalMs = 10;
+    orchestrator._now = () => now;
+    orchestrator._sleep = mock(async (ms) => { now += ms; });
+
+    await expect(orchestrator._restReconcile({ allowPreStart: true, strict: true }))
+      .rejects.toThrow('cancel-pending verification timed out');
+    expect(orchestrator.restClient.getActiveOrders).toHaveBeenCalledTimes(3);
+    expect(orchestrator.restClient.cancelOrder).not.toHaveBeenCalled();
+  });
+
+  test('strict startup rejects malformed or duplicate cancel-pending identities', async () => {
+    const malformed = rawOrder('venue-pending', 'prior-session', 'CANCEL_PENDING');
+    malformed.external_id = '';
+    const duplicateA = rawOrder('venue-a', 'duplicate', 'CANCEL_PENDING');
+    const duplicateB = rawOrder('venue-b', 'duplicate', 'CANCEL_PENDING');
+    for (const rows of [[malformed], [duplicateA, duplicateB]]) {
+      const orchestrator = makeStartupOrchestrator();
+      orchestrator.restClient = { getActiveOrders: mock(async () => rows) };
+      orchestrator.startupCancelVerifyTimeoutMs = 20;
+      orchestrator.startupCancelVerifyIntervalMs = 10;
+      await expect(orchestrator._restReconcile({ allowPreStart: true, strict: true }))
+        .rejects.toThrow('invalid cancel-pending identity');
+    }
   });
 
   test('ordinary reconciliation remains a pre-start no-op', async () => {

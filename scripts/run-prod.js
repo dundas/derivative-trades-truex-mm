@@ -70,6 +70,15 @@ function parseBoolean(envVar, defaultVal) {
   return defaultVal;
 }
 
+function parsePositiveInteger(envVar, defaultVal) {
+  const raw = process.env[envVar];
+  const value = raw === undefined || raw === null || raw === '' ? defaultVal : Number(raw);
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`${envVar} must be a positive integer`);
+  }
+  return value;
+}
+
 const shadowPhase2Criteria = {
   minObservationDays: parseNumber('SHADOW_GO_MIN_OBSERVATION_DAYS', 3),
   minWouldTakeCount: parseNumber('SHADOW_GO_MIN_WOULD_TAKE_COUNT', 50),
@@ -162,6 +171,8 @@ const config = {
 
   // REST URL for reconciliation + balance fetching
   restUrl: process.env.TRUEX_REST_URL || 'http://178.156.230.110:3006',
+  startupCancelVerifyTimeoutMs: parsePositiveInteger('TRUEX_STARTUP_CANCEL_VERIFY_TIMEOUT_MS', 30000),
+  startupCancelVerifyIntervalMs: parsePositiveInteger('TRUEX_STARTUP_CANCEL_VERIFY_INTERVAL_MS', 500),
   pyusdUsdPollIntervalMs: parseInt(process.env.PYUSD_USD_POLL_INTERVAL_MS || '5000', 10),
   pyusdUsdPollTimeoutMs: parseInt(process.env.PYUSD_USD_POLL_TIMEOUT_MS || '1000', 10),
   pyusdUsdStaleThresholdMs: parseInt(process.env.PYUSD_USD_STALE_THRESHOLD_MS || '15000', 10),
@@ -499,6 +510,8 @@ async function main() {
 
     // REST reconciliation + balance refresh
     restUrl: config.restUrl,
+    startupCancelVerifyTimeoutMs: config.startupCancelVerifyTimeoutMs,
+    startupCancelVerifyIntervalMs: config.startupCancelVerifyIntervalMs,
     pyusdUsdPollIntervalMs: config.pyusdUsdPollIntervalMs,
     pyusdUsdPollTimeoutMs: config.pyusdUsdPollTimeoutMs,
     pyusdUsdStaleThresholdMs: config.pyusdUsdStaleThresholdMs,

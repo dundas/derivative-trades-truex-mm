@@ -973,16 +973,44 @@ export class QuoteEngine extends EventEmitter {
 
     // Mark order as 'cancelling' so reconcileOrders skips this level
     const activeOrder = this.activeOrders.get(origClOrdID);
+    const priorLocal = activeOrder ? {
+      hadStatus: Object.prototype.hasOwnProperty.call(activeOrder, 'status'),
+      status: activeOrder.status,
+      hadCancellingAt: Object.prototype.hasOwnProperty.call(activeOrder, 'cancellingAt'),
+      cancellingAt: activeOrder.cancellingAt,
+    } : null;
+    const priorCapital = this.capitalReservationManager?.getReservation(origClOrdID) || null;
     if (activeOrder) {
       activeOrder.status = 'cancelling';
       // A cancel request does not make an acknowledged order disappear from the venue.
       // Presence clears only on a terminal report or fresh REST absence.
       activeOrder.cancellingAt = Date.now();
     }
-    this.capitalReservationManager?.cancelRequested(origClOrdID);
+    const capitalTransitioned = this.capitalReservationManager?.cancelRequested(origClOrdID) || false;
 
     // Track cancel ClOrdID → original ClOrdID for exec report matching
+    const hadCancelMapping = this.cancelToOrigMap.has(newClOrdID);
+    const priorCancelMapping = this.cancelToOrigMap.get(newClOrdID);
     this.cancelToOrigMap.set(newClOrdID, origClOrdID);
+
+    if (this.fixConnection) {
+      try {
+        this.fixConnection.sendMessage(fields);
+      } catch (error) {
+        if (activeOrder && this.activeOrders.get(origClOrdID) === activeOrder) {
+          if (priorLocal.hadStatus) activeOrder.status = priorLocal.status;
+          else delete activeOrder.status;
+          if (priorLocal.hadCancellingAt) activeOrder.cancellingAt = priorLocal.cancellingAt;
+          else delete activeOrder.cancellingAt;
+        }
+        if (capitalTransitioned) {
+          this.capitalReservationManager.cancelDispatchFailed(origClOrdID, priorCapital?.state);
+        }
+        if (hadCancelMapping) this.cancelToOrigMap.set(newClOrdID, priorCancelMapping);
+        else this.cancelToOrigMap.delete(newClOrdID);
+        throw error;
+      }
+    }
 
     this.lastActionByClOrdID.set(origClOrdID, Date.now());
     this.emit('quote-lifecycle', {
@@ -990,10 +1018,6 @@ export class QuoteEngine extends EventEmitter {
       side: order?.side, price: order?.price, size: order?.size, level: order?.level,
       action: 'cancel', reason: 'reprice_or_cancel',
     });
-
-    if (this.fixConnection) {
-      this.fixConnection.sendMessage(fields);
-    }
   }
 
   /**

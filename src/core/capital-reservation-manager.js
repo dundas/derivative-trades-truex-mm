@@ -280,6 +280,18 @@ export class CapitalReservationManager {
     return true;
   }
 
+  cancelDispatchFailed(orderId, priorState) {
+    const order = this.reservations.get(orderId);
+    if (!order || order.state !== 'cancel-in-flight' ||
+        typeof priorState !== 'string' || TERMINAL_STATES.has(priorState) ||
+        priorState === 'cancel-in-flight') return false;
+    order.state = priorState;
+    // Keep the sequence monotonic: an in-flight REST generation must still
+    // observe that this reservation changed while its request was pending.
+    order.lastMutationSequence = this._nextEvent();
+    return true;
+  }
+
   cancelRejected(orderId) {
     const order = this.reservations.get(orderId);
     if (!order || order.state !== 'cancel-in-flight') return false;
