@@ -257,6 +257,37 @@ describe('strict TrueX EBBO maker safety', () => {
     expect(fixConnection.sendMessage.mock.calls.filter(([fields]) => fields['35'] === 'D').length).toBe(3);
   });
 
+  test('changed venue wording still inhibits an unsolicited maker cancellation at side and price', () => {
+    const { engine, fixConnection } = makeEngine();
+    engine.updateTruexEbbo(freshEbbo(99, 105));
+    const id = engine._sendNewOrder(quote('buy', 100));
+
+    engine.onExecutionReport({ '11': id, '39': '4', '58': 'maker protection cancelled the order' });
+
+    expect(engine._sendNewOrder(quote('buy', 100))).toBeNull();
+    expect(engine.getQuoteStatus().suppressed.at(-1)).toMatchObject({
+      reason: 'alo-retry-inhibited',
+      quote: { side: 'buy', price: 100 },
+    });
+    expect(engine.recentRejectsByReason.get('venue-cancel:maker protection cancelled the order')).toBe(1);
+    expect(fixConnection.sendMessage.mock.calls.filter(([fields]) => fields['35'] === 'D')).toHaveLength(1);
+  });
+
+  test('unsolicited cancellation wording does not inhibit an intentional taker order', () => {
+    const { engine } = makeEngine();
+    engine.updateTruexEbbo(freshEbbo(99, 105));
+    engine.activeOrders.set('taker', {
+      ...quote('buy', 100),
+      status: 'active',
+      postOnly: false,
+      liquidityRoleExpected: 'taker',
+    });
+
+    engine.onExecutionReport({ '11': 'taker', '39': '4', '58': 'maker protection cancelled the order' });
+
+    expect(engine.getQuoteStatus().aloRetryInhibitions).toHaveLength(0);
+  });
+
   test('ALO inhibition never couples an intentional taker attempt', () => {
     const { engine } = makeEngine();
     engine.updateTruexEbbo(freshEbbo(99, 105));

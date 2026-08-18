@@ -1591,7 +1591,10 @@ export class QuoteEngine extends EventEmitter {
           const selfInitiated = !!origClOrdID || cancelled?.status === 'cancelling';
           if (cancelled && !selfInitiated) {
             const reason = fields['58'] || 'unsolicited';
-            if (/ALO would trade/i.test(reason)) this._recordAloRetryInhibition(cancelled);
+            // Venue text is diagnostic only. Any unsolicited cancellation of a
+            // maker attempt can indicate post-only marketability and must inhibit
+            // an identical retry storm. The helper deliberately excludes takers.
+            this._recordAloRetryInhibition(cancelled);
             this.logger.warn(
               `[QuoteEngine] Venue-cancelled ${cancelled.side} L${cancelled.level} @ ${cancelled.price} size=${cancelled.size}: ${reason}`
             );

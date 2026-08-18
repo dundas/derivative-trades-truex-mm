@@ -639,7 +639,71 @@ export class FIXConnection extends EventEmitter {
       fields['141'] = 'Y'; // ResetSeqNumFlag
     }
 
-    await this.sendMessage(fields);
+    let accepted;
+    try {
+      accepted = await this.sendMessage(fields);
+    } catch (error) {
+      this._reportSessionSendFailure('logon', error);
+      throw new Error(
+        `FIX Logon dispatch failed: ${error?.message || error}`,
+        { cause: error },
+      );
+    }
+    if (accepted === false) {
+      this._reportSessionSendFailure('logon');
+      throw new Error('FIX Logon was not dispatched');
+    }
+    return true;
+  }
+
+  _reportSessionSendFailure(action, error = null) {
+    const failure = {
+      action,
+      reason: error?.message || 'synchronous dispatch declined',
+    };
+    this._containObserver('session failure logging', () =>
+      this.logger.error(`[FIXConnection] Session ${action} was not dispatched: ${failure.reason}`));
+    this._emitContained('session-send-failed', failure, 'session-send-failed listener');
+    return failure;
+  }
+
+  _warnObserverFailure(label, error) {
+    try {
+      const result = this.logger.warn?.(
+        `[FIXConnection] ${label} failed: ${error?.message || error}`,
+      );
+      if (result?.then) void Promise.resolve(result).catch(() => {});
+    } catch {
+      // Observer warning telemetry is itself fail-soft.
+    }
+  }
+
+  _containObserver(label, operation) {
+    try {
+      const result = operation();
+      if (result?.then) {
+        void Promise.resolve(result).catch((error) => this._warnObserverFailure(label, error));
+      }
+    } catch (error) {
+      this._warnObserverFailure(label, error);
+    }
+  }
+
+  _emitContained(eventName, payload, label = `${eventName} listener`) {
+    for (const listener of this.rawListeners(eventName)) {
+      this._containObserver(label, () => listener.call(this, payload));
+    }
+  }
+
+  _runInboundSessionControl(action, operation) {
+    try {
+      const result = operation();
+      void Promise.resolve(result).catch((error) => {
+        this._reportSessionSendFailure(action, error);
+      });
+    } catch (error) {
+      this._reportSessionSendFailure(action, error);
+    }
   }
   
   /**
@@ -785,9 +849,7 @@ export class FIXConnection extends EventEmitter {
       if (redactedFields['553']) redactedFields['553'] = '[REDACTED]';
       if (redactedFields['554']) redactedFields['554'] = '[REDACTED]';
       const event = { raw: message, fields: redactedFields, msgSeqNum: currentSeqNum };
-      for (const listener of this.rawListeners('sent')) {
-        containAfterEnqueue('outbound sent listener', () => listener.call(this, event));
-      }
+      this._emitContained('sent', event, 'outbound sent listener');
     });
     
     return true;
@@ -927,7 +989,10 @@ export class FIXConnection extends EventEmitter {
         return;
       }
 
-      this.requestResend(this.expectedSeqNum, msgSeqNum - 1);
+      this._runInboundSessionControl(
+        'resend-request',
+        () => this.requestResend(this.expectedSeqNum, msgSeqNum - 1),
+      );
       return;
     }
     
@@ -937,7 +1002,10 @@ export class FIXConnection extends EventEmitter {
         this.handleHeartbeat(message);
         break;
       case '1': // Test Request
-        this.handleTestRequest(message);
+        this._runInboundSessionControl(
+          'test-request-heartbeat',
+          () => this.handleTestRequest(message),
+        );
         break;
       case '2': // Resend Request
         this.handleResendRequest(message);
@@ -1012,8 +1080,19 @@ export class FIXConnection extends EventEmitter {
       '16': endSeqNo.toString(),        // EndSeqNo
     };
     
-    await this.sendMessage(fields);
-    this.emit('resend-request', { beginSeqNo, endSeqNo });
+    let accepted;
+    try {
+      accepted = await this.sendMessage(fields);
+    } catch (error) {
+      this._reportSessionSendFailure('resend-request', error);
+      return false;
+    }
+    if (accepted === false) {
+      this._reportSessionSendFailure('resend-request');
+      return false;
+    }
+    this._emitContained('resend-request', { beginSeqNo, endSeqNo }, 'resend-request listener');
+    return true;
   }
   
   /**
@@ -1042,7 +1121,18 @@ export class FIXConnection extends EventEmitter {
       '112': testReqID,                 // TestReqID
     };
     
-    await this.sendMessage(fields);
+    let accepted;
+    try {
+      accepted = await this.sendMessage(fields);
+    } catch (error) {
+      this._reportSessionSendFailure('test-request-heartbeat', error);
+      return false;
+    }
+    if (accepted === false) {
+      this._reportSessionSendFailure('test-request-heartbeat');
+      return false;
+    }
+    return true;
   }
   
   /**
@@ -1225,7 +1315,17 @@ export class FIXConnection extends EventEmitter {
         '52': this.getUTCTimestamp(),
       };
       
-      await this.sendMessage(fields);
+      let accepted;
+      try {
+        accepted = await this.sendMessage(fields);
+      } catch (error) {
+        this._reportSessionSendFailure('heartbeat', error);
+        return;
+      }
+      if (accepted === false) {
+        this._reportSessionSendFailure('heartbeat');
+        return;
+      }
       this.lastHeartbeatSent = Date.now();
       this.logger.debug(`[FIXConnection] Heartbeat sent to ${this.targetCompID}`);
     }, intervalMs);
@@ -1346,34 +1446,38 @@ export class FIXConnection extends EventEmitter {
       this.reconnectTimer = null;
     }
     
-    // Send logout if logged on
-    if (this.isLoggedOn) {
-      const fields = {
-        '8': this.beginString,
-        '35': '5',                        // MsgType = Logout
-        '49': this.senderCompID,
-        '56': this.targetCompID,
-        '34': this.msgSeqNum.toString(),
-        '52': this.getUTCTimestamp(),
-      };
-      
-      await this.sendMessage(fields);
+    try {
+      // Send logout if logged on. Delivery failure is reported, but teardown is
+      // mandatory and cannot be aborted by either synchronous or Promise APIs.
+      if (this.isLoggedOn) {
+        const fields = {
+          '8': this.beginString,
+          '35': '5',                        // MsgType = Logout
+          '49': this.senderCompID,
+          '56': this.targetCompID,
+          '34': this.msgSeqNum.toString(),
+          '52': this.getUTCTimestamp(),
+        };
+
+        try {
+          const accepted = await this.sendMessage(fields);
+          if (accepted === false) this._reportSessionSendFailure('logout');
+        } catch (error) {
+          this._reportSessionSendFailure('logout', error);
+        }
+      }
+    } finally {
+      this.stopHeartbeat();
+      this.stopCleanupTimer();
+
+      if (this.socket) {
+        this.socket.destroy();
+        this.socket = null;
+      }
+
+      this.isConnected = false;
+      this.isLoggedOn = false;
     }
-    
-    // Stop heartbeat
-    this.stopHeartbeat();
-    
-    // Stop cleanup timer
-    this.stopCleanupTimer();
-    
-    // Close socket
-    if (this.socket) {
-      this.socket.destroy();
-      this.socket = null;
-    }
-    
-    this.isConnected = false;
-    this.isLoggedOn = false;
   }
   
   /**
