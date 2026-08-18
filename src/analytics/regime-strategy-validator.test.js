@@ -4,12 +4,28 @@ import {
   DEFAULT_REGIME_VALIDATOR_CONFIG,
   clusterFragmentedFills,
   deterministicClusterBootstrap,
-  validateRegimeStrategy,
+  validateRegimeStrategy as validateRegimeStrategyRaw,
 } from './regime-strategy-validator.js';
 
 const DAY = 86_400_000;
 const MINUTE = 60_000;
 const CANDIDATE_ID = 'regime-buffer-v1';
+const TEST_BASIS_CONFIG = {
+  basisSource: 'kraken-pretrade', basisRequestedPair: 'PYUSD/USD',
+  basisResolvedPair: 'PYUSD/USD', basisBase: 'PYUSD', basisQuote: 'USD',
+  basisSystem: 'CLOB', basisVenueAllowlist: ['TEST'], maxBasisRttMs: 1_000,
+  maxBasisSourceAgeMs: 5_000,
+};
+
+function validateRegimeStrategy(input = {}) {
+  return validateRegimeStrategyRaw({
+    ...input,
+    config: {
+      ...input.config,
+      sourceQuality: { ...TEST_BASIS_CONFIG, ...input.config?.sourceQuality },
+    },
+  });
+}
 
 function permissiveGates(overrides = {}) {
   return {
@@ -39,9 +55,20 @@ function reference(timestamp, mid, overrides = {}) {
     bid: mid - 0.5,
     ask: mid + 0.5,
     sourceType: 'top-of-book',
+    sourceExchange: 'coinbase', sourceTimestamp: timestamp - 20,
+    receivedTimestamp: timestamp - 10,
     product: 'BTC-USD',
     quoteCurrency: 'USD',
     basisAdjustmentBps: 0,
+    promotionGrade: true,
+    basisSource: 'kraken-pretrade', basisRequestedPair: 'PYUSD/USD',
+    basisResolvedPair: 'PYUSD/USD', basisBase: 'PYUSD', basisQuote: 'USD',
+    basisVenue: 'TEST', basisSystem: 'CLOB', basisRequestTimestamp: timestamp - 50,
+    basisReceivedTimestamp: timestamp - 10, basisBid: 0.9999, basisAsk: 1.0001,
+    basisPrice: 1, basisBidQty: 10, basisAskQty: 11, basisBidCount: 1, basisAskCount: 2,
+    basisBidSubmissionTimestamp: timestamp - 40, basisBidPublicationTimestamp: timestamp - 20,
+    basisAskSubmissionTimestamp: timestamp - 35, basisAskPublicationTimestamp: timestamp - 15,
+    basisTimestamp: timestamp - 20,
     ...overrides,
   };
 }
@@ -74,6 +101,77 @@ function evidence({ days = 7, clustersPerDay = 20 } = {}) {
 }
 
 describe('regime strategy validator', () => {
+  test('keeps legacy available rows without explicit basis provenance diagnostic-only', () => {
+    const timestamp = Date.UTC(2026, 7, 1, 1);
+    const report = validateRegimeStrategy({
+      fills: [fill(timestamp)],
+      references: [reference(timestamp - 1_000, 100, { promotionGrade: false })],
+      candidateId: CANDIDATE_ID,
+      config: { heldOutDays: 1, gates: permissiveGates() },
+      shadowEvidence: shadowEvidence(),
+    });
+    expect(report.evidenceQuality).toMatchObject({
+      promotionGradeReferences: 0, nonPromotionGradeReferences: 1,
+      nonPromotionGradeReasons: { 'legacy-missing-basis-provenance': 1 },
+    });
+    expect(report.heldOut.clusters[0].decisionReferenceStatus).toBe('non-promotion-grade');
+  });
+
+  test('requires explicit promotion attestation and independently rejects forged provenance', () => {
+    const timestamp = Date.UTC(2026, 7, 1, 1);
+    const variants = [
+      [reference(timestamp - 1_000, 100, { promotionGrade: undefined }),
+        'promotion-attestation-required'],
+      [reference(timestamp - 900, 100, { promotionGrade: true, basisVenue: 'FORGED' }),
+        'basis-venue-not-allowed'],
+      [reference(timestamp - 800, 100, { promotionGrade: true, basisPrice: 1.1 }),
+        'basis-midpoint-mismatch'],
+    ];
+    for (const [candidate, reason] of variants) {
+      const report = validateRegimeStrategy({
+        fills: [fill(timestamp)], references: [candidate], candidateId: CANDIDATE_ID,
+        config: { heldOutDays: 1, gates: permissiveGates() }, shadowEvidence: shadowEvidence(),
+      });
+      expect(report.evidenceQuality.promotionGradeReferences).toBe(0);
+      expect(report.evidenceQuality.nonPromotionGradeReasons).toMatchObject({ [reason]: 1 });
+    }
+  });
+
+  test('independently requires exact fresh no-lookahead Coinbase provenance', () => {
+    const timestamp = Date.UTC(2026, 7, 1, 1);
+    const variants = [
+      [{ sourceTimestamp: undefined }, 'missing-reference-source-provenance'],
+      [{ sourceExchange: 'forged' }, 'reference-source-identity-mismatch'],
+      [{ sourceTimestamp: timestamp, receivedTimestamp: timestamp - 1 },
+        'invalid-reference-source-order'],
+      [{ receivedTimestamp: timestamp + 1 }, 'invalid-reference-source-order'],
+      [{ sourceTimestamp: timestamp - 7_000 }, 'stale-reference-source'],
+    ];
+    for (const [overrides, reason] of variants) {
+      const report = validateRegimeStrategy({
+        fills: [fill(timestamp)], references: [reference(timestamp - 1_000, 100, overrides)],
+        candidateId: CANDIDATE_ID, config: { heldOutDays: 1, gates: permissiveGates() },
+        shadowEvidence: shadowEvidence(),
+      });
+      expect(report.evidenceQuality.promotionGradeReferences).toBe(0);
+      expect(report.evidenceQuality.nonPromotionGradeReasons).toMatchObject({ [reason]: 1 });
+    }
+  });
+
+  test('keeps publication-only basis evidence diagnostic with an explicit reason', () => {
+    const timestamp = Date.UTC(2026, 7, 1, 1);
+    const report = validateRegimeStrategy({
+      fills: [fill(timestamp)], references: [reference(timestamp - 1_000, 100, {
+        basisBidSubmissionTimestamp: null, basisAskSubmissionTimestamp: null,
+      })], candidateId: CANDIDATE_ID,
+      config: { heldOutDays: 1, gates: permissiveGates() }, shadowEvidence: shadowEvidence(),
+    });
+    expect(report.evidenceQuality).toMatchObject({
+      promotionGradeReferences: 0,
+      nonPromotionGradeReasons: { 'missing-basis-submission-provenance': 1 },
+    });
+  });
+
   test('joins decision context backward and markout forward without lookahead', () => {
     const timestamp = Date.UTC(2026, 7, 1, 1);
     const report = validateRegimeStrategy({

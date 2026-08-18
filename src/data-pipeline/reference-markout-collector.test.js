@@ -18,8 +18,20 @@ const VALID_CONFIG = {
   claimLeaseMs: 5_000,
   retentionMs: 86_400_000,
   retentionSweepIntervalMs: 3_600_000,
+  retentionBatchSize: 1_000,
+  retentionMaxBatchesPerSweep: 11,
+  maxQuoteDecisionsPerSecond: 1,
+  planningFillEventsPerSecond: 1,
   auditMaxGroups: 100,
   maxAbsBasisAdjustmentBps: 25,
+  basisSource: 'kraken-pretrade',
+  basisRequestedPair: 'PYUSD/USD',
+  basisResolvedPair: 'PYUSD/USD',
+  basisBase: 'PYUSD',
+  basisQuote: 'USD',
+  basisSystem: 'CLOB',
+  basisVenueAllowlist: ['PDSL'],
+  maxBasisRttMs: 1_000,
 };
 
 function market({ sourceTimestamp = 9_900, receivedTimestamp = 9_950, bid = 99, ask = 101 } = {}) {
@@ -30,8 +42,17 @@ function market({ sourceTimestamp = 9_900, receivedTimestamp = 9_950, bid = 99, 
   };
 }
 
-function basis({ timestamp = 9_900, price = 1.0001 } = {}) {
-  return { timestamp, price };
+function basis({ timestamp = 9_900, price = 1.0001, ...overrides } = {}) {
+  return {
+    timestamp, basisTimestamp: timestamp, price, bid: price - 0.00005,
+    ask: price + 0.00005, bidQty: 10, askQty: 11, bidCount: 1, askCount: 2,
+    bidSubmissionTimestamp: timestamp - 10, askSubmissionTimestamp: timestamp - 10,
+    bidPublicationTimestamp: timestamp, askPublicationTimestamp: timestamp,
+    requestTimestamp: timestamp - 20, receivedTimestamp: timestamp,
+    source: 'kraken-pretrade', requestedPair: 'PYUSD/USD', resolvedPair: 'PYUSD/USD',
+    base: 'PYUSD', quote: 'USD', venue: 'PDSL', system: 'CLOB',
+    ...overrides,
+  };
 }
 
 describe('reference mark-out configuration', () => {
@@ -48,16 +69,259 @@ describe('reference mark-out configuration', () => {
       .toThrow('claimLeaseMs');
     expect(() => validateReferenceMarkoutConfig({ ...VALID_CONFIG, batchSize: 1.5 }))
       .toThrow('batchSize');
+    expect(() => validateReferenceMarkoutConfig({ ...VALID_CONFIG, retentionBatchSize: 10_001 }))
+      .toThrow('retentionBatchSize');
+    expect(() => validateReferenceMarkoutConfig({
+      ...VALID_CONFIG, retentionBatchSize: 100, retentionMaxBatchesPerSweep: 1,
+    })).toThrow('retention throughput');
+    expect(() => validateReferenceMarkoutConfig({
+      ...VALID_CONFIG, planningFillEventsPerSecond: 2,
+    })).toThrow('retention throughput');
+    expect(() => validateReferenceMarkoutConfig({
+      ...VALID_CONFIG, dbLockTimeoutMs: 3_000, dbStatementTimeoutMs: 2_000,
+    })).toThrow('database timeouts');
+    expect(() => validateReferenceMarkoutConfig({
+      ...VALID_CONFIG, retentionMaxDurationMs: 3_000,
+      dbQueryTimeoutMs: 2_500, retentionYieldMs: 500,
+    })).toThrow('one query plus yield');
+    expect(() => validateReferenceMarkoutConfig({
+      ...VALID_CONFIG, telemetryWriteConcurrency: 1, maxPendingFillWrites: 80,
+    })).toThrow('earliest horizon');
+    expect(() => validateReferenceMarkoutConfig({
+      ...VALID_CONFIG, horizonsMs: [18_500], telemetryWriteConcurrency: 1,
+      maxPendingFillWrites: 3, maxConsecutiveFillStarts: 1,
+      fillHorizonSafetyMarginMs: 1_000,
+    })).toThrow('earliest horizon');
     expect(() => validateReferenceMarkoutConfig({ ...VALID_CONFIG, horizonsMs: [Number.MAX_SAFE_INTEGER + 1] }))
       .toThrow('horizonsMs');
     expect(() => validateReferenceMarkoutConfig({ ...VALID_CONFIG, product: 'ETH-EUR' }))
       .toThrow('Coinbase BTC-USD');
     expect(() => validateReferenceMarkoutConfig({ ...VALID_CONFIG, sourceType: 'candle' }))
       .toThrow('Coinbase BTC-USD');
+    expect(() => validateReferenceMarkoutConfig({
+      ...VALID_CONFIG, basisVenueAllowlist: [],
+    })).toThrow('basisVenueAllowlist');
+    expect(() => validateReferenceMarkoutConfig({
+      ...VALID_CONFIG, basisResolvedPair: 'USD/PYUSD',
+    })).toThrow('basis identity');
   });
 });
 
 describe('ReferenceMarkoutCollector', () => {
+  test('reports running counters and a safe immutable configuration identity', () => {
+    const collector = new ReferenceMarkoutCollector({ config: VALID_CONFIG });
+    collector.stats.decisionsRecorded = 7;
+    collector.stats.persistenceErrors = 2;
+
+    const stopped = collector.getStats();
+    expect(stopped).toMatchObject({
+      running: false, decisionsRecorded: 7, persistenceErrors: 2,
+      marketObservationsRecorded: 0, lastCycleAt: null,
+      lastMarketObservationAt: null, lastErrorReason: null, lastErrorAt: null,
+      config: {
+        product: 'BTC-USD', quoteCurrency: 'USD', sourceExchange: 'coinbase',
+        sourceType: 'top-of-book', horizonsMs: [60_000, 300_000, 3_600_000],
+        maxSourceAgeMs: 5_000, maxLatenessMs: 30_000, pollIntervalMs: 1_000,
+        batchSize: 50, claimLeaseMs: 5_000, retentionMs: 86_400_000,
+        retentionSweepIntervalMs: 3_600_000, retentionBatchSize: 1_000,
+        retentionMaxBatchesPerSweep: 11, maxQuoteDecisionsPerSecond: 1,
+        planningFillEventsPerSecond: 1,
+        auditMaxGroups: 100, maxAbsBasisAdjustmentBps: 25,
+        basisSource: 'kraken-pretrade', basisRequestedPair: 'PYUSD/USD',
+        basisResolvedPair: 'PYUSD/USD', basisBase: 'PYUSD', basisQuote: 'USD',
+        basisSystem: 'CLOB', basisVenueAllowlist: ['PDSL'], maxBasisRttMs: 1_000,
+      },
+    });
+    expect(Object.isFrozen(stopped.config)).toBe(true);
+    expect(Object.isFrozen(stopped.config.horizonsMs)).toBe(true);
+    expect(Object.keys(stopped.config).sort()).toEqual(Object.keys(collector.config).sort());
+    expect(() => stopped.config.horizonsMs.push(99)).toThrow();
+    expect(collector.getStats().config.horizonsMs).toEqual([60_000, 300_000, 3_600_000]);
+
+    collector._timer = 1;
+    expect(collector.getStats().running).toBe(true);
+    collector._timer = null;
+  });
+
+  test('reports persisted sampling activity and only a sanitized bounded error summary', async () => {
+    let now = 10_000;
+    const writer = {
+      recordReferenceMarketObservation: jest.fn(async () => true),
+      claimDueReferenceMarkouts: jest.fn(async () => []),
+    };
+    const collector = new ReferenceMarkoutCollector({
+      writer, config: VALID_CONFIG, now: () => now,
+      marketProvider: () => market(), basisProvider: () => basis(),
+      logger: { warn: jest.fn() },
+    });
+
+    await collector.processDue();
+    expect(collector.getStats()).toMatchObject({
+      processCycles: 1, marketObservationsRecorded: 1,
+      promotionGradeMarketObservationsRecorded: 1,
+      lastCycleAt: 10_000, lastMarketObservationAt: 10_000,
+      lastErrorReason: null, lastErrorAt: null,
+    });
+
+    now = 11_000;
+    writer.recordReferenceMarketObservation.mockRejectedValueOnce(
+      new Error('postgres password=do-not-expose'),
+    );
+    await collector.processDue();
+    const failed = collector.getStats();
+    expect(failed.persistenceErrors).toBe(1);
+    expect(failed.lastErrorReason).toBe('due processing failed');
+    expect(failed.lastErrorReason).not.toContain('password');
+    expect(failed.lastErrorAt).toBe(11_000);
+    expect(failed.lastMarketObservationAt).toBe(10_000);
+  });
+
+  test('samples only for an open durable horizon and persists before claiming it', async () => {
+    const calls = [];
+    const writer = {
+      hasOpenReferenceMarkoutWindow: jest.fn(async () => false),
+      recordReferenceMarketObservation: jest.fn(async () => { calls.push('record'); return true; }),
+      claimDueReferenceMarkouts: jest.fn(async () => { calls.push('claim'); return []; }),
+    };
+    const collector = new ReferenceMarkoutCollector({
+      writer, config: VALID_CONFIG, now: () => 10_000,
+      marketProvider: () => market(), basisProvider: () => basis(),
+    });
+
+    await collector.processDue();
+    expect(writer.recordReferenceMarketObservation).not.toHaveBeenCalled();
+    expect(calls).toEqual(['claim']);
+    expect(collector.getStats()).toMatchObject({
+      openWindow: false, samplingState: 'idle-no-open-window',
+      marketObservationsRecorded: 0, lastMarketObservationAt: null,
+    });
+
+    calls.length = 0;
+    writer.hasOpenReferenceMarkoutWindow.mockResolvedValueOnce(true);
+    await collector.processDue();
+    expect(calls).toEqual(['record', 'claim']);
+    expect(collector.getStats().marketObservationsRecorded).toBe(1);
+  });
+
+  test('bounds concurrent telemetry writes while slow persistence cannot touch execution', async () => {
+    const sendMessage = jest.fn();
+    const cancelAllQuotes = jest.fn();
+    const never = new Promise(() => {});
+    const writer = { recordReferenceQuoteDecision: jest.fn(() => never) };
+    const collector = new ReferenceMarkoutCollector({
+      writer, config: {
+        ...VALID_CONFIG, telemetryWriteConcurrency: 1, maxPendingFillWrites: 20,
+      }, now: () => 10_000,
+      marketProvider: () => market(), basisProvider: () => basis(),
+      logger: { warn: jest.fn() },
+    });
+
+    for (let index = 0; index < collector.config.maxPendingDecisionWrites + 25; index += 1) {
+      void collector.recordQuoteDecision({ quoteId: `Q-${index}`, decisionTimestamp: 10_000 });
+    }
+    await new Promise(resolve => setImmediate(resolve));
+    expect(writer.recordReferenceQuoteDecision).toHaveBeenCalledTimes(1);
+    expect(collector.getStats()).toMatchObject({
+      telemetryWritesActive: 1,
+      telemetryWritesWaiting: collector.config.maxPendingDecisionWrites,
+      telemetryWritesRejected: 24,
+    });
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(cancelAllQuotes).not.toHaveBeenCalled();
+  });
+
+  test('services the saturated fill lane FIFO before decisions and visibly rejects overflow', async () => {
+    let releaseActiveDecision;
+    let decisionCalls = 0;
+    const serviceOrder = [];
+    const writer = {
+      recordReferenceQuoteDecision: jest.fn(decision => {
+        serviceOrder.push(decision.quoteId);
+        decisionCalls += 1;
+        if (decisionCalls === 1) return new Promise(resolve => { releaseActiveDecision = resolve; });
+        return Promise.resolve();
+      }),
+      scheduleReferenceMarkouts: jest.fn(async fill => { serviceOrder.push(fill.fillId); }),
+    };
+    const collector = new ReferenceMarkoutCollector({
+      writer, config: {
+        ...VALID_CONFIG, telemetryWriteConcurrency: 1, maxPendingFillWrites: 20,
+      }, now: () => 10_000,
+      marketProvider: () => market(), basisProvider: () => basis(),
+      logger: { warn: jest.fn() },
+    });
+    for (let index = 0; index <= collector.config.maxPendingDecisionWrites; index += 1) {
+      void collector.recordQuoteDecision({ quoteId: `Q-${index}`, decisionTimestamp: 10_000 });
+    }
+    await new Promise(resolve => setImmediate(resolve));
+    const fillIds = Array.from({ length: collector.config.maxPendingFillWrites },
+      (_, index) => `F-${String(index).padStart(3, '0')}`);
+    const fillAdmissions = fillIds.map(fillId => collector.scheduleFill({
+      fillId, side: 'buy', price: 100, fillTimestamp: 10_000,
+    }));
+    const overflow = collector.scheduleFill({
+      fillId: 'F-overflow', side: 'buy', price: 100, fillTimestamp: 10_000,
+    });
+    await Promise.resolve();
+    expect(collector._fillWriteQueue).toHaveLength(collector.config.maxPendingFillWrites);
+    expect(await overflow).toBe(false);
+    expect(collector.getStats()).toMatchObject({
+      telemetryWritesActive: 1,
+      fillWritesWaiting: collector.config.maxPendingFillWrites,
+      telemetryWritesRejected: 1,
+      fillWritesRejected: 1,
+      decisionWritesRejected: 0,
+      lastErrorReason: 'fill scheduling queue saturated',
+    });
+    releaseActiveDecision(true);
+    await expect(Promise.all(fillAdmissions)).resolves.toEqual(fillIds.map(() => true));
+    expect(serviceOrder.filter(item => item.startsWith('F-'))).toEqual(fillIds);
+    expect(serviceOrder.indexOf('Q-1')).toBeLessThanOrEqual(
+      collector.config.maxConsecutiveFillStarts + 1,
+    );
+    expect(collector.getStats()).toMatchObject({
+      maxConsecutiveFillStartsObserved: collector.config.maxConsecutiveFillStarts,
+      decisionFairnessStarts: expect.any(Number),
+    });
+    expect(collector.getStats().decisionFairnessStarts).toBeGreaterThanOrEqual(1);
+    const fairnessDecisionStarts = Math.ceil(collector.config.maxPendingFillWrites /
+      collector.config.maxConsecutiveFillStarts);
+    const worstAdmittedFillLatencyMs = (1 + Math.ceil((collector.config.maxPendingFillWrites +
+      fairnessDecisionStarts) / collector.config.telemetryWriteConcurrency)) *
+      collector.config.dbQueryTimeoutMs;
+    expect(worstAdmittedFillLatencyMs + collector.config.fillHorizonSafetyMarginMs).toBeLessThan(
+      Math.min(...collector.config.horizonsMs),
+    );
+  });
+
+  test('captures one immutable sample when work appears between the open-window check and claim', async () => {
+    const marketProvider = jest.fn(() => market());
+    const basisProvider = jest.fn(() => basis());
+    const writer = {
+      hasOpenReferenceMarkoutWindow: jest.fn(async () => false),
+      recordReferenceMarketObservation: jest.fn(async () => true),
+      claimDueReferenceMarkouts: jest.fn(async () => [{
+        fillId: 'F-race', horizonMs: 60_000, dueTimestamp: 10_000,
+        deadlineTimestamp: 40_000, decisionTimestamp: 9_000, quoteId: 'Q-1',
+        side: 'buy', level: 1, policyId: 'maker-v1', price: 100,
+      }]),
+      getFirstReferenceMarketObservation: jest.fn(async () => null),
+      completeReferenceMarkout: jest.fn(async () => true),
+    };
+    const collector = new ReferenceMarkoutCollector({
+      writer, config: VALID_CONFIG, now: () => 10_000, marketProvider, basisProvider,
+    });
+
+    await collector.processDue();
+    expect(marketProvider).toHaveBeenCalledTimes(1);
+    expect(basisProvider).toHaveBeenCalledTimes(1);
+    expect(writer.recordReferenceMarketObservation).toHaveBeenCalledTimes(1);
+    expect(writer.completeReferenceMarkout).toHaveBeenCalledWith(
+      expect.objectContaining({ fillId: 'F-race' }), expect.any(String),
+      expect.objectContaining({ observationTimestamp: 10_000 }),
+    );
+  });
+
   test('persists a no-lookahead quote decision with distinct source and receipt timestamps', async () => {
     const writer = { recordReferenceQuoteDecision: jest.fn(async () => true) };
     const collector = new ReferenceMarkoutCollector({
@@ -94,6 +358,7 @@ describe('ReferenceMarkoutCollector', () => {
       expect(writer.recordReferenceQuoteDecision.mock.calls.at(-1)[0]).toMatchObject({
         available: false, unavailableReason: reason,
       });
+      expect(collector.getStats().invalidSampleReasons).toMatchObject({ [reason]: 1 });
     }
   });
 
@@ -103,9 +368,19 @@ describe('ReferenceMarkoutCollector', () => {
       [market({ sourceTimestamp: null }), basis(), 'invalid-timestamp'],
       [market({ sourceTimestamp: 9_960, receivedTimestamp: 9_950 }), basis(), 'invalid-timestamp-order'],
       [market(), null, 'missing-basis'],
-      [market(), basis({ timestamp: 10_001 }), 'lookahead-basis'],
+      [market(), { timestamp: 9_900, price: 1, source: 'kraken-rest' },
+        'non-promotion-grade-basis-source'],
+      [market(), basis({ timestamp: 10_001 }), 'lookahead-basis-receipt'],
       [market(), basis({ timestamp: 1_000 }), 'stale-basis'],
       [market(), basis({ price: 1.01 }), 'basis-out-of-bounds'],
+      [market(), basis({ receivedTimestamp: 10_001 }), 'lookahead-basis-receipt'],
+      [market(), basis({ bidSubmissionTimestamp: null }),
+        'missing-basis-submission-provenance'],
+      [market(), basis({ requestTimestamp: 9_950, receivedTimestamp: 9_940 }), 'invalid-basis-request-order'],
+      [market(), basis({ bidSubmissionTimestamp: 9_950, bidPublicationTimestamp: 9_940 }), 'invalid-basis-side-order'],
+      [market(), basis({ venue: 'OTHER' }), 'basis-venue-not-allowed'],
+      [market(), basis({ resolvedPair: 'USD/PYUSD' }), 'basis-identity-mismatch'],
+      [market(), basis({ requestTimestamp: 8_000, receivedTimestamp: 9_900 }), 'basis-rtt-exceeded'],
     ];
     for (const [book, basisValue, reason] of cases) {
       const collector = new ReferenceMarkoutCollector({
@@ -117,6 +392,76 @@ describe('ReferenceMarkoutCollector', () => {
         available: false, unavailableReason: reason,
       });
     }
+  });
+
+  test('persists validated publication-only basis as diagnostic while malformed basis is not sampled', async () => {
+    const diagnosticBasis = basis({
+      bidSubmissionTimestamp: null, askSubmissionTimestamp: null,
+    });
+    const writer = {
+      hasOpenReferenceMarkoutWindow: jest.fn(async () => true),
+      recordReferenceMarketObservation: jest.fn(async () => true),
+      claimDueReferenceMarkouts: jest.fn(async () => []),
+      recordReferenceQuoteDecision: jest.fn(async () => true),
+    };
+    const collector = new ReferenceMarkoutCollector({
+      writer, config: VALID_CONFIG, now: () => 10_000,
+      marketProvider: () => market(), basisProvider: () => diagnosticBasis,
+    });
+    await collector.recordQuoteDecision({ quoteId: 'Q-diagnostic', decisionTimestamp: 10_000 });
+    expect(writer.recordReferenceQuoteDecision).toHaveBeenCalledWith(expect.objectContaining({
+      available: false, unavailableReason: 'missing-basis-submission-provenance',
+      sourceTimestamp: 9_900, receivedTimestamp: 9_950, bid: 99, ask: 101,
+      basisSource: 'kraken-pretrade', basisVenue: 'PDSL',
+      basisBidPublicationTimestamp: 9_900, basisAskPublicationTimestamp: 9_900,
+      basisBidSubmissionTimestamp: null, promotionGrade: false,
+      diagnosticPersistable: true,
+    }));
+    await collector.processDue();
+    expect(writer.recordReferenceMarketObservation).toHaveBeenCalledWith(
+      expect.objectContaining({ promotionGrade: false, diagnosticPersistable: true }),
+    );
+
+    writer.recordReferenceMarketObservation.mockClear();
+    const malformed = new ReferenceMarkoutCollector({
+      writer, config: VALID_CONFIG, now: () => 10_000,
+      marketProvider: () => market(), basisProvider: () => basis({ bid: -1 }),
+    });
+    await malformed.processDue();
+    expect(writer.recordReferenceMarketObservation).not.toHaveBeenCalled();
+
+    const malformedBook = new ReferenceMarkoutCollector({
+      writer, config: VALID_CONFIG, now: () => 10_000,
+      marketProvider: () => market({ bid: -1 }), basisProvider: () => diagnosticBasis,
+    });
+    await malformedBook.processDue();
+    expect(writer.recordReferenceMarketObservation).not.toHaveBeenCalled();
+  });
+
+  test('propagates publication-only diagnostic provenance into terminal evidence after cutoff', async () => {
+    const work = { fillId: 'F-diag', horizonMs: 60_000, dueTimestamp: 80_000,
+      deadlineTimestamp: 110_000, quoteId: 'Q-1', decisionTimestamp: 10_000,
+      side: 'buy', level: 1, policyId: 'maker-v1', price: 100 };
+    const writer = {
+      hasOpenReferenceMarkoutWindow: jest.fn(async () => true),
+      recordReferenceMarketObservation: jest.fn(async () => true),
+      claimDueReferenceMarkouts: jest.fn(async () => [work]),
+      getFirstReferenceMarketObservation: jest.fn(async () => null),
+      completeReferenceMarkout: jest.fn(async () => true),
+    };
+    const collector = new ReferenceMarkoutCollector({
+      writer, config: VALID_CONFIG, now: () => 112_000,
+      marketProvider: () => market({ sourceTimestamp: 111_900, receivedTimestamp: 111_950 }),
+      basisProvider: () => basis({ timestamp: 111_900,
+        bidSubmissionTimestamp: null, askSubmissionTimestamp: null }),
+    });
+    await collector.processDue();
+    expect(writer.completeReferenceMarkout).toHaveBeenCalledWith(work, expect.any(String),
+      expect.objectContaining({
+        available: false, unavailableReason: 'after-deadline', sourceTimestamp: 111_900,
+        basisSource: 'kraken-pretrade', basisBidSubmissionTimestamp: null,
+        basisBidPublicationTimestamp: 111_900, promotionGrade: false,
+      }));
   });
 
   test('schedules every configured horizon once with recoverable quote attribution', async () => {
@@ -287,7 +632,7 @@ describe('ReferenceMarkoutCollector', () => {
     expect(observation.observedEdgeBps).toBeCloseTo(-19.96007984, 6);
   });
 
-  test('bounds coverage groups and throttles retention sweeps', async () => {
+  test('bounds coverage groups and runs retention outside due processing', async () => {
     let now = 10_000;
     const writer = {
       claimDueReferenceMarkouts: jest.fn(async () => []),
@@ -306,9 +651,65 @@ describe('ReferenceMarkoutCollector', () => {
     await collector.processDue();
     now += 1_000;
     await collector.processDue();
+    expect(writer.pruneReferenceMarkoutEvidence).not.toHaveBeenCalled();
+    await collector.runRetentionSweep();
     expect(writer.pruneReferenceMarkoutEvidence).toHaveBeenCalledTimes(1);
+    expect(writer.pruneReferenceMarkoutEvidence).toHaveBeenCalledWith(
+      11_000 - VALID_CONFIG.retentionMs, VALID_CONFIG.retentionBatchSize,
+    );
     expect(writer.pruneReferenceQuoteDecisions).toHaveBeenCalledTimes(1);
     expect(writer.pruneReferenceMarketObservations).toHaveBeenCalledTimes(1);
+  });
+
+  test('drains retention in bounded batches and exposes remaining backlog', async () => {
+    const full = { rowCount: VALID_CONFIG.retentionBatchSize };
+    const writer = {
+      claimDueReferenceMarkouts: jest.fn(async () => []),
+      pruneReferenceMarkoutEvidence: jest.fn(async () => full),
+      pruneReferenceQuoteDecisions: jest.fn(async () => ({ rowCount: 3 })),
+      pruneReferenceMarketObservations: jest.fn(async () => full),
+    };
+    const collector = new ReferenceMarkoutCollector({
+      writer, config: VALID_CONFIG, now: () => 10_000, yieldFn: async () => {},
+    });
+
+    await collector.runRetentionSweep();
+
+    expect(writer.pruneReferenceMarkoutEvidence).toHaveBeenCalledTimes(VALID_CONFIG.retentionMaxBatchesPerSweep);
+    expect(writer.pruneReferenceQuoteDecisions).toHaveBeenCalledTimes(1);
+    expect(writer.pruneReferenceMarketObservations).toHaveBeenCalledTimes(VALID_CONFIG.retentionMaxBatchesPerSweep);
+    expect(collector.getStats()).toMatchObject({
+      retentionRowsPruned: {
+        work: VALID_CONFIG.retentionBatchSize * VALID_CONFIG.retentionMaxBatchesPerSweep,
+        decisions: 3,
+        observations: VALID_CONFIG.retentionBatchSize * VALID_CONFIG.retentionMaxBatchesPerSweep,
+      },
+      retentionBacklog: { work: true, decisions: false, observations: true },
+      lastRetentionSweepAt: 10_000,
+    });
+  });
+
+  test('bounds total retention duration and yields between full batches', async () => {
+    let monotonic = 0;
+    const yieldFn = jest.fn(async () => { monotonic += 20_000; });
+    const full = { rowCount: VALID_CONFIG.retentionBatchSize };
+    const writer = {
+      pruneReferenceMarkoutEvidence: jest.fn(async () => full),
+      pruneReferenceQuoteDecisions: jest.fn(async () => full),
+      pruneReferenceMarketObservations: jest.fn(async () => full),
+    };
+    const collector = new ReferenceMarkoutCollector({
+      writer, config: { ...VALID_CONFIG, retentionYieldMs: 20_000 }, now: () => 10_000,
+      monotonicNow: () => monotonic, yieldFn,
+    });
+
+    await collector.runRetentionSweep();
+    expect(yieldFn).toHaveBeenCalledTimes(1);
+    expect(writer.pruneReferenceMarkoutEvidence).toHaveBeenCalledTimes(2);
+    expect(writer.pruneReferenceQuoteDecisions).not.toHaveBeenCalled();
+    expect(collector.getStats().retentionBacklog).toEqual({
+      work: true, decisions: true, observations: true,
+    });
   });
 
   test('persists one cycle sample and reuses the earliest valid sample across rows and restart', async () => {
@@ -427,7 +828,19 @@ describe('ReferenceMarkoutCollector', () => {
       }],
       references: [9_000, 70_000].map(timestamp => ({
         timestamp, bid: 99, ask: 101, sourceType: 'top-of-book',
-        product: 'BTC-USD', quoteCurrency: 'USD', basisAdjustmentBps,
+        product: 'BTC-USD', quoteCurrency: 'USD', sourceExchange: 'coinbase',
+        sourceTimestamp: timestamp - 20, receivedTimestamp: timestamp - 10,
+        basisAdjustmentBps,
+        promotionGrade: true, basisSource: 'kraken-pretrade',
+        basisRequestedPair: 'PYUSD/USD', basisResolvedPair: 'PYUSD/USD',
+        basisBase: 'PYUSD', basisQuote: 'USD', basisVenue: 'TEST', basisSystem: 'CLOB',
+        basisPrice: 1.002, basisBid: 1.0019, basisAsk: 1.0021,
+        basisBidQty: 1, basisAskQty: 1, basisBidCount: 1, basisAskCount: 1,
+        basisRequestTimestamp: timestamp - 50, basisReceivedTimestamp: timestamp - 10,
+        basisBidSubmissionTimestamp: timestamp - 40,
+        basisBidPublicationTimestamp: timestamp - 20,
+        basisAskSubmissionTimestamp: timestamp - 35,
+        basisAskPublicationTimestamp: timestamp - 15, basisTimestamp: timestamp - 20,
       })),
       candidateId: 'basis-contract',
       shadowEvidence: {
@@ -435,6 +848,7 @@ describe('ReferenceMarkoutCollector', () => {
       },
       config: {
         heldOutDays: 1, primaryHorizon: '1m', bootstrap: { iterations: 10 },
+        sourceQuality: { basisVenueAllowlist: ['TEST'] },
         gates: {
           minReferenceCoverage: 0, minClusters: 0, minObservationDays: 0,
           minLowerBoundBps: 0, minShadowClusters: 0, minShadowFillSurvivalRate: 0,

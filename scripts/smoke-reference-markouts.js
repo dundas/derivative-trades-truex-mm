@@ -8,6 +8,9 @@ const config = {
   claimLeaseMs: 5_000, retentionMs: 86_400_000, retentionSweepIntervalMs: 3_600_000,
   auditMaxGroups: 10,
   maxAbsBasisAdjustmentBps: 25,
+  basisSource: 'kraken-pretrade', basisRequestedPair: 'PYUSD/USD',
+  basisResolvedPair: 'PYUSD/USD', basisBase: 'PYUSD', basisQuote: 'USD',
+  basisSystem: 'CLOB', basisVenueAllowlist: ['PDSL'], maxBasisRttMs: 1_000,
 };
 
 let now = 10_000;
@@ -52,7 +55,15 @@ const provider = () => ({ sources: [{
   exchange: 'coinbase', bid: 100, ask: 102, sourceTimestamp: now - 2,
   receivedTimestamp: now - 1, isStale: false,
 }] });
-const basisProvider = () => ({ price: 1, timestamp: now - 2 });
+const basisProvider = () => ({
+  price: 1, timestamp: now - 2, basisTimestamp: now - 2, bid: 0.99995, ask: 1.00005,
+  bidQty: 10, askQty: 10, bidCount: 1, askCount: 1,
+  bidSubmissionTimestamp: now - 3, askSubmissionTimestamp: now - 3,
+  bidPublicationTimestamp: now - 2, askPublicationTimestamp: now - 2,
+  requestTimestamp: now - 2, receivedTimestamp: now - 1,
+  source: 'kraken-pretrade', requestedPair: 'PYUSD/USD', resolvedPair: 'PYUSD/USD',
+  base: 'PYUSD', quote: 'USD', venue: 'PDSL', system: 'CLOB',
+});
 
 const firstProcess = new ReferenceMarkoutCollector({
   writer, config, now: () => now, marketProvider: provider, basisProvider,

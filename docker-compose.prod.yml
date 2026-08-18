@@ -106,6 +106,12 @@ services:
       - TRUEX_MAKER_EBBO_MAX_AGE_MS=${TRUEX_MAKER_EBBO_MAX_AGE_MS:?required}
       - TRUEX_ALO_RETRY_COOLDOWN_MS=${TRUEX_ALO_RETRY_COOLDOWN_MS:?required}
       - TRUEX_ALO_RETRY_MAX_ENTRIES=${TRUEX_ALO_RETRY_MAX_ENTRIES:?required}
+      # Reference mark-outs remain inert by default. When enabled, the Kraken
+      # PreTrade venue allowlist must be explicitly operator supplied.
+      - REFERENCE_MARKOUT_ENABLED=${REFERENCE_MARKOUT_ENABLED:-false}
+      - REFERENCE_MARKOUT_BASIS_REQUESTED_PAIR=${REFERENCE_MARKOUT_BASIS_REQUESTED_PAIR:-PYUSD/USD}
+      - REFERENCE_MARKOUT_BASIS_VENUE_ALLOWLIST=${REFERENCE_MARKOUT_BASIS_VENUE_ALLOWLIST:-}
+      - REFERENCE_MARKOUT_MAX_BASIS_RTT_MS=${REFERENCE_MARKOUT_MAX_BASIS_RTT_MS:-1000}
     volumes:
       - mm-logs:/app/logs
     command: ["bun", "scripts/run-prod.js"]

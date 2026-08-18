@@ -23,6 +23,7 @@ import { createPostgreSQLAPIFromEnv } from '../../lib/postgresql-api/index.js';
 import { readFileSync, existsSync } from 'fs';
 import { handleAnalyticsBalanceSnapshots as _handleBalanceSnapshots } from './analytics-balance-snapshots.js';
 import { handleAnalyticsSpreadPnl as _handleSpreadPnl } from './analytics-spread-pnl.js';
+import { buildApiStatusSnapshot } from './status-snapshot.js';
 
 const PORT         = parseInt(process.env.API_PORT || '3100', 10);
 const CORS_ORIGIN  = process.env.CORS_ORIGIN || '*';
@@ -878,11 +879,7 @@ async function handleEmergencyStop(req) {
 // ---------------------------------------------------------------------------
 
 async function handleApiStatus() {
-  const orchHealth = orchestratorRef?.getHealthStatus() ?? null;
-  if (!orchHealth) {
-    return jsonOk({ status: 'unknown', message: 'Orchestrator not connected' });
-  }
-  return jsonOk(orchHealth);
+  return jsonOk(buildApiStatusSnapshot(orchestratorRef));
 }
 
 function handleDashboard() {

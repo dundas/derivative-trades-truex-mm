@@ -1012,6 +1012,7 @@ export class QuoteEngine extends EventEmitter {
       fields['452'] = '3';                  // PartyRole (3 = Client ID)
     }
 
+    const placedAt = Date.now();
     this.activeOrders.set(clOrdID, {
       side: quote.side,
       price: prepared.price,
@@ -1019,7 +1020,8 @@ export class QuoteEngine extends EventEmitter {
       level: prepared.level,
       status: 'pending',
       acknowledgedLive: false,
-      placedAt: Date.now(),
+      placedAt,
+      decisionTimestamp: placedAt,
       orderIntent: prepared.orderIntent || (prepared.postOnly === false ? 'taker_opportunity' : 'maker_quote'),
       liquidityRoleExpected: prepared.postOnly === false ? 'taker' : 'maker',
     });
@@ -1071,6 +1073,7 @@ export class QuoteEngine extends EventEmitter {
       eventType: prepared.replacesQuoteId ? 'replace' : 'create', quoteId: clOrdID,
       replacesQuoteId: prepared.replacesQuoteId || null, side: prepared.side, price: prepared.price,
       size: prepared.size, level: prepared.level, action: prepared.replacesQuoteId ? 'replace' : 'place',
+      decisionTimestamp: placedAt,
     });
     if (prepared.postOnly === false) {
       this._recordTakerOrder(prepared.size * prepared.price);
@@ -1424,6 +1427,7 @@ export class QuoteEngine extends EventEmitter {
               this.emit('quote-lifecycle', {
                 eventType: 'partial_fill', quoteId: resolvedClOrdID, executionId: execID, side,
                 price: effectivePrice, size: lastQty, level: tracked?.level, action: 'partial_fill',
+                decisionTimestamp: tracked?.decisionTimestamp ?? tracked?.placedAt ?? null,
                 ...(priceEstimated ? { estimated: true, evidenceGap: true } : {}),
               });
               if (tracked) {
@@ -1470,6 +1474,7 @@ export class QuoteEngine extends EventEmitter {
           this.emit('quote-lifecycle', {
             eventType: 'partial_fill', quoteId: resolvedClOrdID, executionId: execID, side,
             price: effectivePrice, size: effectiveLastQty, level: tracked?.level, action: 'partial_fill',
+            decisionTimestamp: tracked?.decisionTimestamp ?? tracked?.placedAt ?? null,
             ...(estimatedEvidence ? { estimated: true, evidenceGap: true } : {}),
           });
           if (tracked) {
@@ -1544,6 +1549,7 @@ export class QuoteEngine extends EventEmitter {
               executionId: execID || `estimated-terminal:${resolvedClOrdID}`,
               side, price: effectivePrice, size: preTerminalRemaining,
               level: tracked?.level, action: 'full_fill',
+              decisionTimestamp: tracked?.decisionTimestamp ?? tracked?.placedAt ?? null,
               ...(estimatedEvidence ? { estimated: true, evidenceGap: true } : {}),
             });
           }
@@ -1572,6 +1578,7 @@ export class QuoteEngine extends EventEmitter {
           this.emit('quote-lifecycle', {
             eventType: 'full_fill', quoteId: resolvedClOrdID, executionId: execID, side,
             price: effectivePrice, size: preTerminalRemaining, level: tracked?.level, action: 'full_fill',
+            decisionTimestamp: tracked?.decisionTimestamp ?? tracked?.placedAt ?? null,
             ...(estimatedEvidence ? { estimated: true, evidenceGap: true } : {}),
           });
           this._recordExecutionIdentity(resolvedClOrdID, execID, { terminal: true });

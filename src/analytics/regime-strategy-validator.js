@@ -18,7 +18,15 @@ export const DEFAULT_REGIME_VALIDATOR_CONFIG = Object.freeze({
   heldOutDays: 5,
   primaryHorizon: '5m',
   regime: Object.freeze({ lookbackMs: 60_000, directionalMoveBps: 5, highVolatilityBps: 15, staleReferenceAgeMs: 5_000 }),
-  sourceQuality: Object.freeze({ promotionGradeSourceTypes: PROMOTION_GRADE_SOURCE_TYPES, referenceProduct: 'BTC-USD', quoteCurrency: 'USD', maxAbsBasisAdjustmentBps: 25 }),
+  sourceQuality: Object.freeze({
+    promotionGradeSourceTypes: PROMOTION_GRADE_SOURCE_TYPES, referenceProduct: 'BTC-USD',
+    quoteCurrency: 'USD', sourceExchange: 'coinbase', maxSourceAgeMs: 5_000,
+    maxAbsBasisAdjustmentBps: 25,
+    basisSource: 'kraken-pretrade', basisRequestedPair: 'PYUSD/USD',
+    basisResolvedPair: 'PYUSD/USD', basisBase: 'PYUSD', basisQuote: 'USD',
+    basisSystem: 'CLOB', basisVenueAllowlist: Object.freeze([]),
+    maxBasisRttMs: 1_000, maxBasisSourceAgeMs: 5_000,
+  }),
   bootstrap: Object.freeze({ iterations: 2_000, confidenceLevel: 0.95, seed: 17 }),
   gates: Object.freeze({ minReferenceCoverage: 0.95, minClusters: 100, minObservationDays: 5, minLowerBoundBps: 2, minShadowClusters: 100, minShadowFillSurvivalRate: 0.5 }),
 });
@@ -92,7 +100,18 @@ function mergeConfig(config = {}) {
   if (merged.bootstrap.seed > 0xFFFFFFFF) throw new Error('bootstrap.seed must fit in an unsigned 32-bit integer');
   nonEmptyString(merged.sourceQuality.referenceProduct, 'sourceQuality.referenceProduct');
   nonEmptyString(merged.sourceQuality.quoteCurrency, 'sourceQuality.quoteCurrency');
+  nonEmptyString(merged.sourceQuality.sourceExchange, 'sourceQuality.sourceExchange');
+  nonNegativeInteger(merged.sourceQuality.maxSourceAgeMs, 'sourceQuality.maxSourceAgeMs');
   nonNegative(merged.sourceQuality.maxAbsBasisAdjustmentBps, 'sourceQuality.maxAbsBasisAdjustmentBps');
+  for (const field of ['basisSource', 'basisRequestedPair', 'basisResolvedPair', 'basisBase',
+    'basisQuote', 'basisSystem']) nonEmptyString(merged.sourceQuality[field], `sourceQuality.${field}`);
+  if (!Array.isArray(merged.sourceQuality.basisVenueAllowlist) ||
+      new Set(merged.sourceQuality.basisVenueAllowlist).size !== merged.sourceQuality.basisVenueAllowlist.length ||
+      merged.sourceQuality.basisVenueAllowlist.some(value => typeof value !== 'string' || !value.trim())) {
+    throw new Error('sourceQuality.basisVenueAllowlist must be a unique array of non-empty strings');
+  }
+  nonNegativeInteger(merged.sourceQuality.maxBasisRttMs, 'sourceQuality.maxBasisRttMs');
+  nonNegativeInteger(merged.sourceQuality.maxBasisSourceAgeMs, 'sourceQuality.maxBasisSourceAgeMs');
   validatePromotionSourceTypes(merged.sourceQuality.promotionGradeSourceTypes);
   ratio(merged.gates.minReferenceCoverage, 'gates.minReferenceCoverage');
   nonNegativeInteger(merged.gates.minClusters, 'gates.minClusters');
@@ -186,6 +205,82 @@ function referenceMid(reference, config) {
   return Number.isFinite(adjusted) && adjusted > 0 ? adjusted : Number.NaN;
 }
 
+function referenceBasisProvenanceReason(reference, config) {
+  if (reference.promotionGrade !== true) {
+    return reference.promotionGrade === false
+      ? 'legacy-missing-basis-provenance' : 'promotion-attestation-required';
+  }
+  const identity = [
+    ['basisSource', config.basisSource], ['basisRequestedPair', config.basisRequestedPair],
+    ['basisResolvedPair', config.basisResolvedPair], ['basisBase', config.basisBase],
+    ['basisQuote', config.basisQuote], ['basisSystem', config.basisSystem],
+  ];
+  if (identity.some(([field, expected]) => reference[field] !== expected)) {
+    return 'basis-identity-mismatch';
+  }
+  if (!config.basisVenueAllowlist.includes(reference.basisVenue)) {
+    return 'basis-venue-not-allowed';
+  }
+  if (reference.basisBidSubmissionTimestamp === null ||
+      reference.basisBidSubmissionTimestamp === undefined ||
+      reference.basisAskSubmissionTimestamp === null ||
+      reference.basisAskSubmissionTimestamp === undefined) {
+    return 'missing-basis-submission-provenance';
+  }
+  const positive = ['basisBid', 'basisAsk', 'basisPrice', 'basisBidQty', 'basisAskQty'];
+  const counts = ['basisBidCount', 'basisAskCount'];
+  if (positive.some(field => !Number.isFinite(reference[field]) || reference[field] <= 0) ||
+      counts.some(field => !Number.isSafeInteger(reference[field]) || reference[field] <= 0) ||
+      reference.basisBid > reference.basisAsk) return 'invalid-basis-book';
+  const midpoint = (reference.basisBid + reference.basisAsk) / 2;
+  if (Math.abs(reference.basisPrice - midpoint) > Math.max(1e-12, midpoint * 1e-12)) {
+    return 'basis-midpoint-mismatch';
+  }
+  const expectedAdjustment = (1 / reference.basisPrice - 1) * 10_000;
+  if (!Number.isFinite(reference.basisAdjustmentBps) ||
+      Math.abs(reference.basisAdjustmentBps - expectedAdjustment) > 1e-8 ||
+      Math.abs(reference.basisAdjustmentBps) > config.maxAbsBasisAdjustmentBps) {
+    return 'basis-adjustment-mismatch';
+  }
+  const timestampFields = ['basisTimestamp', 'basisRequestTimestamp', 'basisReceivedTimestamp',
+    'basisBidSubmissionTimestamp', 'basisBidPublicationTimestamp',
+    'basisAskSubmissionTimestamp', 'basisAskPublicationTimestamp'];
+  if (timestampFields.some(field => !Number.isSafeInteger(reference[field]) || reference[field] < 0)) {
+    return 'invalid-basis-timestamp';
+  }
+  if (reference.basisRequestTimestamp > reference.basisReceivedTimestamp ||
+      reference.basisReceivedTimestamp > reference.timestamp ||
+      reference.basisBidSubmissionTimestamp > reference.basisBidPublicationTimestamp ||
+      reference.basisAskSubmissionTimestamp > reference.basisAskPublicationTimestamp ||
+      reference.basisBidPublicationTimestamp > reference.basisReceivedTimestamp ||
+      reference.basisAskPublicationTimestamp > reference.basisReceivedTimestamp ||
+      reference.basisTimestamp !== Math.min(reference.basisBidPublicationTimestamp,
+        reference.basisAskPublicationTimestamp)) return 'invalid-basis-timestamp-order';
+  if (reference.basisReceivedTimestamp - reference.basisRequestTimestamp > config.maxBasisRttMs) {
+    return 'basis-rtt-exceeded';
+  }
+  if (reference.timestamp - reference.basisReceivedTimestamp > config.maxBasisSourceAgeMs ||
+      reference.timestamp - reference.basisBidPublicationTimestamp > config.maxBasisSourceAgeMs ||
+      reference.timestamp - reference.basisAskPublicationTimestamp > config.maxBasisSourceAgeMs) {
+    return 'stale-basis-provenance';
+  }
+  return null;
+}
+
+function referenceSourceProvenanceReason(reference, config) {
+  if (reference.sourceExchange !== config.sourceExchange) return 'reference-source-identity-mismatch';
+  if (!Number.isSafeInteger(reference.sourceTimestamp) || reference.sourceTimestamp < 0 ||
+      !Number.isSafeInteger(reference.receivedTimestamp) || reference.receivedTimestamp < 0) {
+    return 'missing-reference-source-provenance';
+  }
+  if (reference.sourceTimestamp > reference.receivedTimestamp ||
+      reference.receivedTimestamp > reference.timestamp) return 'invalid-reference-source-order';
+  if (reference.timestamp - reference.sourceTimestamp > config.maxSourceAgeMs) {
+    return 'stale-reference-source';
+  }
+  return null;
+}
+
 function classifyReferences(references, config) {
   const duplicateCounts = new Map();
   for (const reference of references) duplicateCounts.set(referenceKey(reference), (duplicateCounts.get(referenceKey(reference)) || 0) + 1);
@@ -198,7 +293,12 @@ function classifyReferences(references, config) {
     const metadataValid = Number.isFinite(timestamp) && typeof reference.product === 'string' && typeof reference.quoteCurrency === 'string' && typeof reference.sourceType === 'string' && Number.isFinite(reference.basisAdjustmentBps);
     const productMatches = reference.product === config.sourceQuality.referenceProduct && reference.quoteCurrency === config.sourceQuality.quoteCurrency;
     const mid = referenceMid(reference, config);
+    const sourceProvenanceReason = metadataValid
+      ? referenceSourceProvenanceReason(reference, config.sourceQuality) : 'malformed-reference';
+    const basisProvenanceReason = metadataValid && sourceProvenanceReason === null
+      ? referenceBasisProvenanceReason(reference, config.sourceQuality) : sourceProvenanceReason;
     const promotionGrade = metadataValid && productMatches
+      && basisProvenanceReason === null
       && PROMOTION_GRADE_SOURCE_TYPES.includes(reference.sourceType)
       && config.sourceQuality.promotionGradeSourceTypes.includes(reference.sourceType)
       && Number.isFinite(mid);
@@ -207,7 +307,10 @@ function classifyReferences(references, config) {
     else if (duplicate) quality = 'duplicate';
     else if (outOfOrder) quality = 'out-of-order';
     else if (!promotionGrade) quality = 'non-promotion-grade';
-    return { ...reference, inputIndex: index, mid, quality };
+    const qualityReason = quality === 'non-promotion-grade'
+      ? (basisProvenanceReason || (productMatches ? 'non-promotion-grade' : 'reference-identity-mismatch'))
+      : quality;
+    return { ...reference, inputIndex: index, mid, quality, qualityReason };
   });
   return {
     records: records.sort((a, b) => {
@@ -223,13 +326,17 @@ function classifyReferences(references, config) {
       duplicateReferences: records.filter(record => record.quality === 'duplicate').length,
       outOfOrderReferences: records.filter(record => record.quality === 'out-of-order').length,
       nonPromotionGradeReferences: records.filter(record => record.quality === 'non-promotion-grade').length,
+      nonPromotionGradeReasons: records.filter(record => record.quality === 'non-promotion-grade')
+        .reduce((counts, record) => ({
+          ...counts, [record.qualityReason]: (counts[record.qualityReason] || 0) + 1,
+        }), {}),
       malformedReferences: records.filter(record => record.quality === 'malformed').length,
     },
   };
 }
 
 function publicReference(record) {
-  return record ? { timestamp: record.timestamp, price: record.mid, sourceType: record.sourceType, product: record.product, quoteCurrency: record.quoteCurrency, basisAdjustmentBps: record.basisAdjustmentBps } : null;
+  return record ? { timestamp: record.timestamp, price: record.mid, sourceType: record.sourceType, product: record.product, quoteCurrency: record.quoteCurrency, basisAdjustmentBps: record.basisAdjustmentBps, qualityReason: record.qualityReason } : null;
 }
 
 function backwardReference(records, timestamp, maxAgeMs) {

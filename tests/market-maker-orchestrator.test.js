@@ -1,6 +1,7 @@
 import { describe, test, expect, beforeEach, jest } from 'bun:test';
 import { EventEmitter } from 'events';
 import { MarketMakerOrchestrator } from '../src/core/market-maker-orchestrator.js';
+import { ReferenceMarkoutCollector } from '../src/data-pipeline/reference-markout-collector.js';
 
 // --- Mock Factories ---
 
@@ -158,6 +159,15 @@ function createMockLogger() {
 
 function createMockKrakenRestClient() {
   return {
+    getPreTradeTopOfBook: jest.fn(async () => ({
+      requestedSymbol: 'PYUSD/USD', resolvedSymbol: 'PYUSD/USD',
+      base: 'PYUSD', quote: 'USD', venue: 'PDSL', system: 'CLOB',
+      requestTimestamp: Date.now() - 25, receivedTimestamp: Date.now(),
+      bid: { price: 1.0, qty: 10, count: 1,
+        submissionTimestamp: Date.now() - 100, publicationTimestamp: Date.now() - 50 },
+      ask: { price: 1.0001, qty: 11, count: 2,
+        submissionTimestamp: Date.now() - 90, publicationTimestamp: Date.now() - 40 },
+    })),
     getTicker: jest.fn(async () => ({
       exchange: 'kraken',
       symbol: 'PYUSD/USD',
@@ -712,6 +722,7 @@ describe('MarketMakerOrchestrator', () => {
       const status = orchestrator.getStatus();
       expect(status.isRunning).toBe(false);
       expect(status.uptimeMs).toBe(0);
+      expect(orchestrator.getHealthStatus().referenceMarkouts).toBeNull();
     });
 
     test('returns FIX connection state', async () => {
@@ -772,19 +783,22 @@ describe('MarketMakerOrchestrator', () => {
   });
 
   describe('PYUSD/USD basis poller', () => {
-    test('polls Kraken ticker and stores PYUSD/USD reference separately from maker price updates', async () => {
+    test('polls Kraken PreTrade and preserves promotion-grade PYUSD/USD provenance separately from maker pricing', async () => {
       const { orchestrator, mocks } = createOrchestrator({ pyusdUsdPollIntervalMs: 0 });
       orchestrator.isRunning = true;
 
       await orchestrator._pollPyusdUsdReference();
 
-      expect(mocks.krakenRestClient.getTicker).toHaveBeenCalledWith('PYUSD/USD', { timeoutMs: 1 });
-      expect(orchestrator.pyusdUsd.price).toBe(1.00005);
+      expect(mocks.krakenRestClient.getPreTradeTopOfBook).toHaveBeenCalledWith('PYUSD/USD', { timeoutMs: 1 });
+      expect(orchestrator.pyusdUsd.price).toBeCloseTo(1.00005, 8);
       expect(mocks.quoteEngine.updatePyusdUsd).toHaveBeenCalledWith(expect.objectContaining({
-        price: 1.00005,
+        price: expect.closeTo(1.00005, 8),
         bid: 1.0,
         ask: 1.0001,
-        source: 'kraken-rest',
+        source: 'kraken-pretrade', basisTimestamp: expect.any(Number),
+        requestedPair: 'PYUSD/USD', resolvedPair: 'PYUSD/USD',
+        venue: 'PDSL', system: 'CLOB', requestTimestamp: expect.any(Number),
+        receivedTimestamp: expect.any(Number),
       }));
       expect(mocks.quoteEngine.onPriceUpdate).not.toHaveBeenCalled();
       expect(mocks.fixConnection.sendMessage).not.toHaveBeenCalled();
@@ -792,16 +806,16 @@ describe('MarketMakerOrchestrator', () => {
 
     test('falls back to the next source when the first source fails', async () => {
       const krakenRestClient = createMockKrakenRestClient();
-      krakenRestClient.getTicker = jest.fn()
+      krakenRestClient.getPreTradeTopOfBook = jest.fn()
         .mockRejectedValueOnce(new Error('pair unavailable'))
         .mockResolvedValueOnce({
-          exchange: 'kraken',
-          symbol: 'PYUSDUSD',
-          timestamp: Date.now(),
-          bid: 1.0,
-          ask: 1.0002,
-          last: 1.0001,
-          volume24h: 1000,
+          requestedSymbol: 'PYUSDUSD', resolvedSymbol: 'PYUSD/USD',
+          base: 'PYUSD', quote: 'USD', venue: 'PDSL', system: 'CLOB',
+          requestTimestamp: Date.now() - 20, receivedTimestamp: Date.now(),
+          bid: { price: 1.0, qty: 10, count: 1,
+            submissionTimestamp: Date.now() - 100, publicationTimestamp: Date.now() - 50 },
+          ask: { price: 1.0002, qty: 10, count: 1,
+            submissionTimestamp: Date.now() - 90, publicationTimestamp: Date.now() - 40 },
         });
 
       const { orchestrator } = createOrchestrator({
@@ -816,9 +830,10 @@ describe('MarketMakerOrchestrator', () => {
 
       await orchestrator._pollPyusdUsdReference();
 
-      expect(krakenRestClient.getTicker).toHaveBeenNthCalledWith(1, 'PYUSD/USD', { timeoutMs: 1 });
-      expect(krakenRestClient.getTicker).toHaveBeenNthCalledWith(2, 'PYUSDUSD', { timeoutMs: 1 });
-      expect(orchestrator.pyusdUsd.pair).toBe('PYUSDUSD');
+      expect(krakenRestClient.getPreTradeTopOfBook).toHaveBeenNthCalledWith(1, 'PYUSD/USD', { timeoutMs: 1 });
+      expect(krakenRestClient.getPreTradeTopOfBook).toHaveBeenNthCalledWith(2, 'PYUSDUSD', { timeoutMs: 1 });
+      expect(orchestrator.pyusdUsd.requestedPair).toBe('PYUSDUSD');
+      expect(orchestrator.pyusdUsd.resolvedPair).toBe('PYUSD/USD');
       expect(orchestrator.pyusdUsd.price).toBe(1.0001);
     });
 
@@ -1728,16 +1743,112 @@ describe('MarketMakerOrchestrator', () => {
       dataPipeline.pgManager = pgManager;
       const referenceMarkoutCollector = {
         writer: null, setWriter: jest.fn(function setWriter(writer) { this.writer = writer; }),
-        start: jest.fn(), stop: jest.fn(), getStats: jest.fn(() => ({ running: true })),
+        start: jest.fn(), stop: jest.fn(), getStats: jest.fn(() => ({
+          running: true, decisionsRecorded: 5, fillsScheduled: 2,
+          observationsCompleted: 1, persistenceErrors: 3,
+          config: { product: 'BTC-USD', sourceExchange: 'coinbase', horizonsMs: [60_000] },
+        })),
         recordQuoteDecision: jest.fn(async () => true), scheduleFill: jest.fn(async () => true),
       };
       const { orchestrator } = createOrchestrator({ dataPipeline, referenceMarkoutCollector });
       await orchestrator.start();
       expect(referenceMarkoutCollector.setWriter).toHaveBeenCalledWith(pgManager);
       expect(referenceMarkoutCollector.start).toHaveBeenCalledTimes(1);
-      expect(orchestrator.getStatus().referenceMarkouts).toEqual({ running: true });
+      expect(orchestrator.getStatus().referenceMarkouts).toMatchObject({
+        running: true, decisionsRecorded: 5, fillsScheduled: 2,
+        observationsCompleted: 1, persistenceErrors: 3,
+      });
+      const healthBefore = orchestrator.getHealthStatus().status;
+      expect(orchestrator.getHealthStatus().referenceMarkouts).toMatchObject({
+        running: true, persistenceErrors: 3,
+      });
+      expect(orchestrator.getHealthStatus().status).toBe(healthBefore);
+      expect(orchestrator.fixOE.sendMessage).not.toHaveBeenCalled();
       await orchestrator.stop();
       expect(referenceMarkoutCollector.stop).toHaveBeenCalledTimes(1);
+    });
+
+    test('slow bounded reference persistence leaves real QuoteEngine D/F lifecycle identical', async () => {
+      const makeScenario = (withCollector) => {
+        const dependencies = {
+          fixConnection: createMockFIXConnection(),
+          inventoryManager: createMockInventoryManager(),
+          pnlTracker: createMockPnLTracker(),
+          hedgeExecutor: createMockHedgeExecutor(),
+          marketDataFeed: createMockMarketDataFeed(),
+          priceAggregator: createMockPriceAggregator(),
+          logger: createMockLogger(),
+          levels: 1, maxOrdersPerSecond: 100, minRepriceIntervalMs: 0,
+          baseSpreadBps: 50, baseSizeBTC: 0.01, tickSize: 0.5,
+        };
+        dependencies.fixConnection.isConnected = true;
+        dependencies.fixConnection.isLoggedOn = true;
+        dependencies.fixConnection.sendMessage.mockReturnValue(true);
+        if (withCollector) {
+          dependencies.referenceMarkoutCollector = new ReferenceMarkoutCollector({
+            writer: { recordReferenceQuoteDecision: () => new Promise(() => {}) },
+            logger: dependencies.logger,
+            config: {
+              product: 'BTC-USD', quoteCurrency: 'USD', sourceExchange: 'coinbase',
+              sourceType: 'top-of-book', horizonsMs: [60_000], maxSourceAgeMs: 5_000,
+              maxLatenessMs: 30_000, pollIntervalMs: 1_000, batchSize: 50,
+              claimLeaseMs: 5_000, retentionMs: 86_400_000,
+              retentionSweepIntervalMs: 3_600_000, retentionBatchSize: 10_000,
+              retentionMaxBatchesPerSweep: 100, maxQuoteDecisionsPerSecond: 100,
+              planningFillEventsPerSecond: 6, auditMaxGroups: 100,
+              maxPendingDecisionWrites: 300,
+              maxAbsBasisAdjustmentBps: 25,
+              basisSource: 'kraken-pretrade', basisRequestedPair: 'PYUSD/USD',
+              basisResolvedPair: 'PYUSD/USD', basisBase: 'PYUSD', basisQuote: 'USD',
+              basisSystem: 'CLOB', basisVenueAllowlist: ['PDSL'], maxBasisRttMs: 1_000,
+            },
+            marketProvider: () => ({ sources: [{
+              exchange: 'coinbase', bid: 99_950, ask: 100_050,
+              sourceTimestamp: 9_900, receivedTimestamp: 9_950, isStale: false,
+            }] }),
+            basisProvider: () => ({
+              timestamp: 9_900, basisTimestamp: 9_900, price: 1,
+              bid: 0.99995, ask: 1.00005, bidQty: 1, askQty: 1, bidCount: 1, askCount: 1,
+              bidSubmissionTimestamp: 9_890, askSubmissionTimestamp: 9_890,
+              bidPublicationTimestamp: 9_900, askPublicationTimestamp: 9_900,
+              requestTimestamp: 9_900, receivedTimestamp: 9_950,
+              source: 'kraken-pretrade', requestedPair: 'PYUSD/USD', resolvedPair: 'PYUSD/USD',
+              base: 'PYUSD', quote: 'USD', venue: 'PDSL', system: 'CLOB',
+            }), now: () => 10_000,
+          });
+        }
+        const orchestrator = new MarketMakerOrchestrator(dependencies);
+        orchestrator._wireEvents();
+        orchestrator.isRunning = true;
+        orchestrator.quoteEngine.onPriceUpdate({
+          weightedMidpoint: 100_000, confidence: 0.95,
+          sources: [{ exchange: 'coinbase', bid: 99_950, ask: 100_050 }],
+        });
+        const newOrders = dependencies.fixConnection.sendMessage.mock.calls
+          .map(([message]) => message).filter(message => message['35'] === 'D');
+        for (const order of newOrders) {
+          orchestrator.quoteEngine.onExecutionReport({
+            '11': order['11'], '39': '0', '54': order['54'],
+          });
+        }
+        const liveSides = [...orchestrator.quoteEngine.activeOrders.values()]
+          .filter(order => order.status === 'active').map(order => order.side).sort();
+        orchestrator.quoteEngine.cancelAllQuotes('bounded-telemetry-isolation');
+        const messages = dependencies.fixConnection.sendMessage.mock.calls.map(([message]) => message['35']);
+        orchestrator._unwireEvents();
+        return { messages, liveSides, collector: dependencies.referenceMarkoutCollector };
+      };
+
+      const disabled = makeScenario(false);
+      const slow = makeScenario(true);
+      expect(disabled.liveSides).toEqual(['buy', 'sell']);
+      expect(slow.liveSides).toEqual(disabled.liveSides);
+      expect(slow.messages).toEqual(disabled.messages);
+      expect(slow.messages.filter(type => type === 'D')).toHaveLength(2);
+      expect(slow.messages.filter(type => type === 'F')).toHaveLength(2);
+      expect(slow.collector.getStats()).toMatchObject({
+        telemetryWritesActive: 2, telemetryWritesWaiting: 0,
+      });
     });
 
     test('records decisions and schedules fill horizons without dispatching an order', () => {
@@ -1750,14 +1861,17 @@ describe('MarketMakerOrchestrator', () => {
       orchestrator.lastAggregatedPrice = {
         sources: [{ exchange: 'coinbase', bid: 99, ask: 101, sourceTimestamp: 900, receivedTimestamp: 950 }],
       };
-      orchestrator._onQuoteLifecycle({ eventType: 'create', quoteId: 'Q-1', side: 'buy', level: 1 });
+      orchestrator._onQuoteLifecycle({
+        eventType: 'create', quoteId: 'Q-1', side: 'buy', level: 1, decisionTimestamp: 900,
+      });
       orchestrator._onQuoteLifecycle({
         eventType: 'full_fill', quoteId: 'Q-1', executionId: 'E-1',
-        side: 'buy', level: 1, price: 100, size: 0.01,
+        side: 'buy', level: 1, price: 100, size: 0.01, decisionTimestamp: 900,
       });
       expect(referenceMarkoutCollector.recordQuoteDecision).toHaveBeenCalledTimes(1);
       expect(referenceMarkoutCollector.scheduleFill).toHaveBeenCalledWith(expect.objectContaining({
         fillId: 'Q-1-E-1', quoteId: 'Q-1', executionId: 'E-1', policyId: 'maker-v1',
+        decisionTimestamp: 900,
       }));
       expect(mocks.fixConnection.sendMessage).not.toHaveBeenCalled();
     });

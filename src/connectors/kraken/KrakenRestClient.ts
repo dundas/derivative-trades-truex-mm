@@ -122,10 +122,24 @@ export type KrakenTickerResult = Record<
   }
 >;
 
+export type KrakenPreTradeTopOfBook = {
+  requestedSymbol: string;
+  resolvedSymbol: string;
+  base: string;
+  quote: string;
+  venue: string;
+  system: string;
+  requestTimestamp: number;
+  receivedTimestamp: number;
+  bid: { price: number; qty: number; count: number; submissionTimestamp: number | null; publicationTimestamp: number };
+  ask: { price: number; qty: number; count: number; submissionTimestamp: number | null; publicationTimestamp: number };
+};
+
 export class KrakenRestClient {
   private readonly baseUrl: string;
   private readonly apiKey?: string;
   private readonly apiSecret?: string;
+  private readonly now: () => number;
 
   private readonly requestTimeoutMs = 15_000;
 
@@ -157,10 +171,11 @@ export class KrakenRestClient {
     "SOL/BTC": "SOLXBT",
   };
 
-  constructor(options: { baseUrl?: string; apiKey?: string; apiSecret?: string }) {
+  constructor(options: { baseUrl?: string; apiKey?: string; apiSecret?: string; now?: () => number }) {
     this.baseUrl = options.baseUrl ?? "https://api.kraken.com";
     this.apiKey = options.apiKey;
     this.apiSecret = options.apiSecret;
+    this.now = options.now ?? Date.now;
   }
 
   toKrakenPair(pair: string): string {
@@ -261,11 +276,68 @@ export class KrakenRestClient {
     return {
       exchange: "kraken",
       symbol: pair,
-      timestamp: Date.now(),
+      timestamp: this.now(),
       bid,
       ask,
       last,
       volume24h: Number.isFinite(volume24h) ? volume24h : 0,
+    };
+  }
+
+  async getPreTradeTopOfBook(symbol: string, options?: { timeoutMs?: number }): Promise<KrakenPreTradeTopOfBook> {
+    const requestedSymbol = symbol.trim();
+    if (!requestedSymbol) throw new Error("Kraken PreTrade symbol is required");
+    const requestTimestamp = this.now();
+    const result = await this.publicRequest<any>("/0/public/PreTrade", {
+      symbol: requestedSymbol,
+    }, options);
+    const receivedTimestamp = this.now();
+    const parseRequiredTimestamp = (value: unknown): number => {
+      if (typeof value !== "string" || value.trim() === "") return Number.NaN;
+      return Date.parse(value);
+    };
+    const parseOptionalTimestamp = (value: unknown): number | null =>
+      value === undefined || value === null || value === ""
+        ? null : parseRequiredTimestamp(value);
+    const parseLevel = (level: any, side: "BUY" | "SELL") => ({
+      price: Number(level?.price), qty: Number(level?.qty), count: Number(level?.count),
+      submissionTimestamp: parseOptionalTimestamp(level?.submission_ts),
+      publicationTimestamp: parseRequiredTimestamp(level?.publication_ts),
+      side: level?.side,
+      expectedSide: side,
+    });
+    const validLevel = (level: ReturnType<typeof parseLevel>) =>
+      level.side === level.expectedSide && Number.isFinite(level.price) && level.price > 0 &&
+      Number.isFinite(level.qty) && level.qty > 0 && Number.isSafeInteger(level.count) && level.count > 0 &&
+      (level.submissionTimestamp === null ||
+        (Number.isSafeInteger(level.submissionTimestamp) && level.submissionTimestamp >= 0)) &&
+      Number.isSafeInteger(level.publicationTimestamp) && level.publicationTimestamp >= 0;
+    const parsedBids = Array.isArray(result?.bids)
+      ? result.bids.map((item: any) => parseLevel(item, "BUY")) : [];
+    const parsedAsks = Array.isArray(result?.asks)
+      ? result.asks.map((item: any) => parseLevel(item, "SELL")) : [];
+    const levelsValid = parsedBids.length > 0 && parsedAsks.length > 0 &&
+      parsedBids.every(validLevel) && parsedAsks.every(validLevel);
+    const parsedBid = levelsValid
+      ? parsedBids.reduce((best, item) => item.price > best.price ? item : best) : null;
+    const parsedAsk = levelsValid
+      ? parsedAsks.reduce((best, item) => item.price < best.price ? item : best) : null;
+    const identity = [result?.symbol, result?.base_asset, result?.quote_asset, result?.venue, result?.system];
+    if (!Number.isSafeInteger(requestTimestamp) || requestTimestamp < 0 ||
+        !Number.isSafeInteger(receivedTimestamp) || receivedTimestamp < requestTimestamp ||
+        identity.some(value => typeof value !== "string" || value.trim() === "") ||
+        !levelsValid || !parsedBid || !parsedAsk || parsedBid.price > parsedAsk.price) {
+      throw new Error(`Kraken PreTrade invalid top of book for ${requestedSymbol}`);
+    }
+    const level = (parsed: ReturnType<typeof parseLevel>) => ({
+      price: parsed.price, qty: parsed.qty, count: parsed.count,
+      submissionTimestamp: parsed.submissionTimestamp,
+      publicationTimestamp: parsed.publicationTimestamp,
+    });
+    return {
+      requestedSymbol, resolvedSymbol: result.symbol.trim(), base: result.base_asset.trim(),
+      quote: result.quote_asset.trim(), venue: result.venue.trim(), system: result.system.trim(),
+      requestTimestamp, receivedTimestamp, bid: level(parsedBid), ask: level(parsedAsk),
     };
   }
 
