@@ -8,6 +8,8 @@ with enhanced attribution to track which AI model/CLI made each change.
 ## [Unreleased]
 
 ### Added
+- Added the offline regime strategy validator, JSON CLI, conservative evidence gates, and zero-dispatch smoke (Codex, 2026-08-17)
+  - **Context:** PR #72; PRD 0014 tasks 5.3-5.6
 
 ### Fixed
 - Added TrueX FIX self-match prevention and local self-cross quote safeguards (Codex, 2026-06-23)
