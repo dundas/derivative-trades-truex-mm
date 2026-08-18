@@ -289,4 +289,42 @@ describe('MarketMakerOrchestrator strict startup reconciliation', () => {
       orderId: 'unsafe-reuse', side: 'sell', size: 0.01, price: 100000, level: 1,
     })).toMatchObject({ accepted: false, reason: 'capital-reconciliation-failed' });
   });
+
+  test('periodic recovery retries a failed capital resync with one fresh coherent snapshot', async () => {
+    const capital = new CapitalReservationManager();
+    capital.reconcile({ ...balances, liveOrders: [] });
+    capital.insufficientFunds('sell');
+    let releaseFreshSnapshot;
+    const orchestrator = Object.assign(Object.create(MarketMakerOrchestrator.prototype), {
+      isRunning: true,
+      restClient: {},
+      capitalReservationManager: capital,
+      inventoryManager: { refreshBalances: mock(() => {}) },
+      quoteEngine: { deferredRepriceNeeded: false, drainQueue: mock(() => {}) },
+      _capitalResyncInFlight: null,
+      _capitalResyncPending: false,
+      _fetchBalances: mock(async () => balances),
+      _fetchCapitalLiveOrders: mock()
+        .mockRejectedValueOnce(new Error('REST unavailable'))
+        .mockImplementationOnce(() => new Promise((resolve) => { releaseFreshSnapshot = () => resolve([]); })),
+      logger: { info() {}, warn() {}, error() {} },
+    });
+
+    await orchestrator._onCapitalResyncRequired({ side: 'sell', reason: 'insufficient-funds' });
+    expect(capital.getStatus()).toMatchObject({ state: 'failed', blockedSides: ['sell'] });
+
+    const firstTick = orchestrator._periodicBalanceRefresh();
+    const overlappingTick = orchestrator._periodicBalanceRefresh();
+    for (let turn = 0; turn < 5 && !releaseFreshSnapshot; turn++) await Promise.resolve();
+    expect(typeof releaseFreshSnapshot).toBe('function');
+    expect(orchestrator._fetchCapitalLiveOrders).toHaveBeenCalledTimes(2);
+    releaseFreshSnapshot();
+    await Promise.all([firstTick, overlappingTick]);
+
+    expect(capital.getStatus()).toMatchObject({ state: 'normal', blockedSides: [] });
+    expect(orchestrator.inventoryManager.refreshBalances).toHaveBeenCalledTimes(1);
+    expect(capital.reserve({
+      orderId: 'recovered-ask', side: 'sell', size: 0.001, price: 100000, level: 1,
+    }).accepted).toBe(true);
+  });
 });

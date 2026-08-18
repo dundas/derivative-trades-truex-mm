@@ -396,7 +396,10 @@ export class MarketMakerOrchestrator extends EventEmitter {
       this.logger.info(`[Orchestrator] REST reconciliation enabled (every ${this.reconcileIntervalMs / 1000}s)`);
 
       // 10. Start periodic balance refresh (re-syncs tracked balances with exchange)
-      this._balanceRefreshTimer = setInterval(() => this._refreshBalances(), this.balanceRefreshIntervalMs);
+      this._balanceRefreshTimer = setInterval(
+        () => this._periodicBalanceRefresh(),
+        this.balanceRefreshIntervalMs,
+      );
       this.logger.info(`[Orchestrator] Balance refresh enabled (every ${this.balanceRefreshIntervalMs / 1000}s)`);
     }
 
@@ -1623,6 +1626,25 @@ export class MarketMakerOrchestrator extends EventEmitter {
     const canBid = this.inventoryManager.canQuote('buy');
     const canAsk = this.inventoryManager.canQuote('sell');
     this.logger.info(`[Orchestrator] Quoting: bids=${canBid ? 'YES' : 'NO (no ' + quoteAsset + ')'}, asks=${canAsk ? 'YES' : 'NO (no ' + baseAsset + ')'}`);
+  }
+
+  /**
+   * Periodic recovery is bounded by balanceRefreshIntervalMs. Healthy state
+   * keeps the lightweight balance-only refresh; failed/blocked capital state
+   * requires one coalesced, generation-safe balance + live-order snapshot.
+   */
+  _periodicBalanceRefresh() {
+    if (!this.restClient || !this.isRunning) return Promise.resolve();
+    const capital = this.capitalReservationManager?.getStatus();
+    const needsCoherentRecovery = capital &&
+      (capital.state === 'failed' || capital.blockedSides.length > 0);
+    if (!needsCoherentRecovery) return this._refreshBalances();
+    if (this._capitalResyncInFlight) return this._capitalResyncInFlight;
+    const side = capital.blockedSides.length === 1 ? capital.blockedSides[0] : 'multiple';
+    return this._onCapitalResyncRequired({
+      side,
+      reason: 'periodic-capital-recovery',
+    });
   }
 
   /**
