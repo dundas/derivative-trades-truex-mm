@@ -37,6 +37,7 @@ import { PriceAggregator } from '../src/connectors/aggregator/PriceAggregator.ts
 import { KrakenRestClient } from '../src/connectors/kraken/KrakenRestClient.ts';
 import { CoinbaseWsIngest } from '../src/data-pipeline/coinbase-ws-ingest.js';
 import { CoinbaseMarketDataAdapter } from '../src/data-pipeline/coinbase-market-data-adapter.js';
+import { buildReferenceMarkoutRolloutOptions } from './reference-markout-rollout-config.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -68,16 +69,6 @@ function parseBoolean(envVar, defaultVal) {
   return defaultVal;
 }
 
-function parseIntegerList(envVar, defaultVal) {
-  const raw = process.env[envVar];
-  if (raw === undefined || raw === null || raw.trim() === '') return [...defaultVal];
-  const values = raw.split(',').map(value => Number(value.trim()));
-  if (values.some(value => !Number.isSafeInteger(value))) {
-    throw new Error(`${envVar} must be a comma-separated list of safe integers`);
-  }
-  return values;
-}
-
 const shadowPhase2Criteria = {
   minObservationDays: parseNumber('SHADOW_GO_MIN_OBSERVATION_DAYS', 3),
   minWouldTakeCount: parseNumber('SHADOW_GO_MIN_WOULD_TAKE_COUNT', 50),
@@ -88,6 +79,7 @@ const shadowPhase2Criteria = {
   maxAbsPyusdBasisBps: parseNumber('SHADOW_ABORT_MAX_ABS_PYUSD_BASIS_BPS', 100),
   maxP95AbsPyusdBasisBps: parseNumber('SHADOW_ABORT_MAX_P95_ABS_PYUSD_BASIS_BPS', 80),
 };
+const referenceMarkoutRolloutOptions = buildReferenceMarkoutRolloutOptions(process.env);
 
 // ---------------------------------------------------------------------------
 // Configuration — PRODUCTION
@@ -166,22 +158,6 @@ const config = {
   // Data Pipeline
   redisUrl: process.env.REDIS_URL || null,
   pgUrl: process.env.DATABASE_URL || null,
-  referenceMarkoutConfig: {
-    product: process.env.REFERENCE_MARKOUT_PRODUCT || 'BTC-USD',
-    quoteCurrency: process.env.REFERENCE_MARKOUT_QUOTE_CURRENCY || 'USD',
-    sourceExchange: process.env.REFERENCE_MARKOUT_SOURCE_EXCHANGE || 'coinbase',
-    sourceType: process.env.REFERENCE_MARKOUT_SOURCE_TYPE || 'top-of-book',
-    horizonsMs: parseIntegerList('REFERENCE_MARKOUT_HORIZONS_MS', [60_000, 300_000, 3_600_000]),
-    maxSourceAgeMs: parseNumber('REFERENCE_MARKOUT_MAX_SOURCE_AGE_MS', 5_000),
-    maxLatenessMs: parseNumber('REFERENCE_MARKOUT_MAX_LATENESS_MS', 30_000),
-    pollIntervalMs: parseNumber('REFERENCE_MARKOUT_POLL_INTERVAL_MS', 1_000),
-    batchSize: parseNumber('REFERENCE_MARKOUT_BATCH_SIZE', 100),
-    claimLeaseMs: parseNumber('REFERENCE_MARKOUT_CLAIM_LEASE_MS', 5_000),
-    retentionMs: parseNumber('REFERENCE_MARKOUT_RETENTION_MS', 90 * 86_400_000),
-    retentionSweepIntervalMs: parseNumber('REFERENCE_MARKOUT_RETENTION_SWEEP_INTERVAL_MS', 3_600_000),
-    auditMaxGroups: parseNumber('REFERENCE_MARKOUT_AUDIT_MAX_GROUPS', 500),
-    maxAbsBasisAdjustmentBps: parseNumber('REFERENCE_MARKOUT_MAX_ABS_BASIS_BPS', 25),
-  },
 
   // REST URL for reconciliation + balance fetching
   restUrl: process.env.TRUEX_REST_URL || 'http://178.156.230.110:3006',
@@ -512,7 +488,7 @@ async function main() {
 
     // Data pipeline
     dataPipeline,
-    referenceMarkoutConfig: config.referenceMarkoutConfig,
+    ...referenceMarkoutRolloutOptions,
 
     // REST reconciliation + balance refresh
     restUrl: config.restUrl,
