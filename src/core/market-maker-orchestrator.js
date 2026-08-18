@@ -374,6 +374,14 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this._onEmergency = this._onEmergency.bind(this);
     this._onOEDisconnect = this._onOEDisconnect.bind(this);
     this._onCapitalResyncRequired = this._onCapitalResyncRequired.bind(this);
+    this._onLogonResetFallback = this._onLogonResetFallback.bind(this);
+    this._onLogonResetFallbackExhausted = this._onLogonResetFallbackExhausted.bind(this);
+    this._eventsWired = false;
+    this._startInFlight = false;
+    this._fixConnectionOwned = false;
+    this._dirtyStartupResources = {
+      fix: null, marketData: null, pipeline: null, pnl: null, reference: null,
+    };
     this._capitalResyncInFlight = null;
     this._capitalResyncPending = false;
   }
@@ -382,11 +390,58 @@ export class MarketMakerOrchestrator extends EventEmitter {
    * Start the market maker: connect, wire events, begin quoting.
    */
   async start() {
+    if (this.isRunning) return false;
+    if (this._startInFlight) throw new Error('Market maker startup is already in progress');
+
+    this._startInFlight = true;
+    this._intentionalStop = false;
+    try {
+      await this._recoverDirtyStartupResources();
+    } catch (error) {
+      this._startInFlight = false;
+      throw error;
+    }
+    const attempt = {
+      eventsWired: false,
+      fixActivationAttempted: false,
+      marketDataActivationAttempted: false,
+      dataPipelineActivationAttempted: false,
+      pnlActivationAttempted: false,
+      referenceCollectorActivationAttempted: false,
+      timerHandles: [],
+    };
+    attempt.fixInitiallyActive = this._isStartupConnectionActive(this.fixOE);
+    attempt.marketDataInitiallyActive = this._isStartupConnectionActive(this.marketDataFeed);
+    attempt.dataPipelineState = this._capturePipelineStartupState(this.dataPipeline);
+    attempt.dataPipelineInitiallyRunning = this._pipelineStartupStateIsActive(attempt.dataPipelineState);
+    attempt.pnlState = this._captureStartupComponentState(this.pnlTracker);
+    attempt.referenceState = this._captureStartupComponentState(this.referenceMarkoutCollector);
+    attempt.pnlInitiallyRunning = Boolean(this.pnlTracker?._logTimer) ||
+      this._startupComponentStateIsActive(attempt.pnlState);
+    attempt.referenceCollectorInitiallyRunning = Boolean(this.referenceMarkoutCollector?._timer) ||
+      this._startupComponentStateIsActive(attempt.referenceState);
+    const rememberTimers = (owner, properties, clear, group) => {
+      if (!owner) return;
+      for (const property of properties) {
+        attempt.timerHandles.push({ owner, property, handle: owner[property] ?? null, clear, group });
+      }
+    };
+    rememberTimers(this, [
+      'drainQueueTimer', '_reconcileTimer', '_balanceRefreshTimer', '_watchdogTimer', '_snapshotTimer',
+    ], clearInterval, 'orchestrator');
+    rememberTimers(this, ['_truexEbboPollTimer', '_pyusdUsdPollTimer'], clearTimeout, 'orchestrator');
+    rememberTimers(this.pnlTracker, ['_logTimer'], clearInterval, 'pnl');
+    rememberTimers(this.dataPipeline, [
+      '_flushTimer', '_pgFlushTimer', '_migrationTimer', '_cleanupTimer',
+    ], clearInterval, 'pipeline');
+    rememberTimers(this.referenceMarkoutCollector, ['_timer'], clearInterval, 'reference');
+
+    try {
     this.logger.info(`[Orchestrator] Starting market maker session ${this.sessionId}`);
     this._validatePyusdUsdPollingConfig();
 
     // 1. Wire event handlers
-    this._wireEvents();
+    attempt.eventsWired = this._wireEvents();
 
     // 2. Fetch account balances via REST (before connecting FIX)
     //    This is MANDATORY when a REST client is configured — fail-open is too dangerous
@@ -407,25 +462,42 @@ export class MarketMakerOrchestrator extends EventEmitter {
     }
 
     // 4. Connect FIX OE
-    this.logger.info('[Orchestrator] Connecting FIX OE...');
-    await this.fixOE.connect();
-    this.logger.info('[Orchestrator] FIX OE connected');
+    if (!attempt.fixInitiallyActive) {
+      this.logger.info('[Orchestrator] Connecting FIX OE...');
+      attempt.fixActivationAttempted = true;
+      await this.fixOE.connect();
+      this.logger.info('[Orchestrator] FIX OE connected');
+    } else if ('isLoggedOn' in this.fixOE && this.fixOE.isLoggedOn !== true) {
+      throw new Error('preexisting FIX transport is not logged on — refusing to start quoting');
+    }
 
     // 5. Connect market data feed (optional, non-blocking) — TrueX MD FIX or e.g. Coinbase adapter
-    if (this.marketDataFeed) {
+    if (this.marketDataFeed && !attempt.marketDataInitiallyActive) {
       try {
         this.logger.info('[Orchestrator] Connecting market data feed...');
+        attempt.marketDataActivationAttempted = true;
         await this.marketDataFeed.connect();
         await this.marketDataFeed.subscribe(this.symbol);
         this.logger.info('[Orchestrator] Market data feed connect/subscribe completed');
       } catch (err) {
         this.logger.warn(`[Orchestrator] Market data feed failed (non-fatal): ${err.message}`);
+        let cleaned = false;
+        if (attempt.marketDataActivationAttempted && this.marketDataFeed?.disconnect) {
+          cleaned = await this._runFailedStartCleanup('market data', () => this.marketDataFeed.disconnect());
+        }
+        if (!cleaned || this._isStartupConnectionActive(this.marketDataFeed)) {
+          throw err;
+        }
+        if (attempt.marketDataActivationAttempted) {
+          attempt.marketDataActivationAttempted = false;
+        }
       }
     }
 
     // 6. Start data pipeline (optional, non-blocking)
-    if (this.dataPipeline) {
+    if (this.dataPipeline && !attempt.dataPipelineInitiallyRunning) {
       try {
+        attempt.dataPipelineActivationAttempted = true;
         await this.dataPipeline.start();
         // The pipeline initializes its PostgreSQL manager lazily. Bind it only
         // after a successful start so telemetry degrades gracefully with no DB.
@@ -438,11 +510,34 @@ export class MarketMakerOrchestrator extends EventEmitter {
         this.logger.info('[Orchestrator] Data pipeline started');
       } catch (err) {
         this.logger.warn(`[Orchestrator] Data pipeline start failed (non-fatal): ${err.message}`);
+        if (attempt.dataPipelineActivationAttempted) {
+          let cleaned = false;
+          if (this.dataPipeline.stop) {
+            cleaned = await this._runFailedStartCleanup('pipeline', () => this.dataPipeline.stop());
+          }
+          this._restoreStartupTimerHandles(attempt, 'pipeline');
+          const restored = this._startupTimerHandlesMatch(attempt, 'pipeline') &&
+            this._pipelineStartupStateMatches(this.dataPipeline, attempt.dataPipelineState);
+          if (!cleaned || !restored) {
+            throw err;
+          }
+          attempt.dataPipelineActivationAttempted = false;
+        }
+      }
+    } else if (this.dataPipeline) {
+      if (!this.quoteTelemetry.writer && this.dataPipeline.pgManager) {
+        this.quoteTelemetry.writer = this.dataPipeline.pgManager;
+      }
+      if (this.referenceMarkoutCollector && !this.referenceMarkoutCollector.writer && this.dataPipeline.pgManager) {
+        this.referenceMarkoutCollector.setWriter(this.dataPipeline.pgManager);
       }
     }
 
     // 7. Start PnL periodic logging
-    this.pnlTracker.startPeriodicLogging();
+    if (!attempt.pnlInitiallyRunning) {
+      attempt.pnlActivationAttempted = true;
+      this.pnlTracker.startPeriodicLogging();
+    }
 
     // 8. Start quote engine drain queue timer
     this.drainQueueTimer = setInterval(() => {
@@ -475,14 +570,262 @@ export class MarketMakerOrchestrator extends EventEmitter {
 
     this.isRunning = true;
     this.startedAt = Date.now();
-    if (this.referenceMarkoutCollector?.writer) this.referenceMarkoutCollector.start();
+    if (this.referenceMarkoutCollector?.writer && !attempt.referenceCollectorInitiallyRunning) {
+      attempt.referenceCollectorActivationAttempted = true;
+      this.referenceMarkoutCollector.start();
+    }
     this._startTruexEbboPoller();
     this._startPyusdUsdPoller();
+    this._fixConnectionOwned = attempt.fixActivationAttempted;
 
     this.logger.info('[Orchestrator] Market maker started — waiting for price updates to begin quoting');
     this.emit('started', { sessionId: this.sessionId, timestamp: this.startedAt });
 
     return true;
+    } catch (error) {
+      await this._rollbackFailedStart(attempt);
+      throw error;
+    } finally {
+      this._startInFlight = false;
+    }
+  }
+
+  async _rollbackFailedStart(attempt) {
+    this.isRunning = false;
+    this.startedAt = null;
+    this._fixConnectionOwned = false;
+
+    if (attempt.referenceCollectorActivationAttempted && this.referenceMarkoutCollector?.stop) {
+      await this._runFailedStartCleanup('reference collector', () => this.referenceMarkoutCollector.stop());
+    }
+    if (attempt.pnlActivationAttempted) {
+      await this._runFailedStartCleanup('PnL tracker', () => this.pnlTracker.stopPeriodicLogging());
+    }
+    if (attempt.dataPipelineActivationAttempted && this.dataPipeline?.stop) {
+      await this._runFailedStartCleanup('pipeline', () => this.dataPipeline.stop());
+    }
+    if (attempt.marketDataActivationAttempted && this.marketDataFeed?.disconnect) {
+      await this._runFailedStartCleanup('market data', () => this.marketDataFeed.disconnect());
+    }
+    if (attempt.fixActivationAttempted && this.fixOE.disconnect) {
+      await this._runFailedStartCleanup('FIX', () => this.fixOE.disconnect());
+    }
+    this._restoreStartupTimerHandles(attempt);
+    if (attempt.fixActivationAttempted) {
+      this._dirtyStartupResources.fix = this._isStartupConnectionActive(this.fixOE) ? {} : null;
+    }
+    if (attempt.marketDataActivationAttempted) {
+      this._dirtyStartupResources.marketData =
+        this._isStartupConnectionActive(this.marketDataFeed) ? {} : null;
+    }
+    if (attempt.dataPipelineActivationAttempted) {
+      const pipelineTimerHandles = attempt.timerHandles.filter(snapshot => snapshot.group === 'pipeline');
+      const pipelineRestored = this._pipelineStartupStateMatches(
+        this.dataPipeline, attempt.dataPipelineState
+      ) && this._timerSnapshotsMatch(pipelineTimerHandles);
+      this._dirtyStartupResources.pipeline = pipelineRestored ? null : {
+        state: attempt.dataPipelineState,
+        timerHandles: pipelineTimerHandles,
+      };
+    }
+    if (attempt.pnlActivationAttempted) {
+      const timerHandles = attempt.timerHandles.filter(snapshot => snapshot.group === 'pnl');
+      const restored = this._timerSnapshotsMatch(timerHandles) &&
+        this._startupComponentStateMatches(this.pnlTracker, attempt.pnlState);
+      this._dirtyStartupResources.pnl = restored ? null : { timerHandles, state: attempt.pnlState };
+    }
+    if (attempt.referenceCollectorActivationAttempted) {
+      const timerHandles = attempt.timerHandles.filter(snapshot => snapshot.group === 'reference');
+      const restored = this._timerSnapshotsMatch(timerHandles) &&
+        this._startupComponentStateMatches(this.referenceMarkoutCollector, attempt.referenceState);
+      this._dirtyStartupResources.reference = restored ? null : {
+        timerHandles, state: attempt.referenceState,
+      };
+    }
+    if (attempt.eventsWired) {
+      await this._runFailedStartCleanup('event', () => this._unwireEvents());
+    }
+  }
+
+  _isStartupConnectionActive(resource) {
+    if (!resource) return false;
+    const hasTransportSignal =
+      'isConnected' in resource || 'socket' in resource || resource.ingest !== undefined;
+    const transportActive = Boolean(
+      resource.isConnected === true ||
+      (resource.socket && resource.socket.destroyed !== true) ||
+      resource.ingest?.connected === true
+    );
+    if (transportActive) return true;
+    if (!hasTransportSignal) return resource.isLoggedOn === true;
+    return false;
+  }
+
+  async _recoverDirtyStartupResources() {
+    const failures = [];
+    if (this._dirtyStartupResources.fix) {
+      if (this.fixOE?.disconnect) {
+        await this._runFailedStartCleanup('dirty FIX', () => this.fixOE.disconnect());
+      }
+      if (this._isStartupConnectionActive(this.fixOE)) failures.push('FIX');
+      else this._dirtyStartupResources.fix = null;
+    }
+    if (this._dirtyStartupResources.marketData) {
+      if (this.marketDataFeed?.disconnect) {
+        await this._runFailedStartCleanup('dirty market data', () => this.marketDataFeed.disconnect());
+      }
+      if (this._isStartupConnectionActive(this.marketDataFeed)) failures.push('market-data');
+      else this._dirtyStartupResources.marketData = null;
+    }
+    if (this._dirtyStartupResources.pipeline) {
+      const dirty = this._dirtyStartupResources.pipeline;
+      if (this.dataPipeline?.stop) {
+        await this._runFailedStartCleanup('dirty pipeline', () => this.dataPipeline.stop());
+      }
+      this._restoreStartupTimerSnapshots(dirty.timerHandles);
+      const restored = this._pipelineStartupStateMatches(this.dataPipeline, dirty.state) &&
+        this._timerSnapshotsMatch(dirty.timerHandles);
+      if (!restored) failures.push('pipeline');
+      else this._dirtyStartupResources.pipeline = null;
+    }
+    for (const [key, resource, label] of [
+      ['pnl', this.pnlTracker, 'PnL tracker'],
+      ['reference', this.referenceMarkoutCollector, 'reference collector'],
+    ]) {
+      const dirty = this._dirtyStartupResources[key];
+      if (!dirty) continue;
+      if (resource?.stop) await this._runFailedStartCleanup(`dirty ${label}`, () => resource.stop());
+      else if (key === 'pnl' && resource?.stopPeriodicLogging) {
+        await this._runFailedStartCleanup('dirty PnL tracker', () => resource.stopPeriodicLogging());
+      }
+      this._restoreStartupTimerSnapshots(dirty.timerHandles);
+      const restored = this._timerSnapshotsMatch(dirty.timerHandles) &&
+        this._startupComponentStateMatches(resource, dirty.state);
+      if (!restored) failures.push(key);
+      else this._dirtyStartupResources[key] = null;
+    }
+    if (failures.length > 0) {
+      throw new Error(`dirty startup resource cleanup incomplete: ${failures.join(', ')}`);
+    }
+  }
+
+  async _runFailedStartCleanup(label, action) {
+    try {
+      await action();
+      return true;
+    } catch (error) {
+      this.logger.warn(`[Orchestrator] Failed-start ${label} cleanup failed: ${error.message}`);
+      return false;
+    }
+  }
+
+  _restoreStartupTimerHandles(attempt, group = null) {
+    this._restoreStartupTimerSnapshots(
+      group ? attempt.timerHandles.filter(snapshot => snapshot.group === group) : attempt.timerHandles
+    );
+  }
+
+  _restoreStartupTimerSnapshots(snapshots) {
+    for (const snapshot of snapshots) {
+      const current = snapshot.owner[snapshot.property] ?? null;
+      if (current === snapshot.handle) continue;
+      if (current) snapshot.clear(current);
+      snapshot.owner[snapshot.property] = snapshot.handle;
+    }
+  }
+
+  _timerSnapshotsMatch(snapshots) {
+    return snapshots.every(
+      snapshot => (snapshot.owner[snapshot.property] ?? null) === snapshot.handle
+    );
+  }
+
+  _startupTimerHandlesMatch(attempt, group) {
+    return attempt.timerHandles
+      .filter(snapshot => snapshot.group === group)
+      .every(snapshot => (snapshot.owner[snapshot.property] ?? null) === snapshot.handle);
+  }
+
+  _capturePipelineStartupState(pipeline) {
+    if (!pipeline) return null;
+    const signalNames = [
+      'isRunning', 'isConnected', 'isLoggedOn', 'isActive', 'active', 'connected', 'destroyed', 'readyState',
+    ];
+    const captureSignals = (resource) => {
+      if (!resource) return null;
+      const signals = {};
+      for (const name of signalNames) {
+        if (name in resource) signals[name] = resource[name];
+      }
+      return signals;
+    };
+    const resources = {};
+    for (const property of ['ingest', 'socket', 'client', 'redisManager', 'pgManager']) {
+      const value = pipeline[property];
+      resources[property] = {
+        present: property in pipeline,
+        value,
+        signals: captureSignals(value),
+      };
+    }
+    return { component: captureSignals(pipeline), resources };
+  }
+
+  _captureStartupComponentState(component) {
+    if (!component) return null;
+    const state = {};
+    for (const name of ['isRunning', 'isConnected', 'isLoggedOn', 'isActive', 'active', 'connected']) {
+      if (name in component) state[name] = component[name];
+    }
+    return state;
+  }
+
+  _startupComponentStateMatches(component, expected) {
+    if (!component || !expected) return component === null && expected === null;
+    const actual = this._captureStartupComponentState(component);
+    const keys = Object.keys(expected);
+    return keys.length === Object.keys(actual).length &&
+      keys.every(key => Object.prototype.hasOwnProperty.call(actual, key) && Object.is(actual[key], expected[key]));
+  }
+
+  _startupComponentStateIsActive(state) {
+    return Boolean(state && Object.values(state).some(value => value === true));
+  }
+
+  _pipelineStartupStateMatches(pipeline, expected) {
+    if (!pipeline || !expected) return pipeline === null && expected === null;
+    const actual = this._capturePipelineStartupState(pipeline);
+    const sameSignals = (left, right) => {
+      if (left === null || right === null) return left === right;
+      const leftKeys = Object.keys(left);
+      const rightKeys = Object.keys(right);
+      return leftKeys.length === rightKeys.length &&
+        leftKeys.every(key => Object.prototype.hasOwnProperty.call(right, key) && Object.is(left[key], right[key]));
+    };
+    if (!sameSignals(actual.component, expected.component)) return false;
+    return Object.keys(expected.resources).every(property => {
+      const left = actual.resources[property];
+      const right = expected.resources[property];
+      return left.present === right.present && left.value === right.value &&
+        sameSignals(left.signals, right.signals);
+    });
+  }
+
+  _pipelineStartupStateIsActive(state) {
+    if (!state) return false;
+    const activeSignals = (signals) => Boolean(
+      signals && (
+        signals.isRunning === true || signals.isConnected === true || signals.isLoggedOn === true ||
+        signals.isActive === true || signals.active === true || signals.connected === true
+      )
+    );
+    if (activeSignals(state.component)) return true;
+    return ['ingest', 'socket', 'client'].some(property => {
+      const resource = state.resources[property];
+      if (!resource?.value) return false;
+      if (resource.signals?.destroyed === false) return true;
+      return activeSignals(resource.signals);
+    });
   }
 
   /**
@@ -565,9 +908,12 @@ export class MarketMakerOrchestrator extends EventEmitter {
     }
 
     // 6. Disconnect FIX OE
-    try {
-      await this.fixOE.disconnect();
-    } catch (_) { /* best effort */ }
+    if (this._fixConnectionOwned) {
+      try {
+        await this.fixOE.disconnect();
+      } catch (_) { /* best effort */ }
+    }
+    this._fixConnectionOwned = false;
 
     // 7. Log final session report
     const report = this.pnlTracker.getSessionReport();
@@ -702,6 +1048,8 @@ export class MarketMakerOrchestrator extends EventEmitter {
   // --- Event Wiring ---
 
   _wireEvents() {
+    if (this._eventsWired) return false;
+
     // Price → QuoteEngine
     if (this.priceAggregator) {
       this.priceAggregator.on('price', this._onPriceUpdate);
@@ -716,39 +1064,11 @@ export class MarketMakerOrchestrator extends EventEmitter {
 
     // OE logon-reset fallback fired (informational) — log + alert at info level
     // so ops can correlate with TrueX-side restarts.
-    this.fixOE.on('logon-reset-fallback', (info) => {
-      this.logger.warn(
-        `[Orchestrator] FIX logon-reset fallback fired for ${info.targetCompID} ` +
-        `(${info.fallbackAttempt}/${info.maxFallbacks}, after ${info.consecutiveTimeouts} timeouts)`
-      );
-      this.alertManager.sendAlert({
-        reason: 'FIX logon-reset fallback fired',
-        level: 'warn',
-        details: {
-          targetCompID: info.targetCompID,
-          fallbackAttempt: info.fallbackAttempt,
-          maxFallbacks: info.maxFallbacks,
-          consecutiveTimeouts: info.consecutiveTimeouts,
-        },
-      });
-    });
+    this.fixOE.on('logon-reset-fallback', this._onLogonResetFallback);
 
     // OE logon-reset fallback exhausted — loop guard tripped. Real cause is
     // elsewhere (creds, TrueX outage, network). Escalate hard.
-    this.fixOE.on('logon-reset-fallback-exhausted', (info) => {
-      this.logger.error(
-        `[Orchestrator] FIX logon-reset fallback exhausted for ${info.targetCompID} ` +
-        `after ${info.attempts} attempts — manual intervention likely required`
-      );
-      this.alertManager.sendAlert({
-        reason: 'FIX logon-reset fallback exhausted',
-        level: 'error',
-        details: {
-          targetCompID: info.targetCompID,
-          attempts: info.attempts,
-        },
-      });
-    });
+    this.fixOE.on('logon-reset-fallback-exhausted', this._onLogonResetFallbackExhausted);
 
     // QuoteEngine fills → Inventory + PnL
     this.quoteEngine.on('fill', this._onQuoteFill);
@@ -763,21 +1083,62 @@ export class MarketMakerOrchestrator extends EventEmitter {
 
     // Emergency → cancel all
     this.inventoryManager.on('emergency', this._onEmergency);
+
+    this._eventsWired = true;
+    return true;
   }
 
   _unwireEvents() {
+    if (!this._eventsWired) return false;
+
     if (this.priceAggregator) {
       this.priceAggregator.removeListener('price', this._onPriceUpdate);
     }
     this.fixOE.removeListener('message', this._onFIXMessage);
     this.fixOE.removeListener('disconnect', this._onOEDisconnect);
     this.fixOE.removeListener('logout', this._onOEDisconnect);
+    this.fixOE.removeListener('logon-reset-fallback', this._onLogonResetFallback);
+    this.fixOE.removeListener('logon-reset-fallback-exhausted', this._onLogonResetFallbackExhausted);
     this.quoteEngine.removeListener('fill', this._onQuoteFill);
     this.quoteEngine.removeListener('quote-lifecycle', this._onQuoteLifecycle);
     this.quoteEngine.removeListener('capital-resync-required', this._onCapitalResyncRequired);
     this.inventoryManager.removeListener('hedge-signal', this._onHedgeSignal);
     this.hedgeExecutor.removeListener('hedge-filled', this._onHedgeFill);
     this.inventoryManager.removeListener('emergency', this._onEmergency);
+    this._eventsWired = false;
+    return true;
+  }
+
+  _onLogonResetFallback(info) {
+    this.logger.warn(
+      `[Orchestrator] FIX logon-reset fallback fired for ${info.targetCompID} ` +
+      `(${info.fallbackAttempt}/${info.maxFallbacks}, after ${info.consecutiveTimeouts} timeouts)`
+    );
+    this.alertManager.sendAlert({
+      reason: 'FIX logon-reset fallback fired',
+      level: 'warn',
+      details: {
+        targetCompID: info.targetCompID,
+        fallbackAttempt: info.fallbackAttempt,
+        maxFallbacks: info.maxFallbacks,
+        consecutiveTimeouts: info.consecutiveTimeouts,
+      },
+    });
+  }
+
+  _onLogonResetFallbackExhausted(info) {
+    this.logger.error(
+      `[Orchestrator] FIX logon-reset fallback exhausted for ${info.targetCompID} ` +
+      `after ${info.attempts} attempts — manual intervention likely required`
+    );
+    this.alertManager.sendAlert({
+      reason: 'FIX logon-reset fallback exhausted',
+      level: 'error',
+      details: {
+        targetCompID: info.targetCompID,
+        attempts: info.attempts,
+      },
+    });
   }
 
   // --- Event Handlers ---

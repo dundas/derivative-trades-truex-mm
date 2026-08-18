@@ -228,6 +228,459 @@ describe('MarketMakerOrchestrator strict startup reconciliation', () => {
     expect(orchestrator.isRunning).toBe(false);
   });
 
+  test('failed strict startup unwires its attempt and retry installs exactly one handler', async () => {
+    const orchestrator = makeStartupOrchestrator();
+    orchestrator.restClient = {};
+    orchestrator.inventoryManager.balancesInitialized = true;
+    orchestrator._initializeBalances = mock(async () => {});
+    orchestrator._restReconcile = mock()
+      .mockRejectedValueOnce(new Error('strict startup failed'))
+      .mockResolvedValueOnce({ exchange: 0, local: 0, matched: 0, orphansCancelled: 0, ghostsRemoved: 0 });
+    orchestrator._onQuoteFill = mock(() => {});
+    orchestrator._onQuoteLifecycle = mock(() => {});
+    orchestrator._onCapitalResyncRequired = mock(() => {});
+
+    await expect(orchestrator.start()).rejects.toThrow('strict startup failed');
+    expect(orchestrator.isRunning).toBe(false);
+    expect(orchestrator.fixOE.listenerCount('message')).toBe(0);
+    expect(orchestrator.fixOE.listenerCount('logon-reset-fallback')).toBe(0);
+    expect(orchestrator.quoteEngine.listenerCount('fill')).toBe(0);
+
+    await expect(orchestrator.start()).resolves.toBe(true);
+    expect(orchestrator.fixOE.listenerCount('message')).toBe(1);
+    expect(orchestrator.fixOE.listenerCount('logon-reset-fallback')).toBe(1);
+    expect(orchestrator.quoteEngine.listenerCount('fill')).toBe(1);
+    expect(orchestrator.quoteEngine.listenerCount('quote-lifecycle')).toBe(1);
+    expect(orchestrator.quoteEngine.listenerCount('capital-resync-required')).toBe(1);
+
+    orchestrator.quoteEngine.emit('fill', { execID: 'one' });
+    orchestrator.quoteEngine.emit('quote-lifecycle', { quoteId: 'one' });
+    orchestrator.quoteEngine.emit('capital-resync-required', { side: 'sell' });
+    expect(orchestrator._onQuoteFill).toHaveBeenCalledTimes(1);
+    expect(orchestrator._onQuoteLifecycle).toHaveBeenCalledTimes(1);
+    expect(orchestrator._onCapitalResyncRequired).toHaveBeenCalledTimes(1);
+
+    orchestrator.restClient = null;
+    await orchestrator.stop();
+  });
+
+  test('later startup failure clears attempt-owned timers and connections before retry', async () => {
+    const orchestrator = makeStartupOrchestrator({ postgresManager: {} });
+    orchestrator._takeBalanceSnapshot = mock()
+      .mockRejectedValueOnce(new Error('snapshot failed'))
+      .mockResolvedValue(undefined);
+
+    await expect(orchestrator.start()).rejects.toThrow('snapshot failed');
+    expect(orchestrator.isRunning).toBe(false);
+    expect(orchestrator.startedAt).toBeNull();
+    expect(orchestrator.fixOE.disconnect).toHaveBeenCalledTimes(1);
+    expect(orchestrator.pnlTracker.stopPeriodicLogging).toHaveBeenCalledTimes(1);
+    expect(orchestrator.drainQueueTimer).toBeNull();
+    expect(orchestrator._watchdogTimer).toBeNull();
+    expect(orchestrator._snapshotTimer).toBeNull();
+    expect(orchestrator.fixOE.listenerCount('message')).toBe(0);
+
+    await expect(orchestrator.start()).resolves.toBe(true);
+    expect(orchestrator.fixOE.connect).toHaveBeenCalledTimes(2);
+    expect(orchestrator.fixOE.listenerCount('message')).toBe(1);
+    expect(orchestrator.drainQueueTimer).not.toBeNull();
+    expect(orchestrator._watchdogTimer).not.toBeNull();
+    expect(orchestrator._snapshotTimer).not.toBeNull();
+
+    await orchestrator.stop();
+  });
+
+  test('partial FIX and PnL activation throws are owned and unwound', async () => {
+    const fixFailure = makeStartupOrchestrator();
+    fixFailure.fixOE.connect = mock(async function connect() {
+      this.isConnected = true;
+      this.isLoggedOn = true;
+      throw new Error('FIX partial start');
+    });
+    await expect(fixFailure.start()).rejects.toThrow('FIX partial start');
+    expect(fixFailure.fixOE.disconnect).toHaveBeenCalledTimes(1);
+    expect(fixFailure.fixOE.isConnected).toBe(false);
+    expect(fixFailure.fixOE.listenerCount('message')).toBe(0);
+
+    const pnlFailure = makeStartupOrchestrator();
+    pnlFailure.pnlTracker._logTimer = null;
+    pnlFailure.pnlTracker.startPeriodicLogging = mock(function startPeriodicLogging() {
+      this._logTimer = setInterval(() => {}, 60000);
+      throw new Error('PnL partial start');
+    });
+    pnlFailure.pnlTracker.stopPeriodicLogging = mock(function stopPeriodicLogging() {
+      if (this._logTimer) clearInterval(this._logTimer);
+      this._logTimer = null;
+    });
+    try {
+      await expect(pnlFailure.start()).rejects.toThrow('PnL partial start');
+      expect(pnlFailure.pnlTracker.stopPeriodicLogging).toHaveBeenCalledTimes(1);
+      expect(pnlFailure.pnlTracker._logTimer).toBeNull();
+      expect(pnlFailure.fixOE.disconnect).toHaveBeenCalledTimes(1);
+    } finally {
+      if (pnlFailure.pnlTracker._logTimer) clearInterval(pnlFailure.pnlTracker._logTimer);
+    }
+  });
+
+  test('failed FIX cleanup remains attempt-owned across retries until proven inactive', async () => {
+    const orchestrator = makeStartupOrchestrator();
+    let connectAttempts = 0;
+    orchestrator.fixOE.connect = mock(async function connect() {
+      connectAttempts += 1;
+      this.isConnected = true;
+      this.isLoggedOn = true;
+      this.socket = { destroyed: false, attempt: connectAttempts };
+      if (connectAttempts === 1) throw new Error('FIX primary failure');
+    });
+    let disconnectAttempts = 0;
+    orchestrator.fixOE.disconnect = mock(async function disconnect() {
+      disconnectAttempts += 1;
+      if (disconnectAttempts <= 2) throw new Error('FIX cleanup failure');
+      if (this.socket) this.socket.destroyed = true;
+      this.socket = null;
+      this.isConnected = false;
+      this.isLoggedOn = false;
+    });
+
+    await expect(orchestrator.start()).rejects.toThrow('FIX primary failure');
+    expect(orchestrator._dirtyStartupResources.fix).not.toBeNull();
+    expect(orchestrator.fixOE.isConnected).toBe(true);
+
+    await expect(orchestrator.start()).rejects.toThrow('dirty startup resource cleanup incomplete: FIX');
+    expect(orchestrator.fixOE.connect).toHaveBeenCalledTimes(1);
+    expect(orchestrator.fixOE.listenerCount('message')).toBe(0);
+    expect(orchestrator._dirtyStartupResources.fix).not.toBeNull();
+
+    await expect(orchestrator.start()).resolves.toBe(true);
+    expect(orchestrator._dirtyStartupResources.fix).toBeNull();
+    expect(orchestrator.fixOE.connect).toHaveBeenCalledTimes(2);
+    expect(orchestrator.fixOE.socket.attempt).toBe(2);
+    await orchestrator.stop();
+    expect(orchestrator.fixOE.disconnect).toHaveBeenCalledTimes(4);
+    expect(orchestrator.fixOE.isConnected).toBe(false);
+  });
+
+  test('nonfatal partial market-data and pipeline starts are cleaned immediately', async () => {
+    const marketDataFeed = Object.assign(new EventEmitter(), {
+      isLoggedOn: false,
+      connect: mock(async function connect() {
+        this.isLoggedOn = true;
+        throw new Error('MD partial start');
+      }),
+      subscribe: mock(async () => {}),
+      disconnect: mock(async function disconnect() { this.isLoggedOn = false; }),
+    });
+    const dataPipeline = {
+      isRunning: false,
+      start: mock(async function start() {
+        this.isRunning = true;
+        this._cleanupTimer = setInterval(() => {}, 60000);
+        throw new Error('pipeline partial start');
+      }),
+      stop: mock(async function stop() {
+        if (this._cleanupTimer) clearInterval(this._cleanupTimer);
+        this._cleanupTimer = null;
+        this.isRunning = false;
+      }),
+    };
+    const orchestrator = makeStartupOrchestrator({ marketDataFeed, dataPipeline });
+    try {
+      await expect(orchestrator.start()).resolves.toBe(true);
+      expect(marketDataFeed.disconnect).toHaveBeenCalledTimes(1);
+      expect(marketDataFeed.isLoggedOn).toBe(false);
+      expect(dataPipeline.stop).toHaveBeenCalledTimes(1);
+      expect(dataPipeline.isRunning).toBe(false);
+      expect(dataPipeline._cleanupTimer).toBeNull();
+    } finally {
+      await orchestrator.stop();
+      if (dataPipeline._cleanupTimer) clearInterval(dataPipeline._cleanupTimer);
+    }
+  });
+
+  test('partial reference collector activation is stopped and its timer is removed', async () => {
+    const referenceMarkoutCollector = {
+      writer: {},
+      _timer: null,
+      start: mock(function start() {
+        this._timer = setInterval(() => {}, 60000);
+        throw new Error('collector partial start');
+      }),
+      stop: mock(function stop() {
+        if (this._timer) clearInterval(this._timer);
+        this._timer = null;
+      }),
+    };
+    const orchestrator = makeStartupOrchestrator({ referenceMarkoutCollector });
+    try {
+      await expect(orchestrator.start()).rejects.toThrow('collector partial start');
+      expect(referenceMarkoutCollector.stop).toHaveBeenCalledTimes(1);
+      expect(referenceMarkoutCollector._timer).toBeNull();
+      expect(orchestrator.fixOE.disconnect).toHaveBeenCalledTimes(1);
+      expect(orchestrator.fixOE.listenerCount('message')).toBe(0);
+    } finally {
+      if (referenceMarkoutCollector._timer) clearInterval(referenceMarkoutCollector._timer);
+    }
+  });
+
+  test('failed startup preserves every preexisting resource and timer handle', async () => {
+    const marketDataFeed = Object.assign(new EventEmitter(), {
+      isLoggedOn: true,
+      ingest: { connected: true },
+      connect: mock(async () => {}), subscribe: mock(async () => {}), disconnect: mock(async () => {}),
+    });
+    const dataPipeline = {
+      isRunning: true, start: mock(async () => {}), stop: mock(async () => {}),
+      _cleanupTimer: setInterval(() => {}, 60000),
+    };
+    const referenceMarkoutCollector = {
+      writer: {}, _timer: setInterval(() => {}, 60000),
+      start: mock(() => {}), stop: mock(() => {}),
+    };
+    const orchestrator = makeStartupOrchestrator({
+      marketDataFeed, dataPipeline, referenceMarkoutCollector, postgresManager: {},
+    });
+    const preexistingTimers = {
+      drainQueueTimer: setInterval(() => {}, 60000),
+      _reconcileTimer: setInterval(() => {}, 60000),
+      _balanceRefreshTimer: setInterval(() => {}, 60000),
+      _watchdogTimer: setInterval(() => {}, 60000),
+      _snapshotTimer: setInterval(() => {}, 60000),
+      _truexEbboPollTimer: setTimeout(() => {}, 60000),
+      _pyusdUsdPollTimer: setTimeout(() => {}, 60000),
+    };
+    const pnlTimer = setInterval(() => {}, 60000);
+    Object.assign(orchestrator, preexistingTimers);
+    orchestrator.pnlTracker._logTimer = pnlTimer;
+    orchestrator.fixOE.isConnected = true;
+    orchestrator.fixOE.isLoggedOn = true;
+    const fixSocket = { destroyed: false };
+    orchestrator.fixOE.socket = fixSocket;
+    orchestrator._takeBalanceSnapshot = mock(async () => { throw new Error('late startup failure'); });
+
+    try {
+      await expect(orchestrator.start()).rejects.toThrow('late startup failure');
+      for (const [property, handle] of Object.entries(preexistingTimers)) {
+        expect(orchestrator[property]).toBe(handle);
+      }
+      expect(orchestrator.pnlTracker._logTimer).toBe(pnlTimer);
+      expect(dataPipeline._cleanupTimer).not.toBeNull();
+      expect(referenceMarkoutCollector._timer).not.toBeNull();
+      expect(orchestrator.fixOE.socket).toBe(fixSocket);
+      expect(orchestrator.fixOE.isConnected).toBe(true);
+      expect(orchestrator.fixOE.isLoggedOn).toBe(true);
+      expect(marketDataFeed.ingest.connected).toBe(true);
+      expect(orchestrator.fixOE.disconnect).not.toHaveBeenCalled();
+      expect(marketDataFeed.disconnect).not.toHaveBeenCalled();
+      expect(dataPipeline.stop).not.toHaveBeenCalled();
+      expect(orchestrator.pnlTracker.stopPeriodicLogging).not.toHaveBeenCalled();
+      expect(referenceMarkoutCollector.stop).not.toHaveBeenCalled();
+      expect(orchestrator.fixOE.connect).not.toHaveBeenCalled();
+      expect(marketDataFeed.connect).not.toHaveBeenCalled();
+      expect(marketDataFeed.subscribe).not.toHaveBeenCalled();
+      expect(dataPipeline.start).not.toHaveBeenCalled();
+      expect(orchestrator.pnlTracker.startPeriodicLogging).not.toHaveBeenCalled();
+      expect(referenceMarkoutCollector.start).not.toHaveBeenCalled();
+    } finally {
+      for (const handle of Object.values(preexistingTimers)) clearTimeout(handle);
+      clearInterval(pnlTimer);
+      clearInterval(dataPipeline._cleanupTimer);
+      clearInterval(referenceMarkoutCollector._timer);
+      for (const property of Object.keys(preexistingTimers)) orchestrator[property] = null;
+      orchestrator.pnlTracker._logTimer = null;
+      dataPipeline._cleanupTimer = null;
+      referenceMarkoutCollector._timer = null;
+    }
+  });
+
+  test('subscription without a live market-data transport is not treated as preexisting active', async () => {
+    const marketDataFeed = Object.assign(new EventEmitter(), {
+      isSubscribed: true,
+      isLoggedOn: false,
+      isConnected: false,
+      connect: mock(async function connect() { this.isConnected = true; }),
+      subscribe: mock(async () => {}),
+      disconnect: mock(async function disconnect() { this.isConnected = false; }),
+    });
+    const orchestrator = makeStartupOrchestrator({ marketDataFeed });
+    await orchestrator.start();
+    expect(marketDataFeed.connect).toHaveBeenCalledTimes(1);
+    expect(marketDataFeed.subscribe).toHaveBeenCalledTimes(1);
+    await orchestrator.stop();
+  });
+
+  test('failed cleanup of partial nonfatal resources aborts startup with the primary error', async () => {
+    const marketDataFeed = Object.assign(new EventEmitter(), {
+      isLoggedOn: false,
+      connect: mock(async function connect() {
+        this.isLoggedOn = true;
+        throw new Error('MD primary failure');
+      }),
+      subscribe: mock(async () => {}),
+      disconnect: mock(async () => { throw new Error('MD cleanup failure'); }),
+    });
+    const mdOrchestrator = makeStartupOrchestrator({ marketDataFeed });
+    await expect(mdOrchestrator.start()).rejects.toThrow('MD primary failure');
+    expect(mdOrchestrator.isRunning).toBe(false);
+    expect(marketDataFeed.disconnect).toHaveBeenCalledTimes(2);
+    expect(mdOrchestrator.fixOE.disconnect).toHaveBeenCalledTimes(1);
+
+    const dataPipeline = {
+      isRunning: false,
+      start: mock(async function start() {
+        this.isRunning = true;
+        throw new Error('pipeline primary failure');
+      }),
+      stop: mock(async () => { throw new Error('pipeline cleanup failure'); }),
+    };
+    const pipelineOrchestrator = makeStartupOrchestrator({ dataPipeline });
+    await expect(pipelineOrchestrator.start()).rejects.toThrow('pipeline primary failure');
+    expect(pipelineOrchestrator.isRunning).toBe(false);
+    expect(dataPipeline.stop).toHaveBeenCalledTimes(2);
+    expect(pipelineOrchestrator.fixOE.disconnect).toHaveBeenCalledTimes(1);
+  });
+
+  test('pipeline cleanup must restore nested transport state before startup may continue', async () => {
+    const dataPipeline = {
+      isRunning: false,
+      ingest: { connected: false },
+      start: mock(async function start() {
+        this.ingest.connected = true;
+        throw new Error('pipeline ingest primary failure');
+      }),
+      stop: mock(async function stop() {
+        if (!this.isRunning) return;
+        this.ingest.connected = false;
+        this.isRunning = false;
+      }),
+    };
+    const orchestrator = makeStartupOrchestrator({ dataPipeline });
+    await expect(orchestrator.start()).rejects.toThrow('pipeline ingest primary failure');
+    expect(orchestrator.isRunning).toBe(false);
+    expect(dataPipeline.stop).toHaveBeenCalledTimes(2);
+    expect(dataPipeline.ingest.connected).toBe(true);
+    expect(orchestrator.fixOE.disconnect).toHaveBeenCalledTimes(1);
+  });
+
+  test('dirty pipeline ownership survives retry until nested state is restored', async () => {
+    let startAttempts = 0;
+    let stopAttempts = 0;
+    const dataPipeline = {
+      isRunning: false,
+      ingest: { connected: false },
+      start: mock(async function start() {
+        startAttempts += 1;
+        if (startAttempts === 1) {
+          this.ingest.connected = true;
+          throw new Error('pipeline primary failure');
+        }
+        this.isRunning = true;
+      }),
+      stop: mock(async function stop() {
+        stopAttempts += 1;
+        if (stopAttempts <= 3) throw new Error('pipeline cleanup failure');
+        this.ingest.connected = false;
+        this.isRunning = false;
+      }),
+    };
+    const orchestrator = makeStartupOrchestrator({ dataPipeline });
+
+    await expect(orchestrator.start()).rejects.toThrow('pipeline primary failure');
+    expect(orchestrator._dirtyStartupResources.pipeline).not.toBeNull();
+    await expect(orchestrator.start()).rejects.toThrow('dirty startup resource cleanup incomplete: pipeline');
+    expect(dataPipeline.start).toHaveBeenCalledTimes(1);
+    expect(orchestrator._dirtyStartupResources.pipeline).not.toBeNull();
+
+    await expect(orchestrator.start()).resolves.toBe(true);
+    expect(orchestrator._dirtyStartupResources.pipeline).toBeNull();
+    expect(dataPipeline.start).toHaveBeenCalledTimes(2);
+    await orchestrator.stop();
+    expect(dataPipeline.stop).toHaveBeenCalledTimes(5);
+  });
+
+  test('preexisting pipeline active contract or ingest transport is a no-touch resource', async () => {
+    for (const pipeline of [
+      { isRunning: false, isActive: true },
+      { isRunning: false, ingest: { connected: true } },
+    ]) {
+      pipeline.start = mock(async () => {});
+      pipeline.stop = mock(async () => {});
+      const orchestrator = makeStartupOrchestrator({ dataPipeline: pipeline, postgresManager: {} });
+      orchestrator._takeBalanceSnapshot = mock(async () => { throw new Error('late failure'); });
+      await expect(orchestrator.start()).rejects.toThrow('late failure');
+      expect(pipeline.start).not.toHaveBeenCalled();
+      expect(pipeline.stop).not.toHaveBeenCalled();
+      if (pipeline.ingest) expect(pipeline.ingest.connected).toBe(true);
+      if ('isActive' in pipeline) expect(pipeline.isActive).toBe(true);
+    }
+  });
+
+  test('preexisting live transport is external even before FIX or MD logon completes', async () => {
+    for (const resourceKind of ['fix-connected', 'fix-socket', 'md-connected', 'md-ingest']) {
+      const marketDataFeed = Object.assign(new EventEmitter(), {
+        isConnected: resourceKind === 'md-connected',
+        isLoggedOn: false,
+        ingest: { connected: resourceKind === 'md-ingest' },
+        connect: mock(async () => {}), subscribe: mock(async () => {}), disconnect: mock(async () => {}),
+      });
+      const orchestrator = makeStartupOrchestrator({ marketDataFeed, postgresManager: {} });
+      const oldFixSocket = { destroyed: false };
+      orchestrator.fixOE.isConnected = resourceKind === 'fix-connected';
+      orchestrator.fixOE.isLoggedOn = false;
+      orchestrator.fixOE.socket = resourceKind === 'fix-socket' ? oldFixSocket : null;
+      orchestrator._takeBalanceSnapshot = mock(async () => { throw new Error('late failure'); });
+
+      await expect(orchestrator.start()).rejects.toThrow(
+        resourceKind.startsWith('fix-') ? 'preexisting FIX transport is not logged on' : 'late failure'
+      );
+      if (resourceKind.startsWith('fix-')) {
+        expect(orchestrator.fixOE.connect).not.toHaveBeenCalled();
+        expect(orchestrator.fixOE.disconnect).not.toHaveBeenCalled();
+        expect(orchestrator.fixOE.socket).toBe(resourceKind === 'fix-socket' ? oldFixSocket : null);
+        expect(orchestrator.fixOE.isConnected).toBe(resourceKind === 'fix-connected');
+        expect(orchestrator.pnlTracker.startPeriodicLogging).not.toHaveBeenCalled();
+        expect(orchestrator.drainQueueTimer).toBeNull();
+        expect(orchestrator.isRunning).toBe(false);
+      }
+      if (resourceKind.startsWith('md-')) {
+        expect(marketDataFeed.connect).not.toHaveBeenCalled();
+        expect(marketDataFeed.subscribe).not.toHaveBeenCalled();
+        expect(marketDataFeed.disconnect).not.toHaveBeenCalled();
+      }
+    }
+  });
+
+  test('fully logged-on preexisting FIX succeeds without taking connection ownership', async () => {
+    const orchestrator = makeStartupOrchestrator();
+    const oldSocket = { destroyed: false };
+    orchestrator.fixOE.isConnected = true;
+    orchestrator.fixOE.isLoggedOn = true;
+    orchestrator.fixOE.socket = oldSocket;
+
+    await expect(orchestrator.start()).resolves.toBe(true);
+    expect(orchestrator.fixOE.connect).not.toHaveBeenCalled();
+    expect(orchestrator.fixOE.socket).toBe(oldSocket);
+    expect(orchestrator.fixOE.isLoggedOn).toBe(true);
+    await orchestrator.stop();
+    expect(orchestrator.fixOE.disconnect).not.toHaveBeenCalled();
+    expect(orchestrator.fixOE.socket).toBe(oldSocket);
+  });
+
+  test('preconnected FIX adapter without a logon contract remains eligible and no-touch', async () => {
+    const orchestrator = makeStartupOrchestrator();
+    const adapter = Object.assign(new EventEmitter(), {
+      isConnected: true,
+      connect: mock(async () => {}),
+      disconnect: mock(async () => {}),
+      sendMessage: mock(() => {}),
+    });
+    orchestrator.fixOE = adapter;
+
+    await expect(orchestrator.start()).resolves.toBe(true);
+    expect(adapter.connect).not.toHaveBeenCalled();
+    await orchestrator.stop();
+    expect(adapter.disconnect).not.toHaveBeenCalled();
+  });
+
   test('strict startup waits for cancel-pending orders to become terminal', async () => {
     let now = 0;
     const getActiveOrders = mock()
