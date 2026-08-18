@@ -166,6 +166,7 @@ export class CapitalReservationManager {
   }
 
   reserve({ orderId, side, price, size, level = null, replacesOrderId = null }) {
+    if (this.state === 'failed') return { accepted: false, reason: 'capital-reconciliation-failed' };
     if (!orderId || this.reservations.has(orderId)) return { accepted: false, reason: 'duplicate-order-id' };
     if (!SIDES.has(side)) return { accepted: false, reason: 'invalid-side' };
     if (this.blockedSides.has(side)) return { accepted: false, reason: 'insufficient-funds-resync-required' };

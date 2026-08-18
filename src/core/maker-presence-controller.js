@@ -63,12 +63,15 @@ export class MakerPresenceController {
     }
 
     const uniqueLevels = { buy: new Set(), sell: new Set() };
+    const fundedSafeL1 = { buy: false, sell: false };
     for (const order of orders) {
       if (order?.acknowledgedLive !== true || !['buy', 'sell'].includes(order.side)) continue;
       if (!Number.isFinite(Number(order.remainingSize)) ||
           Number(order.remainingSize) < this.config.minimumFundedQuoteSize) continue;
       if (!Number.isInteger(Number(order.level)) || Number(order.level) <= 0) continue;
-      uniqueLevels[order.side].add(Number(order.level));
+      const level = Number(order.level);
+      uniqueLevels[order.side].add(level);
+      if (level === 1) fundedSafeL1[order.side] = true;
     }
     const activeLevels = { buy: uniqueLevels.buy.size, sell: uniqueLevels.sell.size };
     const present = {
@@ -109,14 +112,16 @@ export class MakerPresenceController {
     if (!oeHealthy) unsafeReasons.push('order-entry-unhealthy');
     if (!referenceHealthy) unsafeReasons.push('reference-unhealthy');
     const blocked = new Set(blockedSides);
-    const capitalDegraded = reconciliationState === 'degraded' || blocked.size > 0;
+    const reconciliationFailed = reconciliationState === 'failed';
+    const capitalDegraded = reconciliationState === 'degraded' || reconciliationFailed || blocked.size > 0;
     if (reconciliationState === 'degraded') reasons.push('capital-reconciliation-degraded');
+    if (reconciliationFailed) reasons.push('capital-reconciliation-failed');
     for (const side of [...blocked].sort()) reasons.push(`capital-side-blocked-${side}`);
-    const noAcknowledgedFundedL1 = activeLevels.buy === 0 && activeLevels.sell === 0;
+    const noAcknowledgedFundedL1 = !fundedSafeL1.buy && !fundedSafeL1.sell;
     const bothSidesUnavailable = ['buy', 'sell'].every((side) =>
       blocked.has(side) || Number(fundedSizeBySide[side]) < this.config.minimumFundedQuoteSize);
     if (noAcknowledgedFundedL1 &&
-        (reconciliationState === 'failed' || bothSidesUnavailable)) {
+        (reconciliationFailed || bothSidesUnavailable)) {
       unsafeReasons.push('reconciliation-failed-no-safe-l1');
     }
     reasons.push(...unsafeReasons);

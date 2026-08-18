@@ -88,4 +88,36 @@ describe('CapitalReservationManager', () => {
     expect(capital.reserve({ orderId: 'ask-l2', side: 'sell', price: 100000, size: 0.0068, level: 2 }).accepted).toBe(true);
     expect(capital.reserve({ orderId: 'ask-l1', side: 'sell', price: 100000, size: 0.01, level: 1 }).accepted).toBe(true);
   });
+
+  test('failed reconciliation preserves acknowledged L1 but rejects new reservations until coherent recovery', () => {
+    const capital = new CapitalReservationManager();
+    capital.reconcile({ ...snapshot(), liveOrders: [] });
+    expect(capital.reserve({
+      orderId: 'bid-l1', side: 'buy', price: 100000, size: 0.01, level: 1,
+    }).accepted).toBe(true);
+    expect(capital.reserve({
+      orderId: 'ask-l1', side: 'sell', price: 100000, size: 0.01, level: 1,
+    }).accepted).toBe(true);
+    capital.accept('bid-l1');
+    capital.accept('ask-l1');
+
+    capital.reconciliationFailed();
+    expect(capital.getPresence()).toEqual({ buy: 1, sell: 1 });
+    expect(capital.reserve({
+      orderId: 'ask-l2', side: 'sell', price: 100001, size: 0.001, level: 2,
+    })).toEqual({ accepted: false, reason: 'capital-reconciliation-failed' });
+    expect(capital.getReservation('ask-l1')).toMatchObject({
+      state: 'active', acknowledgedLive: true, remainingSize: 0.01,
+    });
+
+    capital.reconcile({
+      baseBalance: { available: 0.00686, held: 0.01, total: 0.01686 },
+      quoteBalance: { available: 1000, held: 1000, total: 2000 },
+      liveOrders: [{ orderId: 'bid-l1' }, { orderId: 'ask-l1' }],
+    });
+    expect(capital.getStatus().state).toBe('normal');
+    expect(capital.reserve({
+      orderId: 'ask-l2', side: 'sell', price: 100001, size: 0.001, level: 2,
+    }).accepted).toBe(true);
+  });
 });

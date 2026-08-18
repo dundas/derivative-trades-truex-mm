@@ -74,5 +74,27 @@ describe('MakerPresenceController', () => {
     expect(controller.observe({ orders, reconciliationState: 'degraded', blockedSides: ['sell'] })).toMatchObject({
       executionState: 'degraded', reasons: expect.arrayContaining(['capital-reconciliation-degraded', 'capital-side-blocked-sell']),
     });
+    expect(controller.observe({ orders, reconciliationState: 'failed' })).toMatchObject({
+      executionState: 'degraded',
+      reasons: expect.arrayContaining(['capital-reconciliation-failed']),
+    });
+  });
+
+  test('failed reconciliation is unsafe without an acknowledged funded safe L1', () => {
+    const controller = new MakerPresenceController(CONFIG, { now: () => 1000 });
+    const onlyDepth = [
+      { side: 'buy', level: 2, remainingSize: 0.01, acknowledgedLive: true },
+      { side: 'sell', level: 2, remainingSize: 0.01, acknowledgedLive: true },
+    ];
+    expect(controller.observe({
+      orders: onlyDepth,
+      reconciliationState: 'failed',
+      fundedSizeBySide: { buy: 1, sell: 1 },
+    })).toMatchObject({
+      executionState: 'unsafe',
+      reasons: expect.arrayContaining([
+        'capital-reconciliation-failed', 'reconciliation-failed-no-safe-l1',
+      ]),
+    });
   });
 });
