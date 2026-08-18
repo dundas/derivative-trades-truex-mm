@@ -19,6 +19,15 @@ const OriginalSocket = net.Socket;
 const mockSocketConstructor = jest.fn(() => new MockSocket());
 net.Socket = mockSocketConstructor;
 
+function makeFixFrame(fields) {
+  const soh = '\x01';
+  const body = Object.entries(fields).map(([tag, value]) => `${tag}=${value}${soh}`).join('');
+  const withoutChecksum = `8=FIXT.1.1${soh}9=${body.length}${soh}${body}`;
+  let sum = 0;
+  for (let index = 0; index < withoutChecksum.length; index++) sum += withoutChecksum.charCodeAt(index);
+  return `${withoutChecksum}10=${String(sum % 256).padStart(3, '0')}${soh}`;
+}
+
 describe('FIXConnection', () => {
   let connection;
   let mockSocket;
@@ -80,6 +89,29 @@ describe('FIXConnection', () => {
       expect(connection.isLoggedOn).toBe(false);
       expect(connection.msgSeqNum).toBe(1);
       expect(connection.expectedSeqNum).toBe(1);
+    });
+
+    it('validates TestRequest idle and response windows as HeartBtInt multipliers', () => {
+      expect(connection.testRequestIdleMultiplier).toBe(1.2);
+      expect(connection.testRequestTimeoutMultiplier).toBe(1);
+
+      const configured = new FIXConnection({
+        host: 'h', port: 1, targetCompID: 'T', apiKey: 'k', apiSecret: 's',
+        testRequestIdleMultiplier: 1.5,
+        testRequestTimeoutMultiplier: 0.5,
+      });
+      expect(configured.testRequestIdleMultiplier).toBe(1.5);
+      expect(configured.testRequestTimeoutMultiplier).toBe(0.5);
+
+      for (const invalid of [0, -1, 1, 3.1, NaN, '1.2', null]) {
+        const candidate = new FIXConnection({
+          host: 'h', port: 1, targetCompID: 'T', apiKey: 'k', apiSecret: 's',
+          testRequestIdleMultiplier: invalid,
+          testRequestTimeoutMultiplier: invalid,
+        });
+        expect(candidate.testRequestIdleMultiplier).toBe(1.2);
+        expect(candidate.testRequestTimeoutMultiplier).toBe(1);
+      }
     });
 
     it('should default logon-reset fallback to enabled with threshold 3', () => {
@@ -207,7 +239,7 @@ describe('FIXConnection', () => {
         const check = setInterval(() => {
           if (mockSocketInstance.write.mock.calls.length > 0) {
             clearInterval(check);
-            const logonResponse = '8=FIXT.1.1\x019=50\x0135=A\x0149=TRUEX_UAT_OE\x0156=CLI_CLIENT\x0134=1\x0152=20251007-13:40:00.000\x0110=123\x01';
+            const logonResponse = makeFixFrame({ '35': 'A', '49': 'TRUEX_UAT_OE', '56': 'CLI_CLIENT', '34': '1' });
             mockSocketInstance.emit('data', Buffer.from(logonResponse));
             resolve();
           }
@@ -233,7 +265,7 @@ describe('FIXConnection', () => {
         const check = setInterval(() => {
           if (mockSocketInstance.write.mock.calls.length > 0) {
             clearInterval(check);
-            const logonResponse = '8=FIXT.1.1\x019=50\x0135=A\x0149=TRUEX_UAT_OE\x0156=CLI_CLIENT\x0134=1\x0152=20251007-13:40:00.000\x0110=123\x01';
+            const logonResponse = makeFixFrame({ '35': 'A', '49': 'TRUEX_UAT_OE', '56': 'CLI_CLIENT', '34': '1' });
             mockSocketInstance.emit('data', Buffer.from(logonResponse));
             resolve();
           }
@@ -306,7 +338,7 @@ describe('FIXConnection', () => {
         const check = setInterval(() => {
           if (mockSocketInstance.write.mock.calls.length > 0) {
             clearInterval(check);
-            const ack = '8=FIXT.1.1\x019=50\x0135=A\x0149=TRUEX_UAT_OE\x0156=CLI_CLIENT\x0134=1\x0152=20251007-13:40:00.000\x0110=123\x01';
+            const ack = makeFixFrame({ '35': 'A', '49': 'TRUEX_UAT_OE', '56': 'CLI_CLIENT', '34': '1' });
             mockSocketInstance.emit('data', Buffer.from(ack));
             resolve();
           }
@@ -353,7 +385,7 @@ describe('FIXConnection', () => {
         const check = setInterval(() => {
           if (mockSocketInstance.write.mock.calls.length > 0) {
             clearInterval(check);
-            const ack = '8=FIXT.1.1\x019=50\x0135=A\x0149=TRUEX_UAT_OE\x0156=CLI_CLIENT\x0134=1\x0152=20251007-13:40:00.000\x0110=123\x01';
+            const ack = makeFixFrame({ '35': 'A', '49': 'TRUEX_UAT_OE', '56': 'CLI_CLIENT', '34': '1' });
             mockSocketInstance.emit('data', Buffer.from(ack));
             resolve();
           }
@@ -387,7 +419,7 @@ describe('FIXConnection', () => {
         const check = setInterval(() => {
           if (mockSocketInstance.write.mock.calls.length > 0) {
             clearInterval(check);
-            const ack = '8=FIXT.1.1\x019=50\x0135=A\x0149=TRUEX_UAT_OE\x0156=CLI_CLIENT\x0134=1\x0152=20251007-13:40:00.000\x0110=123\x01';
+            const ack = makeFixFrame({ '35': 'A', '49': 'TRUEX_UAT_OE', '56': 'CLI_CLIENT', '34': '1' });
             mockSocketInstance.emit('data', Buffer.from(ack));
             resolve();
           }
@@ -418,7 +450,10 @@ describe('FIXConnection', () => {
         const check = setInterval(() => {
           if (mockSocketInstance.write.mock.calls.length > 0) {
             clearInterval(check);
-            const reject = '8=FIXT.1.1\x019=92\x0135=3\x0149=TRUEX_UAT_OE\x0156=CLI_CLIENT\x0134=1\x0152=20251007-13:40:00.000\x0158=Already authenticated cannot logon again\x0110=123\x01';
+            const reject = makeFixFrame({
+              '35': '3', '49': 'TRUEX_UAT_OE', '56': 'CLI_CLIENT', '34': '1',
+              '58': 'Already authenticated cannot logon again',
+            });
             mockSocketInstance.emit('data', Buffer.from(reject));
             resolve();
           }
@@ -917,8 +952,80 @@ describe('FIXConnection', () => {
       expect(connection.isLoggedOn).toBe(false);
       expect(logoutHandler).toHaveBeenCalledWith({
         text: 'Session ended',
-        message
+        message,
+        reason: 'logout',
       });
+    });
+
+    it('responds to peer Logout and tears down a TCP session even when the peer keeps it open', () => {
+      const socket = new MockSocket();
+      connection.socket = socket;
+      connection._connectionGeneration = 4;
+      connection.isConnected = true;
+      connection.isLoggedOn = true;
+      connection.attemptReconnect = jest.fn();
+      connection.sendMessage = jest.fn(() => true);
+
+      connection.handleLogout(
+        { fields: { '35': '5', '58': 'peer shutdown' } },
+        socket,
+        4,
+      );
+
+      expect(connection.sendMessage).toHaveBeenCalledWith(expect.objectContaining({ '35': '5' }));
+      expect(socket.destroy).toHaveBeenCalledTimes(1);
+      expect(connection.attemptReconnect).toHaveBeenCalledTimes(1);
+      expect(connection.socket).toBeNull();
+    });
+
+    it.each([
+      ['declined', () => false],
+      ['throwing', () => { throw new Error('logout response failed'); }],
+    ])('tears down and reconnects when the peer Logout response is %s', (_name, result) => {
+      const socket = new MockSocket();
+      connection.socket = socket;
+      connection._connectionGeneration = 5;
+      connection.isConnected = true;
+      connection.isLoggedOn = true;
+      connection.attemptReconnect = jest.fn();
+      connection.sendMessage = jest.fn(result);
+      const failed = jest.fn();
+      connection.on('session-send-failed', failed);
+
+      connection.handleLogout({ fields: { '35': '5' } }, socket, 5);
+
+      expect(failed).toHaveBeenCalledTimes(1);
+      expect(failed).toHaveBeenCalledWith(expect.objectContaining({ action: 'logout-response' }));
+      expect(socket.destroy).toHaveBeenCalledTimes(1);
+      expect(connection.attemptReconnect).toHaveBeenCalledTimes(1);
+    });
+
+    it('fences the socket close race and does not reconnect after intentional local disconnect', () => {
+      const peerSocket = new MockSocket();
+      connection.socket = peerSocket;
+      connection._connectionGeneration = 6;
+      connection.isConnected = true;
+      connection.isLoggedOn = true;
+      connection.attemptReconnect = jest.fn();
+      const disconnected = jest.fn();
+      connection.on('disconnect', disconnected);
+
+      connection.handleLogout({ fields: { '35': '5' } }, peerSocket, 6);
+      connection.handleDisconnect(peerSocket, 6);
+      expect(disconnected).toHaveBeenCalledTimes(1);
+      expect(connection.attemptReconnect).toHaveBeenCalledTimes(1);
+
+      const localSocket = new MockSocket();
+      connection.socket = localSocket;
+      connection._connectionGeneration = 7;
+      connection.isConnected = true;
+      connection.isLoggedOn = true;
+      connection._intentionalCloseGeneration = 7;
+      connection.sendMessage = jest.fn(() => true);
+      connection.handleLogout({ fields: { '35': '5' } }, localSocket, 7);
+
+      expect(connection.sendMessage).not.toHaveBeenCalled();
+      expect(connection.attemptReconnect).toHaveBeenCalledTimes(1);
     });
   });
   
@@ -926,6 +1033,8 @@ describe('FIXConnection', () => {
     beforeEach(() => {
       connection.socket = new MockSocket();
       mockSocketInstance = connection.socket;
+      connection.isConnected = true;
+      connection.isLoggedOn = true;
     });
     
     it('should start heartbeat timer', async () => {
@@ -960,6 +1069,7 @@ describe('FIXConnection', () => {
 
     it('does not mark a heartbeat sent when synchronous dispatch is declined', async () => {
       connection.heartbeatInterval = 0.01;
+      connection.testRequestIdleMultiplier = 3;
       connection.sendMessage = jest.fn(() => false);
       const failed = jest.fn();
       connection.on('session-send-failed', failed);
@@ -971,6 +1081,303 @@ describe('FIXConnection', () => {
       expect(connection.lastHeartbeatSent).toBeNull();
       expect(failed).toHaveBeenCalledWith(expect.objectContaining({ action: 'heartbeat' }));
       expect(connection.logger.debug).not.toHaveBeenCalledWith(expect.stringContaining('Heartbeat sent'));
+    });
+  });
+
+  describe('FIX liveness probing', () => {
+    let now;
+    let socket;
+
+    beforeEach(() => {
+      now = 10_000;
+      socket = new MockSocket();
+      connection._now = () => now;
+      connection._monotonicNow = () => now;
+      connection.socket = socket;
+      connection._connectionGeneration = 7;
+      connection.isConnected = true;
+      connection.isLoggedOn = true;
+      connection.heartbeatInterval = 1;
+      connection.lastInboundActivityAt = now;
+      connection.lastInboundActivityMonotonic = now;
+      connection.pendingTestRequest = null;
+      connection.sendMessage = jest.fn(() => true);
+      connection.handleDisconnect = jest.fn();
+    });
+
+    it('uses valid application traffic as activity and avoids the production false-disconnect', async () => {
+      connection.lastHeartbeatReceived = now - 60_000;
+      now += 900;
+      connection.handleMessage({ raw: 'execution', fields: { '35': '8', '34': '1' } });
+      now += 900;
+
+      await connection._heartbeatTick(socket, 7);
+
+      expect(connection.handleDisconnect).not.toHaveBeenCalled();
+      expect(connection.pendingTestRequest).toBeNull();
+      expect(connection.sendMessage).toHaveBeenCalledWith(expect.objectContaining({ '35': '0' }));
+    });
+
+    it('sends one correlated TestRequest after true idleness and disconnects only after its deadline', async () => {
+      now += 1_200;
+      await connection._heartbeatTick(socket, 7);
+      const probe = connection.sendMessage.mock.calls[0][0];
+      expect(probe).toMatchObject({ '35': '1', '112': expect.any(String) });
+
+      now += 999;
+      await connection._heartbeatTick(socket, 7);
+      expect(connection.sendMessage).toHaveBeenCalledTimes(1);
+      expect(connection.handleDisconnect).not.toHaveBeenCalled();
+
+      now += 1;
+      await connection._heartbeatTick(socket, 7);
+      expect(connection.sendMessage).toHaveBeenCalledTimes(1);
+      expect(connection.handleDisconnect).toHaveBeenCalledTimes(1);
+      expect(connection.handleDisconnect).toHaveBeenCalledWith(socket, 7);
+    });
+
+    it('keeps a probe pending for mismatched TestReqID and clears it only for the match', async () => {
+      now += 1_200;
+      await connection._heartbeatTick(socket, 7);
+      const probeId = connection.pendingTestRequest.id;
+
+      now += 100;
+      connection.handleHeartbeat({ fields: { '35': '0', '112': 'different-probe' } });
+      expect(connection.pendingTestRequest.id).toBe(probeId);
+
+      now += 100;
+      connection.handleHeartbeat({ fields: { '35': '0', '112': probeId } });
+      expect(connection.pendingTestRequest).toBeNull();
+      expect(connection.lastInboundActivityAt).toBe(now);
+    });
+
+    it('counts valid duplicate and gap frames as transport activity before sequence disposition', () => {
+      connection.expectedSeqNum = 5;
+      connection.requestResend = jest.fn(() => true);
+
+      now += 100;
+      connection.handleMessage({ raw: 'duplicate', fields: { '35': '0', '34': '4' } });
+      expect(connection.lastInboundActivityAt).toBe(now);
+
+      now += 100;
+      connection.handleMessage({ raw: 'gap', fields: { '35': '0', '34': '7' } });
+      expect(connection.lastInboundActivityAt).toBe(now);
+      expect(connection.requestResend).toHaveBeenCalledWith(5, 6);
+    });
+
+    it('does not count permissively parseable or unsafe sequence fields as valid activity', () => {
+      for (const rawSequence of ['1junk', '0', '-1', '9007199254740992']) {
+        now += 100;
+        connection.handleMessage({ raw: 'bad-sequence', fields: { '35': '0', '34': rawSequence } });
+        expect(connection.lastInboundActivityAt).toBe(10_000);
+      }
+    });
+
+    it('does not let a duplicate matching Heartbeat satisfy the correlated probe', () => {
+      connection.expectedSeqNum = 5;
+      connection.pendingTestRequest = {
+        id: 'probe-7', sentAt: now - 100, deadlineAt: now + 900,
+        sentMonotonic: now - 100, deadlineMonotonic: now + 900,
+        socket, generation: 7, phase: 'sent',
+      };
+
+      connection.handleMessage({ raw: 'duplicate-heartbeat', fields: { '35': '0', '34': '4', '112': 'probe-7' } });
+      expect(connection.pendingTestRequest?.id).toBe('probe-7');
+
+      connection.handleMessage({ raw: 'accepted-heartbeat', fields: { '35': '0', '34': '5', '112': 'probe-7' } });
+      expect(connection.pendingTestRequest).toBeNull();
+    });
+
+    it('counts only complete current-generation frames and isolates partial buffers across reconnect', () => {
+      const complete = makeFixFrame({ '35': '0', '34': '1' });
+      connection.handleIncomingData(Buffer.from('8=FIXT.1.1\x019=20\x0135=0\x01'), socket, 7);
+      expect(connection.lastInboundActivityAt).toBe(now);
+
+      now += 100;
+      connection.handleIncomingData(Buffer.from(complete), new MockSocket(), 6);
+      expect(connection.lastInboundActivityAt).toBe(10_000);
+
+      connection.messageBuffer = 'stale-partial';
+      connection._resetLivenessState();
+      expect(connection.messageBuffer).toBe('');
+      expect(connection.lastInboundActivityAt).toBeNull();
+
+      connection.handleIncomingData(Buffer.from(complete), socket, 7);
+      expect(connection.lastInboundActivityAt).toBe(now);
+    });
+
+    it('does not count complete frame-shaped data with bad BodyLength or checksum as liveness', () => {
+      const valid = makeFixFrame({ '35': '0', '34': '1' });
+      const badLength = valid.replace(/9=\d+/, '9=999');
+      const badChecksum = valid.replace(/10=\d{3}/, '10=999');
+      const message = jest.fn();
+      connection.on('message', message);
+      connection.expectedSeqNum = 1;
+
+      now += 100;
+      connection.handleIncomingData(Buffer.from(badLength), socket, 7);
+      expect(connection.lastInboundActivityAt).toBe(10_000);
+      connection.messageBuffer = '';
+      connection.handleIncomingData(Buffer.from(badChecksum), socket, 7);
+      expect(connection.lastInboundActivityAt).toBe(10_000);
+      expect(connection.expectedSeqNum).toBe(1);
+      expect(message).not.toHaveBeenCalled();
+
+      connection.messageBuffer = '';
+      connection.handleIncomingData(Buffer.from(valid), socket, 7);
+      expect(connection.lastInboundActivityAt).toBe(now);
+    });
+
+    it.each([
+      ['false', () => false, 'dispatch-declined'],
+      ['throw', () => { throw new Error('probe enqueue failed'); }, 'dispatch-error'],
+      ['rejected Promise', () => Promise.reject(new Error('probe rejected')), 'dispatch-error'],
+    ])('fails closed when TestRequest dispatch returns %s', async (_name, sendResult, reason) => {
+      connection.sendMessage = jest.fn(sendResult);
+      const failed = jest.fn();
+      const liveness = jest.fn();
+      connection.on('session-send-failed', failed);
+      connection.on('liveness', liveness);
+      now += 1_200;
+
+      await connection._heartbeatTick(socket, 7);
+
+      expect(failed).toHaveBeenCalledTimes(1);
+      expect(failed).toHaveBeenCalledWith(expect.objectContaining({ action: 'test-request' }));
+      expect(connection.pendingTestRequest).toBeNull();
+      expect(connection.handleDisconnect).toHaveBeenCalledWith(socket, 7);
+      expect(liveness).toHaveBeenCalledTimes(1);
+      expect(liveness).toHaveBeenCalledWith(expect.objectContaining({ state: 'failed', reason }));
+      expect(connection.lastLivenessReason).toBe(reason);
+    });
+
+    it('bounds a never-settling TestRequest dispatch and disconnects exactly once', async () => {
+      connection.heartbeatInterval = 0.01;
+      connection._now = Date.now;
+      connection._monotonicNow = () => performance.now();
+      connection.lastInboundActivityAt = Date.now() - 20;
+      connection.lastInboundActivityMonotonic = performance.now() - 20;
+      connection.sendMessage = jest.fn(() => new Promise(() => {}));
+      const failed = jest.fn();
+      const liveness = jest.fn();
+      connection.on('session-send-failed', failed);
+      connection.on('liveness', liveness);
+
+      await connection._heartbeatTick(socket, 7);
+
+      expect(failed).toHaveBeenCalledTimes(1);
+      expect(failed).toHaveBeenCalledWith(expect.objectContaining({ action: 'test-request' }));
+      expect(connection.handleDisconnect).toHaveBeenCalledTimes(1);
+      expect(liveness).toHaveBeenCalledWith(expect.objectContaining({
+        state: 'failed', reason: 'dispatch-timeout',
+      }));
+    });
+
+    it('serializes heartbeat ticks per session generation while a send is slow', async () => {
+      let resolveSend;
+      connection.lastInboundActivityMonotonic = now;
+      connection._heartbeatStartedMonotonic = now - 1_000;
+      connection.sendMessage = jest.fn(() => new Promise((resolve) => { resolveSend = resolve; }));
+
+      const first = connection._scheduleHeartbeatTick(socket, 7);
+      const second = connection._scheduleHeartbeatTick(socket, 7);
+      expect(connection.sendMessage).toHaveBeenCalledTimes(1);
+      expect(second).toBe(first);
+
+      resolveSend(true);
+      await Promise.all([first, second]);
+      expect(connection.sendMessage).toHaveBeenCalledTimes(1);
+      expect(connection._heartbeatTickInFlight).toBeNull();
+    });
+
+    it('uses monotonic elapsed time when the wall clock jumps forward and backward', async () => {
+      let wall = now;
+      let monotonic = now;
+      connection._now = () => wall;
+      connection._monotonicNow = () => monotonic;
+      connection.lastInboundActivityAt = wall;
+      connection.lastInboundActivityMonotonic = monotonic;
+      connection._heartbeatStartedMonotonic = monotonic;
+
+      wall += 3_600_000;
+      monotonic += 500;
+      await connection._heartbeatTick(socket, 7);
+      expect(connection.pendingTestRequest).toBeNull();
+
+      wall -= 7_200_000;
+      monotonic += 700;
+      await connection._heartbeatTick(socket, 7);
+      expect(connection.pendingTestRequest).toMatchObject({ phase: 'sent' });
+    });
+
+    it('schedules the idle probe at the exact declared deadline without polling granularity', async () => {
+      connection._heartbeatStartedMonotonic = now;
+      connection.lastInboundActivityMonotonic = now;
+      const activity = now;
+
+      now += 1_199;
+      connection._onInboundIdleDeadline(socket, 7, activity);
+      expect(connection.sendMessage).not.toHaveBeenCalled();
+
+      now += 1;
+      connection._onInboundIdleDeadline(socket, 7, activity);
+      await Promise.resolve();
+      await connection._heartbeatTickInFlight;
+
+      expect(connection.sendMessage).toHaveBeenCalledTimes(1);
+      expect(connection.sendMessage).toHaveBeenCalledWith(expect.objectContaining({ '35': '1' }));
+      expect(connection.pendingTestRequest.deadlineMonotonic).toBe(12_200);
+    });
+
+    it('does not extend the absolute detection budget when the idle callback runs late', async () => {
+      connection._heartbeatStartedMonotonic = now;
+      connection.lastInboundActivityMonotonic = now;
+      const activity = now;
+
+      // Idle deadline is 11_200 and the absolute response deadline is 12_200.
+      // A stalled event loop reaching the latter must disconnect rather than
+      // starting a fresh response window from the delayed callback time.
+      now = 12_200;
+      connection._onInboundIdleDeadline(socket, 7, activity);
+      await Promise.resolve();
+      await connection._heartbeatTickInFlight;
+
+      expect(connection.sendMessage).not.toHaveBeenCalled();
+      expect(connection.handleDisconnect).toHaveBeenCalledTimes(1);
+      expect(connection.lastLivenessReason).toBe('response-timeout');
+    });
+
+    it('has one response-timeout winner and exposes structured liveness state', async () => {
+      const liveness = jest.fn();
+      connection.on('liveness', liveness);
+      now += 1_200;
+      await connection._heartbeatTick(socket, 7);
+      const pending = connection.pendingTestRequest;
+      expect(connection.getState()).toMatchObject({ pendingTestRequestId: pending.id });
+      expect(liveness).toHaveBeenCalledWith(expect.objectContaining({
+        state: 'probe-pending', reason: 'inbound-idle', testRequestId: pending.id,
+      }));
+
+      now = pending.deadlineMonotonic;
+      connection.handleHeartbeat({ fields: { '35': '0', '112': pending.id } });
+      await connection._heartbeatTick(socket, 7);
+      expect(connection.handleDisconnect).not.toHaveBeenCalled();
+      expect(liveness).toHaveBeenCalledWith(expect.objectContaining({
+        state: 'healthy', reason: 'test-request-response', testRequestId: pending.id,
+      }));
+    });
+
+    it('ignores a stale heartbeat tick after reconnect generation changes', async () => {
+      const oldSocket = socket;
+      connection.socket = new MockSocket();
+      connection._connectionGeneration = 8;
+      now += 10_000;
+
+      await connection._heartbeatTick(oldSocket, 7);
+
+      expect(connection.sendMessage).not.toHaveBeenCalled();
+      expect(connection.handleDisconnect).not.toHaveBeenCalled();
+      expect(connection.pendingTestRequest).toBeNull();
     });
   });
   
@@ -1008,6 +1415,7 @@ describe('FIXConnection', () => {
       expect(mockSocketInstance.destroy).toHaveBeenCalled();
       expect(connection.isConnected).toBe(false);
       expect(connection.isLoggedOn).toBe(false);
+      expect(connection._intentionalCloseGeneration).toBeNull();
     });
     
     it('should not send logout if not logged on', async () => {
@@ -1054,6 +1462,47 @@ describe('FIXConnection', () => {
       expect(connection.isConnected).toBe(false);
       expect(connection.isLoggedOn).toBe(false);
     });
+
+    it.each(['old close before replacement', 'old close after replacement'])(
+      'does not let delayed generation-one disconnect cleanup destroy generation two: %s',
+      async (timing) => {
+        const oldSocket = new MockSocket();
+        connection.socket = oldSocket;
+        connection._connectionGeneration = 1;
+        connection.isConnected = true;
+        connection.isLoggedOn = true;
+        let settleLogout;
+        connection.sendMessage = jest.fn(() => new Promise((resolve) => { settleLogout = resolve; }));
+        connection.attemptReconnect = jest.fn();
+
+        const disconnecting = connection.disconnect();
+        await Promise.resolve();
+
+        if (timing === 'old close before replacement') {
+          connection.handleDisconnect(oldSocket, 1);
+        }
+
+        const newSocket = new MockSocket();
+        connection.socket = newSocket;
+        connection._connectionGeneration = 2;
+        connection.isConnected = true;
+        connection.isLoggedOn = true;
+        connection.messageBuffer = 'generation-two-partial';
+
+        settleLogout(true);
+        await disconnecting;
+
+        if (timing === 'old close after replacement') {
+          connection.handleDisconnect(oldSocket, 1);
+        }
+
+        expect(connection.socket).toBe(newSocket);
+        expect(newSocket.destroy).not.toHaveBeenCalled();
+        expect(connection.isConnected).toBe(true);
+        expect(connection.isLoggedOn).toBe(true);
+        expect(connection.messageBuffer).toBe('generation-two-partial');
+      },
+    );
   });
   
   describe('calculateChecksum()', () => {
@@ -1113,7 +1562,11 @@ describe('FIXConnection', () => {
         expectedSeqNum: 5,
         reconnectAttempts: 2,
         lastHeartbeatReceived: null,
-        lastHeartbeatSent: null
+        lastHeartbeatSent: null,
+        lastInboundActivityAt: null,
+        pendingTestRequestId: null,
+        livenessState: 'idle',
+        lastLivenessReason: 'not-started',
       });
     });
   });
@@ -1142,6 +1595,22 @@ describe('FIXConnection', () => {
       connection.handleDisconnect();
       
       expect(disconnectHandler).toHaveBeenCalled();
+    });
+
+    it('classifies a close from the intentionally stopped generation before emitting', () => {
+      connection._connectionGeneration = 9;
+      connection._intentionalCloseGeneration = 9;
+      connection.isConnected = true;
+      connection.isLoggedOn = true;
+      const disconnectHandler = jest.fn();
+      connection.on('disconnect', disconnectHandler);
+
+      connection.handleDisconnect(connection.socket, 9);
+
+      expect(disconnectHandler).toHaveBeenCalledWith(expect.objectContaining({
+        reason: 'intentional-disconnect', generation: 9,
+      }));
+      expect(connection._intentionalCloseGeneration).toBeNull();
     });
   });
   
@@ -1242,8 +1711,8 @@ describe('FIXConnection', () => {
   
   describe('handleIncomingData()', () => {
     it.each([
-      ['gap resend', '8=FIXT.1.1\x019=50\x0135=0\x0134=3\x0110=123\x01', 'resend-request'],
-      ['test request', '8=FIXT.1.1\x019=50\x0135=1\x0134=1\x01112=probe\x0110=123\x01', 'test-request-heartbeat'],
+      ['gap resend', makeFixFrame({ '35': '0', '34': '3' }), 'resend-request'],
+      ['test request', makeFixFrame({ '35': '1', '34': '1', '112': 'probe' }), 'test-request-heartbeat'],
     ])('contains inbound fire-and-forget %s dispatch rejection', async (_name, raw, action) => {
       connection.sendMessage = jest.fn(() => { throw new Error(`${action} enqueue failed`); });
       const failed = jest.fn();
@@ -1265,7 +1734,7 @@ describe('FIXConnection', () => {
       const messageHandler = jest.fn();
       connection.on('message', messageHandler);
       
-      const message = '8=FIXT.1.1\x019=50\x0135=8\x0149=TRUEX\x0156=CLIENT\x0134=1\x0152=20251007-13:40:00.000\x0110=123\x01';
+      const message = makeFixFrame({ '35': '8', '49': 'TRUEX', '56': 'CLIENT', '34': '1' });
       
       connection.handleIncomingData(Buffer.from(message));
       
@@ -1277,14 +1746,16 @@ describe('FIXConnection', () => {
       connection.on('message', messageHandler);
       
       // Send partial message
-      const part1 = '8=FIXT.1.1\x019=50\x0135=8\x01';
+      const message = makeFixFrame({ '35': '8', '49': 'TRUEX', '56': 'CLIENT', '34': '1' });
+      const splitAt = message.indexOf('49=');
+      const part1 = message.slice(0, splitAt);
       connection.handleIncomingData(Buffer.from(part1));
       
       expect(messageHandler).not.toHaveBeenCalled();
       expect(connection.messageBuffer).toContain('8=FIXT.1.1');
       
       // Send rest of message
-      const part2 = '49=TRUEX\x0156=CLIENT\x0134=1\x0152=20251007-13:40:00.000\x0110=123\x01';
+      const part2 = message.slice(splitAt);
       connection.handleIncomingData(Buffer.from(part2));
       
       expect(messageHandler).toHaveBeenCalled();
@@ -1294,8 +1765,8 @@ describe('FIXConnection', () => {
       const messageHandler = jest.fn();
       connection.on('message', messageHandler);
       
-      const message1 = '8=FIXT.1.1\x019=50\x0135=8\x0149=TRUEX\x0156=CLIENT\x0134=1\x0152=20251007-13:40:00.000\x0110=123\x01';
-      const message2 = '8=FIXT.1.1\x019=50\x0135=8\x0149=TRUEX\x0156=CLIENT\x0134=2\x0152=20251007-13:40:01.000\x0110=124\x01';
+      const message1 = makeFixFrame({ '35': '8', '49': 'TRUEX', '56': 'CLIENT', '34': '1' });
+      const message2 = makeFixFrame({ '35': '8', '49': 'TRUEX', '56': 'CLIENT', '34': '2' });
       
       connection.handleIncomingData(Buffer.from(message1 + message2));
 

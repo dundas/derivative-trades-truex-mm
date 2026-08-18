@@ -92,6 +92,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
       apiKey: options.apiKey,
       apiSecret: options.apiSecret,
       heartbeatInterval: options.heartbeatInterval || 30,
+      testRequestIdleMultiplier: options.testRequestIdleMultiplier,
+      testRequestTimeoutMultiplier: options.testRequestTimeoutMultiplier,
+      maxLivenessDetectionSeconds: options.maxLivenessDetectionSeconds,
       logger: this.logger,
       redisClient: this.redis,
       // Default ON: after 3 consecutive logon timeouts, fall back to
@@ -391,10 +394,13 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this._onHedgeFill = this._onHedgeFill.bind(this);
     this._onEmergency = this._onEmergency.bind(this);
     this._onOEDisconnect = this._onOEDisconnect.bind(this);
+    this._onOELogout = this._onOELogout.bind(this);
+    this._onFIXLiveness = this._onFIXLiveness.bind(this);
     this._onCapitalResyncRequired = this._onCapitalResyncRequired.bind(this);
     this._onLogonResetFallback = this._onLogonResetFallback.bind(this);
     this._onLogonResetFallbackExhausted = this._onLogonResetFallbackExhausted.bind(this);
     this._eventsWired = false;
+    this._fixSessionLossForwarded = false;
     this._startInFlight = false;
     this._fixConnectionOwned = false;
     this._dirtyStartupResources = {
@@ -1097,7 +1103,8 @@ export class MarketMakerOrchestrator extends EventEmitter {
 
     // OE disconnect → flush inflight orders so QuoteEngine can resume on reconnect
     this.fixOE.on('disconnect', this._onOEDisconnect);
-    this.fixOE.on('logout', this._onOEDisconnect);
+    this.fixOE.on('logout', this._onOELogout);
+    this.fixOE.on('liveness', this._onFIXLiveness);
 
     // OE logon-reset fallback fired (informational) — log + alert at info level
     // so ops can correlate with TrueX-side restarts.
@@ -1133,7 +1140,8 @@ export class MarketMakerOrchestrator extends EventEmitter {
     }
     this.fixOE.removeListener('message', this._onFIXMessage);
     this.fixOE.removeListener('disconnect', this._onOEDisconnect);
-    this.fixOE.removeListener('logout', this._onOEDisconnect);
+    this.fixOE.removeListener('logout', this._onOELogout);
+    this.fixOE.removeListener('liveness', this._onFIXLiveness);
     this.fixOE.removeListener('logon-reset-fallback', this._onLogonResetFallback);
     this.fixOE.removeListener('logon-reset-fallback-exhausted', this._onLogonResetFallbackExhausted);
     this.quoteEngine.removeListener('fill', this._onQuoteFill);
@@ -1580,7 +1588,28 @@ export class MarketMakerOrchestrator extends EventEmitter {
    * force a fresh reprice after reconnect while preserving late-ack recovery
    * state for venue-facing cancels.
    */
-  _onOEDisconnect() {
+  _onFIXLiveness(event = {}) {
+    if (event.state === 'healthy') this._fixSessionLossForwarded = false;
+    this.emit('fix_liveness', { ...event, channel: 'oe' });
+  }
+
+  _onOELogout(details = {}) {
+    return this._onOEDisconnect(details, 'logout');
+  }
+
+  _onOEDisconnect(details = {}, source = 'disconnect') {
+    if (this._intentionalStop && details.reason === 'intentional-disconnect') {
+      this.logger.info('[Orchestrator] OE FIX disconnected as part of intentional stop');
+      return;
+    }
+    if (!this._fixSessionLossForwarded) {
+      this._fixSessionLossForwarded = true;
+      this.emit('fix_disconnected', {
+        source,
+        reason: details.reason || details.text ||
+          (source === 'logout' ? 'FIX session logged out' : 'FIX transport disconnected'),
+      });
+    }
     if (!this.isRunning) return;
     this.quoteEngine.suspendQuoting();
     this.quoteEngine.invalidateQueuedWork?.(true);
