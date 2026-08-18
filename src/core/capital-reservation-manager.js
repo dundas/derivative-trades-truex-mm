@@ -68,6 +68,7 @@ export class CapitalReservationManager {
 
   beginReconciliation() {
     const knownOrders = new Map();
+    const knownPendingOrders = new Map();
     for (const order of this.reservations.values()) {
       if (!TERMINAL_STATES.has(order.state) && order.acknowledgedLive) {
         knownOrders.set(order.orderId, {
@@ -76,12 +77,22 @@ export class CapitalReservationManager {
           amount: reservationAmount(order),
           acknowledgedLive: true,
         });
+      } else if (!TERMINAL_STATES.has(order.state) &&
+          (order.state === 'pending-new' || order.state === 'replacement-pending-new')) {
+        knownPendingOrders.set(order.orderId, {
+          orderId: order.orderId,
+          side: order.side,
+          price: order.price,
+          size: order.remainingSize,
+          amount: reservationAmount(order),
+        });
       }
     }
     return {
       id: ++this.reconciliationSequence,
       eventSequence: this.eventSequence,
       knownOrders,
+      knownPendingOrders,
     };
   }
 
@@ -94,11 +105,47 @@ export class CapitalReservationManager {
     this.initialized = true;
 
     const liveIds = new Set(liveOrders.map((order) => order?.orderId).filter(Boolean));
+    const liveByOrderId = new Map();
+    for (const live of liveOrders) {
+      if (!live?.orderId) continue;
+      const matches = liveByOrderId.get(live.orderId) || [];
+      matches.push(live);
+      liveByOrderId.set(live.orderId, matches);
+    }
+    const promotedOrderIds = [];
+    const promotionMismatches = [];
+    if (generation?.knownPendingOrders) {
+      for (const [orderId, known] of generation.knownPendingOrders) {
+        const current = this.reservations.get(orderId);
+        if (!current || current.acknowledgedLive || current.lastMutationSequence > generation.eventSequence ||
+            !['pending-new', 'replacement-pending-new'].includes(current.state)) continue;
+        const candidates = liveByOrderId.get(orderId) || [];
+        if (candidates.length === 0) continue;
+        const live = candidates[0];
+        const exactMatch = candidates.length === 1 && live.status === 'ACTIVE' &&
+          live.promotionEvidenceValid === true &&
+          live.localOrderMatches === true && live.side === known.side &&
+          Number.isFinite(Number(live.price)) && Math.abs(Number(live.price) - known.price) <= EPSILON &&
+          Number.isFinite(Number(live.size)) && Math.abs(Number(live.size) - known.size) <= EPSILON;
+        if (!exactMatch) {
+          promotionMismatches.push({ orderId, side: known.side, reason: 'live-order-promotion-evidence-mismatch' });
+          continue;
+        }
+        current.state = 'active';
+        current.acknowledgedLive = true;
+        current.lastMutationSequence = this._nextEvent();
+        promotedOrderIds.push(orderId);
+      }
+    }
     const coveredAtRequest = new Set();
     const coverageByAsset = { base: [], quote: [] };
     if (generation) {
       for (const [orderId, known] of generation.knownOrders) {
         if (liveIds.has(orderId)) coverageByAsset[known.side === 'sell' ? 'base' : 'quote'].push(known);
+      }
+      for (const orderId of promotedOrderIds) {
+        const known = generation.knownPendingOrders.get(orderId);
+        coverageByAsset[known.side === 'sell' ? 'base' : 'quote'].push(known);
       }
     }
 
@@ -157,6 +204,11 @@ export class CapitalReservationManager {
         if (blockedAt <= coveredSequence && !heldShortfallByAsset[asset]) this.blockedSides.delete(side);
       }
     }
+    for (const mismatch of promotionMismatches) {
+      if (!this.blockedSides.has(mismatch.side)) {
+        this.blockedSides.set(mismatch.side, this._nextEvent());
+      }
+    }
     const heldShortfall = heldShortfallByAsset.base || heldShortfallByAsset.quote;
     this.state = heldShortfall ? 'degraded' : 'normal';
     this.reason = heldShortfall ? 'rest-held-below-live-reservations' : null;
@@ -164,8 +216,12 @@ export class CapitalReservationManager {
       this.state = 'degraded';
       this.reason ||= 'insufficient-funds-resync-required';
     }
+    if (promotionMismatches.length > 0) {
+      this.state = 'degraded';
+      this.reason = 'live-order-promotion-evidence-mismatch';
+    }
     if (generation) this.lastAppliedReconciliation = generation.id;
-    return this.getStatus();
+    return { ...this.getStatus(), promotedOrderIds, promotionMismatches };
   }
 
   reserve({ orderId, side, price, size, level = null, replacesOrderId = null }) {

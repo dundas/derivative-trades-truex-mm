@@ -433,4 +433,147 @@ describe('MarketMakerOrchestrator strict startup reconciliation', () => {
     expect(activeOrders.has('healthy')).toBe(true);
     expect(capital.getReservation('healthy')).toMatchObject({ acknowledgedLive: true, state: 'active' });
   });
+
+  test('lost New ack after OE disconnect promotes only matching stable REST evidence without double count', async () => {
+    const capital = new CapitalReservationManager();
+    capital.reconcile({ ...balances, liveOrders: [] });
+    const engine = new QuoteEngine({
+      capitalReservationManager: capital,
+      fixConnection: { sendMessage: mock(() => {}) },
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+    });
+    const orderId = engine._sendNewOrder({ side: 'sell', size: 0.01, price: 100000, level: 1 });
+    const orchestrator = Object.assign(Object.create(MarketMakerOrchestrator.prototype), {
+      isRunning: true,
+      restClient: { getActiveOrders: mock(async () => [{
+        id: 'venue-order', external_id: orderId, status: 'ACTIVE',
+        order_info: {
+          side: 'SELL', type: 'LIMIT', instrument_id: 'btc-pyusd', price: '100000', qty: '0.01',
+        },
+        pending_qty: '0', leaves_qty: '0.01', exeuted_qty: '0', executed_vwap: '0',
+      }]) },
+      capitalReservationManager: capital,
+      quoteEngine: engine,
+      inventoryManager: { refreshBalances: mock(() => {}) },
+      _capitalResyncInFlight: null,
+      _fetchBalances: mock(async () => ({
+        baseBalance: { available: 0.0068, held: 0.01, total: 0.0168 },
+        quoteBalance: balances.quoteBalance,
+      })),
+      logger: { info() {}, warn() {}, error() {} },
+    });
+    orchestrator._onOEDisconnect();
+    expect(engine.activeOrders.get(orderId)).toMatchObject({ status: 'active', acknowledgedLive: false });
+    expect(capital.getReservation(orderId)).toMatchObject({ state: 'pending-new', acknowledgedLive: false });
+
+    await orchestrator._refreshBalances({ requireLiveOrders: true, clearBlockedSides: true });
+    expect(capital.getReservation(orderId)).toMatchObject({
+      state: 'active', acknowledgedLive: true, representedByHeld: true,
+    });
+    expect(engine.activeOrders.get(orderId)).toMatchObject({ status: 'active', acknowledgedLive: true });
+    expect(capital.getPresence()).toEqual({ buy: 0, sell: 1 });
+    expect(capital.getAvailable('sell')).toBeCloseTo(0.0068, 8);
+
+    engine.onExecutionReport({ '11': orderId, '39': '0', '54': '2' });
+    expect(capital.getPresence()).toEqual({ buy: 0, sell: 1 });
+    expect(capital.getAvailable('sell')).toBeCloseTo(0.0068, 8);
+  });
+
+  test('mismatched or ambiguous REST rows cannot promote a pending reservation', async () => {
+    for (const liveRows of [
+      [{ orderId: 'pending', status: 'ACTIVE', side: 'buy', price: 100000, size: 0.01 }],
+      [
+        { orderId: 'pending', status: 'ACTIVE', side: 'sell', price: 100000, size: 0.01 },
+        { orderId: 'pending', status: 'ACTIVE', side: 'sell', price: 100000, size: 0.01 },
+      ],
+    ]) {
+      const capital = new CapitalReservationManager();
+      capital.reconcile({ ...balances, liveOrders: [] });
+      capital.reserve({ orderId: 'pending', side: 'sell', size: 0.01, price: 100000, level: 1 });
+      const activeOrders = new Map([['pending', {
+        side: 'sell', size: 0.01, price: 100000, level: 1, status: 'pending', acknowledgedLive: false,
+      }]]);
+      const quoteEngine = { activeOrders, removeStaleOrder: mock(() => false) };
+      const orchestrator = Object.assign(Object.create(MarketMakerOrchestrator.prototype), {
+        isRunning: true,
+        restClient: {},
+        capitalReservationManager: capital,
+        quoteEngine,
+        inventoryManager: { refreshBalances: mock(() => {}) },
+        _capitalResyncInFlight: null,
+        _fetchBalances: mock(async () => balances),
+        _fetchCapitalLiveOrders: mock(async () => liveRows),
+        logger: { warn() {} },
+      });
+
+      await orchestrator._refreshBalances({ requireLiveOrders: true, clearBlockedSides: true });
+      expect(capital.getReservation('pending')).toMatchObject({
+        state: 'pending-new', acknowledgedLive: false,
+      });
+      expect(activeOrders.get('pending')).toMatchObject({ status: 'pending', acknowledgedLive: false });
+      expect(capital.getStatus()).toMatchObject({
+        state: 'degraded', reason: 'live-order-promotion-evidence-mismatch', blockedSides: ['sell'],
+      });
+      expect(capital.reserve({
+        orderId: `blocked-${liveRows.length}`, side: 'sell', size: 0.001, price: 100000, level: 2,
+      }).accepted).toBe(false);
+    }
+  });
+
+  test('raw REST promotion evidence rejects malformed, transitional, missing-local, and duplicate rows', async () => {
+    const raw = ({
+      price = '100000', leaves = '0.01', status = 'ACTIVE', side = 'SELL', externalId = 'pending',
+    } = {}) => ({
+      id: `venue-${externalId}`,
+      external_id: externalId,
+      status,
+      order_info: {
+        side, type: 'LIMIT', instrument_id: 'btc-pyusd', price, qty: '0.01',
+      },
+      pending_qty: '0', leaves_qty: leaves, exeuted_qty: '0', executed_vwap: '0',
+    });
+    const cases = [
+      { name: 'empty price', rows: [raw({ price: '' })] },
+      { name: 'garbage price', rows: [raw({ price: 'bad' })] },
+      { name: 'partial-garbage price', rows: [raw({ price: '100000junk' })] },
+      { name: 'zero leaves', rows: [raw({ leaves: '0' })] },
+      { name: 'garbage leaves', rows: [raw({ leaves: 'bad' })] },
+      { name: 'partial-garbage leaves', rows: [raw({ leaves: '0.01junk' })] },
+      { name: 'different price', rows: [raw({ price: '100001' })] },
+      { name: 'different remaining size', rows: [raw({ leaves: '0.005' })] },
+      { name: 'cancel pending', rows: [raw({ status: 'CANCEL_PENDING' })] },
+      { name: 'missing local order', rows: [raw()], missingLocal: true },
+      { name: 'duplicate rows', rows: [raw(), raw()] },
+    ];
+
+    for (const evidence of cases) {
+      const capital = new CapitalReservationManager();
+      capital.reconcile({ ...balances, liveOrders: [] });
+      capital.reserve({ orderId: 'pending', side: 'sell', size: 0.01, price: 100000, level: 1 });
+      const activeOrders = evidence.missingLocal ? new Map() : new Map([['pending', {
+        side: 'sell', size: 0.01, price: 100000, level: 1,
+        status: 'pending', acknowledgedLive: false,
+      }]]);
+      const orchestrator = Object.assign(Object.create(MarketMakerOrchestrator.prototype), {
+        isRunning: true,
+        restClient: { getActiveOrders: mock(async () => evidence.rows) },
+        capitalReservationManager: capital,
+        quoteEngine: { activeOrders, removeStaleOrder: mock(() => false) },
+        inventoryManager: { refreshBalances: mock(() => {}) },
+        _capitalResyncInFlight: null,
+        _fetchBalances: mock(async () => balances),
+        logger: { warn() {} },
+      });
+
+      const adapted = await orchestrator._fetchCapitalLiveOrders();
+      expect(adapted.length).toBe(evidence.rows.length);
+      await orchestrator._refreshBalances({ requireLiveOrders: true, clearBlockedSides: true });
+      expect(capital.getReservation('pending'), evidence.name).toMatchObject({
+        state: 'pending-new', acknowledgedLive: false,
+      });
+      expect(capital.getStatus(), evidence.name).toMatchObject({
+        state: 'degraded', reason: 'live-order-promotion-evidence-mismatch', blockedSides: ['sell'],
+      });
+    }
+  });
 });

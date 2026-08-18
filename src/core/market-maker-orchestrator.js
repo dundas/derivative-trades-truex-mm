@@ -14,6 +14,13 @@ import { ReferenceMarkoutCollector } from '../data-pipeline/reference-markout-co
 import { CapitalReservationManager } from './capital-reservation-manager.js';
 import { MakerPresenceController } from './maker-presence-controller.js';
 
+function strictPositiveRestNumber(value) {
+  if ((typeof value !== 'string' && typeof value !== 'number') ||
+      (typeof value === 'string' && value.trim() === '')) return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
 /**
  * MarketMakerOrchestrator - Wires all components and manages lifecycle.
  *
@@ -1661,9 +1668,17 @@ export class MarketMakerOrchestrator extends EventEmitter {
         this._fetchBalances(),
         this.capitalReservationManager || requireLiveOrders ? this._fetchCapitalLiveOrders() : Promise.resolve([]),
       ]);
+      const reconciledLiveOrders = liveOrders.map((live) => {
+        const local = this.quoteEngine.activeOrders.get(live?.orderId);
+        const localOrderMatches = Boolean(local &&
+          local.side === live?.side &&
+          Number.isFinite(Number(live?.price)) && Math.abs(Number(live.price) - Number(local.price)) <= 1e-10 &&
+          Number.isFinite(Number(live?.size)) && Math.abs(Number(live.size) - Number(local.size)) <= 1e-10);
+        return { ...live, localOrderMatches };
+      });
       const absentLocalOrderIds = [];
       if (this.capitalReservationManager && generation) {
-        const liveIds = new Set(liveOrders.map((order) => order?.orderId).filter(Boolean));
+        const liveIds = new Set(reconciledLiveOrders.map((order) => order?.orderId).filter(Boolean));
         for (const orderId of generation.knownOrders.keys()) {
           if (liveIds.has(orderId)) continue;
           const current = this.capitalReservationManager.getReservation(orderId);
@@ -1679,13 +1694,20 @@ export class MarketMakerOrchestrator extends EventEmitter {
         }
       }
       this.inventoryManager.refreshBalances({ baseBalance, quoteBalance });
-      this.capitalReservationManager?.reconcile({
+      const capitalResult = this.capitalReservationManager?.reconcile({
         baseBalance,
         quoteBalance,
-        liveOrders,
+        liveOrders: reconciledLiveOrders,
         clearBlockedSides,
         generation,
       });
+      for (const orderId of capitalResult?.promotedOrderIds || []) {
+        const local = this.quoteEngine.activeOrders.get(orderId);
+        if (local) {
+          local.status = 'active';
+          local.acknowledgedLive = true;
+        }
+      }
       if (absentLocalOrderIds.length > 0) {
         // removeStaleOrder created a conservative delta after this request
         // began, so this snapshot cannot absorb/unblock it. Require one more
@@ -1711,8 +1733,22 @@ export class MarketMakerOrchestrator extends EventEmitter {
     const liveOrders = [];
     for (const raw of rawOrders) {
       const parsed = TrueXRESTClient.parseOrder(raw);
-      if (!parsed.externalId || parsed.status === 'NEW_PENDING') continue;
-      liveOrders.push({ orderId: parsed.externalId });
+      if (!parsed.externalId || !['ACTIVE', 'CANCEL_PENDING'].includes(parsed.status)) continue;
+      // Promotion evidence is intentionally read from the raw fields. The
+      // general REST parser uses parseFloat and is suitable for display, but
+      // would accept partial garbage ("0.01junk"). A zero/malformed live row
+      // must remain visible to reconciliation as a mismatch; never substitute
+      // the original quantity for missing or invalid leaves.
+      const price = strictPositiveRestNumber(raw?.order_info?.price);
+      const size = strictPositiveRestNumber(raw?.leaves_qty);
+      liveOrders.push({
+        orderId: parsed.externalId,
+        status: parsed.status,
+        side: String(parsed.side).toLowerCase(),
+        price,
+        size,
+        promotionEvidenceValid: price !== null && size !== null,
+      });
     }
     return liveOrders;
   }
