@@ -48,6 +48,8 @@ export class DataPipelineManager extends EventEmitter {
     // Only auto-connects if pgUrl is provided and no pgManager injected
     this.pgManager = options.pgManager || null;
     this.pgUrl = options.pgUrl || null;
+    this.pgSslCa = options.pgSslCa;
+    this.referenceQueryOptions = options.referenceQueryOptions || null;
 
     // --- Timer configuration (direct PG flush when Redis unavailable) ---
     this.pgFlushIntervalMs = options.pgFlushIntervalMs || 5000; // 5s direct PG flush
@@ -116,7 +118,11 @@ export class DataPipelineManager extends EventEmitter {
     // Connect PG if not injected but pgUrl is configured
     if (!this.pgManager && this.pgUrl) {
       try {
-        this.pgManager = new TrueXPostgreSQLManager({ logger: this.logger, pgUrl: this.pgUrl });
+        this.pgManager = new TrueXPostgreSQLManager({
+          logger: this.logger, pgUrl: this.pgUrl,
+          sslCa: this.pgSslCa,
+          referenceQueryOptions: this.referenceQueryOptions,
+        });
         await this.pgManager.initialize();
         this.logger.info('[DataPipeline] PostgreSQL connected');
       } catch (err) {

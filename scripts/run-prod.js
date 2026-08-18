@@ -95,7 +95,6 @@ const shadowPhase2Criteria = {
   maxAbsPyusdBasisBps: parseNumber('SHADOW_ABORT_MAX_ABS_PYUSD_BASIS_BPS', 100),
   maxP95AbsPyusdBasisBps: parseNumber('SHADOW_ABORT_MAX_P95_ABS_PYUSD_BASIS_BPS', 80),
 };
-const referenceMarkoutRolloutOptions = buildReferenceMarkoutRolloutOptions(process.env);
 const orderReconciliationScope = buildOrderReconciliationScope(process.env);
 const fixLivenessConfig = buildFixLivenessConfig(process.env);
 
@@ -170,6 +169,7 @@ const config = {
   // Data Pipeline
   redisUrl: process.env.REDIS_URL || null,
   pgUrl: process.env.DATABASE_URL || null,
+  pgSslCa: process.env.POSTGRES_SSL_CA || undefined,
 
   // REST URL for reconciliation + balance fetching
   restUrl: process.env.TRUEX_REST_URL || 'http://178.156.230.110:3006',
@@ -212,6 +212,16 @@ config.truexMakerSafety = buildTruexMakerSafetyConfig(process.env, {
   ebboPollIntervalMs: config.truexEbboPollIntervalMs,
   maxOrdersPerSecond: config.maxOrdersPerSecond,
 });
+const referenceMarkoutRolloutOptions = buildReferenceMarkoutRolloutOptions(process.env, {
+  maxQuoteDecisionsPerSecond: config.maxOrdersPerSecond,
+  basisPollTimeoutMs: config.pyusdUsdPollTimeoutMs,
+});
+if (referenceMarkoutRolloutOptions.referenceMarkoutConfig) {
+  config.pyusdUsdReferenceSources = [{
+    type: 'kraken-rest',
+    pair: referenceMarkoutRolloutOptions.referenceMarkoutConfig.basisRequestedPair,
+  }];
+}
 
 // ---------------------------------------------------------------------------
 // Webhook Alerting
@@ -346,6 +356,12 @@ async function main() {
     symbol: config.symbol,
     redisUrl: config.redisUrl,
     pgUrl: config.pgUrl,
+    pgSslCa: config.pgSslCa,
+    referenceQueryOptions: referenceMarkoutRolloutOptions.referenceMarkoutConfig ? {
+      statementTimeoutMs: referenceMarkoutRolloutOptions.referenceMarkoutConfig.dbStatementTimeoutMs,
+      queryTimeoutMs: referenceMarkoutRolloutOptions.referenceMarkoutConfig.dbQueryTimeoutMs,
+      lockTimeoutMs: referenceMarkoutRolloutOptions.referenceMarkoutConfig.dbLockTimeoutMs,
+    } : null,
     logger,
   });
 

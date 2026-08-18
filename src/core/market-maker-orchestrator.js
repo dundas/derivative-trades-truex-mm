@@ -1487,7 +1487,8 @@ export class MarketMakerOrchestrator extends EventEmitter {
       : null;
     const enrichedEvent = {
       ...event,
-      decisionTimestamp: now,
+      decisionTimestamp: Number.isSafeInteger(event.decisionTimestamp) && event.decisionTimestamp >= 0
+        ? event.decisionTimestamp : now,
       sessionId: this.sessionId,
       symbol: this.symbol,
       targetInventoryBTC: summary.targetInventoryBTC ?? this.inventoryManager.targetInventoryBTC,
@@ -1518,7 +1519,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
         quoteId: event.quoteId,
         sessionId: this.sessionId,
         fillTimestamp: now,
-        decisionTimestamp: null,
+        decisionTimestamp: enrichedEvent.decisionTimestamp,
         side: event.side,
         level: event.level,
         policyId: this.quoteTelemetry.policyId,
@@ -1960,7 +1961,35 @@ export class MarketMakerOrchestrator extends EventEmitter {
       throw new Error('Kraken REST client unavailable for PYUSD/USD reference poll');
     }
 
-    const ticker = await this.krakenRestClient.getTicker(source.pair || 'PYUSD/USD', {
+    const pair = source.pair || 'PYUSD/USD';
+    if (typeof this.krakenRestClient.getPreTradeTopOfBook === 'function') {
+      const book = await this.krakenRestClient.getPreTradeTopOfBook(pair, {
+        timeoutMs: this.pyusdUsdPollTimeoutMs,
+      });
+      const basisTimestamp = Math.min(
+        book.bid.publicationTimestamp, book.ask.publicationTimestamp,
+      );
+      return {
+        price: (book.bid.price + book.ask.price) / 2,
+        bid: book.bid.price, ask: book.ask.price,
+        bidQty: book.bid.qty, askQty: book.ask.qty,
+        bidCount: book.bid.count, askCount: book.ask.count,
+        bidSubmissionTimestamp: book.bid.submissionTimestamp,
+        askSubmissionTimestamp: book.ask.submissionTimestamp,
+        bidPublicationTimestamp: book.bid.publicationTimestamp,
+        askPublicationTimestamp: book.ask.publicationTimestamp,
+        basisTimestamp, timestamp: basisTimestamp,
+        requestTimestamp: book.requestTimestamp,
+        receivedTimestamp: book.receivedTimestamp,
+        source: 'kraken-pretrade', requestedPair: book.requestedSymbol,
+        resolvedPair: book.resolvedSymbol, base: book.base, quote: book.quote,
+        venue: book.venue, system: book.system,
+      };
+    }
+    // Legacy callers can still provide a ticker-only connector for shadow/runtime
+    // compatibility. Its local timestamp is intentionally not promoted to venue
+    // provenance; the reference collector classifies it as non-promotion-grade.
+    const ticker = await this.krakenRestClient.getTicker(pair, {
       timeoutMs: this.pyusdUsdPollTimeoutMs,
     });
     return {
@@ -2669,6 +2698,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
       sessionId: this.sessionId,
       continuity,
       capital: this.capitalReservationManager?.getStatus() || null,
+      // Additive observability only. Persistence failures remain visible in
+      // this payload but are deliberately excluded from health classification.
+      referenceMarkouts: this.referenceMarkoutCollector?.getStats?.() || null,
     };
   }
 

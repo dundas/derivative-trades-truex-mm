@@ -383,11 +383,17 @@ change a live policy.
 
 Reference collection is a separate, observability-only path gated by
 `REFERENCE_MARKOUT_ENABLED` (default `false`). When enabled, create/replace decisions and
-fills schedule durable 1/5/60-minute work. A one-second sampler stores point-in-time Coinbase
-BTC-USD top-of-book observations with distinct source, receipt, observation, and PYUSD/USD basis
-timestamps. The earliest valid observation at or after each horizon is claimed with an
+fills schedule durable 1/5/60-minute work. At the one-second cadence, the collector stores
+point-in-time Coinbase BTC-USD top-of-book observations only while an unfinished horizon window is
+open, with distinct source, receipt, observation, and promotion-grade Kraken PreTrade PYUSD/USD
+provenance. Basis evidence retains both side submission/publication timestamps, request/receipt,
+requested/resolved symbol, assets, system, and an operator-allowlisted venue; the conservative basis
+timestamp is the older publication time and is never synthesized from local receipt. The earliest
+valid observation at or after each horizon is claimed with an
 overlap-safe lease and persisted as immutable evidence; missing or invalid evidence is terminally
 classified after the configured lateness window.
+PreTrade publication timestamps are required. Optional/missing venue submission timestamps remain
+nullable diagnostic provenance and are never synthesized or selected as promotion-grade.
 
 PostgreSQL stores decisions, sampled observations, pending work, and terminal evidence in four
 additive tables. Claims use `FOR UPDATE ... SKIP LOCKED`, expired leases are recoverable after
@@ -396,9 +402,21 @@ indexes are aligned to observation and receipt time respectively. The bounded co
 available through `bun scripts/report-reference-markout-coverage.js`; full operating and rollout
 instructions are in [REFERENCE_MARKOUTS.md](REFERENCE_MARKOUTS.md).
 
+Reference writes use separate bounded FIFO decision and priority fill lanes and bounded PostgreSQL lock, statement, pool
+acquisition, and protocol-step timeouts. Retention runs on an independent timer with bounded batch,
+total-duration, and yield controls; it never runs in the due-work sampling/claim cycle.
 Collector and persistence failures are logged and counted but never block, cancel, resize,
 reprice, or dispatch an order. The feature changes no strategy parameters and cannot authorize a
 candidate produced by the offline regime validator.
+
+The authenticated `GET /api/status` snapshot exposes `referenceMarkouts` as `null` while disabled.
+When enabled it exposes the collector's running state, safe source/horizon identity, cycle and
+persisted-observation counters, open-window/sampling state, queue/pool pressure, query latency,
+invalid-sample reasons, retention backlog, last cycle/observation timestamps, and a sanitized last
+persistence error reason/time. Idle zero-observation state is healthy when no window is open. These
+fields are observability only and do not participate in top-level health classification. Production
+enablement remains blocked until PYUSD/USD basis evidence has distinct, auditable source and receipt
+provenance; see [REFERENCE_MARKOUTS.md](REFERENCE_MARKOUTS.md).
 
 ### TrueXRESTClient (`src/exchanges/truex/TrueXRESTClient.ts`)
 
@@ -501,6 +519,8 @@ PostgreSQL-backed analytics server using `Bun.serve()` on port 3100.
 | `DATABASE_URL` | No | -- | PostgreSQL connection string (Hetzner truex-pg-analytics 178.156.247.87:5432/truex_analytics) |
 | `REDIS_URL` | No | -- | Redis connection string (optional, auto-fallback) |
 | `REFERENCE_MARKOUT_ENABLED` | No | `false` | Explicitly enable restart-safe 1/5/60-minute reference collection; keep false for the inert rollout stage |
+| `REFERENCE_MARKOUT_BASIS_VENUE_ALLOWLIST` | When enabled | -- | Explicit Kraken PreTrade venue identity/identities accepted for promotion-grade basis evidence; deliberately no shared MIC default |
+| `REFERENCE_MARKOUT_MAX_BASIS_RTT_MS` | No | `1000` | Maximum PreTrade request-to-receipt duration; bounded by source freshness and poll timeout |
 | `MM_MIN_ACTIVE_LEVELS_PER_SIDE` | Yes | -- | Minimum distinct acknowledged and funded quote levels required on each side; cannot exceed normal quote levels |
 | `MM_MIN_FUNDED_QUOTE_SIZE_BTC` | Yes | -- | Smallest BTC quote size that counts toward maker presence |
 | `MM_L1_RESERVE_BASE_BTC` | Yes | -- | Base-asset capital reserved for the sell-side L1 obligation |

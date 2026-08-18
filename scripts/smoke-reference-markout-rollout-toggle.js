@@ -8,7 +8,9 @@ if ('referenceMarkoutConfig' in disabledOptions || disabled.referenceMarkoutColl
   throw new Error('disabled rollout instantiated a reference collector');
 }
 
-const enabledOptions = buildReferenceMarkoutRolloutOptions({ REFERENCE_MARKOUT_ENABLED: 'true' });
+const enabledOptions = buildReferenceMarkoutRolloutOptions({
+  REFERENCE_MARKOUT_ENABLED: 'true', REFERENCE_MARKOUT_BASIS_VENUE_ALLOWLIST: 'PDSL',
+});
 const enabled = new MarketMakerOrchestrator(enabledOptions);
 if (!enabled.referenceMarkoutCollector ||
     JSON.stringify(enabled.referenceMarkoutCollector.config) !==

@@ -1,5 +1,23 @@
 import { PostgreSQLAPI, createPostgreSQLAPIFromEnv } from '../../lib/postgresql-api/index.js';
 
+const REFERENCE_BASIS_COLUMNS = [
+  'basis_source', 'basis_requested_pair', 'basis_resolved_pair', 'basis_base', 'basis_quote',
+  'basis_venue', 'basis_system', 'basis_request_timestamp', 'basis_received_timestamp',
+  'basis_bid', 'basis_ask', 'basis_bid_qty', 'basis_ask_qty', 'basis_bid_count',
+  'basis_ask_count', 'basis_bid_submission_timestamp', 'basis_bid_publication_timestamp',
+  'basis_ask_submission_timestamp', 'basis_ask_publication_timestamp', 'promotion_grade',
+];
+
+const referenceBasisValues = value => [
+  value.basisSource, value.basisRequestedPair, value.basisResolvedPair, value.basisBase,
+  value.basisQuote, value.basisVenue, value.basisSystem, value.basisRequestTimestamp,
+  value.basisReceivedTimestamp, value.basisBid, value.basisAsk, value.basisBidQty,
+  value.basisAskQty, value.basisBidCount, value.basisAskCount,
+  value.basisBidSubmissionTimestamp, value.basisBidPublicationTimestamp,
+  value.basisAskSubmissionTimestamp, value.basisAskPublicationTimestamp,
+  value.promotionGrade === true,
+];
+
 /**
  * TrueX PostgreSQL Manager - Layer 3: Analytics & Long-term Storage
  *
@@ -15,12 +33,17 @@ import { PostgreSQLAPI, createPostgreSQLAPIFromEnv } from '../../lib/postgresql-
 export class TrueXPostgreSQLManager {
   constructor(options = {}) {
     this.logger = options.logger || console;
+    this.referenceQueryOptions = options.referenceQueryOptions || null;
 
     // Create PostgreSQL API instance
     if (options.db) {
       this.db = options.db;
     } else if (options.pgUrl) {
-      this.db = new PostgreSQLAPI({ connectionString: options.pgUrl, logger: this.logger });
+      this.db = new PostgreSQLAPI({
+        connectionString: options.pgUrl, logger: this.logger,
+        sslCa: options.sslCa,
+        connectionTimeoutMillis: options.referenceQueryOptions?.queryTimeoutMs,
+      });
     } else {
       this.db = createPostgreSQLAPIFromEnv();
     }
@@ -40,6 +63,24 @@ export class TrueXPostgreSQLManager {
     this.schemaLockA = 874521; // arbitrary constant namespace
     this.schemaLockB = 1001;   // schema changes
     this.migrationLockA = 874521; // same namespace, per-session B derived from sessionId
+  }
+
+  _referenceQuery(text, params = []) {
+    if (this.referenceQueryOptions && typeof this.db.boundedQuery === 'function') {
+      return this.db.boundedQuery(text, params, this.referenceQueryOptions);
+    }
+    return this.db.query(text, params);
+  }
+
+  getReferencePersistenceStats() {
+    const stats = this.db.getStats?.() || {};
+    return {
+      activeQueries: Number(stats.activeQueries) || 0,
+      waitingRequests: Number(stats.waitingRequests) || 0,
+      lastQueryLatencyMs: Number.isFinite(stats.lastQueryLatencyMs) ? stats.lastQueryLatencyMs : null,
+      maxQueryLatencyMs: Number(stats.maxQueryLatencyMs) || 0,
+      queryErrors: Number(stats.queryErrors) || 0,
+    };
   }
   
   /**
@@ -206,6 +247,7 @@ export class TrueXPostgreSQLManager {
         `);
         await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_decision_quote_ts ON reference_quote_decisions(quote_id, decision_timestamp DESC)`);
         await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_decision_session_quote_ts ON reference_quote_decisions(session_id, quote_id, decision_timestamp DESC)`);
+        await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_decision_retention_v3 ON reference_quote_decisions(decision_timestamp, decision_id, session_id, quote_id)`);
 
         await this.db.query(`
           CREATE TABLE IF NOT EXISTS reference_market_observations (
@@ -231,7 +273,7 @@ export class TrueXPostgreSQLManager {
         // idx_reference_market_window in place would be ignored by IF NOT EXISTS
         // on databases that already created the original index.
         await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_market_selector_v2 ON reference_market_observations(product, quote_currency, source_exchange, source_type, observation_timestamp, source_timestamp, received_timestamp, basis_timestamp)`);
-        await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_market_retention_v2 ON reference_market_observations(received_timestamp, observation_timestamp)`);
+        await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_market_retention_v3 ON reference_market_observations(received_timestamp, observation_timestamp, observation_id)`);
 
         await this.db.query(`
           CREATE TABLE IF NOT EXISTS fill_reference_markout_work (
@@ -265,6 +307,9 @@ export class TrueXPostgreSQLManager {
         `);
         await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_markout_due ON fill_reference_markout_work(state, due_timestamp, claim_expires_at)`);
         await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_markout_grouping ON fill_reference_markout_work(side, level, policy_id, horizon_ms)`);
+        await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_markout_retention_v2 ON fill_reference_markout_work(completed_at, fill_id, horizon_ms) WHERE state = 'completed'`);
+        await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_markout_pending_attribution_v2 ON fill_reference_markout_work(session_id, quote_id) WHERE state <> 'completed'`);
+        await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_markout_unfinished_window_v2 ON fill_reference_markout_work(due_timestamp, deadline_timestamp) WHERE state <> 'completed'`);
 
         await this.db.query(`
           CREATE TABLE IF NOT EXISTS fill_reference_markout_evidence (
@@ -296,6 +341,24 @@ export class TrueXPostgreSQLManager {
         await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_evidence_availability ON fill_reference_markout_evidence(available, unavailable_reason)`);
         await this.db.query(`ALTER TABLE fill_reference_markout_evidence ADD COLUMN IF NOT EXISTS observed_edge_bps NUMERIC`);
         await this.db.query(`ALTER TABLE fill_reference_markout_evidence ADD COLUMN IF NOT EXISTS adjusted_midpoint NUMERIC`);
+        const provenanceTypes = {
+          basis_request_timestamp: 'BIGINT', basis_received_timestamp: 'BIGINT',
+          basis_bid: 'NUMERIC', basis_ask: 'NUMERIC', basis_bid_qty: 'NUMERIC',
+          basis_ask_qty: 'NUMERIC', basis_bid_count: 'INTEGER', basis_ask_count: 'INTEGER',
+          basis_bid_submission_timestamp: 'BIGINT', basis_bid_publication_timestamp: 'BIGINT',
+          basis_ask_submission_timestamp: 'BIGINT', basis_ask_publication_timestamp: 'BIGINT',
+          promotion_grade: 'BOOLEAN',
+        };
+        for (const table of ['reference_quote_decisions', 'reference_market_observations',
+          'fill_reference_markout_evidence']) {
+          for (const column of REFERENCE_BASIS_COLUMNS) {
+            await this.db.query(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${column} ${provenanceTypes[column] || 'TEXT'}`);
+          }
+        }
+        await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_market_selector_v3
+          ON reference_market_observations(product, quote_currency, source_exchange, source_type,
+            basis_source, basis_requested_pair, basis_resolved_pair, basis_base, basis_quote,
+            basis_system, basis_venue, observation_timestamp, observation_id)`);
 
         // Create index on exec_id for fills deduplication
         await this.db.query(`
@@ -355,13 +418,7 @@ export class TrueXPostgreSQLManager {
   async recordReferenceQuoteDecision(decision) {
     const decisionId = decision.eventId ||
       `${decision.sessionId || 'unknown'}:${decision.quoteId}:${decision.decisionTimestamp}`;
-    return this.db.query(`INSERT INTO reference_quote_decisions (
-      decision_id, event_id, decision_timestamp, session_id, quote_id, symbol, side, level,
-      policy_id, quote_price, quote_size, product, quote_currency, source_exchange, source_type,
-      source_timestamp, received_timestamp, bid, ask, midpoint, basis_timestamp, basis_price,
-      basis_adjustment_bps, available, unavailable_reason
-    ) VALUES (${Array.from({ length: 25 }, (_, index) => `$${index + 1}`).join(',')})
-    ON CONFLICT (decision_id) DO NOTHING`, [
+    const values = [
       decisionId, decision.eventId || null, decision.decisionTimestamp, decision.sessionId || null,
       decision.quoteId, decision.symbol || null, decision.side || null, decision.level ?? null,
       decision.policyId || null, decision.price ?? null, decision.size ?? null, decision.product,
@@ -369,13 +426,21 @@ export class TrueXPostgreSQLManager {
       decision.sourceTimestamp, decision.receivedTimestamp, decision.bid, decision.ask,
       decision.midpoint, decision.basisTimestamp, decision.basisPrice,
       decision.basisAdjustmentBps, decision.available, decision.unavailableReason,
-    ]);
+      ...referenceBasisValues(decision),
+    ];
+    return this._referenceQuery(`INSERT INTO reference_quote_decisions (
+      decision_id, event_id, decision_timestamp, session_id, quote_id, symbol, side, level,
+      policy_id, quote_price, quote_size, product, quote_currency, source_exchange, source_type,
+      source_timestamp, received_timestamp, bid, ask, midpoint, basis_timestamp, basis_price,
+      basis_adjustment_bps, available, unavailable_reason, ${REFERENCE_BASIS_COLUMNS.join(', ')}
+    ) VALUES (${values.map((_, index) => `$${index + 1}`).join(',')})
+    ON CONFLICT (decision_id) DO NOTHING`, values);
   }
 
   async scheduleReferenceMarkouts(fill) {
     const count = fill.horizonsMs.length;
     const repeat = value => Array(count).fill(value ?? null);
-    const result = await this.db.query(`WITH input AS (
+    const result = await this._referenceQuery(`WITH input AS (
       SELECT * FROM UNNEST(
         $1::text[], $2::bigint[], $3::text[], $4::text[], $5::text[], $6::bigint[],
         $7::bigint[], $8::text[], $9::integer[], $10::text[], $11::numeric[],
@@ -418,48 +483,80 @@ export class TrueXPostgreSQLManager {
       observation.sourceTimestamp,
       observation.receivedTimestamp, observation.bid, observation.ask,
       observation.basisTimestamp, observation.basisPrice,
+      ...referenceBasisValues(observation),
     ].join(':');
-    const result = await this.db.query(`INSERT INTO reference_market_observations (
-      observation_id, observation_timestamp, product, quote_currency, source_exchange,
-      source_type, source_timestamp, received_timestamp, bid, ask, midpoint,
-      basis_timestamp, basis_price, basis_adjustment_bps
-    ) VALUES (${Array.from({ length: 14 }, (_, index) => `$${index + 1}`).join(',')})
-    ON CONFLICT (observation_id) DO NOTHING`, [
+    const values = [
       observationId, observation.observationTimestamp, observation.product,
       observation.quoteCurrency, observation.sourceExchange, observation.sourceType,
       observation.sourceTimestamp, observation.receivedTimestamp, observation.bid,
       observation.ask, observation.midpoint, observation.basisTimestamp,
       observation.basisPrice, observation.basisAdjustmentBps,
-    ]);
+      ...referenceBasisValues(observation),
+    ];
+    const result = await this._referenceQuery(`INSERT INTO reference_market_observations (
+      observation_id, observation_timestamp, product, quote_currency, source_exchange,
+      source_type, source_timestamp, received_timestamp, bid, ask, midpoint,
+      basis_timestamp, basis_price, basis_adjustment_bps, ${REFERENCE_BASIS_COLUMNS.join(', ')}
+    ) VALUES (${values.map((_, index) => `$${index + 1}`).join(',')})
+    ON CONFLICT (observation_id) DO NOTHING`, values);
     return (result.rowCount ?? 0) > 0;
   }
 
   async getFirstReferenceMarketObservation({ dueTimestamp, deadlineTimestamp, product,
-    quoteCurrency, sourceExchange, sourceType, maxSourceAgeMs, maxAbsBasisAdjustmentBps }) {
-    const result = await this.db.query(`SELECT * FROM reference_market_observations
+    quoteCurrency, sourceExchange, sourceType, maxSourceAgeMs, maxAbsBasisAdjustmentBps,
+    basisSource, basisRequestedPair, basisResolvedPair, basisBase, basisQuote, basisSystem,
+    basisVenueAllowlist, maxBasisRttMs }) {
+    const result = await this._referenceQuery(`SELECT * FROM reference_market_observations
       WHERE product = $1 AND quote_currency = $2 AND source_exchange = $3 AND source_type = $4
         AND observation_timestamp >= $5 AND observation_timestamp <= $6
         AND observation_timestamp >= 0 AND source_timestamp >= 0
         AND received_timestamp >= 0 AND basis_timestamp >= 0
+        AND basis_request_timestamp >= 0 AND basis_received_timestamp >= 0
+        AND basis_bid_submission_timestamp >= 0 AND basis_bid_publication_timestamp >= 0
+        AND basis_ask_submission_timestamp >= 0 AND basis_ask_publication_timestamp >= 0
         AND bid::text NOT IN ('NaN', 'Infinity', '-Infinity')
         AND ask::text NOT IN ('NaN', 'Infinity', '-Infinity')
         AND midpoint::text NOT IN ('NaN', 'Infinity', '-Infinity')
         AND basis_price::text NOT IN ('NaN', 'Infinity', '-Infinity')
         AND basis_adjustment_bps::text NOT IN ('NaN', 'Infinity', '-Infinity')
+        AND basis_bid::text NOT IN ('NaN', 'Infinity', '-Infinity')
+        AND basis_ask::text NOT IN ('NaN', 'Infinity', '-Infinity')
+        AND basis_bid_qty::text NOT IN ('NaN', 'Infinity', '-Infinity')
+        AND basis_ask_qty::text NOT IN ('NaN', 'Infinity', '-Infinity')
         AND bid > 0 AND ask > 0 AND bid <= ask AND midpoint > 0
         AND basis_price > 0
+        AND basis_bid > 0 AND basis_ask > 0 AND basis_bid <= basis_ask
+        AND basis_bid_qty > 0 AND basis_ask_qty > 0
+        AND basis_bid_count > 0 AND basis_ask_count > 0
         AND source_timestamp <= received_timestamp
         AND received_timestamp <= observation_timestamp
         AND source_timestamp <= observation_timestamp
         AND basis_timestamp <= observation_timestamp
+        AND basis_source = $9 AND basis_requested_pair = $10 AND basis_resolved_pair = $11
+        AND basis_base = $12 AND basis_quote = $13 AND basis_system = $14
+        AND basis_venue = ANY($15::text[]) AND promotion_grade IS TRUE
+        AND basis_request_timestamp <= basis_received_timestamp
+        AND basis_received_timestamp <= observation_timestamp
+        AND basis_received_timestamp - basis_request_timestamp <= $16
+        AND basis_bid_submission_timestamp <= basis_bid_publication_timestamp
+        AND basis_ask_submission_timestamp <= basis_ask_publication_timestamp
+        AND basis_bid_publication_timestamp <= basis_received_timestamp
+        AND basis_ask_publication_timestamp <= basis_received_timestamp
+        AND basis_timestamp = LEAST(basis_bid_publication_timestamp, basis_ask_publication_timestamp)
         AND observation_timestamp - source_timestamp <= $7
-        AND observation_timestamp - basis_timestamp <= $7
+        AND observation_timestamp - basis_bid_publication_timestamp <= $7
+        AND observation_timestamp - basis_ask_publication_timestamp <= $7
+        AND observation_timestamp - basis_received_timestamp <= $7
         AND ABS(basis_adjustment_bps) <= $8
+        AND ABS(basis_price - ((basis_bid + basis_ask) / 2)) <= 0.000000000001
+        AND ABS(basis_adjustment_bps - ((1 / basis_price - 1) * 10000)) <= 0.00000001
       ORDER BY observation_timestamp ASC,
         GREATEST(source_timestamp, received_timestamp, basis_timestamp) ASC,
         observation_id ASC
       LIMIT 1`, [product, quoteCurrency, sourceExchange, sourceType, dueTimestamp,
-      deadlineTimestamp, maxSourceAgeMs, maxAbsBasisAdjustmentBps]);
+      deadlineTimestamp, maxSourceAgeMs, maxAbsBasisAdjustmentBps, basisSource,
+      basisRequestedPair, basisResolvedPair, basisBase, basisQuote, basisSystem,
+      basisVenueAllowlist, maxBasisRttMs]);
     const row = result.rows?.[0];
     if (!row) return null;
     return {
@@ -471,11 +568,24 @@ export class TrueXPostgreSQLManager {
       ask: Number(row.ask), midpoint: Number(row.midpoint),
       basisTimestamp: Number(row.basis_timestamp), basisPrice: Number(row.basis_price),
       basisAdjustmentBps: Number(row.basis_adjustment_bps),
+      basisSource: row.basis_source, basisRequestedPair: row.basis_requested_pair,
+      basisResolvedPair: row.basis_resolved_pair, basisBase: row.basis_base,
+      basisQuote: row.basis_quote, basisVenue: row.basis_venue, basisSystem: row.basis_system,
+      basisRequestTimestamp: Number(row.basis_request_timestamp),
+      basisReceivedTimestamp: Number(row.basis_received_timestamp),
+      basisBid: Number(row.basis_bid), basisAsk: Number(row.basis_ask),
+      basisBidQty: Number(row.basis_bid_qty), basisAskQty: Number(row.basis_ask_qty),
+      basisBidCount: Number(row.basis_bid_count), basisAskCount: Number(row.basis_ask_count),
+      basisBidSubmissionTimestamp: Number(row.basis_bid_submission_timestamp),
+      basisBidPublicationTimestamp: Number(row.basis_bid_publication_timestamp),
+      basisAskSubmissionTimestamp: Number(row.basis_ask_submission_timestamp),
+      basisAskPublicationTimestamp: Number(row.basis_ask_publication_timestamp),
+      promotionGrade: row.promotion_grade === true,
     };
   }
 
   async claimDueReferenceMarkouts({ now, claimToken, leaseMs, batchSize }) {
-    const result = await this.db.query(`WITH candidates AS (
+    const result = await this._referenceQuery(`WITH candidates AS (
       SELECT work.fill_id, work.horizon_ms,
         COALESCE(work.decision_timestamp, decision.decision_timestamp) AS recovered_decision_timestamp,
         COALESCE(work.policy_id, decision.policy_id) AS recovered_policy_id
@@ -511,8 +621,18 @@ export class TrueXPostgreSQLManager {
     }));
   }
 
+  async hasOpenReferenceMarkoutWindow(now) {
+    if (!Number.isSafeInteger(now) || now < 0) throw new Error('now must be a non-negative safe integer');
+    const result = await this._referenceQuery(`SELECT EXISTS (
+      SELECT 1 FROM fill_reference_markout_work
+      WHERE state <> 'completed' AND due_timestamp <= $1 AND deadline_timestamp >= $1
+      LIMIT 1
+    ) AS has_open_window`, [now]);
+    return result.rows?.[0]?.has_open_window === true;
+  }
+
   async releaseReferenceMarkoutClaim(work, claimToken, reason) {
-    const result = await this.db.query(`UPDATE fill_reference_markout_work
+    const result = await this._referenceQuery(`UPDATE fill_reference_markout_work
       SET state = 'pending', claim_token = NULL, claim_expires_at = NULL,
           last_unavailable_reason = $4
       WHERE fill_id = $1 AND horizon_ms = $2 AND state = 'claimed' AND claim_token = $3`,
@@ -521,7 +641,17 @@ export class TrueXPostgreSQLManager {
   }
 
   async completeReferenceMarkout(work, claimToken, observation) {
-    const result = await this.db.query(`WITH eligible AS (
+    const values = [
+      work.fillId, work.horizonMs, claimToken, observation.observationTimestamp,
+      observation.product, observation.quoteCurrency, observation.sourceExchange,
+      observation.sourceType, observation.sourceTimestamp, observation.receivedTimestamp,
+      observation.bid, observation.ask, observation.midpoint, observation.basisTimestamp,
+      observation.basisPrice, observation.basisAdjustmentBps, observation.adjustedMidpoint,
+      observation.observedEdgeBps, observation.available, observation.unavailableReason,
+      ...referenceBasisValues(observation),
+    ];
+    const provenancePlaceholders = REFERENCE_BASIS_COLUMNS.map((_, index) => `$${21 + index}`);
+    const result = await this._referenceQuery(`WITH eligible AS (
       SELECT fill_id, horizon_ms FROM fill_reference_markout_work
       WHERE fill_id = $1 AND horizon_ms = $2 AND state = 'claimed' AND claim_token = $3
       FOR UPDATE
@@ -530,8 +660,9 @@ export class TrueXPostgreSQLManager {
         fill_id, horizon_ms, observation_timestamp, product, quote_currency,
         source_exchange, source_type, source_timestamp, received_timestamp, bid, ask,
         midpoint, basis_timestamp, basis_price, basis_adjustment_bps, adjusted_midpoint,
-        observed_edge_bps, available, unavailable_reason
-      ) SELECT $1,$2,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20
+        observed_edge_bps, available, unavailable_reason, ${REFERENCE_BASIS_COLUMNS.join(', ')}
+      ) SELECT $1,$2,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+        ${provenancePlaceholders.join(',')}
         FROM eligible
       ON CONFLICT (fill_id, horizon_ms) DO NOTHING
     )
@@ -540,63 +671,88 @@ export class TrueXPostgreSQLManager {
         last_unavailable_reason = $20
     FROM eligible
     WHERE work.fill_id = eligible.fill_id AND work.horizon_ms = eligible.horizon_ms
-    RETURNING work.fill_id`, [
-      work.fillId, work.horizonMs, claimToken, observation.observationTimestamp,
-      observation.product, observation.quoteCurrency, observation.sourceExchange,
-      observation.sourceType, observation.sourceTimestamp, observation.receivedTimestamp,
-      observation.bid, observation.ask, observation.midpoint, observation.basisTimestamp,
-      observation.basisPrice, observation.basisAdjustmentBps, observation.adjustedMidpoint,
-      observation.observedEdgeBps, observation.available,
-      observation.unavailableReason,
-    ]);
+    RETURNING work.fill_id`, values);
     return (result.rowCount ?? 0) > 0;
   }
 
-  async pruneReferenceMarkoutEvidence(cutoffTimestamp) {
+  async pruneReferenceMarkoutEvidence(cutoffTimestamp, batchSize = 1_000) {
     if (!Number.isFinite(cutoffTimestamp)) throw new Error('cutoffTimestamp must be finite');
-    return this.db.query(`WITH deleted_evidence AS (
+    if (!Number.isSafeInteger(batchSize) || batchSize < 1 || batchSize > 10_000) {
+      throw new Error('batchSize must be a positive safe integer at most 10000');
+    }
+    return this._referenceQuery(`WITH eligible AS MATERIALIZED (
+      SELECT work.fill_id, work.horizon_ms
+      FROM fill_reference_markout_work work
+      WHERE work.state = 'completed' AND work.completed_at < $1
+      ORDER BY work.completed_at, work.fill_id, work.horizon_ms
+      LIMIT $2
+    ), deleted_evidence AS (
       DELETE FROM fill_reference_markout_evidence evidence
-      USING fill_reference_markout_work work
-      WHERE evidence.fill_id = work.fill_id AND evidence.horizon_ms = work.horizon_ms
-        AND work.state = 'completed' AND work.completed_at < $1
-    ) DELETE FROM fill_reference_markout_work
-      WHERE state = 'completed' AND completed_at < $1`, [cutoffTimestamp]);
+      USING eligible
+      WHERE evidence.fill_id = eligible.fill_id AND evidence.horizon_ms = eligible.horizon_ms
+    ) DELETE FROM fill_reference_markout_work work
+      USING eligible
+      WHERE work.fill_id = eligible.fill_id AND work.horizon_ms = eligible.horizon_ms`,
+    [cutoffTimestamp, batchSize]);
   }
 
-  async pruneReferenceQuoteDecisions(cutoffTimestamp) {
+  async pruneReferenceQuoteDecisions(cutoffTimestamp, batchSize = 1_000) {
     if (!Number.isFinite(cutoffTimestamp)) throw new Error('cutoffTimestamp must be finite');
-    return this.db.query(`DELETE FROM reference_quote_decisions decision
+    if (!Number.isSafeInteger(batchSize) || batchSize < 1 || batchSize > 10_000) {
+      throw new Error('batchSize must be a positive safe integer at most 10000');
+    }
+    return this._referenceQuery(`WITH eligible AS MATERIALIZED (
+      SELECT decision.ctid
+      FROM reference_quote_decisions decision
       WHERE decision.decision_timestamp < $1
         AND NOT EXISTS (
           SELECT 1 FROM fill_reference_markout_work work
           WHERE work.state <> 'completed' AND work.session_id = decision.session_id
             AND work.quote_id = decision.quote_id
-        )`, [cutoffTimestamp]);
+        )
+      ORDER BY decision.decision_timestamp, decision.decision_id
+      LIMIT $2
+    ) DELETE FROM reference_quote_decisions decision
+      USING eligible WHERE decision.ctid = eligible.ctid`, [cutoffTimestamp, batchSize]);
   }
 
-  async pruneReferenceMarketObservations(cutoffTimestamp) {
+  async pruneReferenceMarketObservations(cutoffTimestamp, batchSize = 1_000) {
     if (!Number.isFinite(cutoffTimestamp)) throw new Error('cutoffTimestamp must be finite');
-    return this.db.query(`DELETE FROM reference_market_observations observation
+    if (!Number.isSafeInteger(batchSize) || batchSize < 1 || batchSize > 10_000) {
+      throw new Error('batchSize must be a positive safe integer at most 10000');
+    }
+    return this._referenceQuery(`WITH eligible AS MATERIALIZED (
+      SELECT observation.ctid
+      FROM reference_market_observations observation
       WHERE observation.received_timestamp < $1
         AND NOT EXISTS (
           SELECT 1 FROM fill_reference_markout_work work
           WHERE work.state <> 'completed'
             AND observation.observation_timestamp BETWEEN work.due_timestamp AND work.deadline_timestamp
-        )`, [cutoffTimestamp]);
+        )
+      ORDER BY observation.received_timestamp, observation.observation_timestamp, observation.observation_id
+      LIMIT $2
+    ) DELETE FROM reference_market_observations observation
+      USING eligible WHERE observation.ctid = eligible.ctid`, [cutoffTimestamp, batchSize]);
   }
 
   async getReferenceMarkoutCoverage({ fromTimestamp, toTimestamp, limit = 100 } = {}) {
     const boundedLimit = Math.max(1, Math.min(Number(limit) || 100, 1000));
-    const result = await this.db.query(`WITH classified AS (
+    const result = await this._referenceQuery(`WITH classified AS (
       SELECT work.side, work.level, work.policy_id, work.horizon_ms,
         CASE
-          WHEN evidence.fill_id IS NOT NULL AND evidence.available THEN 'available'
+          WHEN evidence.fill_id IS NOT NULL AND evidence.available AND evidence.promotion_grade IS TRUE
+            THEN 'promotion-grade'
+          WHEN evidence.fill_id IS NOT NULL AND evidence.available THEN 'non-promotion-grade'
           WHEN evidence.fill_id IS NOT NULL THEN 'unavailable'
           WHEN work.state = 'claimed' THEN 'claimed'
           ELSE 'pending'
         END AS availability_status,
         CASE
-          WHEN evidence.fill_id IS NOT NULL AND evidence.available THEN 'available'
+          WHEN evidence.fill_id IS NOT NULL AND evidence.available AND evidence.promotion_grade IS TRUE
+            THEN 'promotion-grade'
+          WHEN evidence.fill_id IS NOT NULL AND evidence.available
+            THEN 'legacy-missing-basis-provenance'
           WHEN evidence.fill_id IS NOT NULL THEN COALESCE(evidence.unavailable_reason, 'unavailable-unspecified')
           WHEN work.last_unavailable_reason IS NOT NULL THEN work.last_unavailable_reason
           WHEN work.state = 'claimed' THEN 'claim-in-progress'

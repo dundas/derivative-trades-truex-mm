@@ -14,6 +14,7 @@ const mockDb = {
     // Default simulate success for DDL/DML queries
     return { rows: [] };
   }),
+  boundedQuery: jest.fn().mockResolvedValue({ rows: [] }),
   bulk: {
     sessions: {
       save: jest.fn().mockResolvedValue({ success: 1, failed: 0 })
@@ -31,9 +32,12 @@ const mockDb = {
   getStats: jest.fn().mockReturnValue({ totalConnections: 5 }),
   close: jest.fn().mockResolvedValue(true)
 };
+let lastPostgreSQLConfig = null;
 
 mock.module('../../lib/postgresql-api/index.js', () => ({
-  PostgreSQLAPI: class PostgreSQLAPI { constructor() { return mockDb; } },
+  PostgreSQLAPI: class PostgreSQLAPI {
+    constructor(config) { lastPostgreSQLConfig = config; return mockDb; }
+  },
   createPostgreSQLAPIFromEnv: jest.fn(() => mockDb)
 }));
 
@@ -47,6 +51,7 @@ describe('TrueXPostgreSQLManager', () => {
   
   beforeEach(() => {
     jest.clearAllMocks();
+    lastPostgreSQLConfig = null;
     
     mockLogger = {
       debug: jest.fn(),
@@ -87,6 +92,28 @@ describe('TrueXPostgreSQLManager', () => {
       expect(stats.fillsMigrated).toBe(0);
       expect(stats.ohlcMigrated).toBe(0);
     });
+
+    it('propagates an operator-supplied TLS CA to the PostgreSQL adapter', () => {
+      const manager = new TrueXPostgreSQLManager({
+        pgUrl: 'postgresql://db.example.com/app', sslCa: 'trusted-ca', logger: mockLogger,
+      });
+      expect(manager.db).toBe(mockDb);
+      expect(lastPostgreSQLConfig).toMatchObject({
+        connectionString: 'postgresql://db.example.com/app', sslCa: 'trusted-ca',
+      });
+    });
+
+    it('routes reference persistence through the bounded database contract', async () => {
+      const options = { lockTimeoutMs: 100, statementTimeoutMs: 500, queryTimeoutMs: 750 };
+      const bounded = new TrueXPostgreSQLManager({
+        db: mockDb, logger: mockLogger, referenceQueryOptions: options,
+      });
+      await bounded.hasOpenReferenceMarkoutWindow(1_000);
+      expect(mockDb.boundedQuery).toHaveBeenCalledWith(
+        expect.stringContaining('fill_reference_markout_work'), [1_000], options,
+      );
+      expect(mockDb.query).not.toHaveBeenCalled();
+    });
   });
   
   describe('initialize()', () => {
@@ -115,9 +142,18 @@ describe('TrueXPostgreSQLManager', () => {
       expect(sql).toContain("CHECK (state IN ('pending', 'claimed', 'completed'))");
       expect(sql).toContain('idx_reference_markout_due');
       expect(sql).toContain('CREATE INDEX IF NOT EXISTS idx_reference_market_selector_v2');
+      expect(sql).toContain('CREATE INDEX IF NOT EXISTS idx_reference_market_selector_v3');
+      expect(sql).toContain('ADD COLUMN IF NOT EXISTS basis_bid_publication_timestamp BIGINT');
+      expect(sql).toContain('ADD COLUMN IF NOT EXISTS basis_bid_submission_timestamp BIGINT');
+      expect(sql).not.toContain('basis_bid_submission_timestamp BIGINT NOT NULL');
+      expect(sql).toContain('ADD COLUMN IF NOT EXISTS promotion_grade BOOLEAN');
       expect(sql).toContain('(product, quote_currency, source_exchange, source_type, observation_timestamp');
-      expect(sql).toContain('CREATE INDEX IF NOT EXISTS idx_reference_market_retention_v2');
-      expect(sql).toContain('(received_timestamp, observation_timestamp)');
+      expect(sql).toContain('CREATE INDEX IF NOT EXISTS idx_reference_market_retention_v3');
+      expect(sql).toContain('(received_timestamp, observation_timestamp, observation_id)');
+      expect(sql).toContain('idx_reference_decision_retention_v3');
+      expect(sql).toContain('(decision_timestamp, decision_id, session_id, quote_id)');
+      expect(sql).toContain('idx_reference_markout_retention_v2');
+      expect(sql).toContain('(completed_at, fill_id, horizon_ms)');
     });
     
     it('should create TrueX-specific schema', async () => {
@@ -170,6 +206,14 @@ describe('TrueXPostgreSQLManager', () => {
       sourceType: 'top-of-book', sourceTimestamp: 990, receivedTimestamp: 995,
       bid: 99, ask: 101, midpoint: 100, basisTimestamp: 990, basisPrice: 1,
       basisAdjustmentBps: 0, available: true, unavailableReason: null,
+      basisSource: 'kraken-pretrade', basisRequestedPair: 'PYUSD/USD',
+      basisResolvedPair: 'PYUSD/USD', basisBase: 'PYUSD', basisQuote: 'USD',
+      basisVenue: 'PDSL', basisSystem: 'CLOB', basisRequestTimestamp: 970,
+      basisReceivedTimestamp: 995, basisBid: 0.9999, basisAsk: 1.0001,
+      basisBidQty: 10, basisAskQty: 11, basisBidCount: 1, basisAskCount: 2,
+      basisBidSubmissionTimestamp: 980, basisBidPublicationTimestamp: 990,
+      basisAskSubmissionTimestamp: 981, basisAskPublicationTimestamp: 991,
+      promotionGrade: true,
     };
 
     it('stores decisions and schedules every horizon idempotently', async () => {
@@ -207,12 +251,31 @@ describe('TrueXPostgreSQLManager', () => {
       expect(rows[0]).toMatchObject({ fillId: 'F-1', horizonMs: 60_000, dueTimestamp: 62_000 });
     });
 
+    it('checks an indexed unfinished window without mutating work', async () => {
+      mockDb.query.mockResolvedValueOnce({ rows: [{ has_open_window: true }] });
+      await expect(pgManager.hasOpenReferenceMarkoutWindow(1_000)).resolves.toBe(true);
+      const [sql, values] = mockDb.query.mock.calls.at(-1);
+      expect(sql).toContain("state <> 'completed'");
+      expect(sql).toContain('due_timestamp <= $1');
+      expect(sql).toContain('deadline_timestamp >= $1');
+      expect(sql).not.toContain('UPDATE');
+      expect(values).toEqual([1_000]);
+    });
+
     it('persists immutable market samples and selects the earliest sample in the due window', async () => {
       await pgManager.recordReferenceMarketObservation({ ...decision, observationTimestamp: 995 });
       const firstObservationId = mockDb.query.mock.calls.at(-1)[1][0];
       await pgManager.recordReferenceMarketObservation({ ...decision, observationTimestamp: 996 });
       const secondObservationId = mockDb.query.mock.calls.at(-1)[1][0];
       expect(firstObservationId).not.toBe(secondObservationId);
+      await pgManager.recordReferenceMarketObservation({
+        ...decision, observationTimestamp: 997, basisBidQty: 10,
+      });
+      const firstBookIdentity = mockDb.query.mock.calls.at(-1)[1][0];
+      await pgManager.recordReferenceMarketObservation({
+        ...decision, observationTimestamp: 997, basisBidQty: 12,
+      });
+      expect(mockDb.query.mock.calls.at(-1)[1][0]).not.toBe(firstBookIdentity);
       expect(mockDb.query).toHaveBeenLastCalledWith(
         expect.stringContaining('ON CONFLICT (observation_id) DO NOTHING'),
         expect.arrayContaining(['BTC-USD', 990, 995]),
@@ -222,17 +285,58 @@ describe('TrueXPostgreSQLManager', () => {
         source_exchange: 'coinbase', source_type: 'top-of-book', source_timestamp: '990',
         received_timestamp: '995', bid: '99', ask: '101', midpoint: '100',
         basis_timestamp: '990', basis_price: '1', basis_adjustment_bps: '0',
+        basis_source: 'kraken-pretrade', basis_requested_pair: 'PYUSD/USD',
+        basis_resolved_pair: 'PYUSD/USD', basis_base: 'PYUSD', basis_quote: 'USD',
+        basis_venue: 'PDSL', basis_system: 'CLOB', basis_request_timestamp: '970',
+        basis_received_timestamp: '995', basis_bid: '0.9999', basis_ask: '1.0001',
+        basis_bid_qty: '10', basis_ask_qty: '11', basis_bid_count: 1, basis_ask_count: 2,
+        basis_bid_submission_timestamp: '980', basis_bid_publication_timestamp: '990',
+        basis_ask_submission_timestamp: '981', basis_ask_publication_timestamp: '991',
+        promotion_grade: true,
       }] });
       const sample = await pgManager.getFirstReferenceMarketObservation({
         dueTimestamp: 980, deadlineTimestamp: 1000, product: 'BTC-USD',
         quoteCurrency: 'USD', sourceExchange: 'coinbase', sourceType: 'top-of-book',
         maxSourceAgeMs: 100, maxAbsBasisAdjustmentBps: 25,
+        basisSource: 'kraken-pretrade', basisRequestedPair: 'PYUSD/USD',
+        basisResolvedPair: 'PYUSD/USD', basisBase: 'PYUSD', basisQuote: 'USD',
+        basisSystem: 'CLOB', basisVenueAllowlist: ['PDSL'], maxBasisRttMs: 50,
       });
       expect(mockDb.query).toHaveBeenLastCalledWith(
-        expect.stringMatching(/observation_timestamp <= \$6[\s\S]*observation_timestamp >= 0 AND source_timestamp >= 0[\s\S]*received_timestamp >= 0 AND basis_timestamp >= 0[\s\S]*bid::text NOT IN \('NaN', 'Infinity', '-Infinity'\)[\s\S]*ask::text NOT IN \('NaN', 'Infinity', '-Infinity'\)[\s\S]*midpoint::text NOT IN \('NaN', 'Infinity', '-Infinity'\)[\s\S]*basis_price::text NOT IN \('NaN', 'Infinity', '-Infinity'\)[\s\S]*basis_adjustment_bps::text NOT IN \('NaN', 'Infinity', '-Infinity'\)[\s\S]*bid > 0 AND ask > 0 AND bid <= ask[\s\S]*basis_price > 0[\s\S]*source_timestamp <= received_timestamp[\s\S]*received_timestamp <= observation_timestamp[\s\S]*basis_timestamp <= observation_timestamp[\s\S]*ABS\(basis_adjustment_bps\) <= \$8[\s\S]*ORDER BY observation_timestamp ASC,[\s\S]*GREATEST\(source_timestamp, received_timestamp, basis_timestamp\) ASC/),
-        ['BTC-USD', 'USD', 'coinbase', 'top-of-book', 980, 1000, 100, 25],
+        expect.stringMatching(/basis_bid_submission_timestamp >= 0[\s\S]*basis_ask_submission_timestamp >= 0[\s\S]*basis_source = \$9[\s\S]*basis_venue = ANY\(\$15::text\[\]\)[\s\S]*promotion_grade IS TRUE[\s\S]*basis_received_timestamp - basis_request_timestamp <= \$16[\s\S]*basis_timestamp = LEAST[\s\S]*basis_price - \(\(basis_bid \+ basis_ask\) \/ 2\)/),
+        ['BTC-USD', 'USD', 'coinbase', 'top-of-book', 980, 1000, 100, 25,
+          'kraken-pretrade', 'PYUSD/USD', 'PYUSD/USD', 'PYUSD', 'USD', 'CLOB', ['PDSL'], 50],
       );
-      expect(sample).toMatchObject({ available: true, sourceTimestamp: 990, receivedTimestamp: 995 });
+      expect(sample).toMatchObject({ available: true, promotionGrade: true,
+        sourceTimestamp: 990, receivedTimestamp: 995, basisVenue: 'PDSL' });
+    });
+
+    it('persists publication-only diagnostic provenance without promoting it', async () => {
+      const diagnostic = {
+        ...decision, available: false,
+        unavailableReason: 'missing-basis-submission-provenance', promotionGrade: false,
+        basisBidSubmissionTimestamp: null, basisAskSubmissionTimestamp: null,
+      };
+      const expectedProvenance = [
+        'kraken-pretrade', 'PYUSD/USD', 'PYUSD/USD', 'PYUSD', 'USD', 'PDSL', 'CLOB',
+        970, 995, 0.9999, 1.0001, 10, 11, 1, 2, null, 990, null, 991, false,
+      ];
+
+      await pgManager.recordReferenceQuoteDecision(diagnostic);
+      expect(mockDb.query.mock.calls.at(-1)[1].slice(-20)).toEqual(expectedProvenance);
+
+      await pgManager.recordReferenceMarketObservation({
+        ...diagnostic, observationTimestamp: 1000,
+      });
+      expect(mockDb.query.mock.calls.at(-1)[1].slice(-20)).toEqual(expectedProvenance);
+
+      await pgManager.completeReferenceMarkout(
+        { fillId: 'F-diagnostic', horizonMs: 60_000 }, 'owner-diagnostic',
+        { ...diagnostic, observationTimestamp: 62_001 },
+      );
+      const [sql, values] = mockDb.query.mock.calls.at(-1);
+      expect(sql).toContain('promotion_grade');
+      expect(values.slice(-20)).toEqual(expectedProvenance);
     });
 
     it('binds release and terminal evidence completion to the claim owner', async () => {
@@ -252,19 +356,23 @@ describe('TrueXPostgreSQLManager', () => {
     });
 
     it('prunes only terminal evidence and returns a bounded grouped coverage audit', async () => {
-      await pgManager.pruneReferenceMarkoutEvidence(1000);
+      await pgManager.pruneReferenceMarkoutEvidence(1000, 250);
       const pruneSql = String(mockDb.query.mock.calls.at(-1)[0]);
       expect(pruneSql).toContain("work.state = 'completed'");
-      expect(pruneSql).toContain("WHERE state = 'completed'");
-      await pgManager.pruneReferenceQuoteDecisions(1000);
-      expect(mockDb.query).toHaveBeenLastCalledWith(expect.stringContaining("work.state <> 'completed'"), [1000]);
-      await pgManager.pruneReferenceMarketObservations(1000);
+      expect(pruneSql).toContain('LIMIT $2');
+      expect(mockDb.query).toHaveBeenLastCalledWith(expect.any(String), [1000, 250]);
+      await pgManager.pruneReferenceQuoteDecisions(1000, 250);
+      expect(mockDb.query).toHaveBeenLastCalledWith(expect.stringContaining("work.state <> 'completed'"), [1000, 250]);
+      expect(String(mockDb.query.mock.calls.at(-1)[0])).toContain('LIMIT $2');
+      await pgManager.pruneReferenceMarketObservations(1000, 250);
       expect(mockDb.query).toHaveBeenLastCalledWith(
-        expect.stringMatching(/work\.state <> 'completed'[\s\S]*observation\.observation_timestamp BETWEEN work\.due_timestamp AND work\.deadline_timestamp/),
-        [1000],
+        expect.stringMatching(/work\.state <> 'completed'[\s\S]*observation\.observation_timestamp BETWEEN work\.due_timestamp AND work\.deadline_timestamp[\s\S]*LIMIT \$2/),
+        [1000, 250],
       );
+      await expect(pgManager.pruneReferenceMarkoutEvidence(1000, 0)).rejects.toThrow('batchSize');
       const audit = await pgManager.getReferenceMarkoutCoverage({ fromTimestamp: 1, toTimestamp: 2, limit: 5000 });
       expect(mockDb.query).toHaveBeenLastCalledWith(expect.stringContaining('availability_reason'), [1, 2, 1001]);
+      expect(String(mockDb.query.mock.calls.at(-1)[0])).toContain('legacy-missing-basis-provenance');
       expect(audit).toEqual({ groups: [], truncated: false, limit: 1000 });
     });
   });
