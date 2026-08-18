@@ -528,6 +528,50 @@ describe('FIXConnection', () => {
       
       expect(fields['554']).toBe(expectedSignature);
     });
+
+    it('fails logon explicitly when synchronous dispatch is declined', async () => {
+      connection.sendMessage = jest.fn(() => false);
+      const failed = jest.fn();
+      connection.on('session-send-failed', failed);
+
+      await expect(connection.sendLogon()).rejects.toThrow('Logon was not dispatched');
+      expect(failed).toHaveBeenCalledWith(expect.objectContaining({ action: 'logon' }));
+    });
+
+    it('contains an async rejecting session-send-failed observer exactly once', async () => {
+      connection.sendMessage = jest.fn(() => false);
+      const observed = jest.fn(async () => { throw new Error('failure observer rejected'); });
+      const unhandled = jest.fn();
+      connection.on('session-send-failed', observed);
+      process.on('unhandledRejection', unhandled);
+
+      try {
+        await expect(connection.sendLogon()).rejects.toThrow('Logon was not dispatched');
+        await Bun.sleep(10);
+        expect(observed).toHaveBeenCalledTimes(1);
+        expect(unhandled).not.toHaveBeenCalled();
+      } finally {
+        process.off('unhandledRejection', unhandled);
+      }
+    });
+
+    it.each([
+      ['synchronous throw', () => { throw new Error('logon enqueue failed'); }, 'logon enqueue failed'],
+      ['rejected Promise', () => Promise.reject(new Error('logon dispatch rejected')), 'logon dispatch rejected'],
+    ])('reports Logon %s exactly once and remains logged out', async (_name, sendResult, causeText) => {
+      connection.sendMessage = jest.fn(sendResult);
+      const failed = jest.fn();
+      connection.on('session-send-failed', failed);
+
+      await expect(connection.sendLogon()).rejects.toThrow(`FIX Logon dispatch failed: ${causeText}`);
+
+      expect(failed).toHaveBeenCalledTimes(1);
+      expect(failed).toHaveBeenCalledWith(expect.objectContaining({
+        action: 'logon',
+        reason: causeText,
+      }));
+      expect(connection.isLoggedOn).toBe(false);
+    });
   });
   
   describe('sendMessage()', () => {
@@ -556,6 +600,86 @@ describe('FIXConnection', () => {
       expect(sentMessage).toContain('11=ORDER123');
       expect(sentMessage).toContain('55=BTC/USD');
       expect(sentMessage).toContain('10='); // CheckSum
+    });
+
+    it('returns synchronous definitive enqueue acceptance without waiting for socket drain', () => {
+      mockSocketInstance.write.mockReturnValue(false); // net.Socket backpressure, bytes still enqueued
+      const result = connection.sendMessage({ '35': 'D', '11': 'ORDER123' });
+
+      expect(result).not.toBeInstanceOf(Promise);
+      expect(result).toBe(true);
+      expect(mockSocketInstance.write).toHaveBeenCalledTimes(1);
+      expect(connection.msgSeqNum).toBe(2);
+    });
+
+    it('throws synchronously without recording dispatch when socket enqueue throws', () => {
+      mockSocketInstance.write.mockImplementation(() => { throw new Error('enqueue failed'); });
+      expect(() => connection.sendMessage({ '35': 'D', '11': 'ORDER123' })).toThrow('enqueue failed');
+      expect(connection.msgSeqNum).toBe(1);
+      expect(connection.sentMessages.size).toBe(0);
+    });
+
+    it('does not turn post-enqueue telemetry failure into a dispatch rejection', () => {
+      connection.auditLogger = { logFIXMessage: jest.fn(() => { throw new Error('audit failed'); }) };
+      mockSocketInstance.write.mockReturnValue(true);
+      expect(connection.sendMessage({ '35': 'D', '11': 'ORDER123' })).toBe(true);
+      expect(connection.msgSeqNum).toBe(2);
+      expect(connection.sentMessages.has(1)).toBe(true);
+    });
+
+    it('reserves sequence and resend bookkeeping before reentrant debug observers', () => {
+      mockSocketInstance.write.mockReturnValue(true);
+      let reentered = false;
+      connection.logger.debug.mockImplementation(() => {
+        if (reentered) return;
+        reentered = true;
+        connection.sendMessage({ '35': '0', '11': 'SECOND' });
+      });
+
+      expect(connection.sendMessage({ '35': '0', '11': 'FIRST' })).toBe(true);
+      const sequences = mockSocketInstance.write.mock.calls.map(([raw]) =>
+        Number(raw.match(/\x0134=(\d+)\x01/)[1]));
+      expect(sequences).toEqual([1, 2]);
+      expect([...connection.sentMessages.keys()]).toEqual([1, 2]);
+      expect(connection.msgSeqNum).toBe(3);
+    });
+
+    it('never publishes a reentrant N+1 when the outer socket write fails', () => {
+      const nestedResults = [];
+      mockSocketInstance.write.mockImplementation(() => {
+        nestedResults.push(connection.sendMessage({ '35': '0', '11': 'INNER' }));
+        throw new Error('outer enqueue failed');
+      });
+
+      expect(() => connection.sendMessage({ '35': 'D', '11': 'OUTER' })).toThrow('outer enqueue failed');
+      expect(nestedResults).toEqual([false]);
+      expect(connection.msgSeqNum).toBe(1);
+      expect([...connection.sentMessages.keys()]).toEqual([]);
+      expect(mockSocketInstance.write).toHaveBeenCalledTimes(1);
+    });
+
+    it('contains every synchronous post-enqueue failure, including warning logger failure', () => {
+      mockSocketInstance.write.mockReturnValue(true);
+      connection.redisClient = { set: jest.fn(() => { throw new Error('redis invoke'); }) };
+      connection.auditLogger = { logFIXMessage: jest.fn(() => { throw new Error('audit invoke'); }) };
+      connection.logger.warn.mockImplementation(() => { throw new Error('warn invoke'); });
+      connection.on('sent', () => { throw new Error('sent invoke'); });
+
+      expect(connection.sendMessage({ '35': 'D', '11': 'ORDER123' })).toBe(true);
+      expect(connection.msgSeqNum).toBe(2);
+      expect(connection.sentMessages.has(1)).toBe(true);
+    });
+
+    it('contains asynchronous post-enqueue persistence, audit, and sent-listener rejections', async () => {
+      mockSocketInstance.write.mockReturnValue(true);
+      connection.redisClient = { set: jest.fn(() => Promise.reject(new Error('redis async'))) };
+      connection.auditLogger = { logFIXMessage: jest.fn(() => Promise.reject(new Error('audit async'))) };
+      connection.on('sent', async () => { throw new Error('sent async'); });
+
+      expect(connection.sendMessage({ '35': 'D', '11': 'ORDER123' })).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(connection.msgSeqNum).toBe(2);
+      expect(connection.sentMessages.has(1)).toBe(true);
     });
 
     it('should serialize self-match prevention before order body fields', async () => {
@@ -665,6 +789,50 @@ describe('FIXConnection', () => {
       
       expect(resendHandler).toHaveBeenCalledWith({ beginSeqNo: 5, endSeqNo: 10 });
     });
+
+    it('does not report a resend request as sent when synchronous dispatch is declined', async () => {
+      connection.sendMessage = jest.fn(() => false);
+      const resendHandler = jest.fn();
+      const failed = jest.fn();
+      connection.on('resend-request', resendHandler);
+      connection.on('session-send-failed', failed);
+
+      expect(await connection.requestResend(5, 10)).toBe(false);
+      expect(resendHandler).not.toHaveBeenCalled();
+      expect(failed).toHaveBeenCalledWith(expect.objectContaining({ action: 'resend-request' }));
+    });
+
+    it('contains an async rejecting resend-request observer without relabeling accepted dispatch', async () => {
+      const unhandled = jest.fn();
+      const failed = jest.fn();
+      process.on('unhandledRejection', unhandled);
+      connection.on('session-send-failed', failed);
+      connection.on('resend-request', async () => { throw new Error('observer rejected'); });
+
+      try {
+        expect(await connection.requestResend(5, 10)).toBe(true);
+        await Bun.sleep(10);
+        expect(unhandled).not.toHaveBeenCalled();
+        expect(failed).not.toHaveBeenCalled();
+      } finally {
+        process.off('unhandledRejection', unhandled);
+      }
+    });
+
+    it('contains a synchronous resend dispatch throw and reports no success', async () => {
+      connection.sendMessage = jest.fn(() => { throw new Error('resend enqueue failed'); });
+      const resendHandler = jest.fn();
+      const failed = jest.fn();
+      connection.on('resend-request', resendHandler);
+      connection.on('session-send-failed', failed);
+
+      expect(await connection.requestResend(5, 10)).toBe(false);
+      expect(resendHandler).not.toHaveBeenCalled();
+      expect(failed).toHaveBeenCalledWith(expect.objectContaining({
+        action: 'resend-request',
+        reason: 'resend enqueue failed',
+      }));
+    });
   });
   
   describe('handleHeartbeat()', () => {
@@ -695,6 +863,27 @@ describe('FIXConnection', () => {
       expect(sentMessage).toContain('35=0'); // MsgType = Heartbeat
       expect(sentMessage).toContain('112=TEST123'); // TestReqID
       expect(sentMessage).not.toContain('1137=');
+    });
+
+    it('reports a test-request response as failed when synchronous dispatch is declined', async () => {
+      connection.sendMessage = jest.fn(() => false);
+      const failed = jest.fn();
+      connection.on('session-send-failed', failed);
+
+      expect(await connection.handleTestRequest({ fields: { '35': '1', '112': 'TEST123' } })).toBe(false);
+      expect(failed).toHaveBeenCalledWith(expect.objectContaining({ action: 'test-request-heartbeat' }));
+    });
+
+    it('contains a synchronous test-response dispatch throw', async () => {
+      connection.sendMessage = jest.fn(() => { throw new Error('test response enqueue failed'); });
+      const failed = jest.fn();
+      connection.on('session-send-failed', failed);
+
+      expect(await connection.handleTestRequest({ fields: { '35': '1', '112': 'TEST123' } })).toBe(false);
+      expect(failed).toHaveBeenCalledWith(expect.objectContaining({
+        action: 'test-request-heartbeat',
+        reason: 'test response enqueue failed',
+      }));
     });
   });
   
@@ -768,6 +957,21 @@ describe('FIXConnection', () => {
 
       connection.stopHeartbeat();
     });
+
+    it('does not mark a heartbeat sent when synchronous dispatch is declined', async () => {
+      connection.heartbeatInterval = 0.01;
+      connection.sendMessage = jest.fn(() => false);
+      const failed = jest.fn();
+      connection.on('session-send-failed', failed);
+
+      connection.startHeartbeat();
+      await Bun.sleep(30);
+      connection.stopHeartbeat();
+
+      expect(connection.lastHeartbeatSent).toBeNull();
+      expect(failed).toHaveBeenCalledWith(expect.objectContaining({ action: 'heartbeat' }));
+      expect(connection.logger.debug).not.toHaveBeenCalledWith(expect.stringContaining('Heartbeat sent'));
+    });
   });
   
   describe('stopHeartbeat()', () => {
@@ -813,6 +1017,42 @@ describe('FIXConnection', () => {
       
       expect(mockSocketInstance.write).not.toHaveBeenCalled();
       expect(mockSocketInstance.destroy).toHaveBeenCalled();
+    });
+
+    it('reports a declined logout without treating it as dispatched and still closes transport', async () => {
+      connection.isLoggedOn = true;
+      connection.sendMessage = jest.fn(() => false);
+      const failed = jest.fn();
+      connection.on('session-send-failed', failed);
+
+      await connection.disconnect();
+
+      expect(failed).toHaveBeenCalledWith(expect.objectContaining({ action: 'logout' }));
+      expect(mockSocketInstance.destroy).toHaveBeenCalled();
+      expect(connection.isConnected).toBe(false);
+      expect(connection.isLoggedOn).toBe(false);
+    });
+
+    it.each([
+      ['synchronous throw', () => { throw new Error('logout enqueue failed'); }],
+      ['rejected Promise', () => Promise.reject(new Error('logout outcome rejected'))],
+    ])('contains logout %s and always completes teardown', async (_name, sendResult) => {
+      connection.isLoggedOn = true;
+      connection.heartbeatTimer = setInterval(() => {}, 10_000);
+      connection.cleanupTimer = setInterval(() => {}, 10_000);
+      connection.sendMessage = jest.fn(sendResult);
+      const failed = jest.fn();
+      connection.on('session-send-failed', failed);
+
+      await expect(connection.disconnect()).resolves.toBeUndefined();
+
+      expect(failed).toHaveBeenCalledWith(expect.objectContaining({ action: 'logout' }));
+      expect(connection.heartbeatTimer).toBeNull();
+      expect(connection.cleanupTimer).toBeNull();
+      expect(mockSocketInstance.destroy).toHaveBeenCalled();
+      expect(connection.socket).toBeNull();
+      expect(connection.isConnected).toBe(false);
+      expect(connection.isLoggedOn).toBe(false);
     });
   });
   
@@ -1001,6 +1241,26 @@ describe('FIXConnection', () => {
   });
   
   describe('handleIncomingData()', () => {
+    it.each([
+      ['gap resend', '8=FIXT.1.1\x019=50\x0135=0\x0134=3\x0110=123\x01', 'resend-request'],
+      ['test request', '8=FIXT.1.1\x019=50\x0135=1\x0134=1\x01112=probe\x0110=123\x01', 'test-request-heartbeat'],
+    ])('contains inbound fire-and-forget %s dispatch rejection', async (_name, raw, action) => {
+      connection.sendMessage = jest.fn(() => { throw new Error(`${action} enqueue failed`); });
+      const failed = jest.fn();
+      const unhandled = jest.fn();
+      connection.on('session-send-failed', failed);
+      process.on('unhandledRejection', unhandled);
+
+      try {
+        connection.handleIncomingData(Buffer.from(raw));
+        await Bun.sleep(10);
+        expect(unhandled).not.toHaveBeenCalled();
+        expect(failed).toHaveBeenCalledWith(expect.objectContaining({ action }));
+      } finally {
+        process.off('unhandledRejection', unhandled);
+      }
+    });
+
     it('should handle complete messages', () => {
       const messageHandler = jest.fn();
       connection.on('message', messageHandler);
