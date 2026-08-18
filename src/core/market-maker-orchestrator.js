@@ -384,6 +384,8 @@ export class MarketMakerOrchestrator extends EventEmitter {
     };
     this._capitalResyncInFlight = null;
     this._capitalResyncPending = false;
+    this._capitalResyncStrictPending = false;
+    this._capitalResyncStrictDrainSuppressed = false;
   }
 
   /**
@@ -539,11 +541,6 @@ export class MarketMakerOrchestrator extends EventEmitter {
       this.pnlTracker.startPeriodicLogging();
     }
 
-    // 8. Start quote engine drain queue timer
-    this.drainQueueTimer = setInterval(() => {
-      this.quoteEngine.drainQueue();
-    }, this.drainQueueIntervalMs);
-
     // 9. Start REST reconciliation timer (if REST client configured)
     if (this.restClient) {
       this._reconcileTimer = setInterval(() => this._restReconcile(), this.reconcileIntervalMs);
@@ -577,6 +574,13 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this._startTruexEbboPoller();
     this._startPyusdUsdPoller();
     this._fixConnectionOwned = attempt.fixActivationAttempted;
+    // Queue execution begins only after all awaited startup work has completed
+    // and the session is explicitly eligible. The callback revalidates that
+    // gate on every tick so emergency/connection changes cannot dispatch work.
+    this.drainQueueTimer = setInterval(() => {
+      if (this._isQueueDrainExecutionEligible()) this.quoteEngine.drainQueue();
+    }, this.drainQueueIntervalMs);
+    this._drainDeferredAfterStartup();
 
     this.logger.info('[Orchestrator] Market maker started — waiting for price updates to begin quoting');
     this.emit('started', { sessionId: this.sessionId, timestamp: this.startedAt });
@@ -1197,28 +1201,69 @@ export class MarketMakerOrchestrator extends EventEmitter {
     }
   }
 
-  _onCapitalResyncRequired({ side, reason }) {
+  _onCapitalResyncRequired({ side, reason, strict = false }) {
     if (this._capitalResyncInFlight) {
       this._capitalResyncPending = true;
-      return this._capitalResyncInFlight;
+      if (strict) {
+        this._capitalResyncStrictPending = true;
+        this._capitalResyncStrictDrainSuppressed = true;
+      }
+      return this._capitalResyncResult(this._capitalResyncInFlight, { side, reason, strict });
     }
     this.logger.warn(`[Orchestrator] Capital resync required for ${side}: ${reason}`);
-    this._capitalResyncInFlight = (async () => {
+    if (strict) {
+      this._capitalResyncStrictPending = true;
+      this._capitalResyncStrictDrainSuppressed = true;
+    }
+    const operation = (async () => {
       do {
         this._capitalResyncPending = false;
-        await this._refreshBalances({ requireLiveOrders: true, clearBlockedSides: true });
+        const strictPass = this._capitalResyncStrictPending;
+        this._capitalResyncStrictPending = false;
+        const refreshOptions = { requireLiveOrders: true, clearBlockedSides: true };
+        if (strictPass) refreshOptions.allowPreStart = true;
+        await this._refreshBalances(refreshOptions);
+        if (strictPass && this.capitalReservationManager?.getStatus?.().state === 'failed') {
+          throw new Error('capital reconciliation remained failed after strict recovery');
+        }
         // Re-derive from the reconciled balance snapshot; never replay the rejected size.
         this.quoteEngine.deferredRepriceNeeded = true;
-        this.quoteEngine.drainQueue();
-      } while (this._capitalResyncPending);
-    })()
-      .catch((error) => {
-        this.logger.error(`[Orchestrator] Capital resync failed for ${side}: ${error.message}`);
-      })
-      .finally(() => {
+        if (!this._capitalResyncStrictDrainSuppressed) this.quoteEngine.drainQueue();
+      } while (this._capitalResyncPending || this._capitalResyncStrictPending);
+    })();
+    const tracked = operation.finally(() => {
+      if (this._capitalResyncInFlight === tracked) {
         this._capitalResyncInFlight = null;
+        this._capitalResyncStrictDrainSuppressed = false;
+      }
+    });
+    this._capitalResyncInFlight = tracked;
+    return this._capitalResyncResult(tracked, { side, reason, strict });
+  }
+
+  _capitalResyncResult(operation, { side, strict }) {
+    if (strict) {
+      return operation.then(() => {
+        if (this.capitalReservationManager?.getStatus?.().state === 'failed') {
+          throw new Error('capital reconciliation remained failed after strict recovery');
+        }
       });
-    return this._capitalResyncInFlight;
+    }
+    return operation.catch((error) => {
+      this.logger.error(`[Orchestrator] Capital resync failed for ${side}: ${error.message}`);
+    });
+  }
+
+  _drainDeferredAfterStartup() {
+    if (!this._isQueueDrainExecutionEligible() || !this.quoteEngine.deferredRepriceNeeded) return false;
+    this.quoteEngine.drainQueue();
+    return true;
+  }
+
+  _isQueueDrainExecutionEligible() {
+    const exposesLogonState = 'isLoggedOn' in this.fixOE;
+    return this.isRunning && this._emergencyUnsafe !== true &&
+      (!exposesLogonState || this.fixOE.isLoggedOn === true);
   }
 
   _getContinuityStatus() {
@@ -2059,7 +2104,11 @@ export class MarketMakerOrchestrator extends EventEmitter {
     const needsCoherentRecovery = capital &&
       (capital.state === 'failed' || capital.blockedSides.length > 0);
     if (!needsCoherentRecovery) return this._refreshBalances();
-    if (this._capitalResyncInFlight) return this._capitalResyncInFlight;
+    if (this._capitalResyncInFlight) {
+      return this._capitalResyncResult(this._capitalResyncInFlight, {
+        side: 'multiple', reason: 'periodic-capital-recovery', strict: false,
+      });
+    }
     const side = capital.blockedSides.length === 1 ? capital.blockedSides[0] : 'multiple';
     return this._onCapitalResyncRequired({
       side,
@@ -2072,8 +2121,10 @@ export class MarketMakerOrchestrator extends EventEmitter {
    * Uses refreshBalances() which does NOT reset netPosition/VWAP.
    * Safe to call during active trading.
    */
-  async _refreshBalances({ requireLiveOrders = false, clearBlockedSides = false } = {}) {
-    if (!this.restClient || !this.isRunning) return;
+  async _refreshBalances({
+    requireLiveOrders = false, clearBlockedSides = false, allowPreStart = false,
+  } = {}) {
+    if (!this.restClient || (!this.isRunning && !allowPreStart)) return;
 
     const generation = this.capitalReservationManager?.beginReconciliation();
     try {
@@ -2599,7 +2650,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
     let current = rawOrders;
     while (true) {
       if (postScan) this._validateStartupPostScanSnapshot(current, cancellationTargets);
-      const pending = current.filter((raw) => raw?.status === 'CANCEL_PENDING');
+      const pending = current.filter((raw) =>
+        raw?.status === 'CANCEL_PENDING' || raw?.status === 'MODIFY_PENDING'
+      );
       const unresolvedTargets = cancellationTargets.length > 0
         ? this._validateStartupOrphanTargets(current, cancellationTargets)
         : new Set();
@@ -2607,11 +2660,15 @@ export class MarketMakerOrchestrator extends EventEmitter {
 
       const venueIds = new Set();
       const externalIds = new Set();
+      const hasModifyPending = pending.some(raw => raw?.status === 'MODIFY_PENDING');
       for (const raw of pending) {
         const venueId = typeof raw?.id === 'string' ? raw.id.trim() : '';
         const externalId = typeof raw?.external_id === 'string' ? raw.external_id.trim() : '';
         if (!venueId || !externalId || venueIds.has(venueId) || externalIds.has(externalId)) {
-          throw new Error('invalid cancel-pending identity during strict startup reconciliation');
+          throw new Error(
+            `${hasModifyPending ? 'invalid transitional-order' : 'invalid cancel-pending'} identity ` +
+            'during strict startup reconciliation'
+          );
         }
         venueIds.add(venueId);
         externalIds.add(externalId);
@@ -2621,7 +2678,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
         budget,
         cancellationTargets.length > 0
           ? 'orphan cancellation verification timed out'
-          : 'cancel-pending verification timed out',
+          : (hasModifyPending
+            ? 'transitional-order verification timed out'
+            : 'cancel-pending verification timed out'),
       );
     }
   }
@@ -2688,7 +2747,8 @@ export class MarketMakerOrchestrator extends EventEmitter {
         const parsed = TrueXRESTClient.parseOrder(raw);
         if (['CANCELED', 'FILLED', 'REJECTED'].includes(parsed.status)) continue;
         // Skip transitional states
-        if (parsed.status === 'NEW_PENDING' || parsed.status === 'CANCEL_PENDING') continue;
+        if (parsed.status === 'NEW_PENDING' || parsed.status === 'CANCEL_PENDING' ||
+            parsed.status === 'MODIFY_PENDING') continue;
         exchangeOrders.push({ ...parsed, rawId: raw.id });
         if (parsed.externalId) exchangeClOrdIDs.add(parsed.externalId);
       }
@@ -2817,10 +2877,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
       if (ghostsRemoved > 0 && this.capitalReservationManager) {
         const side = ghostSides.size === 1 ? [...ghostSides][0]
           : (ghostSides.size > 1 ? 'multiple' : 'unknown');
-        await this._onCapitalResyncRequired({
-          side,
-          reason: 'rest-order-absence-unknown-outcome',
-        });
+        const resyncRequest = { side, reason: 'rest-order-absence-unknown-outcome' };
+        if (strict) resyncRequest.strict = true;
+        await this._onCapitalResyncRequired(resyncRequest);
       }
 
       const stats = {

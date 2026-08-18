@@ -290,6 +290,37 @@ describe('MarketMakerOrchestrator strict startup reconciliation', () => {
     await orchestrator.stop();
   });
 
+  test('slow startup snapshot cannot run the drain timer before execution eligibility', async () => {
+    let releaseSnapshot;
+    let snapshotCalls = 0;
+    const orchestrator = makeStartupOrchestrator({
+      postgresManager: {}, drainQueueIntervalMs: 5,
+    });
+    orchestrator.quoteEngine.deferredRepriceNeeded = true;
+    orchestrator._takeBalanceSnapshot = mock(() => {
+      snapshotCalls += 1;
+      if (snapshotCalls > 1) return Promise.resolve();
+      return new Promise(resolve => { releaseSnapshot = resolve; });
+    });
+
+    const starting = orchestrator.start();
+    while (!releaseSnapshot) await Promise.resolve();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(orchestrator.isRunning).toBe(false);
+    expect(orchestrator.drainQueueTimer).toBeNull();
+    expect(orchestrator.quoteEngine.drainQueue).not.toHaveBeenCalled();
+
+    releaseSnapshot();
+    await starting;
+    expect(orchestrator.isRunning).toBe(true);
+    expect(orchestrator.quoteEngine.drainQueue).toHaveBeenCalledTimes(1);
+    for (let turn = 0; turn < 50 && orchestrator.quoteEngine.drainQueue.mock.calls.length === 1; turn++) {
+      await new Promise(resolve => setTimeout(resolve, 1));
+    }
+    expect(orchestrator.quoteEngine.drainQueue.mock.calls.length).toBeGreaterThan(1);
+    await orchestrator.stop();
+  });
+
   test('partial FIX and PnL activation throws are owned and unwound', async () => {
     const fixFailure = makeStartupOrchestrator();
     fixFailure.fixOE.connect = mock(async function connect() {
@@ -731,6 +762,52 @@ describe('MarketMakerOrchestrator strict startup reconciliation', () => {
       await expect(orchestrator._restReconcile({ allowPreStart: true, strict: true }))
         .rejects.toThrow('invalid cancel-pending identity');
     }
+  });
+
+  test('strict startup waits for modify-pending settlement before orphan handling', async () => {
+    let now = 0;
+    const terminalRows = mock()
+      .mockResolvedValueOnce([rawOrder('venue-modify', 'prior-modify', 'MODIFY_PENDING')])
+      .mockResolvedValueOnce([rawOrder('venue-modify', 'prior-modify', 'CANCELED')]);
+    const terminal = makeStartupOrchestrator({ now: () => now, sleep: async (ms) => { now += ms; } });
+    terminal.restClient = { getActiveOrders: terminalRows, cancelOrder: mock(async () => {}) };
+    await expect(terminal._restReconcile({ allowPreStart: true, strict: true })).resolves.toMatchObject({
+      orphansCancelled: 0,
+    });
+    expect(terminal.restClient.cancelOrder).not.toHaveBeenCalled();
+
+    const activeRows = mock()
+      .mockResolvedValueOnce([rawOrder('venue-modify', 'prior-modify', 'MODIFY_PENDING')])
+      .mockResolvedValueOnce([rawOrder('venue-modify', 'prior-modify', 'ACTIVE')])
+      .mockResolvedValueOnce([rawOrder('venue-modify', 'prior-modify', 'CANCEL_PENDING')])
+      .mockResolvedValueOnce([rawOrder('venue-modify', 'prior-modify', 'CANCELED')]);
+    const active = makeStartupOrchestrator({ now: () => now, sleep: async (ms) => { now += ms; } });
+    active.restClient = { getActiveOrders: activeRows, cancelOrder: mock(async () => {}) };
+    await expect(active._restReconcile({ allowPreStart: true, strict: true })).resolves.toMatchObject({
+      orphansCancelled: 1,
+    });
+    expect(active.restClient.cancelOrder).toHaveBeenCalledWith('venue-modify');
+  });
+
+  test('strict startup rejects timed-out or malformed modify-pending evidence', async () => {
+    let now = 0;
+    const timeout = makeStartupOrchestrator({
+      startupCancelVerifyTimeoutMs: 20, startupCancelVerifyIntervalMs: 10,
+      now: () => now, sleep: async (ms) => { now += ms; },
+    });
+    timeout.restClient = {
+      getActiveOrders: mock(async () => [rawOrder('venue-modify', 'prior-modify', 'MODIFY_PENDING')]),
+      cancelOrder: mock(async () => {}),
+    };
+    await expect(timeout._restReconcile({ allowPreStart: true, strict: true }))
+      .rejects.toThrow('transitional-order verification timed out');
+    expect(timeout.restClient.cancelOrder).not.toHaveBeenCalled();
+
+    const malformed = makeStartupOrchestrator();
+    const malformedRow = rawOrder('venue-modify', '', 'MODIFY_PENDING');
+    malformed.restClient = { getActiveOrders: mock(async () => [malformedRow]) };
+    await expect(malformed._restReconcile({ allowPreStart: true, strict: true }))
+      .rejects.toThrow('invalid transitional-order identity');
   });
 
   test('strict startup verifies newly cancelled ACTIVE orphan terminal before succeeding', async () => {
@@ -1232,6 +1309,112 @@ describe('MarketMakerOrchestrator strict startup reconciliation', () => {
     releaseResync();
     await reconciling;
     expect(reconcileFinished).toBe(true);
+  });
+
+  test('strict startup ghost recovery propagates refresh errors and failed manager state', async () => {
+    for (const refreshThrows of [true, false]) {
+      const capital = new CapitalReservationManager();
+      capital.reconcile({ ...balances, liveOrders: [] });
+      capital.reserve({ orderId: 'ghost', side: 'sell', size: 0.01, price: 100000, level: 1 });
+      capital.accept('ghost');
+      const orchestrator = makeStartupOrchestrator({ capitalReservationManager: capital });
+      orchestrator.restClient = { getActiveOrders: mock(async () => []) };
+      orchestrator.quoteEngine.activeOrders.set('ghost', { side: 'sell', status: 'active' });
+      orchestrator.quoteEngine.removeStaleOrder = mock((orderId) => {
+        orchestrator.quoteEngine.activeOrders.delete(orderId);
+        capital.restOrderAbsent(orderId);
+        return true;
+      });
+      orchestrator._refreshBalances = mock(async (options) => {
+        expect(options).toEqual({
+          requireLiveOrders: true, clearBlockedSides: true, allowPreStart: true,
+        });
+        capital.reconciliationFailed();
+        if (refreshThrows) throw new Error('strict fresh snapshot unavailable');
+      });
+
+      await expect(orchestrator._restReconcile({ allowPreStart: true, strict: true }))
+        .rejects.toThrow(refreshThrows ? 'strict fresh snapshot unavailable' : 'capital reconciliation remained failed');
+      expect(orchestrator._capitalResyncInFlight).toBeNull();
+      expect(capital.getStatus().state).toBe('failed');
+      expect(orchestrator.quoteEngine.drainQueue).not.toHaveBeenCalled();
+      expect(orchestrator.quoteEngine.deferredRepriceNeeded).toBeFalsy();
+      expect(orchestrator.drainQueueTimer).toBeNull();
+    }
+  });
+
+  test('successful strict recovery defers queue work until startup is execution-eligible', async () => {
+    const capital = new CapitalReservationManager();
+    capital.reconcile({ ...balances, liveOrders: [] });
+    const orchestrator = makeStartupOrchestrator({ capitalReservationManager: capital });
+    orchestrator.restClient = {};
+    orchestrator._refreshBalances = mock(async () => {
+      capital.reconcile({ ...balances, liveOrders: [], clearBlockedSides: true });
+    });
+
+    await orchestrator._onCapitalResyncRequired({
+      side: 'sell', reason: 'strict-startup-ghost', strict: true,
+    });
+    expect(orchestrator.quoteEngine.deferredRepriceNeeded).toBe(true);
+    expect(orchestrator.quoteEngine.drainQueue).not.toHaveBeenCalled();
+    expect(orchestrator._drainDeferredAfterStartup()).toBe(false);
+    expect(orchestrator.quoteEngine.drainQueue).not.toHaveBeenCalled();
+
+    orchestrator.isRunning = true;
+    orchestrator.fixOE.isLoggedOn = true;
+    expect(orchestrator._drainDeferredAfterStartup()).toBe(true);
+    expect(orchestrator.quoteEngine.drainQueue).toHaveBeenCalledTimes(1);
+    orchestrator.isRunning = false;
+  });
+
+  test('start drains strict recovery work only after FIX eligibility is established', async () => {
+    const capital = new CapitalReservationManager();
+    capital.reconcile({ ...balances, liveOrders: [] });
+    const orchestrator = makeStartupOrchestrator({ capitalReservationManager: capital });
+    orchestrator.restClient = {};
+    orchestrator.inventoryManager.balancesInitialized = true;
+    orchestrator._initializeBalances = mock(async () => {});
+    orchestrator._refreshBalances = mock(async () => {
+      capital.reconcile({ ...balances, liveOrders: [], clearBlockedSides: true });
+    });
+    orchestrator._restReconcile = mock(async () => {
+      await orchestrator._onCapitalResyncRequired({
+        side: 'sell', reason: 'strict-startup-ghost', strict: true,
+      });
+      expect(orchestrator.isRunning).toBe(false);
+      expect(orchestrator.fixOE.isLoggedOn).toBe(false);
+      expect(orchestrator.quoteEngine.drainQueue).not.toHaveBeenCalled();
+    });
+
+    await orchestrator.start();
+    expect(orchestrator.fixOE.isLoggedOn).toBe(true);
+    expect(orchestrator.quoteEngine.drainQueue).toHaveBeenCalledTimes(1);
+    orchestrator.restClient = null;
+    await orchestrator.stop();
+  });
+
+  test('strict capital recovery joining a runtime single-flight still observes its error', async () => {
+    let rejectRefresh;
+    const orchestrator = makeStartupOrchestrator();
+    orchestrator._capitalResyncInFlight = null;
+    orchestrator._capitalResyncPending = false;
+    orchestrator._capitalResyncStrictPending = false;
+    orchestrator._refreshBalances = mock(() => new Promise((_, reject) => { rejectRefresh = reject; }));
+
+    const runtime = orchestrator._onCapitalResyncRequired({
+      side: 'sell', reason: 'runtime-insufficient-funds',
+    });
+    const strict = orchestrator._onCapitalResyncRequired({
+      side: 'sell', reason: 'strict-startup-ghost', strict: true,
+    });
+    const runtimeObserved = runtime.then(value => ({ value }), error => ({ error }));
+    const strictObserved = strict.then(value => ({ value }), error => ({ error }));
+    rejectRefresh(new Error('shared fresh snapshot failed'));
+
+    expect(await runtimeObserved).toEqual({ value: undefined });
+    expect((await strictObserved).error?.message).toContain('shared fresh snapshot failed');
+    expect(orchestrator._refreshBalances).toHaveBeenCalledTimes(1);
+    expect(orchestrator._capitalResyncInFlight).toBeNull();
   });
 
   test('failed runtime ghost resync leaves the affected side blocked and failed', async () => {
