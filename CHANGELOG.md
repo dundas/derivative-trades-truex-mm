@@ -8,6 +8,9 @@ with enhanced attribution to track which AI model/CLI made each change.
 ## [Unreleased]
 
 ### Added
+- Added authoritative exchange-capital reservations, acknowledged two-sided presence, fail-soft
+  execution states, and configurable degraded-mode continuity controls (Codex, 2026-08-18)
+  - **Context:** [PRD 0014](tasks/0014-prd-continuous-market-maker-control.md) | Tasks 2.0 and 3.1-3.4
 - Added durable, restart-safe 1/5/60-minute Coinbase reference mark-outs, bounded coverage auditing, and a default-off production rollout switch (Codex, 2026-08-17)
   - **Context:** [PRD 0014](tasks/0014-prd-continuous-market-maker-control.md) | Tasks 5.1-5.2 | PR #74 | PR #75
 - Added the offline regime strategy validator, JSON CLI, conservative evidence gates, and zero-dispatch smoke (Codex, 2026-08-17)
