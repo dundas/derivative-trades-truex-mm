@@ -1661,6 +1661,23 @@ export class MarketMakerOrchestrator extends EventEmitter {
         this._fetchBalances(),
         this.capitalReservationManager || requireLiveOrders ? this._fetchCapitalLiveOrders() : Promise.resolve([]),
       ]);
+      const absentLocalOrderIds = [];
+      if (this.capitalReservationManager && generation) {
+        const liveIds = new Set(liveOrders.map((order) => order?.orderId).filter(Boolean));
+        for (const orderId of generation.knownOrders.keys()) {
+          if (liveIds.has(orderId)) continue;
+          const current = this.capitalReservationManager.getReservation(orderId);
+          // The absence snapshot is stale for any order mutated after the
+          // request began. Only remove an unchanged acknowledged-live order.
+          if (!current?.acknowledgedLive || current.lastMutationSequence > generation.eventSequence) continue;
+          const reconciled = typeof this.quoteEngine.reconcileRestAbsentOrder === 'function'
+            ? this.quoteEngine.reconcileRestAbsentOrder(orderId)
+            : (this.quoteEngine.activeOrders.has(orderId) && this.quoteEngine.removeStaleOrder(orderId));
+          if (reconciled?.changed || reconciled === true) {
+            absentLocalOrderIds.push(orderId);
+          }
+        }
+      }
       this.inventoryManager.refreshBalances({ baseBalance, quoteBalance });
       this.capitalReservationManager?.reconcile({
         baseBalance,
@@ -1669,6 +1686,19 @@ export class MarketMakerOrchestrator extends EventEmitter {
         clearBlockedSides,
         generation,
       });
+      if (absentLocalOrderIds.length > 0) {
+        // removeStaleOrder created a conservative delta after this request
+        // began, so this snapshot cannot absorb/unblock it. Require one more
+        // coalesced fresh generation, then re-derive quotes from that state.
+        if (this._capitalResyncInFlight) {
+          this._capitalResyncPending = true;
+        } else {
+          await this._onCapitalResyncRequired({
+            side: 'multiple',
+            reason: 'rest-order-absence-local-state-reconciled',
+          });
+        }
+      }
     } catch (err) {
       this.logger.warn(`[Orchestrator] Balance refresh failed (non-fatal): ${err.message}`);
       this.capitalReservationManager?.reconciliationFailed();

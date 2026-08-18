@@ -3,6 +3,7 @@ import { EventEmitter } from 'events';
 import { CapitalReservationManager } from './capital-reservation-manager.js';
 import { MarketMakerOrchestrator } from './market-maker-orchestrator.js';
 import { MakerPresenceController } from './maker-presence-controller.js';
+import { QuoteEngine } from './quote-engine.js';
 
 const continuity = {
   minActiveLevelsPerSide: 1, minimumFundedQuoteSize: 0.0001,
@@ -326,5 +327,110 @@ describe('MarketMakerOrchestrator strict startup reconciliation', () => {
     expect(capital.reserve({
       orderId: 'recovered-ask', side: 'sell', size: 0.001, price: 100000, level: 1,
     }).accepted).toBe(true);
+  });
+
+  test('lost cancel ack removes stale local replacement state before a second fresh snapshot unblocks', async () => {
+    const capital = new CapitalReservationManager();
+    capital.reconcile({ ...balances, liveOrders: [] });
+    const engine = new QuoteEngine({
+      capitalReservationManager: capital,
+      fixConnection: { sendMessage: mock(() => {}) },
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+    });
+    const orderId = engine._sendNewOrder({ side: 'sell', size: 0.01, price: 100000, level: 1 });
+    engine.onExecutionReport({ '11': orderId, '39': '0', '54': '2' });
+    engine.pendingReplacements.set(orderId, {
+      quote: { side: 'sell', size: 0.01, price: 100001, level: 1 },
+      expiresAt: Date.now() - 1,
+    });
+    engine.cancelAllQuotes('lost-cancel-ack-test');
+    const cancelId = [...engine.cancelToOrigMap.entries()]
+      .find(([, originalId]) => originalId === orderId)?.[0];
+    expect(cancelId).toBeString();
+    expect(engine.activeOrders.has(orderId)).toBe(false);
+    expect(capital.getReservation(orderId)).toMatchObject({
+      state: 'cancel-in-flight', acknowledgedLive: true,
+    });
+    let releaseSecondSnapshot;
+    const fetchLiveOrders = mock()
+      .mockResolvedValueOnce([])
+      .mockImplementationOnce(() => new Promise((resolve) => {
+        releaseSecondSnapshot = () => resolve([]);
+      }));
+    engine.drainQueue = mock(() => {});
+    const orchestrator = Object.assign(Object.create(MarketMakerOrchestrator.prototype), {
+      isRunning: true,
+      restClient: {},
+      capitalReservationManager: capital,
+      quoteEngine: engine,
+      inventoryManager: { refreshBalances: mock(() => {}) },
+      _capitalResyncInFlight: null,
+      _capitalResyncPending: false,
+      _fetchBalances: mock(async () => balances),
+      _fetchCapitalLiveOrders: fetchLiveOrders,
+      logger: { info() {}, warn() {}, error() {} },
+    });
+
+    const recovering = orchestrator._onCapitalResyncRequired({
+      side: 'sell', reason: 'lost-cancel-ack',
+    });
+    for (let turn = 0; turn < 10 && !releaseSecondSnapshot; turn++) await Promise.resolve();
+    expect(typeof releaseSecondSnapshot).toBe('function');
+    expect(engine.activeOrders.has(orderId)).toBe(false);
+    expect(engine.pendingReplacements.has(orderId)).toBe(false);
+    expect([...engine.cancelToOrigMap.values()]).not.toContain(orderId);
+    expect(capital.getReservation(orderId)).toMatchObject({
+      state: 'rest-absence-evidence-gap', acknowledgedLive: false,
+    });
+    expect(capital.getStatus()).toMatchObject({ state: 'degraded', blockedSides: ['sell'] });
+    expect(capital.reserve({
+      orderId: 'premature-reuse', side: 'sell', size: 0.001, price: 100000, level: 1,
+    }).accepted).toBe(false);
+
+    releaseSecondSnapshot();
+    await recovering;
+    expect(fetchLiveOrders).toHaveBeenCalledTimes(2);
+    expect(capital.getStatus()).toMatchObject({ state: 'normal', blockedSides: [] });
+    engine._expirePendingReplacements();
+    expect(engine.activeOrders.has(orderId)).toBe(false);
+
+    engine.onExecutionReport({
+      '11': orderId, '39': '2', '54': '2', '17': 'delayed-terminal',
+      '31': '100000', '32': '0.01', '151': '0',
+    });
+    engine.onExecutionReport({ '11': cancelId, '41': orderId, '39': '4', '54': '2' });
+    expect(capital.getPresence()).toEqual({ buy: 0, sell: 0 });
+    expect(capital.consumedEvents).toHaveLength(0);
+    expect(engine.deferredRepriceNeeded).toBe(true);
+  });
+
+  test('coherent live-order snapshot retains healthy acknowledged local order', async () => {
+    const capital = new CapitalReservationManager();
+    capital.reconcile({ ...balances, liveOrders: [] });
+    const activeOrders = new Map([['healthy', {
+      side: 'buy', size: 0.001, price: 100000, level: 1, status: 'active', acknowledgedLive: true,
+    }]]);
+    capital.reserve({ orderId: 'healthy', side: 'buy', size: 0.001, price: 100000, level: 1 });
+    capital.accept('healthy');
+    const quoteEngine = {
+      activeOrders,
+      removeStaleOrder: mock(() => false),
+    };
+    const orchestrator = Object.assign(Object.create(MarketMakerOrchestrator.prototype), {
+      isRunning: true,
+      restClient: {},
+      capitalReservationManager: capital,
+      quoteEngine,
+      inventoryManager: { refreshBalances: mock(() => {}) },
+      _capitalResyncInFlight: null,
+      _fetchBalances: mock(async () => balances),
+      _fetchCapitalLiveOrders: mock(async () => [{ orderId: 'healthy' }]),
+      logger: { warn() {} },
+    });
+
+    await orchestrator._refreshBalances({ requireLiveOrders: true, clearBlockedSides: true });
+    expect(quoteEngine.removeStaleOrder).not.toHaveBeenCalled();
+    expect(activeOrders.has('healthy')).toBe(true);
+    expect(capital.getReservation('healthy')).toMatchObject({ acknowledgedLive: true, state: 'active' });
   });
 });

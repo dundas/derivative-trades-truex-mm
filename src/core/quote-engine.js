@@ -1523,22 +1523,34 @@ export class QuoteEngine extends EventEmitter {
    */
   removeStaleOrder(clOrdID) {
     const tracked = this.activeOrders.get(clOrdID);
-    if (tracked) {
-      this.activeOrders.delete(clOrdID);
-      if (this.capitalReservationManager) {
-        const evidence = this.capitalReservationManager.restOrderAbsent(clOrdID);
-        if (evidence) {
-          this.emit('rest-order-absence', {
-            ...evidence,
-            level: tracked.level,
-            executionState: 'degraded',
-          });
-        }
-      }
-      this._clearExecutionIdentity(clOrdID);
-      return true;
+    if (!tracked) return false;
+    this.reconcileRestAbsentOrder(clOrdID);
+    return true;
+  }
+
+  /**
+   * Reconcile a manager-known acknowledged order absent from REST. Unlike the
+   * legacy stale-order helper, this also works after emergency cancel-all has
+   * already cleared activeOrders.
+   */
+  reconcileRestAbsentOrder(clOrdID) {
+    const tracked = this.activeOrders.get(clOrdID);
+    if (tracked) this.activeOrders.delete(clOrdID);
+    const evidence = this.capitalReservationManager?.restOrderAbsent(clOrdID) || null;
+    if (evidence) {
+      this.emit('rest-order-absence', {
+        ...evidence,
+        level: tracked?.level,
+        executionState: 'degraded',
+      });
     }
-    return false;
+    this.pendingReplacements.delete(clOrdID);
+    for (const [cancelId, originalId] of this.cancelToOrigMap) {
+      if (originalId === clOrdID) this.cancelToOrigMap.delete(cancelId);
+    }
+    this.deferredRepriceNeeded = true;
+    this._clearExecutionIdentity(clOrdID);
+    return { changed: Boolean(tracked || evidence), removedLocal: Boolean(tracked), evidence };
   }
 
   /**
