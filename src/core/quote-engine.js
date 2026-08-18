@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events';
+import { randomBytes } from 'node:crypto';
 
 // Intentionally duplicated from the CJS FIX builder across the CJS/ESM boundary.
 // Numeric 0 means send 2964=0; boolean/string false disables the tag here via null.
@@ -31,6 +32,19 @@ export class QuoteEngine extends EventEmitter {
     // Dependencies (injected)
     this.inventoryManager = options.inventoryManager;
     this.fixConnection = options.fixConnection;
+    this.capitalReservationManager = options.capitalReservationManager || null;
+    this.continuityStateProvider = options.continuityStateProvider || null;
+    this.maxExecutionDedupeOrders = options.maxExecutionDedupeOrders ?? 10000;
+    if (!Number.isInteger(this.maxExecutionDedupeOrders) || this.maxExecutionDedupeOrders < 1) {
+      throw new Error('maxExecutionDedupeOrders must be a positive integer');
+    }
+    this.maxExecutionIdsPerOrder = options.maxExecutionIdsPerOrder ?? 256;
+    if (!Number.isInteger(this.maxExecutionIdsPerOrder) || this.maxExecutionIdsPerOrder < 1) {
+      throw new Error('maxExecutionIdsPerOrder must be a positive integer');
+    }
+    this.executionDedupeByOrder = new Map();
+    this.terminalExecutionOrders = new Set();
+    this.executionEvidenceGap = null;
     this.logger = options.logger || console;
 
     // Config
@@ -75,6 +89,10 @@ export class QuoteEngine extends EventEmitter {
       marketablePostOnlyAction: options.marketablePostOnlyAction || 'skip',
       replaceMode: options.replaceMode || 'passive-safe',
       minActiveLevelsPerSide: options.minActiveLevelsPerSide ?? 0,
+      minimumFundedQuoteSize: options.minimumFundedQuoteSize ?? 0,
+      degradedMaxLevels: options.degradedMaxLevels ?? 1,
+      degradedSizeFactor: options.degradedSizeFactor ?? 1,
+      defensiveSpreadFloorBps: options.defensiveSpreadFloorBps ?? 0,
       maxReplacementsPerSidePerCycle: options.maxReplacementsPerSidePerCycle ?? Number.POSITIVE_INFINITY,
       pendingReplacementTimeoutMs: options.pendingReplacementTimeoutMs || 5000,
       pendingSelfCrossGuardMs: options.pendingSelfCrossGuardMs ?? 5000,
@@ -105,6 +123,16 @@ export class QuoteEngine extends EventEmitter {
       truexTapeOutlierThresholdBps: options.truexTapeOutlierThresholdBps ?? 50,
       marketDataProvider: options.marketDataProvider || null,
     };
+    if (!Number.isInteger(this.config.degradedMaxLevels) || this.config.degradedMaxLevels < 1) {
+      throw new Error('degradedMaxLevels must be a positive integer');
+    }
+    if (!Number.isFinite(this.config.degradedSizeFactor) ||
+        this.config.degradedSizeFactor <= 0 || this.config.degradedSizeFactor > 1) {
+      throw new Error('degradedSizeFactor must be in (0, 1]');
+    }
+    if (!Number.isFinite(this.config.defensiveSpreadFloorBps) || this.config.defensiveSpreadFloorBps < 0) {
+      throw new Error('defensiveSpreadFloorBps must be a finite non-negative number');
+    }
 
     // State
     this.activeOrders = new Map(); // clOrdID -> { side, price, size, level, status, placedAt }
@@ -114,6 +142,11 @@ export class QuoteEngine extends EventEmitter {
     this.isQuoting = false;
     this.quotingSuspended = false;
     this.orderSequence = 0;
+    this.orderIdNamespace = options.orderIdNamespace || randomBytes(5).toString('base64url').slice(0, 6);
+    this.continuityState = Object.freeze({ executionState: 'normal', reasons: [] });
+    if (!/^[A-Za-z0-9_-]{4,6}$/.test(this.orderIdNamespace)) {
+      throw new Error('orderIdNamespace must contain 4-6 URL-safe characters');
+    }
 
     // Rate limiting
     this.actionQueue = [];
@@ -240,6 +273,7 @@ export class QuoteEngine extends EventEmitter {
    */
   onPriceUpdate(aggregatedPrice) {
     if (!aggregatedPrice) return;
+    this._refreshContinuityState();
     this._expirePendingReplacements();
 
     // Gate on confidence
@@ -360,7 +394,13 @@ export class QuoteEngine extends EventEmitter {
       coinbaseAnchorBufferTicks,
     } = this.config;
 
-    const halfSpread = (baseSpreadBps / 10000) * mid / 2;
+    const degraded = this.continuityState.executionState === 'degraded';
+    const effectiveLevels = degraded ? Math.min(levels, this.config.degradedMaxLevels) : levels;
+    const effectiveSpreadBps = degraded
+      ? Math.max(baseSpreadBps, this.config.defensiveSpreadFloorBps)
+      : baseSpreadBps;
+    const effectiveSizeFactor = degraded ? this.config.degradedSizeFactor : 1;
+    const halfSpread = (effectiveSpreadBps / 10000) * mid / 2;
 
     // coinbase-mirror: anchor L1 to the anchor venue's best bid/ask offset out by a small buffer
     // so our spread mirrors that venue's width while staying maker-safe. Deeper levels step out
@@ -378,24 +418,33 @@ export class QuoteEngine extends EventEmitter {
 
     const bids = [];
     const asks = [];
+    const recordDegradedOmission = (side, level, cause) => {
+      if (!degraded) return;
+      this._recordSuppression(
+        { side, level, cause, transition: 'degraded-quote-omitted' },
+        `degraded-${cause}`,
+      );
+    };
 
     // Track cumulative committed balance: start from what's already committed in active orders
     // This prevents double-commitment when orders from previous reprice are still live
     let bidCommittedQuote = 0;
     let askCommittedBase = 0;
-    for (const [, order] of this.activeOrders) {
-      if (order.status === 'active' || order.status === 'pending') {
-        if (order.side === 'buy') {
-          bidCommittedQuote += order.size * order.price;
-        } else if (order.side === 'sell') {
-          askCommittedBase += order.size;
+    if (!this.capitalReservationManager) {
+      for (const [, order] of this.activeOrders) {
+        if (order.status === 'active' || order.status === 'pending') {
+          if (order.side === 'buy') {
+            bidCommittedQuote += order.size * order.price;
+          } else if (order.side === 'sell') {
+            askCommittedBase += order.size;
+          }
         }
       }
     }
 
-    for (let level = 1; level <= levels; level++) {
+    for (let level = 1; level <= effectiveLevels; level++) {
       const levelOffset = this._getLevelOffset(mid, level, levelSpacingTicks, tickSize);
-      const rawSize = baseSizeBTC * Math.pow(sizeDecayFactor, level - 1);
+      const rawSize = baseSizeBTC * effectiveSizeFactor * Math.pow(sizeDecayFactor, level - 1);
       const size = parseFloat(rawSize.toFixed(this.config.sizeDecimalPlaces));
 
       let rawBid;
@@ -409,37 +458,76 @@ export class QuoteEngine extends EventEmitter {
         rawBid = mid - halfSpread - levelOffset - (skew.bidSkewTicks * tickSize);
         rawAsk = mid + halfSpread + levelOffset + (skew.askSkewTicks * tickSize);
       }
+      if (degraded) {
+        rawBid = Math.min(rawBid, mid - halfSpread - levelOffset);
+        rawAsk = Math.max(rawAsk, mid + halfSpread + levelOffset);
+      }
       const bidPrice = this.snapToTick(rawBid);
       const askPrice = this.snapToTick(rawAsk);
 
       // Filter bids — cap size to remaining available quote balance
-      if (
-        this._canQuoteSide('buy') &&
-        this.withinPriceBand(bidPrice, mid) &&
-        bidPrice * size >= minNotional
-      ) {
-        const cappedBidSize = this._capSizeToBalance('buy', size, bidPrice, bidCommittedQuote);
-        if (cappedBidSize > 0 && bidPrice * cappedBidSize >= minNotional) {
+      if (!this._canQuoteSide('buy')) {
+        recordDegradedOmission('buy', level, 'can-quote-disabled');
+      } else if (!this.withinPriceBand(bidPrice, mid)) {
+        recordDegradedOmission('buy', level, 'price-band');
+      } else if (bidPrice * size < minNotional) {
+        recordDegradedOmission('buy', level, 'minimum-notional');
+      } else {
+        const cappedBidSize = this._capSizeToBalance('buy', size, bidPrice, bidCommittedQuote, level);
+        if (cappedBidSize >= this.config.minimumFundedQuoteSize && bidPrice * cappedBidSize >= minNotional) {
           bids.push({ side: 'buy', price: bidPrice, size: cappedBidSize, level });
           bidCommittedQuote += cappedBidSize * bidPrice;
+        } else if (cappedBidSize < this.config.minimumFundedQuoteSize) {
+          recordDegradedOmission(
+            'buy', level,
+            cappedBidSize + 1e-12 < size ? 'balance-cap-below-minimum-size' : 'minimum-funded-size',
+          );
+        } else {
+          recordDegradedOmission('buy', level, 'minimum-notional-after-cap');
         }
       }
 
       // Filter asks — cap size to remaining available base balance
-      if (
-        this._canQuoteSide('sell') &&
-        this.withinPriceBand(askPrice, mid) &&
-        askPrice * size >= minNotional
-      ) {
-        const cappedAskSize = this._capSizeToBalance('sell', size, askPrice, askCommittedBase);
-        if (cappedAskSize > 0 && askPrice * cappedAskSize >= minNotional) {
+      if (!this._canQuoteSide('sell')) {
+        recordDegradedOmission('sell', level, 'can-quote-disabled');
+      } else if (!this.withinPriceBand(askPrice, mid)) {
+        recordDegradedOmission('sell', level, 'price-band');
+      } else if (askPrice * size < minNotional) {
+        recordDegradedOmission('sell', level, 'minimum-notional');
+      } else {
+        const cappedAskSize = this._capSizeToBalance('sell', size, askPrice, askCommittedBase, level);
+        if (cappedAskSize >= this.config.minimumFundedQuoteSize && askPrice * cappedAskSize >= minNotional) {
           asks.push({ side: 'sell', price: askPrice, size: cappedAskSize, level });
           askCommittedBase += cappedAskSize;
+        } else if (cappedAskSize < this.config.minimumFundedQuoteSize) {
+          recordDegradedOmission(
+            'sell', level,
+            cappedAskSize + 1e-12 < size ? 'balance-cap-below-minimum-size' : 'minimum-funded-size',
+          );
+        } else {
+          recordDegradedOmission('sell', level, 'minimum-notional-after-cap');
         }
       }
     }
 
-    return [...bids, ...asks];
+    if (degraded) {
+      for (let omittedLevel = effectiveLevels + 1; omittedLevel <= levels; omittedLevel++) {
+        for (const side of ['buy', 'sell']) {
+          this._recordSuppression(
+            { side, level: omittedLevel, cause: 'maximum-depth', transition: 'degraded-quote-omitted' },
+            'degraded-max-levels',
+          );
+        }
+      }
+    }
+    const desired = [...bids, ...asks];
+    return degraded
+      ? desired.map((quote) => ({
+          ...quote,
+          executionState: 'degraded',
+          controlReasons: ['degraded-size-factor', 'defensive-spread-floor'],
+        }))
+      : desired;
   }
 
   /**
@@ -531,6 +619,7 @@ export class QuoteEngine extends EventEmitter {
    * Priority: pure cancels first, then replacements, then new places.
    */
   executeActions(actions) {
+    this._refreshContinuityState();
     // Reset rate counter if a second has passed
     const now = Date.now();
     if (now - this.lastActionReset >= 1000) {
@@ -538,15 +627,48 @@ export class QuoteEngine extends EventEmitter {
       this.lastActionReset = now;
     }
 
+    const hasAuthoritativePresence = Boolean(this.capitalReservationManager);
+    const authoritativePresence = this.capitalReservationManager?.getPresence() || { buy: 0, sell: 0 };
+    const absentSides = new Set(
+      ['buy', 'sell'].filter((side) =>
+        hasAuthoritativePresence && this.config.minActiveLevelsPerSide > 0 &&
+          authoritativePresence[side] < this.config.minActiveLevelsPerSide)
+    );
+
     // Build ordered action list. TrueX default is passive-safe because ALO
     // replacements that cross the book are cancelled/rejected by the venue.
     const orderedActions = [];
+    const enforcePresenceFloor = this.continuityState.executionState !== 'unsafe';
 
+    const projectedSafeLevels = { buy: new Set(), sell: new Set() };
+    for (const reservation of this.capitalReservationManager?.getReservations?.() || []) {
+      if (reservation.acknowledgedLive && Number.isInteger(reservation.level) && reservation.level > 0) {
+        projectedSafeLevels[reservation.side]?.add(reservation.level);
+      }
+    }
     for (const c of actions.toCancel) {
+      const side = c.order?.side;
+      const level = c.order?.level;
+      const safeSide = absentSides.size > 0 && side && !absentSides.has(side);
+      const removesUniqueLevel = Boolean(side && projectedSafeLevels[side]?.has(level));
+      const preserveSafeL1 = enforcePresenceFloor && (
+        (hasAuthoritativePresence && removesUniqueLevel &&
+          projectedSafeLevels[side].size <= this.config.minActiveLevelsPerSide) ||
+        (absentSides.size > 0 && level === 1)
+      );
+      if (preserveSafeL1) {
+        this._recordSuppression(
+          c.order,
+          absentSides.size > 0 ? 'degraded-preserve-safe-l1' : 'presence-floor-preserved',
+        );
+        this.deferredRepriceNeeded = true;
+        continue;
+      }
+      if (removesUniqueLevel) projectedSafeLevels[side].delete(level);
       orderedActions.push({ type: 'cancel', clOrdID: c.clOrdID, order: c.order });
     }
 
-    if (this.config.replaceMode === 'place-before-cancel') {
+    if (this.config.replaceMode === 'place-before-cancel' && !hasAuthoritativePresence) {
       for (const r of actions.toReplace) {
         orderedActions.push({ type: 'place', quote: { ...r.place, replacesQuoteId: r.cancel } });
         orderedActions.push({ type: 'cancel', clOrdID: r.cancel, order: r.cancelOrder });
@@ -583,11 +705,25 @@ export class QuoteEngine extends EventEmitter {
 
       for (const r of replacements) {
         const side = r.cancelOrder?.side || r.place?.side;
+        const level = r.cancelOrder?.level || r.place?.level;
         const liveOnSide = liveCountsBySide.get(side) || 0;
         const initialLiveOnSide = initialLiveCountsBySide.get(side) || 0;
         const inflightOnSide = inflightCountsBySide.get(side) || 0;
         const replacementsOnSide = replacementCountsBySide.get(side) || 0;
-        const singleQuoteException = this.config.minActiveLevelsPerSide === 1 &&
+        const safeSide = absentSides.size > 0 && side && !absentSides.has(side);
+        const removesSafeLevel = Boolean(side && projectedSafeLevels[side]?.has(level));
+        if ((enforcePresenceFloor && hasAuthoritativePresence && removesSafeLevel &&
+              projectedSafeLevels[side].size <= this.config.minActiveLevelsPerSide) ||
+            (absentSides.size > 0 && level === 1)) {
+          this._recordSuppression(
+            r.cancelOrder || r.place,
+            level === 1 ? 'degraded-preserve-funded-l1' : 'degraded-preserve-safe-level',
+          );
+          this.deferredRepriceNeeded = true;
+          continue;
+        }
+        const singleQuoteException = !hasAuthoritativePresence && absentSides.size === 0 &&
+          this.config.minActiveLevelsPerSide === 1 &&
           initialLiveOnSide === 1 &&
           inflightOnSide === 0;
 
@@ -603,18 +739,34 @@ export class QuoteEngine extends EventEmitter {
           order: r.cancelOrder,
           quote: r.place,
         });
+        if (removesSafeLevel) projectedSafeLevels[side].delete(level);
         liveCountsBySide.set(side, liveOnSide - 1);
         replacementCountsBySide.set(side, replacementsOnSide + 1);
       }
     }
 
-    for (const p of actions.toPlace) {
+    const placements = [...actions.toPlace].sort((left, right) => {
+      const leftAbsentL1 = absentSides.has(left.side) && left.level === 1 ? 0 : 1;
+      const rightAbsentL1 = absentSides.has(right.side) && right.level === 1 ? 0 : 1;
+      return leftAbsentL1 - rightAbsentL1 || left.level - right.level;
+    });
+    for (const p of placements) {
+      if (absentSides.has(p.side) && p.level > this.config.degradedMaxLevels) {
+        this._recordSuppression(p, 'degraded-missing-side-depth-suppressed');
+        this.deferredRepriceNeeded = true;
+        continue;
+      }
       orderedActions.push({ type: 'place', quote: p });
     }
 
     let dispatched = false;
     let deferredThisCycle = 0;
     for (const action of orderedActions) {
+      if (this.continuityState.executionState === 'unsafe' && action.type !== 'cancel') {
+        this._recordSuppression(action.quote || action.order, 'unsafe-execution-gate');
+        this.deferredRepriceNeeded = false;
+        continue;
+      }
       // Balance-safety gate: a pure placement must not go out while a same-side
       // cancel is still in flight — the venue holds those funds until the cancel
       // is processed, so the new order could exceed available balance and be
@@ -630,6 +782,11 @@ export class QuoteEngine extends EventEmitter {
 
       if (this.actionsThisSecond >= this.config.maxOrdersPerSecond) {
         if (action.type === 'replacement-cancel') {
+          this.deferredRepriceNeeded = true;
+          this.emit('rate-limited', { action: action.type, queueDepth: this.actionQueue.length });
+          continue;
+        }
+        if (this.capitalReservationManager && action.type === 'cancel') {
           this.deferredRepriceNeeded = true;
           this.emit('rate-limited', { action: action.type, queueDepth: this.actionQueue.length });
           continue;
@@ -668,6 +825,11 @@ export class QuoteEngine extends EventEmitter {
    * Dispatch a single action to FIX connection.
    */
   _dispatchAction(action) {
+    this._refreshContinuityState();
+    if (this.continuityState.executionState === 'unsafe' && action.type !== 'cancel') {
+      this._recordSuppression(action.quote || action.order, 'unsafe-execution-gate');
+      return;
+    }
     if (action.type === 'cancel') {
       this._sendCancel(action.clOrdID, action.order);
     } else if (action.type === 'replacement-cancel') {
@@ -708,10 +870,29 @@ export class QuoteEngine extends EventEmitter {
    * Send a FIX New Order Single (35=D).
    */
   _sendNewOrder(quote) {
+    this._refreshContinuityState();
+    if (this.continuityState.executionState === 'unsafe') {
+      this._recordSuppression(quote, 'unsafe-execution-gate');
+      return null;
+    }
     const prepared = this._prepareQuoteForSend(quote);
     if (!prepared) return null;
 
     const clOrdID = this.generateClOrdID();
+    if (this.capitalReservationManager) {
+      const reservation = this.capitalReservationManager.reserve({
+        orderId: clOrdID,
+        side: prepared.side,
+        price: prepared.price,
+        size: prepared.size,
+        level: prepared.level,
+        replacesOrderId: prepared.replacesQuoteId || null,
+      });
+      if (!reservation.accepted) {
+        this._recordSuppression(prepared, reservation.reason);
+        return null;
+      }
+    }
     const fields = {
       '35': 'D',
       '11': clOrdID,
@@ -743,6 +924,7 @@ export class QuoteEngine extends EventEmitter {
       size: prepared.size,
       level: prepared.level,
       status: 'pending',
+      acknowledgedLive: false,
       placedAt: Date.now(),
       orderIntent: prepared.orderIntent || (prepared.postOnly === false ? 'taker_opportunity' : 'maker_quote'),
       liquidityRoleExpected: prepared.postOnly === false ? 'taker' : 'maker',
@@ -756,7 +938,13 @@ export class QuoteEngine extends EventEmitter {
     this.lastActionByClOrdID.set(clOrdID, Date.now());
 
     if (this.fixConnection) {
-      this.fixConnection.sendMessage(fields);
+      try {
+        this.fixConnection.sendMessage(fields);
+      } catch (error) {
+        this.activeOrders.delete(clOrdID);
+        this.capitalReservationManager?.rejected(clOrdID);
+        throw error;
+      }
     }
     if (prepared.postOnly === false) {
       this._recordTakerOrder(prepared.size * prepared.price);
@@ -787,8 +975,11 @@ export class QuoteEngine extends EventEmitter {
     const activeOrder = this.activeOrders.get(origClOrdID);
     if (activeOrder) {
       activeOrder.status = 'cancelling';
+      // A cancel request does not make an acknowledged order disappear from the venue.
+      // Presence clears only on a terminal report or fresh REST absence.
       activeOrder.cancellingAt = Date.now();
     }
+    this.capitalReservationManager?.cancelRequested(origClOrdID);
 
     // Track cancel ClOrdID → original ClOrdID for exec report matching
     this.cancelToOrigMap.set(newClOrdID, origClOrdID);
@@ -808,7 +999,7 @@ export class QuoteEngine extends EventEmitter {
   /**
    * Handle inbound execution reports from FIX.
    */
-  _emitFillEvent(resolvedClOrdID, side, price, size, execID) {
+  _emitFillEvent(resolvedClOrdID, side, price, size, execID, metadata = {}) {
     const tracked = this.activeOrders.get(resolvedClOrdID);
     this.emit('fill', {
       side,
@@ -819,8 +1010,54 @@ export class QuoteEngine extends EventEmitter {
       orderIntent: tracked?.orderIntent || 'maker_quote',
       liquidityRoleExpected: tracked?.liquidityRoleExpected || 'maker',
       isMaker: (tracked?.liquidityRoleExpected || 'maker') === 'maker',
+      ...metadata,
     });
     return tracked;
+  }
+
+  _emitCapitalEvidenceGap(orderId) {
+    const gap = this.capitalReservationManager?.takeEvidenceGap();
+    if (!gap) return;
+    this.emit('capital-resync-required', { ...gap, orderId });
+  }
+
+  setContinuityState(status = {}) {
+    const executionState = ['normal', 'degraded', 'unsafe'].includes(status.executionState)
+      ? status.executionState
+      : 'unsafe';
+    this.continuityState = Object.freeze({
+      executionState,
+      reasons: Object.freeze(Array.isArray(status.reasons) ? [...status.reasons] : ['invalid-continuity-state']),
+      activeLevels: status.activeLevels ? Object.freeze({ ...status.activeLevels }) : undefined,
+    });
+  }
+
+  setContinuityStateProvider(provider) {
+    this.continuityStateProvider = typeof provider === 'function' ? provider : null;
+  }
+
+  _refreshContinuityState() {
+    if (this.executionEvidenceGap) {
+      this.setContinuityState({
+        executionState: 'unsafe',
+        reasons: ['execution-evidence-gap', this.executionEvidenceGap.reason],
+      });
+      return this.continuityState;
+    }
+    if (!this.continuityStateProvider) return this.continuityState;
+    try {
+      const status = this.continuityStateProvider();
+      if (!status || typeof status.then === 'function') throw new Error('continuity provider must be synchronous');
+      this.setContinuityState(status);
+    } catch (error) {
+      this.setContinuityState({ executionState: 'unsafe', reasons: ['continuity-state-provider-failed'] });
+      this.logger.error(`[QuoteEngine] Continuity provider failed closed: ${error.message}`);
+    }
+    return this.continuityState;
+  }
+
+  getContinuityState() {
+    return this.continuityState;
   }
 
   onExecutionReport(fields) {
@@ -831,53 +1068,248 @@ export class QuoteEngine extends EventEmitter {
     const execID = fields['17'];
     const lastPx = parseFloat(fields['31'] || fields['44'] || '0');
     const lastQty = fields['32'] ? parseFloat(fields['32']) : null;
-    const side = fields['54'] === '1' ? 'buy' : 'sell';
-
     // Resolve cancel ClOrdID → original ClOrdID if this is a cancel ack
     const origClOrdID = this.cancelToOrigMap.get(clOrdID);
     const resolvedClOrdID = origClOrdID || clOrdID;
+    const side = this.activeOrders.get(resolvedClOrdID)?.side || (fields['54'] === '1' ? 'buy' : 'sell');
+    if (!this.capitalReservationManager && (ordStatus === '1' || ordStatus === '2')) {
+      if (this.executionEvidenceGap) return;
+      if (this.terminalExecutionOrders.has(resolvedClOrdID)) return;
+      if (!this.activeOrders.has(resolvedClOrdID)) return;
+      if (!execID) {
+        this._failClosedExecutionEvidence(resolvedClOrdID, 'execution-id-required');
+        return;
+      }
+      const identity = this.executionDedupeByOrder.get(resolvedClOrdID);
+      if (identity?.terminal || (execID && identity?.execIDs.has(execID))) return;
+      if (identity && identity.execIDs.size >= this.maxExecutionIdsPerOrder) {
+        this._failClosedExecutionEvidence(resolvedClOrdID, 'execution-id-capacity-exceeded');
+        return;
+      }
+      if (!identity && this.executionDedupeByOrder.size >= this.maxExecutionDedupeOrders) {
+        this._failClosedExecutionEvidence(resolvedClOrdID, 'execution-order-capacity-exceeded');
+        return;
+      }
+      if (ordStatus === '2') {
+        const previousRemaining = Number(this.activeOrders.get(resolvedClOrdID)?.size);
+        const rawLeaves = fields['151'];
+        const leavesSupplied = rawLeaves !== undefined;
+        const parsedLeaves = leavesSupplied && String(rawLeaves).trim() !== '' ? Number(rawLeaves) : NaN;
+        if (!Number.isFinite(previousRemaining) || previousRemaining <= 0) {
+          this._failClosedExecutionEvidence(resolvedClOrdID, 'invalid-terminal-remaining-quantity');
+          return;
+        }
+        if (leavesSupplied && (!Number.isFinite(parsedLeaves) || parsedLeaves !== 0)) {
+          this._failClosedExecutionEvidence(resolvedClOrdID, 'invalid-terminal-leaves-quantity');
+          return;
+        }
+        const quantityProvesTerminal = Number.isFinite(lastQty) && lastQty > 0 &&
+          Math.abs(lastQty - previousRemaining) <= 1e-10;
+        const leavesProveTerminal = leavesSupplied && parsedLeaves === 0;
+        if (!quantityProvesTerminal && !leavesProveTerminal) {
+          this._failClosedExecutionEvidence(resolvedClOrdID, 'unproven-terminal-fill');
+          return;
+        }
+      }
+    }
 
     switch (ordStatus) {
       case '0': // New - order accepted
         this.consecutiveRejects = 0; // Reset backoff on success
         if (this.activeOrders.has(resolvedClOrdID)) {
-          this.activeOrders.get(resolvedClOrdID).status = 'active';
+          const tracked = this.activeOrders.get(resolvedClOrdID);
+          if (tracked.status !== 'cancelling') tracked.status = 'active';
+          tracked.acknowledgedLive = true;
         }
+        this.capitalReservationManager?.accept(resolvedClOrdID);
         break;
 
       case '1': // Partially Filled — record the partial, keep the order live (reduced)
         this.consecutiveRejects = 0; // a fill means the order pipeline is healthy
-        if (lastQty && lastQty > 0) {
+        {
+          const rawLeaves = fields['151'];
+          const trackedBeforeFill = this.activeOrders.get(resolvedClOrdID);
+          let parsedLeaves =
+            rawLeaves !== undefined && String(rawLeaves).trim() !== '' ? Number(rawLeaves) : NaN;
+          if (!this.capitalReservationManager) {
+            const previousRemaining = Number(trackedBeforeFill?.size);
+            if (!Number.isFinite(lastQty) || lastQty <= 0 || !Number.isFinite(previousRemaining) ||
+                lastQty > previousRemaining + 1e-10) {
+              this._failClosedExecutionEvidence(resolvedClOrdID, 'invalid-partial-last-quantity');
+              break;
+            }
+            const expectedLeaves = Math.max(0, previousRemaining - lastQty);
+            if (rawLeaves === undefined) {
+              parsedLeaves = expectedLeaves;
+            } else if (!Number.isFinite(parsedLeaves) || parsedLeaves < 0 ||
+                parsedLeaves > previousRemaining + 1e-10 ||
+                Math.abs(parsedLeaves - expectedLeaves) > 1e-10) {
+              this._failClosedExecutionEvidence(resolvedClOrdID, 'inconsistent-partial-quantity');
+              break;
+            }
+          }
+          let effectiveLastQty = lastQty;
+          let derivedQuantity = false;
+          if ((!Number.isFinite(effectiveLastQty) || effectiveLastQty <= 0) && Number.isFinite(parsedLeaves)) {
+            const remaining = this.capitalReservationManager?.getReservation(resolvedClOrdID)?.remainingSize ??
+              trackedBeforeFill?.size;
+            const derived = Number(remaining) - parsedLeaves;
+            if (Number.isFinite(derived) && derived > 0) {
+              effectiveLastQty = derived;
+              derivedQuantity = true;
+            }
+          }
+          if (!Number.isFinite(effectiveLastQty) || effectiveLastQty <= 0 ||
+              !Number.isFinite(parsedLeaves) || parsedLeaves < 0) {
+            if (!this.capitalReservationManager && Number.isFinite(lastQty) && lastQty > 0 && trackedBeforeFill) {
+              const fallbackLeaves = Math.max(0, Number(trackedBeforeFill.size) - lastQty);
+              const priceEstimated = !Number.isFinite(lastPx) || lastPx <= 0;
+              const effectivePrice = priceEstimated ? Number(trackedBeforeFill.price) : lastPx;
+              if (!Number.isFinite(effectivePrice) || effectivePrice <= 0) {
+                this._failClosedExecutionEvidence(resolvedClOrdID, 'fill-price-evidence-gap');
+                break;
+              }
+              const tracked = this._emitFillEvent(
+                resolvedClOrdID, side, effectivePrice, lastQty, execID,
+                priceEstimated ? { estimated: true, evidenceGap: true } : {},
+              );
+              this.emit('quote-lifecycle', {
+                eventType: 'partial_fill', quoteId: resolvedClOrdID, executionId: execID, side,
+                price: effectivePrice, size: lastQty, level: tracked?.level, action: 'partial_fill',
+                ...(priceEstimated ? { estimated: true, evidenceGap: true } : {}),
+              });
+              if (tracked) {
+                tracked.size = fallbackLeaves;
+                tracked.status = tracked.status === 'cancelling' ? 'cancelling' : 'active';
+                tracked.acknowledgedLive = true;
+              }
+              this._recordExecutionIdentity(resolvedClOrdID, execID);
+              break;
+            }
+            this.capitalReservationManager?.failClosedForEvidenceGap(resolvedClOrdID, 'partial-fill-evidence-gap');
+            this._emitCapitalEvidenceGap(resolvedClOrdID);
+            break;
+          }
+          const leavesQty = parsedLeaves;
+          if (this.capitalReservationManager && !this.capitalReservationManager.fill({
+            orderId: resolvedClOrdID,
+            executionId: execID,
+            quantity: effectiveLastQty,
+            leavesQuantity: leavesQty,
+          })) {
+            this._emitCapitalEvidenceGap(resolvedClOrdID);
+            break;
+          }
           // The generic fill event is rewritten below so consumers receive an explicit lifecycle type.
-          const tracked = this._emitFillEvent(resolvedClOrdID, side, lastPx, lastQty, execID);
+          const fallbackPrice = Number(trackedBeforeFill?.price) ||
+            Number(this.capitalReservationManager?.getReservation(resolvedClOrdID)?.price);
+          const priceEstimated = !Number.isFinite(lastPx) || lastPx <= 0;
+          const effectivePrice = priceEstimated ? fallbackPrice : lastPx;
+          const estimatedEvidence = derivedQuantity || priceEstimated;
+          if (!Number.isFinite(effectivePrice) || effectivePrice <= 0) {
+            if (this.capitalReservationManager) {
+              this.capitalReservationManager.failClosedForEvidenceGap(resolvedClOrdID, 'fill-price-evidence-gap');
+              this._emitCapitalEvidenceGap(resolvedClOrdID);
+            } else {
+              this._failClosedExecutionEvidence(resolvedClOrdID, 'fill-price-evidence-gap');
+            }
+            break;
+          }
+          const tracked = this._emitFillEvent(
+            resolvedClOrdID, side, effectivePrice, effectiveLastQty, execID,
+            estimatedEvidence ? { estimated: true, evidenceGap: true } : {},
+          );
           this.emit('quote-lifecycle', {
             eventType: 'partial_fill', quoteId: resolvedClOrdID, executionId: execID, side,
-            price: lastPx, size: lastQty, level: tracked?.level, action: 'partial_fill',
+            price: effectivePrice, size: effectiveLastQty, level: tracked?.level, action: 'partial_fill',
+            ...(estimatedEvidence ? { estimated: true, evidenceGap: true } : {}),
           });
           if (tracked) {
             // Remaining size = LeavesQty (tag 151) when it is a strictly-numeric value, else
             // subtract LastQty. Strict Number() (not parseFloat) rejects partial garbage like
             // '0.007foo'; the trim guard rejects absent/empty/whitespace (Number('') === 0).
-            const rawLeaves = fields['151'];
-            const parsedLeaves =
-              rawLeaves !== undefined && String(rawLeaves).trim() !== '' ? Number(rawLeaves) : NaN;
-            const leavesQty = Number.isFinite(parsedLeaves) ? parsedLeaves : (tracked.size - lastQty);
             tracked.size = Math.max(0, leavesQty);
             // A fill proves the order is live, so promote 'pending' → 'active'. But preserve
             // 'cancelling' so reconcileOrders doesn't double-act on an in-flight cancel.
             tracked.status = tracked.status === 'cancelling' ? 'cancelling' : 'active';
+            tracked.acknowledgedLive = true;
           }
+          if (!this.capitalReservationManager) this._recordExecutionIdentity(resolvedClOrdID, execID);
         }
         break;
 
       case '2': // Filled — record the fill and remove the order
         this.consecutiveRejects = 0;
-        {
-          const tracked = this._emitFillEvent(resolvedClOrdID, side, lastPx, lastQty, execID);
+        if (this.capitalReservationManager) {
+          const reservation = this.capitalReservationManager.getReservation(resolvedClOrdID);
+          const preTerminalRemaining = reservation?.remainingSize;
+          const fallbackPrice = Number(this.activeOrders.get(resolvedClOrdID)?.price) || Number(reservation?.price);
+          const priceEstimated = !Number.isFinite(lastPx) || lastPx <= 0;
+          const effectivePrice = priceEstimated ? fallbackPrice : lastPx;
+          const leavesProveTerminal = String(fields['151'] ?? '').trim() === '0';
+          const quantityProvesTerminal = lastQty && reservation &&
+            Math.abs(lastQty - reservation.remainingSize) <= 1e-10;
+          let applied = false;
+          const quantityEvidenceGap = !Number.isFinite(lastQty) || lastQty <= 0 ||
+            Math.abs(lastQty - preTerminalRemaining) > 1e-10;
+          if (!execID) {
+            applied = this.capitalReservationManager.terminalEvidenceGap(
+              resolvedClOrdID, 'terminal-fill-execution-id-required',
+            );
+          } else if (leavesProveTerminal || quantityProvesTerminal) {
+            applied = this.capitalReservationManager.fullFill(resolvedClOrdID, execID, {
+              lastQuantity: lastQty,
+              leavesQuantity: 0,
+            });
+          } else {
+            this.logger.warn(`[QuoteEngine] Ignoring unproven full fill without LastQty or LeavesQty=0: clOrdID=${resolvedClOrdID}`);
+            applied = this.capitalReservationManager.terminalEvidenceGap(
+              resolvedClOrdID, 'unproven-terminal-fill',
+            );
+          }
+          this._emitCapitalEvidenceGap(resolvedClOrdID);
+          if (!applied) break;
+          if (preTerminalRemaining > 0 && effectivePrice > 0) {
+            const estimatedEvidence = !execID || quantityEvidenceGap || priceEstimated;
+            const tracked = this._emitFillEvent(
+              resolvedClOrdID, side, effectivePrice, preTerminalRemaining,
+              execID || `estimated-terminal:${resolvedClOrdID}`,
+              estimatedEvidence ? { estimated: true, evidenceGap: true } : {},
+            );
+            this.emit('quote-lifecycle', {
+              eventType: 'full_fill', quoteId: resolvedClOrdID,
+              executionId: execID || `estimated-terminal:${resolvedClOrdID}`,
+              side, price: effectivePrice, size: preTerminalRemaining,
+              level: tracked?.level, action: 'full_fill',
+              ...(estimatedEvidence ? { estimated: true, evidenceGap: true } : {}),
+            });
+          }
+          this.activeOrders.delete(resolvedClOrdID);
+          this.cancelToOrigMap.delete(clOrdID);
+          break;
+        }
+        if (execID) {
+          const trackedBeforeFill = this.activeOrders.get(resolvedClOrdID);
+          const preTerminalRemaining = Number(trackedBeforeFill?.size);
+          const quantityProvesTerminal = Number.isFinite(lastQty) && lastQty > 0 &&
+            Math.abs(lastQty - preTerminalRemaining) <= 1e-10;
+          const priceEstimated = !Number.isFinite(lastPx) || lastPx <= 0;
+          const effectivePrice = priceEstimated ? Number(trackedBeforeFill?.price) : lastPx;
+          if (!Number.isFinite(effectivePrice) || effectivePrice <= 0) {
+            this._failClosedExecutionEvidence(resolvedClOrdID, 'fill-price-evidence-gap');
+            break;
+          }
+          const estimatedEvidence = !quantityProvesTerminal || priceEstimated;
+          const tracked = this._emitFillEvent(
+            resolvedClOrdID, side, effectivePrice, preTerminalRemaining, execID,
+            estimatedEvidence ? { estimated: true, evidenceGap: true } : {},
+          );
           this.emit('quote-lifecycle', {
             eventType: 'full_fill', quoteId: resolvedClOrdID, executionId: execID, side,
-            price: lastPx, size: lastQty, level: tracked?.level, action: 'full_fill',
+            price: effectivePrice, size: preTerminalRemaining, level: tracked?.level, action: 'full_fill',
+            ...(estimatedEvidence ? { estimated: true, evidenceGap: true } : {}),
           });
+          this._recordExecutionIdentity(resolvedClOrdID, execID, { terminal: true });
         }
         this.activeOrders.delete(resolvedClOrdID);
         this.cancelToOrigMap.delete(clOrdID);
@@ -909,6 +1341,8 @@ export class QuoteEngine extends EventEmitter {
           action: 'cancelled', reason: fields['58'] || null,
         });
         this.cancelToOrigMap.delete(clOrdID);
+        this.capitalReservationManager?.cancelled(resolvedClOrdID);
+        this._clearExecutionIdentity(resolvedClOrdID);
         this._releasePendingReplacement(resolvedClOrdID);
         break;
 
@@ -925,19 +1359,43 @@ export class QuoteEngine extends EventEmitter {
           const origOrder = this.activeOrders.get(origClOrdID);
           if (origOrder) {
             origOrder.status = 'active';
+            origOrder.acknowledgedLive = true;
           }
+          this.capitalReservationManager?.cancelRejected(origClOrdID);
           this.cancelToOrigMap.delete(clOrdID);
         } else {
           // New order was rejected — remove from tracking (never made it to exchange)
           this.activeOrders.delete(resolvedClOrdID);
+          this._clearExecutionIdentity(resolvedClOrdID);
         }
         {
           const reason = fields['58'] || 'unknown';
+          const newlyRejected = origClOrdID ? false : (this.capitalReservationManager?.rejected(resolvedClOrdID) ?? true);
+          if (newlyRejected && /insufficient\s+(?:balance|funds)/i.test(reason)) {
+            this.capitalReservationManager?.insufficientFunds(side);
+            this.emit('capital-resync-required', { side, reason });
+          }
           this.recentRejectsByReason.set(reason, (this.recentRejectsByReason.get(reason) || 0) + 1);
           this.logger.error(`[QuoteEngine] Order rejected: clOrdID=${clOrdID}, reason=${reason}, code=${fields['103'] || 'n/a'}`);
           this.emit('quote-lifecycle', {
             eventType: 'reject', quoteId: resolvedClOrdID, orderId: clOrdID, side,
             action: 'reject', reason, executionId: execID,
+          });
+        }
+        break;
+
+      case 'C': // Expired
+        if (!this.capitalReservationManager) {
+          this.logger.warn(`[QuoteEngine] Unhandled execution report ordStatus=${ordStatus} clOrdID=${clOrdID} execID=${execID}`);
+          break;
+        }
+        if (this.capitalReservationManager.expired(resolvedClOrdID)) {
+          const expired = this.activeOrders.get(resolvedClOrdID);
+          this.activeOrders.delete(resolvedClOrdID);
+          this.emit('quote-lifecycle', {
+            eventType: 'cancel', quoteId: resolvedClOrdID, executionId: execID,
+            side: expired?.side || side, price: expired?.price, size: expired?.size,
+            level: expired?.level, action: 'expired', reason: fields['58'] || 'expired',
           });
         }
         break;
@@ -977,12 +1435,15 @@ export class QuoteEngine extends EventEmitter {
       if (cxlRejReason === '1') {
         // Unknown order — it's gone from the exchange, remove from tracking
         this.activeOrders.delete(resolvedOrigClOrdID);
+        this.capitalReservationManager?.cancelled(resolvedOrigClOrdID);
       } else {
         // Cancel failed but original order still lives — restore to 'active'
         const origOrder = this.activeOrders.get(resolvedOrigClOrdID);
         if (origOrder) {
           origOrder.status = 'active';
+          origOrder.acknowledgedLive = true;
         }
+        this.capitalReservationManager?.cancelRejected(resolvedOrigClOrdID);
         this.pendingReplacements.delete(resolvedOrigClOrdID);
       }
     }
@@ -1025,9 +1486,9 @@ export class QuoteEngine extends EventEmitter {
    * Generate a unique ClOrdID that fits within 18 characters.
    */
   generateClOrdID() {
-    const ts = Date.now().toString(36);
-    const seq = (++this.orderSequence % 999).toString().padStart(3, '0');
-    return `Q${ts}${seq}`;
+    const ts = Date.now().toString(36).slice(-7).padStart(7, '0');
+    const seq = (++this.orderSequence % 46655).toString(36).padStart(3, '0').slice(-3);
+    return `Q${this.orderIdNamespace}${ts}${seq}`;
   }
 
   /**
@@ -1037,6 +1498,8 @@ export class QuoteEngine extends EventEmitter {
   removeStaleOrder(clOrdID) {
     if (this.activeOrders.has(clOrdID)) {
       this.activeOrders.delete(clOrdID);
+      this.capitalReservationManager?.cancelled(clOrdID);
+      this._clearExecutionIdentity(clOrdID);
       return true;
     }
     return false;
@@ -1067,6 +1530,7 @@ export class QuoteEngine extends EventEmitter {
       lastRepriceAt: this.lastRepriceAt,
       isQuoting: this.isQuoting,
       suppressed,
+      continuity: this.getContinuityState(),
       lastMarketableAloSkip: this.lastMarketableAloSkip,
       recentRejectsByReason: Object.fromEntries(this.recentRejectsByReason),
       truexEbbo: this.truexEbbo ? { ...this.truexEbbo } : null,
@@ -1102,7 +1566,18 @@ export class QuoteEngine extends EventEmitter {
    *   For sells: BTC already committed. For buys: PYUSD already committed.
    * Returns capped size rounded to sizeDecimalPlaces.
    */
-  _capSizeToBalance(side, desiredSize, price, alreadyCommitted = 0) {
+  _capSizeToBalance(side, desiredSize, price, alreadyCommitted = 0, level = 1) {
+    if (this.capitalReservationManager) {
+      let available = this.capitalReservationManager.getQuoteCapacity(side);
+      if (level > 1 && alreadyCommitted === 0) {
+        const asset = side === 'sell' ? 'base' : 'quote';
+        available = Math.max(0, available - this.capitalReservationManager.l1Reserve[asset]);
+      }
+      const remaining = Math.max(0, available - alreadyCommitted);
+      const maxSize = side === 'sell' ? remaining : (price > 0 ? remaining / price : 0);
+      const factor = Math.pow(10, this.config.sizeDecimalPlaces);
+      return Math.floor(Math.max(0, Math.min(desiredSize, maxSize)) * factor) / factor;
+    }
     if (!this.inventoryManager || !this.inventoryManager.balancesInitialized) {
       return desiredSize; // No balance info — use full size
     }
@@ -1139,6 +1614,7 @@ export class QuoteEngine extends EventEmitter {
    * Drain queued actions (call periodically from orchestrator or timer).
    */
   drainQueue() {
+    this._refreshContinuityState();
     this._expirePendingReplacements();
     if (this.quotingSuspended) {
       return;
@@ -1152,6 +1628,13 @@ export class QuoteEngine extends EventEmitter {
     let droppedStalePlacements = 0;
     while (this.actionQueue.length > 0 && this.actionsThisSecond < this.config.maxOrdersPerSecond) {
       const action = this.actionQueue.shift();
+      if (this.capitalReservationManager &&
+          (action.type === 'replacement-cancel' ||
+            (action.type === 'cancel' && this.continuityState.executionState !== 'unsafe'))) {
+        this._recordSuppression(action.quote || action.order, 'queued-cancel-rederive-required');
+        this.deferredRepriceNeeded = true;
+        continue;
+      }
       // Same balance-safety gate as the dispatch loop: gated placements are
       // DROPPED, not held — they were built in an earlier cycle and would be
       // stale by the time the cancel clears. deferredRepriceNeeded re-derives
@@ -1626,7 +2109,14 @@ export class QuoteEngine extends EventEmitter {
 
   _recordSuppression(quote, reason) {
     const key = `${quote.side}:${quote.level}`;
-    const value = { reason, timestamp: Date.now(), quote: { ...quote } };
+    const value = {
+      reason,
+      cause: quote?.cause || reason,
+      transition: quote?.transition || `${this.continuityState.executionState}-state-retained`,
+      executionState: this.continuityState.executionState,
+      timestamp: Date.now(),
+      quote: { ...quote },
+    };
     this.suppressedLevels.set(key, value);
     if (reason === 'marketable-post-only') {
       this.lastMarketableAloSkip = value;
@@ -1635,6 +2125,38 @@ export class QuoteEngine extends EventEmitter {
       this.deferredRepriceNeeded = true;
     }
     this.logger.warn(`[QuoteEngine] Suppressed ${quote.side} L${quote.level}: ${reason}`);
+  }
+
+  _recordExecutionIdentity(orderId, execID, { terminal = false } = {}) {
+    if (!orderId) return;
+    if (terminal) {
+      this.executionDedupeByOrder.delete(orderId);
+      this.terminalExecutionOrders.add(orderId);
+      while (this.terminalExecutionOrders.size > this.maxExecutionDedupeOrders) {
+        this.terminalExecutionOrders.delete(this.terminalExecutionOrders.values().next().value);
+      }
+      return;
+    }
+    const current = this.executionDedupeByOrder.get(orderId) || { execIDs: new Set(), terminal: false };
+    if (execID) current.execIDs.add(execID);
+    this.executionDedupeByOrder.delete(orderId);
+    this.executionDedupeByOrder.set(orderId, current);
+  }
+
+  _clearExecutionIdentity(orderId) {
+    if (!orderId) return;
+    this.executionDedupeByOrder.delete(orderId);
+    this.terminalExecutionOrders.delete(orderId);
+  }
+
+  _failClosedExecutionEvidence(orderId, reason) {
+    if (this.executionEvidenceGap) return false;
+    this.executionEvidenceGap = { orderId, reason, executionState: 'unsafe' };
+    this.setContinuityState({ executionState: 'unsafe', reasons: ['execution-evidence-gap', reason] });
+    this.suspendQuoting();
+    this.emit('execution-evidence-gap', { ...this.executionEvidenceGap });
+    this.logger.error(`[QuoteEngine] Execution evidence failed closed: orderId=${orderId} reason=${reason}`);
+    return false;
   }
 
   _prepareQuoteForSend(quote) {
@@ -1774,6 +2296,7 @@ export class QuoteEngine extends EventEmitter {
   }
 
   _releasePendingReplacement(origClOrdID) {
+    this._refreshContinuityState();
     const pending = this.pendingReplacements.get(origClOrdID);
     if (!pending) return;
     this.pendingReplacements.delete(origClOrdID);
@@ -1783,6 +2306,10 @@ export class QuoteEngine extends EventEmitter {
     }
     if (this.quotingSuspended || this.rejectBackoffUntil > Date.now()) {
       this.deferredRepriceNeeded = true;
+      return;
+    }
+    if (this.continuityState.executionState === 'unsafe') {
+      this._recordSuppression(pending.quote, 'unsafe-execution-gate');
       return;
     }
     this._dispatchAction({ type: 'place', quote: pending.quote });
@@ -1796,6 +2323,8 @@ export class QuoteEngine extends EventEmitter {
       const original = this.activeOrders.get(origClOrdID);
       if (original?.status === 'cancelling') {
         original.status = 'active';
+        original.acknowledgedLive = true;
+        this.capitalReservationManager?.cancelRejected(origClOrdID);
       }
       this._recordSuppression(pending.quote, 'pending-replacement-expired');
     }
@@ -1862,6 +2391,7 @@ export class QuoteEngine extends EventEmitter {
   }
 
   _runDeferredReprice() {
+    this._refreshContinuityState();
     if (this.quotingSuspended) {
       this.deferredRepriceNeeded = true;
       return false;

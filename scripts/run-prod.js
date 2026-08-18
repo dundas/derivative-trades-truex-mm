@@ -38,6 +38,7 @@ import { KrakenRestClient } from '../src/connectors/kraken/KrakenRestClient.ts';
 import { CoinbaseWsIngest } from '../src/data-pipeline/coinbase-ws-ingest.js';
 import { CoinbaseMarketDataAdapter } from '../src/data-pipeline/coinbase-market-data-adapter.js';
 import { buildReferenceMarkoutRolloutOptions } from './reference-markout-rollout-config.js';
+import { buildContinuityConfig } from './continuity-config.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -189,6 +190,11 @@ const config = {
   truexTapeMaxAgeMs: parseInt(process.env.SHADOW_SEND_TAPE_MAX_AGE_MS || '5000', 10),
   shadowPhase2Criteria,
 };
+config.continuityConfig = buildContinuityConfig(process.env, {
+  levels: config.levels,
+  baseSizeBTC: config.baseSizeBTC,
+  baseSpreadBps: config.baseSpreadBps,
+});
 
 // ---------------------------------------------------------------------------
 // Webhook Alerting
@@ -489,6 +495,7 @@ async function main() {
     // Data pipeline
     dataPipeline,
     ...referenceMarkoutRolloutOptions,
+    continuityConfig: config.continuityConfig,
 
     // REST reconciliation + balance refresh
     restUrl: config.restUrl,

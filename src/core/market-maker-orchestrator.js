@@ -11,6 +11,8 @@ import { TrueXRESTClient } from '../exchanges/truex/TrueXRESTClient.js';
 import { AlertManager, normalizeAlertReason } from '../alerts/alert-manager.js';
 import { QuoteLifecycleTelemetry } from '../data-pipeline/quote-lifecycle-telemetry.js';
 import { ReferenceMarkoutCollector } from '../data-pipeline/reference-markout-collector.js';
+import { CapitalReservationManager } from './capital-reservation-manager.js';
+import { MakerPresenceController } from './maker-presence-controller.js';
 
 /**
  * MarketMakerOrchestrator - Wires all components and manages lifecycle.
@@ -66,6 +68,11 @@ export class MarketMakerOrchestrator extends EventEmitter {
       logger: this.logger,
     });
 
+    this.capitalReservationManager = options.capitalReservationManager ||
+      (options.continuityConfig ? new CapitalReservationManager(options.continuityConfig) : null);
+    this.presenceController = options.presenceController ||
+      (options.continuityConfig ? new MakerPresenceController(options.continuityConfig, { now: options.now || Date.now }) : null);
+
     this.pnlTracker = options.pnlTracker || new PnLTracker({
       truexMakerFeeBps: options.truexMakerFeeBps ?? 0,
       truexTakerFeeBps: options.truexTakerFeeBps ?? 0,
@@ -78,6 +85,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
 
     this.quoteEngine = options.quoteEngine || new QuoteEngine({
       inventoryManager: this.inventoryManager,
+      capitalReservationManager: this.capitalReservationManager,
       fixConnection: this.fixOE,
       levels: options.levels || 5,
       baseSpreadBps: options.baseSpreadBps || 50,
@@ -105,7 +113,11 @@ export class MarketMakerOrchestrator extends EventEmitter {
       pyusdUsdStaleThresholdMs: options.pyusdUsdStaleThresholdMs ?? 15000,
       marketablePostOnlyAction: options.marketablePostOnlyAction || 'skip',
       replaceMode: options.replaceMode || 'passive-safe',
-      minActiveLevelsPerSide: options.minActiveLevelsPerSide ?? 1,
+      minActiveLevelsPerSide: options.continuityConfig?.minActiveLevelsPerSide ?? options.minActiveLevelsPerSide ?? 1,
+      minimumFundedQuoteSize: options.continuityConfig?.minimumFundedQuoteSize ?? 0,
+      degradedMaxLevels: options.continuityConfig?.degradedMaxLevels ?? 1,
+      degradedSizeFactor: options.continuityConfig?.degradedSizeFactor ?? 1,
+      defensiveSpreadFloorBps: options.continuityConfig?.defensiveSpreadFloorBps ?? 0,
       maxReplacementsPerSidePerCycle: options.maxReplacementsPerSidePerCycle ?? 1,
       pendingReplacementTimeoutMs: options.pendingReplacementTimeoutMs || 5000,
       pendingSelfCrossGuardMs: options.pendingSelfCrossGuardMs ?? 5000,
@@ -131,6 +143,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
       marketDataProvider: () => this.marketDataFeed?.getBestBidAsk?.(),
       logger: this.logger,
     });
+    if (options.continuityConfig) {
+      this.quoteEngine.setContinuityStateProvider?.(() => this._getContinuityStatus());
+    }
 
     this.hedgeExecutor = options.hedgeExecutor || new HedgeExecutor({
       krakenClient: options.krakenClient,
@@ -223,6 +238,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     // State
     this.isRunning = false;
     this.startedAt = null;
+    this._emergencyUnsafe = false;
 
     // Watchdog state
     this._lastMdUpdateTime = 0;
@@ -298,6 +314,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this._onHedgeFill = this._onHedgeFill.bind(this);
     this._onEmergency = this._onEmergency.bind(this);
     this._onOEDisconnect = this._onOEDisconnect.bind(this);
+    this._onCapitalResyncRequired = this._onCapitalResyncRequired.bind(this);
+    this._capitalResyncInFlight = null;
+    this._capitalResyncPending = false;
   }
 
   /**
@@ -540,6 +559,8 @@ export class MarketMakerOrchestrator extends EventEmitter {
       pyusdUsdConsecutiveErrors: this._pyusdUsdConsecutiveErrors,
       dataPipeline: this.dataPipeline ? this.dataPipeline.getStats() : null,
       referenceMarkouts: this.referenceMarkoutCollector?.getStats?.() || null,
+      capital: this.capitalReservationManager?.getStatus() || null,
+      continuity: this._getContinuityStatus(),
     };
   }
 
@@ -668,6 +689,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     // QuoteEngine fills → Inventory + PnL
     this.quoteEngine.on('fill', this._onQuoteFill);
     this.quoteEngine.on('quote-lifecycle', this._onQuoteLifecycle);
+    this.quoteEngine.on('capital-resync-required', this._onCapitalResyncRequired);
 
     // Inventory hedge signal → HedgeExecutor
     this.inventoryManager.on('hedge-signal', this._onHedgeSignal);
@@ -688,6 +710,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this.fixOE.removeListener('logout', this._onOEDisconnect);
     this.quoteEngine.removeListener('fill', this._onQuoteFill);
     this.quoteEngine.removeListener('quote-lifecycle', this._onQuoteLifecycle);
+    this.quoteEngine.removeListener('capital-resync-required', this._onCapitalResyncRequired);
     this.inventoryManager.removeListener('hedge-signal', this._onHedgeSignal);
     this.hedgeExecutor.removeListener('hedge-filled', this._onHedgeFill);
     this.inventoryManager.removeListener('emergency', this._onEmergency);
@@ -737,6 +760,8 @@ export class MarketMakerOrchestrator extends EventEmitter {
     if (this.marketDataFeed?.getBestBidAsk) {
       this.quoteEngine.updateTrueXBook(this.marketDataFeed.getBestBidAsk());
     }
+    const continuity = this._getContinuityStatus();
+    if (continuity) this.quoteEngine.setContinuityState(continuity);
     this.quoteEngine.onPriceUpdate(aggregatedPrice);
     this._lastRepriceTime = Date.now();
 
@@ -745,6 +770,58 @@ export class MarketMakerOrchestrator extends EventEmitter {
         this.logger.warn(`[Orchestrator] Shadow coinbase reevaluation failed (non-fatal): ${err.message}`);
       });
     }
+  }
+
+  _onCapitalResyncRequired({ side, reason }) {
+    if (this._capitalResyncInFlight) {
+      this._capitalResyncPending = true;
+      return this._capitalResyncInFlight;
+    }
+    this.logger.warn(`[Orchestrator] Capital resync required for ${side}: ${reason}`);
+    this._capitalResyncInFlight = (async () => {
+      do {
+        this._capitalResyncPending = false;
+        await this._refreshBalances({ requireLiveOrders: true, clearBlockedSides: true });
+        // Re-derive from the reconciled balance snapshot; never replay the rejected size.
+        this.quoteEngine.deferredRepriceNeeded = true;
+        this.quoteEngine.drainQueue();
+      } while (this._capitalResyncPending);
+    })()
+      .catch((error) => {
+        this.logger.error(`[Orchestrator] Capital resync failed for ${side}: ${error.message}`);
+      })
+      .finally(() => {
+        this._capitalResyncInFlight = null;
+      });
+    return this._capitalResyncInFlight;
+  }
+
+  _getContinuityStatus() {
+    if (!this.presenceController || !this.capitalReservationManager) return null;
+    const reservations = this.capitalReservationManager.getReservations();
+    const capital = this.capitalReservationManager.getStatus();
+    const mid = Number(this._lastMidPrice || this.quoteEngine.lastMid || 0);
+    const status = this.presenceController.observe({
+      orders: reservations,
+      oeHealthy: this.fixOE.isLoggedOn === true,
+      referenceHealthy: this._lastMdUpdateTime > 0 &&
+        Date.now() - this._lastMdUpdateTime <= this._mdStaleThresholdMs,
+      reconciliationState: capital.state === 'uninitialized' ? 'failed' : capital.state,
+      fundedSizeBySide: {
+        buy: mid > 0 ? this.capitalReservationManager.getQuoteCapacity('buy') / mid : 0,
+        sell: this.capitalReservationManager.getQuoteCapacity('sell'),
+      },
+      blockedSides: capital.blockedSides,
+      emergency: this._emergencyUnsafe === true,
+    });
+    for (const alert of status.alerts) {
+      this.alertManager.sendAlert({
+        reason: `Market-maker ${alert.side} side gap`,
+        level: 'error',
+        details: alert,
+      }).catch((error) => this.logger.error(`[Orchestrator] Side-gap alert failed: ${error.message}`));
+    }
+    return status;
   }
 
   _onFIXMessage(message) {
@@ -820,7 +897,10 @@ export class MarketMakerOrchestrator extends EventEmitter {
     }
   }
 
-  _onQuoteFill({ side, price, size, clOrdID, execID, orderIntent, liquidityRoleExpected, isMaker = true }) {
+  _onQuoteFill({
+    side, price, size, clOrdID, execID, orderIntent, liquidityRoleExpected,
+    isMaker = true, estimated = false, evidenceGap = false,
+  }) {
     // Route fill to InventoryManager
     this.inventoryManager.onFill({
       side,
@@ -828,6 +908,8 @@ export class MarketMakerOrchestrator extends EventEmitter {
       price,
       venue: 'truex',
       execID,
+      ...(estimated ? { estimated: true } : {}),
+      ...(evidenceGap ? { evidenceGap: true } : {}),
     });
 
     // Route fill to PnLTracker
@@ -839,6 +921,8 @@ export class MarketMakerOrchestrator extends EventEmitter {
       isMaker,
       execID,
       timestamp: Date.now(),
+      ...(estimated ? { estimated: true } : {}),
+      ...(evidenceGap ? { evidenceGap: true } : {}),
     });
 
     // Route fill to data pipeline (unified or legacy audit logger)
@@ -855,6 +939,8 @@ export class MarketMakerOrchestrator extends EventEmitter {
       liquidityRoleExpected: liquidityRoleExpected || (isMaker ? 'maker' : 'taker'),
       isMaker,
       timestamp: Date.now(),
+      ...(estimated ? { estimated: true } : {}),
+      ...(evidenceGap ? { evidenceGap: true } : {}),
     };
     if (this.dataPipeline) {
       this._addPipelineFillOnce(this.dataPipeline, fillRecord);
@@ -862,7 +948,12 @@ export class MarketMakerOrchestrator extends EventEmitter {
       this.auditLogger.logFillEvent(fillRecord);
     }
 
-    this.emit('fill', { side, price, size, clOrdID, execID, venue: 'truex', orderIntent, liquidityRoleExpected, isMaker });
+    this.emit('fill', {
+      side, price, size, clOrdID, execID, venue: 'truex', orderIntent,
+      liquidityRoleExpected, isMaker,
+      ...(estimated ? { estimated: true } : {}),
+      ...(evidenceGap ? { evidenceGap: true } : {}),
+    });
   }
 
   _onQuoteLifecycle(event) {
@@ -966,6 +1057,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
 
   _onEmergency({ netPosition, reason }) {
     this.logger.error(`[Orchestrator] EMERGENCY: ${reason}`);
+    this._emergencyUnsafe = true;
 
     // Cancel all quotes immediately
     this.quoteEngine.cancelAllQuotes(`emergency: ${reason}`);
@@ -1521,6 +1613,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
 
     // Initialize inventory manager (sets netPosition from base total)
     this.inventoryManager.initializeFromBalances({ baseBalance, quoteBalance });
+    this.capitalReservationManager?.reconcile({ baseBalance, quoteBalance, liveOrders: [] });
 
     // Log which sides we'll quote
     const [, quoteAsset] = this.symbol.split('-');
@@ -1535,15 +1628,39 @@ export class MarketMakerOrchestrator extends EventEmitter {
    * Uses refreshBalances() which does NOT reset netPosition/VWAP.
    * Safe to call during active trading.
    */
-  async _refreshBalances() {
+  async _refreshBalances({ requireLiveOrders = false, clearBlockedSides = false } = {}) {
     if (!this.restClient || !this.isRunning) return;
 
+    const generation = this.capitalReservationManager?.beginReconciliation();
     try {
-      const { baseBalance, quoteBalance } = await this._fetchBalances();
+      const [{ baseBalance, quoteBalance }, liveOrders] = await Promise.all([
+        this._fetchBalances(),
+        this.capitalReservationManager || requireLiveOrders ? this._fetchCapitalLiveOrders() : Promise.resolve([]),
+      ]);
       this.inventoryManager.refreshBalances({ baseBalance, quoteBalance });
+      this.capitalReservationManager?.reconcile({
+        baseBalance,
+        quoteBalance,
+        liveOrders,
+        clearBlockedSides,
+        generation,
+      });
     } catch (err) {
       this.logger.warn(`[Orchestrator] Balance refresh failed (non-fatal): ${err.message}`);
+      this.capitalReservationManager?.reconciliationFailed();
+      if (requireLiveOrders) throw err;
     }
+  }
+
+  async _fetchCapitalLiveOrders() {
+    const rawOrders = await this.restClient.getActiveOrders();
+    const liveOrders = [];
+    for (const raw of rawOrders) {
+      const parsed = TrueXRESTClient.parseOrder(raw);
+      if (!parsed.externalId || parsed.status === 'NEW_PENDING') continue;
+      liveOrders.push({ orderId: parsed.externalId });
+    }
+    return liveOrders;
   }
 
   /**
@@ -1689,6 +1806,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
     if (!this.isRunning || this._intentionalStop) return;
     const now = Date.now();
     const issues = [];
+    // Presence alerts are independently rate-limited and never feed the generic
+    // watchdog cancel-all path: a missing side must preserve the funded live side.
+    this._getContinuityStatus();
 
     // Check OE FIX
     if (!this.fixOE.isLoggedOn) {
@@ -1780,6 +1900,8 @@ export class MarketMakerOrchestrator extends EventEmitter {
     const mdConnected = this.marketDataFeed ? (this.marketDataFeed.isLoggedOn === true) : null;
     const uptime = this.startedAt ? now - this.startedAt : 0;
 
+    const continuity = this._getContinuityStatus();
+
     // Status logic
     const quotingIdle = lastRepriceAge !== null && lastRepriceAge > this._quotingIdleThresholdMs;
     const bothConnected = oeConnected && (mdConnected === null || mdConnected === true);
@@ -1787,7 +1909,11 @@ export class MarketMakerOrchestrator extends EventEmitter {
     const isUnhealthy = quotingIdle || !oeConnected || mdConnected === false;
 
     let status;
-    if (isHealthy) {
+    if (continuity?.executionState === 'unsafe') {
+      status = 'unhealthy';
+    } else if (continuity?.executionState === 'degraded') {
+      status = 'degraded';
+    } else if (isHealthy) {
       status = 'healthy';
     } else if (!isUnhealthy && this.isRunning) {
       status = 'degraded';
@@ -1814,6 +1940,8 @@ export class MarketMakerOrchestrator extends EventEmitter {
       pnl: this.pnlTracker.getSummary(),
       uptime,
       sessionId: this.sessionId,
+      continuity,
+      capital: this.capitalReservationManager?.getStatus() || null,
     };
   }
 
