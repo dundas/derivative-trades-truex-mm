@@ -396,6 +396,7 @@ describe('MarketMakerOrchestrator strict startup reconciliation', () => {
     orchestrator.restClient = {};
     orchestrator.inventoryManager.balancesInitialized = true;
     orchestrator._initializeBalances = mock(async () => {});
+    orchestrator._refreshBalances = mock(async () => {});
     let releaseReconciliation;
     orchestrator._restReconcile = mock(() => new Promise((resolve) => {
       releaseReconciliation = () => resolve({ exchange: 0, local: 0, matched: 0, orphansCancelled: 0, ghostsRemoved: 0 });
@@ -408,10 +409,139 @@ describe('MarketMakerOrchestrator strict startup reconciliation', () => {
     expect(orchestrator.isRunning).toBe(false);
     releaseReconciliation();
     await starting;
+    expect(orchestrator._refreshBalances).toHaveBeenCalledWith({
+      requireLiveOrders: true, clearBlockedSides: true, allowPreStart: true, strict: true,
+    });
     expect(orchestrator.fixOE.connect).toHaveBeenCalledTimes(1);
     expect(orchestrator.isRunning).toBe(true);
 
     orchestrator.restClient = null;
+    await orchestrator.stop();
+  });
+
+  test('refreshes released orphan holds coherently before FIX and permits only newly funded size', async () => {
+    const orderId = 'QMM001abcde000001';
+    const capital = new CapitalReservationManager();
+    const orchestrator = makeStartupOrchestrator({
+      truexInstrumentId: '12345', orderIdNamespace: 'MM001',
+      capitalReservationManager: capital,
+      startupCancelVerifyTimeoutMs: 20, startupCancelVerifyIntervalMs: 10,
+      now: () => 0, sleep: async () => {},
+    });
+    orchestrator.inventoryManager.balancesInitialized = true;
+    orchestrator.inventoryManager.refreshBalances = mock(() => {});
+    orchestrator._initializeBalances = mock(async () => {
+      capital.reconcile({
+        baseBalance: { available: 1, held: 0, total: 1 },
+        quoteBalance: { available: 0, held: 100, total: 100 },
+        liveOrders: [],
+      });
+    });
+    orchestrator._fetchBalances = mock(async () => {
+      expect(orchestrator.fixOE.connect).not.toHaveBeenCalled();
+      return {
+        baseBalance: { available: 1, held: 0, total: 1 },
+        quoteBalance: { available: 100, held: 0, total: 100 },
+      };
+    });
+    const own = rawOrder('venue-own', orderId, 'ACTIVE');
+    own.order_info.instrument_id = '12345';
+    const terminal = rawOrder('venue-own', orderId, 'CANCELED');
+    terminal.order_info.instrument_id = '12345';
+    orchestrator.restClient = {
+      getActiveOrders: mock()
+        .mockResolvedValueOnce([own])
+        .mockResolvedValueOnce([terminal])
+        .mockResolvedValueOnce([]),
+      cancelOrder: mock(async () => {}),
+    };
+
+    await orchestrator.start();
+    expect(orchestrator._fetchBalances).toHaveBeenCalledTimes(1);
+    expect(orchestrator.restClient.getActiveOrders).toHaveBeenCalledTimes(3);
+    expect(capital.getStatus()).toMatchObject({ state: 'normal', blockedSides: [] });
+    expect(capital.reserve({
+      orderId: 'new-funded-bid', side: 'buy', size: 0.001, price: 100000, level: 1,
+    })).toMatchObject({ accepted: true });
+    expect(orchestrator.fixOE.connect).toHaveBeenCalledTimes(1);
+
+    orchestrator.restClient = null;
+    await orchestrator.stop();
+  });
+
+  test('aborts startup when the post-cleanup coherent capital refresh fails', async () => {
+    const orchestrator = makeStartupOrchestrator();
+    orchestrator.restClient = {};
+    orchestrator.inventoryManager.balancesInitialized = true;
+    orchestrator._initializeBalances = mock(async () => {});
+    orchestrator._restReconcile = mock(async () => ({ orphansCancelled: 1 }));
+    orchestrator._refreshBalances = mock(async () => { throw new Error('fresh capital unavailable'); });
+
+    await expect(orchestrator.start()).rejects.toThrow('fresh capital unavailable');
+    expect(orchestrator.fixOE.connect).not.toHaveBeenCalled();
+    expect(orchestrator.quoteEngine.drainQueue).not.toHaveBeenCalled();
+    expect(orchestrator.isRunning).toBe(false);
+  });
+
+  test('uses one optional FIX logon contract across continuity and queue eligibility', () => {
+    const orchestrator = makeStartupOrchestrator({ continuityConfig: continuity, now: () => 1000 });
+    delete orchestrator.fixOE.isLoggedOn;
+    orchestrator.isRunning = true;
+    orchestrator._lastMdUpdateTime = 1000;
+    orchestrator._mdStaleThresholdMs = 1000;
+    orchestrator.capitalReservationManager.reconcile({ ...balances, liveOrders: [] });
+    for (const [orderId, side] of [['bid', 'buy'], ['ask', 'sell']]) {
+      orchestrator.capitalReservationManager.reserve({
+        orderId, side, level: 1, size: 0.001, price: 100000,
+      });
+      orchestrator.capitalReservationManager.accept(orderId);
+    }
+    expect(orchestrator._isFixExecutionHealthy()).toBe(true);
+    expect(orchestrator._isQueueDrainExecutionEligible()).toBe(true);
+    expect(orchestrator._getContinuityStatus().reasons).not.toContain('order-entry-unhealthy');
+
+    orchestrator.fixOE.isLoggedOn = false;
+    expect(orchestrator._isFixExecutionHealthy()).toBe(false);
+    expect(orchestrator._isQueueDrainExecutionEligible()).toBe(false);
+    expect(orchestrator._getContinuityStatus().reasons).toContain('order-entry-unhealthy');
+  });
+
+  test('rejects an attempt-owned FIX transport that connects without logon and fully rolls it back', async () => {
+    const fixOE = Object.assign(new EventEmitter(), {
+      isConnected: false,
+      isLoggedOn: false,
+      connect: mock(async function connect() { this.isConnected = true; }),
+      disconnect: mock(async function disconnect() {
+        this.isConnected = false;
+        this.isLoggedOn = false;
+      }),
+      sendMessage: mock(() => {}),
+    });
+    const orchestrator = makeStartupOrchestrator({ fixConnection: fixOE });
+
+    await expect(orchestrator.start()).rejects.toThrow('not logged on');
+    expect(fixOE.connect).toHaveBeenCalledTimes(1);
+    expect(fixOE.disconnect).toHaveBeenCalledTimes(1);
+    expect(fixOE.isConnected).toBe(false);
+    expect(orchestrator.isRunning).toBe(false);
+    expect(orchestrator.drainQueueTimer).toBeNull();
+    expect(orchestrator._watchdogTimer).toBeNull();
+    expect(fixOE.listenerCount('message')).toBe(0);
+    expect(orchestrator.quoteEngine.listenerCount('fill')).toBe(0);
+  });
+
+  test('keeps an initially inactive FIX adapter without a logon property compatible after connect', async () => {
+    const fixOE = Object.assign(new EventEmitter(), {
+      isConnected: false,
+      connect: mock(async function connect() { this.isConnected = true; }),
+      disconnect: mock(async function disconnect() { this.isConnected = false; }),
+      sendMessage: mock(() => {}),
+    });
+    const orchestrator = makeStartupOrchestrator({ fixConnection: fixOE });
+
+    await expect(orchestrator.start()).resolves.toBe(true);
+    expect(fixOE.connect).toHaveBeenCalledTimes(1);
+    expect(orchestrator.isRunning).toBe(true);
     await orchestrator.stop();
   });
 
@@ -435,6 +565,7 @@ describe('MarketMakerOrchestrator strict startup reconciliation', () => {
     orchestrator.restClient = {};
     orchestrator.inventoryManager.balancesInitialized = true;
     orchestrator._initializeBalances = mock(async () => {});
+    orchestrator._refreshBalances = mock(async () => {});
     orchestrator._restReconcile = mock()
       .mockRejectedValueOnce(new Error('strict startup failed'))
       .mockResolvedValueOnce({ exchange: 0, local: 0, matched: 0, orphansCancelled: 0, ghostsRemoved: 0 });

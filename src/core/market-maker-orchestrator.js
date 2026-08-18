@@ -475,6 +475,19 @@ export class MarketMakerOrchestrator extends EventEmitter {
     // periodic/manual calls remain gated on isRunning.
     if (this.restClient) {
       await this._restReconcile({ allowPreStart: true, strict: true });
+      // Orphan cancellation can release venue-held funds after the initial
+      // balance snapshot. Re-establish one coherent balance + scoped-live view
+      // before FIX can connect or any queued work can become executable.
+      await this._refreshBalances({
+        requireLiveOrders: true,
+        clearBlockedSides: true,
+        allowPreStart: true,
+        strict: true,
+      });
+      const capital = this.capitalReservationManager?.getStatus?.();
+      if (capital && (capital.state !== 'normal' || capital.blockedSides.length > 0)) {
+        throw new Error('capital reconciliation did not converge after strict startup cleanup');
+      }
     }
 
     // 4. Connect FIX OE
@@ -483,8 +496,10 @@ export class MarketMakerOrchestrator extends EventEmitter {
       attempt.fixActivationAttempted = true;
       await this.fixOE.connect();
       this.logger.info('[Orchestrator] FIX OE connected');
-    } else if ('isLoggedOn' in this.fixOE && this.fixOE.isLoggedOn !== true) {
-      throw new Error('preexisting FIX transport is not logged on — refusing to start quoting');
+    }
+    if (!this._isFixExecutionHealthy()) {
+      const ownership = attempt.fixInitiallyActive ? 'preexisting ' : '';
+      throw new Error(`${ownership}FIX transport is not logged on — refusing to start quoting`);
     }
 
     // 5. Connect market data feed (optional, non-blocking) — TrueX MD FIX or e.g. Coinbase adapter
@@ -1174,7 +1189,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       this.pnlTracker.markToMarket(aggregatedPrice.weightedMidpoint);
     }
 
-    if (!this.fixOE.isLoggedOn) {
+    if (!this._isFixExecutionHealthy()) {
       this.quoteEngine.suspendQuoting();
       this.quoteEngine.invalidateQueuedWork?.(true);
       this.logger.warn('[WATCHDOG] Quoting gate closed: OE not logged on');
@@ -1275,9 +1290,12 @@ export class MarketMakerOrchestrator extends EventEmitter {
   }
 
   _isQueueDrainExecutionEligible() {
-    const exposesLogonState = 'isLoggedOn' in this.fixOE;
     return this.isRunning && this._emergencyUnsafe !== true &&
-      (!exposesLogonState || this.fixOE.isLoggedOn === true);
+      this._isFixExecutionHealthy();
+  }
+
+  _isFixExecutionHealthy() {
+    return !this.fixOE || !('isLoggedOn' in this.fixOE) || this.fixOE.isLoggedOn === true;
   }
 
   _getContinuityStatus() {
@@ -1287,7 +1305,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     const mid = Number(this._lastMidPrice || this.quoteEngine.lastMid || 0);
     const status = this.presenceController.observe({
       orders: reservations,
-      oeHealthy: this.fixOE.isLoggedOn === true,
+      oeHealthy: this._isFixExecutionHealthy(),
       referenceHealthy: this._lastMdUpdateTime > 0 &&
         Date.now() - this._lastMdUpdateTime <= this._mdStaleThresholdMs,
       reconciliationState: capital.state === 'uninitialized' ? 'failed' : capital.state,
@@ -2136,7 +2154,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
    * Safe to call during active trading.
    */
   async _refreshBalances({
-    requireLiveOrders = false, clearBlockedSides = false, allowPreStart = false,
+    requireLiveOrders = false, clearBlockedSides = false, allowPreStart = false, strict = false,
   } = {}) {
     if (!this.restClient || (!this.isRunning && !allowPreStart)) return;
 
@@ -2196,6 +2214,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
           await this._onCapitalResyncRequired({
             side: 'multiple',
             reason: 'rest-order-absence-local-state-reconciled',
+            strict,
           });
         }
       }
@@ -2448,7 +2467,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this._getContinuityStatus();
 
     // Check OE FIX
-    if (!this.fixOE.isLoggedOn) {
+    if (!this._isFixExecutionHealthy()) {
       issues.push('OE FIX not logged on');
     }
 
@@ -2505,7 +2524,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       }
 
       // Force-reconnect failed sessions (FR-2.2 step 4)
-      if (!this.fixOE.isLoggedOn) {
+      if (!this._isFixExecutionHealthy()) {
         this.logger.info('[WATCHDOG] Force-reconnecting OE FIX session...');
         this.fixOE.connect().catch(err =>
           this.logger.error(`[WATCHDOG] OE reconnect failed: ${err.message}`)
@@ -2533,7 +2552,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     const now = Date.now();
     const lastRepriceAge = this._lastRepriceTime > 0 ? now - this._lastRepriceTime : null;
     const lastMdAge = this._lastMdUpdateTime > 0 ? now - this._lastMdUpdateTime : null;
-    const oeConnected = this.fixOE.isLoggedOn;
+    const oeConnected = this._isFixExecutionHealthy();
     const mdConnected = this.marketDataFeed ? (this.marketDataFeed.isLoggedOn === true) : null;
     const uptime = this.startedAt ? now - this.startedAt : 0;
 
