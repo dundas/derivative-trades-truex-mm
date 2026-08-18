@@ -1,6 +1,7 @@
 import { describe, it, expect, jest, beforeEach } from 'bun:test';
 import { EventEmitter } from 'events';
 import { MarketMakerOrchestrator } from './market-maker-orchestrator.js';
+import { FIXConnection } from '../fix-protocol/fix-connection.js';
 
 // Minimal mock for FIXConnection — tracks constructor options
 class MockFIXConnection extends EventEmitter {
@@ -75,6 +76,21 @@ function makeOrch(overrides = {}) {
 // Task 1.4 — Orchestrator passes redisClient to FIXConnection
 // -----------------------------------------------------------------------
 describe('MarketMakerOrchestrator — Redis wiring (Task 1.4)', () => {
+  it('passes validated FIX liveness settings to the owned connection', () => {
+    const orch = new MarketMakerOrchestrator({
+      truexHost: 'test.host', truexPort: 1234,
+      apiKey: 'test-key', apiSecret: 'test-secret',
+      heartbeatInterval: 20,
+      testRequestIdleMultiplier: 1.5,
+      testRequestTimeoutMultiplier: 0.75,
+      maxLivenessDetectionSeconds: 90,
+    });
+    expect(orch.fixOE.heartbeatInterval).toBe(20);
+    expect(orch.fixOE.testRequestIdleMultiplier).toBe(1.5);
+    expect(orch.fixOE.testRequestTimeoutMultiplier).toBe(0.75);
+    expect(orch.fixOE.maxLivenessDetectionSeconds).toBe(90);
+  });
+
   it('should pass redisClient to fixOE when provided', () => {
     const mockRedis = {
       get: jest.fn().mockResolvedValue(null),
@@ -967,6 +983,160 @@ describe('balance snapshot job', () => {
 // OE disconnect — inflight order flush
 // -----------------------------------------------------------------------
 describe('OE disconnect flushes inflight orders', () => {
+  it('does not raise a critical FIX loss when owned stop races peer TCP close during Logout', async () => {
+    const fix = new FIXConnection({
+      host: 'test.host', port: 1234, senderCompID: 'S', targetCompID: 'T',
+      apiKey: 'key', apiSecret: 'secret',
+      logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
+    });
+    const socket = new EventEmitter();
+    socket.destroyed = false;
+    socket.destroy = jest.fn(() => { socket.destroyed = true; });
+    fix.socket = socket;
+    fix._connectionGeneration = 1;
+    fix.isConnected = true;
+    fix.isLoggedOn = true;
+    fix.attemptReconnect = jest.fn();
+    let settleLogout;
+    fix.sendMessage = jest.fn(() => new Promise((resolve) => { settleLogout = resolve; }));
+
+    const orch = makeOrch({ fixConnection: fix });
+    orch._fixConnectionOwned = true;
+    orch.isRunning = true;
+    orch.startedAt = Date.now();
+    orch._wireEvents();
+    const critical = jest.fn();
+    orch.on('fix_disconnected', critical);
+
+    const stopping = orch.stop();
+    while (!settleLogout) await Promise.resolve();
+    fix.handleDisconnect(socket, 1);
+
+    expect(critical).not.toHaveBeenCalled();
+    expect(fix.attemptReconnect).not.toHaveBeenCalled();
+    settleLogout(true);
+    await stopping;
+  });
+
+  it('does not raise a critical FIX loss when owned stop receives the peer Logout ack', async () => {
+    const fix = new FIXConnection({
+      host: 'test.host', port: 1234, senderCompID: 'S', targetCompID: 'T',
+      apiKey: 'key', apiSecret: 'secret',
+      logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
+    });
+    const socket = new EventEmitter();
+    socket.destroyed = false;
+    socket.destroy = jest.fn(() => { socket.destroyed = true; });
+    fix.socket = socket;
+    fix._connectionGeneration = 1;
+    fix.isConnected = true;
+    fix.isLoggedOn = true;
+    fix.attemptReconnect = jest.fn();
+    let settleLogout;
+    fix.sendMessage = jest.fn(() => new Promise((resolve) => { settleLogout = resolve; }));
+
+    const orch = makeOrch({ fixConnection: fix });
+    orch._fixConnectionOwned = true;
+    orch.isRunning = true;
+    orch.startedAt = Date.now();
+    orch._wireEvents();
+    const critical = jest.fn();
+    orch.on('fix_disconnected', critical);
+
+    const stopping = orch.stop();
+    while (!settleLogout) await Promise.resolve();
+    fix.handleLogout({ fields: { '35': '5', '58': 'ack' } }, socket, 1);
+
+    expect(critical).not.toHaveBeenCalled();
+    expect(fix.attemptReconnect).not.toHaveBeenCalled();
+    settleLogout(true);
+    await stopping;
+  });
+
+  it('alerts and reconnects for a genuine unsolicited peer Logout', () => {
+    const fix = new FIXConnection({
+      host: 'test.host', port: 1234, senderCompID: 'S', targetCompID: 'T',
+      apiKey: 'key', apiSecret: 'secret',
+      logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
+    });
+    const socket = new EventEmitter();
+    socket.destroyed = false;
+    socket.destroy = jest.fn(() => { socket.destroyed = true; });
+    fix.socket = socket;
+    fix._connectionGeneration = 2;
+    fix.isConnected = true;
+    fix.isLoggedOn = true;
+    fix.sendMessage = jest.fn(() => true);
+    fix.attemptReconnect = jest.fn();
+    const orch = makeOrch({ fixConnection: fix });
+    orch.isRunning = true;
+    orch._wireEvents();
+    const critical = jest.fn();
+    orch.on('fix_disconnected', critical);
+
+    fix.handleLogout({ fields: { '35': '5', '58': 'peer shutdown' } }, socket, 2);
+
+    expect(critical).toHaveBeenCalledTimes(1);
+    expect(critical).toHaveBeenCalledWith(expect.objectContaining({
+      source: 'logout', reason: 'peer-logout',
+    }));
+    expect(fix.attemptReconnect).toHaveBeenCalledTimes(1);
+  });
+
+  it('still forwards a genuine peer transport loss while stop classification is active', () => {
+    const orch = makeOrch();
+    orch.isRunning = true;
+    orch._intentionalStop = true;
+    orch._wireEvents();
+    const critical = jest.fn();
+    orch.on('fix_disconnected', critical);
+
+    orch.fixOE.emit('disconnect', { reason: 'transport-disconnect', generation: 3 });
+
+    expect(critical).toHaveBeenCalledTimes(1);
+    expect(critical).toHaveBeenCalledWith(expect.objectContaining({
+      source: 'disconnect', reason: 'transport-disconnect',
+    }));
+  });
+
+  it('ownership-safely forwards liveness and emits one session-loss event for logout plus disconnect', () => {
+    const orch = makeOrch();
+    orch.isRunning = true;
+    const liveness = jest.fn();
+    const disconnected = jest.fn();
+    orch.on('fix_liveness', liveness);
+    orch.on('fix_disconnected', disconnected);
+
+    expect(orch._wireEvents()).toBe(true);
+    expect(orch._wireEvents()).toBe(false);
+    orch.fixOE.emit('liveness', { state: 'probe-pending', reason: 'inbound-idle' });
+    orch.fixOE.emit('logout', { text: 'server logout' });
+    // A frame already buffered on the failed socket is not proof of a new,
+    // healthy session and must not re-arm the session-loss notification.
+    orch.fixOE.emit('message', { fields: { '35': '0', '34': '99' } });
+    orch.fixOE.emit('disconnect');
+
+    expect(liveness).toHaveBeenCalledTimes(1);
+    expect(liveness).toHaveBeenCalledWith(expect.objectContaining({
+      state: 'probe-pending', reason: 'inbound-idle', channel: 'oe',
+    }));
+    expect(disconnected).toHaveBeenCalledTimes(1);
+    expect(disconnected).toHaveBeenCalledWith(expect.objectContaining({ source: 'logout' }));
+
+    // A normal reconnect emits healthy/logon without requiring a TestRequest.
+    // The next independent generation loss must be forwarded again.
+    orch.fixOE.emit('liveness', { state: 'healthy', reason: 'logon', generation: 2 });
+    orch.fixOE.emit('disconnect', { reason: 'transport-disconnect', generation: 2 });
+    expect(disconnected).toHaveBeenCalledTimes(2);
+    expect(disconnected).toHaveBeenLastCalledWith(expect.objectContaining({
+      source: 'disconnect', reason: 'transport-disconnect',
+    }));
+
+    expect(orch._unwireEvents()).toBe(true);
+    orch.fixOE.emit('liveness', { state: 'failed', reason: 'response-timeout' });
+    expect(liveness).toHaveBeenCalledTimes(2);
+  });
+
   it('restores cancelling and pending orders to active on OE disconnect', () => {
     const orch = makeOrch();
     orch.isRunning = true;

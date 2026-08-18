@@ -44,6 +44,7 @@ import { buildContinuityConfig } from './continuity-config.js';
 import { buildOrderReconciliationScope } from './order-reconciliation-scope-config.js';
 import { startProductionOrchestrator } from './production-orchestrator-startup.js';
 import { buildTruexMakerSafetyConfig } from './truex-maker-safety-config.js';
+import { buildFixLivenessConfig } from './fix-liveness-config.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -96,6 +97,7 @@ const shadowPhase2Criteria = {
 };
 const referenceMarkoutRolloutOptions = buildReferenceMarkoutRolloutOptions(process.env);
 const orderReconciliationScope = buildOrderReconciliationScope(process.env);
+const fixLivenessConfig = buildFixLivenessConfig(process.env);
 
 // ---------------------------------------------------------------------------
 // Configuration — PRODUCTION
@@ -114,7 +116,7 @@ const config = {
   apiKey: process.env.TRUEX_PROD_API_KEY,
   apiSecret: process.env.TRUEX_PROD_SECRET_KEY,
   clientId: process.env.TRUEX_CLIENT_ID || '78932725357888855',
-  heartbeatInterval: 30,
+  ...fixLivenessConfig,
 
   // Quote Engine — CONSERVATIVE production sizing
   //   2 levels per side (TrueX requested; matches available BTC inventory)
@@ -436,6 +438,9 @@ async function main() {
     apiKey: config.apiKey,
     apiSecret: config.apiSecret,
     heartbeatInterval: config.heartbeatInterval,
+    testRequestIdleMultiplier: config.testRequestIdleMultiplier,
+    testRequestTimeoutMultiplier: config.testRequestTimeoutMultiplier,
+    maxLivenessDetectionSeconds: config.maxLivenessDetectionSeconds,
 
     // Price feed
     priceAggregator,
@@ -657,6 +662,11 @@ function wireOrchestratorEvents(orch) {
       port: config.truexPort,
       targetCompID: config.targetCompID,
     });
+  });
+  orch.on('fix_liveness', (event = {}) => {
+    const message = `[FIX] liveness state=${event.state || 'unknown'} reason=${event.reason || 'unknown'}`;
+    if (['failed', 'disconnecting'].includes(event.state)) logger.error(message);
+    else logger.info(message);
   });
 }
 

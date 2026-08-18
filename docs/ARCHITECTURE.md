@@ -486,6 +486,10 @@ PostgreSQL-backed analytics server using `Bun.serve()` on port 3100.
 | `TRUEX_CLIENT_ID` | Yes | `78932725357888855` | Production client ID (FIX PartyID tag 448) |
 | `TRUEX_FIX_HOST` | Yes | `178.156.230.110` | Hetzner FIX proxy host |
 | `TRUEX_FIX_PORT` | Yes | `3004` | Hetzner FIX proxy port |
+| `FIX_HEARTBEAT_INTERVAL` | No | `30` | FIX HeartBtInt seconds; validated integer in `[1,300]` |
+| `FIX_TEST_REQUEST_IDLE_MULTIPLIER` | No | `1.2` | Send one correlated TestRequest after this multiple of HeartBtInt without a structurally valid inbound FIX frame; validated in `(1,3]` |
+| `FIX_TEST_REQUEST_TIMEOUT_MULTIPLIER` | No | `1` | Disconnect if the correlated Heartbeat is absent for this multiple of HeartBtInt after probe dispatch began; validated in `(0,3]` and the derived response window must be at least 1000ms |
+| `FIX_LIVENESS_MAX_DETECTION_SECONDS` | No | `120` | Fail-closed absolute ceiling for `HeartBtInt × (idle multiplier + timeout multiplier)`; validated integer in `[2,120]` |
 | `TRUEX_PROD_HOST` | No | `10.20.6.11` | TrueX production internal IP (reachable via WireGuard tunnel). Substituted into `TRUEX_UPSTREAM_HOST` for both FIX proxies and `TRUEX_REST_URL` in `docker-compose.prod.yml`. WireGuard `AllowedIPs` must include this `/32`. If TrueX migrates the endpoint, update this var **and** add the new `/32` to `/etc/wireguard/truemarkets.conf`. Empty string does not fall back to default — keep populated or unset. |
 | `TRUEX_REST_URL` | No | `http://10.20.6.11:9742` | TrueX REST URL — derived from `TRUEX_PROD_HOST` by `docker-compose.prod.yml`. Override only when accessing from outside Hetzner (e.g. `http://178.156.230.110:3006` socat tunnel for local development). |
 | `TRUEX_TARGET_COMP_ID` | No | `TRUEX_PROD_OE` | FIX TargetCompID |

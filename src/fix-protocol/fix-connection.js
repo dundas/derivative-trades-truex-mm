@@ -36,6 +36,30 @@ export class FIXConnection extends EventEmitter {
     this.beginString = 'FIXT.1.1';
     this.defaultApplVerID = 'FIX.5.0SP2';
     this.heartbeatInterval = options.heartbeatInterval || 30; // seconds
+    this.testRequestIdleMultiplier = Number.isFinite(options.testRequestIdleMultiplier) &&
+      options.testRequestIdleMultiplier > 1 && options.testRequestIdleMultiplier <= 3
+      ? options.testRequestIdleMultiplier
+      : 1.2;
+    this.testRequestTimeoutMultiplier = Number.isFinite(options.testRequestTimeoutMultiplier) &&
+      options.testRequestTimeoutMultiplier > 0 && options.testRequestTimeoutMultiplier <= 3
+      ? options.testRequestTimeoutMultiplier
+      : 1;
+    this.maxLivenessDetectionSeconds = Number.isInteger(options.maxLivenessDetectionSeconds) &&
+      options.maxLivenessDetectionSeconds >= 2 && options.maxLivenessDetectionSeconds <= 120
+      ? options.maxLivenessDetectionSeconds
+      : 120;
+    if (this.heartbeatInterval *
+        (this.testRequestIdleMultiplier + this.testRequestTimeoutMultiplier) >
+        this.maxLivenessDetectionSeconds) {
+      throw new Error('FIX liveness detection budget exceeds configured absolute maximum');
+    }
+    if (this.heartbeatInterval * this.testRequestTimeoutMultiplier * 1000 < 1000) {
+      throw new Error('FIX TestRequest response window must be at least 1000ms');
+    }
+    this._now = typeof options.now === 'function' ? options.now : Date.now;
+    this._monotonicNow = typeof options.monotonicNow === 'function'
+      ? options.monotonicNow
+      : () => performance.now();
     
     // Connection state
     this.socket = null;
@@ -57,8 +81,19 @@ export class FIXConnection extends EventEmitter {
     
     // Heartbeat management
     this.heartbeatTimer = null;
+    this.inboundIdleTimer = null;
     this.lastHeartbeatReceived = null;
     this.lastHeartbeatSent = null;
+    this.lastHeartbeatSentMonotonic = null;
+    this.lastInboundActivityAt = null;
+    this.lastInboundActivityMonotonic = null;
+    this._heartbeatStartedMonotonic = null;
+    this.pendingTestRequest = null;
+    this.testRequestTimeoutTimer = null;
+    this._testRequestSequence = 0;
+    this._heartbeatTickInFlight = null;
+    this.livenessState = 'idle';
+    this.lastLivenessReason = 'not-started';
     
     // Reconnection settings
     this.reconnectAttempts = 0;
@@ -66,7 +101,7 @@ export class FIXConnection extends EventEmitter {
     this.initialReconnectDelay = options.initialReconnectDelay || 1000;
     this.maxReconnectDelay = options.maxReconnectDelay || 30000;
     this.reconnectTimer = null;
-    this.intentionalClose = false;
+    this._intentionalCloseGeneration = null;
     this.isReconnecting = false; // guard against duplicate reconnect scheduling
     this._stableTimer = null;    // clears reconnectAttempts after 60s stable connection
     this._connectionGeneration = 0; // guards stale socket callbacks/timers
@@ -258,6 +293,7 @@ export class FIXConnection extends EventEmitter {
    */
   _clearLifecycleTimers() {
     this.stopHeartbeat();
+    this._resetLivenessState();
     this.stopCleanupTimer();
     if (this._stableTimer) {
       clearTimeout(this._stableTimer);
@@ -267,6 +303,34 @@ export class FIXConnection extends EventEmitter {
       clearTimeout(this._logonSetupTimer);
       this._logonSetupTimer = null;
     }
+  }
+
+  _clearPendingTestRequest(expected = this.pendingTestRequest) {
+    if (expected && this.pendingTestRequest !== expected) return false;
+    if (this.testRequestTimeoutTimer) {
+      clearTimeout(this.testRequestTimeoutTimer);
+      this.testRequestTimeoutTimer = null;
+    }
+    this.pendingTestRequest = null;
+    return true;
+  }
+
+  _resetLivenessState() {
+    if (this.inboundIdleTimer) {
+      clearTimeout(this.inboundIdleTimer);
+      this.inboundIdleTimer = null;
+    }
+    this._clearPendingTestRequest();
+    this.lastInboundActivityAt = null;
+    this.lastInboundActivityMonotonic = null;
+    this._heartbeatStartedMonotonic = null;
+    this.lastHeartbeatReceived = null;
+    this.lastHeartbeatSent = null;
+    this.lastHeartbeatSentMonotonic = null;
+    this.messageBuffer = '';
+    this._heartbeatTickInFlight = null;
+    this.livenessState = 'idle';
+    this.lastLivenessReason = 'session-reset';
   }
 
   async _forceSessionReset(reason, details = {}) {
@@ -308,8 +372,7 @@ export class FIXConnection extends EventEmitter {
 
       // Reset heartbeat timestamps so stale values from a previous session cannot
       // trigger an immediate disconnect the moment startHeartbeat() fires.
-      this.lastHeartbeatReceived = null;
-      this.lastHeartbeatSent = null;
+      this._resetLivenessState();
 
       // Cancel any pending reconnect timer so it cannot fire a second connection.
       if (this.reconnectTimer) {
@@ -370,7 +433,7 @@ export class FIXConnection extends EventEmitter {
       // Handle incoming data
       socket.on('data', (data) => {
         if (!isCurrentAttempt()) return;
-        this.handleIncomingData(data);
+        this.handleIncomingData(data, socket, generation);
       });
       
       // Handle connection close
@@ -540,6 +603,12 @@ export class FIXConnection extends EventEmitter {
                 // Successful logon clears both fallback counters
                 this._consecutiveLogonTimeouts = 0;
                 this._consecutiveResetFallbacks = 0;
+                this.livenessState = 'healthy';
+                this.lastLivenessReason = 'logon';
+                this._emitContained('liveness', {
+                  state: 'healthy', reason: 'logon', generation,
+                  timestamp: this._now(),
+                });
                 // Do NOT reset reconnectAttempts immediately — _startStableTimer will
                 // reset it after 60s of stable uptime, preventing a brief drop from
                 // resetting the counter too eagerly.
@@ -858,7 +927,8 @@ export class FIXConnection extends EventEmitter {
   /**
    * Handle incoming data from socket
    */
-  handleIncomingData(data) {
+  handleIncomingData(data, socket = this.socket, generation = this._connectionGeneration) {
+    if (socket !== this.socket || generation !== this._connectionGeneration) return;
     // Append to buffer
     this.messageBuffer += data.toString('binary');
     
@@ -885,12 +955,12 @@ export class FIXConnection extends EventEmitter {
       // Parse and emit message
       const parsedMessage = this.parseMessage(rawMessage);
       if (parsedMessage) {
-        this.handleMessage(parsedMessage);
+        this.handleMessage(parsedMessage, socket, generation);
       }
       processed++;
       if (processed >= MAX_PER_TICK) {
         // Yield to event loop to avoid blocking under high load
-        setImmediate(() => this.handleIncomingData(Buffer.from('')));
+        setImmediate(() => this.handleIncomingData(Buffer.from(''), socket, generation));
         break;
       }
     }
@@ -913,16 +983,58 @@ export class FIXConnection extends EventEmitter {
     
     return {
       raw: rawMessage,
-      fields: fields
+      fields: fields,
+      transportIntegrityValid: this._hasValidTransportIntegrity(rawMessage),
     };
+  }
+
+  _hasValidTransportIntegrity(rawMessage) {
+    const header = rawMessage.match(/^8=[^\x01]+\x019=(\d+)\x01/);
+    const checksum = rawMessage.match(/\x0110=(\d{3})\x01$/);
+    if (!header || !checksum) return false;
+    const checksumBoundary = rawMessage.lastIndexOf(`${this.SOH}10=`);
+    if (checksumBoundary < header[0].length) return false;
+    const declaredBodyLength = Number(header[1]);
+    const actualBodyLength = rawMessage.slice(header[0].length, checksumBoundary + 1).length;
+    if (!Number.isSafeInteger(declaredBodyLength) || declaredBodyLength !== actualBodyLength) return false;
+    const checksummed = rawMessage.slice(0, checksumBoundary + 1);
+    let sum = 0;
+    for (let index = 0; index < checksummed.length; index++) sum += checksummed.charCodeAt(index);
+    return sum % 256 === Number(checksum[1]);
   }
   
   /**
    * Handle parsed FIX message
    */
-  handleMessage(message) {
+  handleMessage(message, socket = this.socket, generation = this._connectionGeneration) {
+    if (socket !== this.socket || generation !== this._connectionGeneration) return;
     const msgType = message.fields['35'];
-    const msgSeqNum = parseInt(message.fields['34']);
+    const rawMsgSeqNum = message.fields['34'];
+    const msgSeqNum = parseInt(rawMsgSeqNum);
+    const validInboundFrame = message.transportIntegrityValid !== false &&
+        typeof msgType === 'string' && msgType.length > 0 &&
+        typeof rawMsgSeqNum === 'string' && /^[1-9]\d*$/.test(rawMsgSeqNum) &&
+        Number.isSafeInteger(msgSeqNum) && msgSeqNum > 0;
+    const socketParsed = Object.prototype.hasOwnProperty.call(message, 'transportIntegrityValid');
+    if (socketParsed && !validInboundFrame) {
+      this.logger.warn(`[FIXConnection] Discarding malformed FIX frame from ${this.targetCompID}`);
+      this._emitContained('liveness', {
+        state: 'unchanged', reason: 'malformed-frame', generation,
+        timestamp: this._now(),
+      });
+      return;
+    }
+    if (validInboundFrame) {
+      this.lastInboundActivityAt = this._now();
+      this.lastInboundActivityMonotonic = this._monotonicNow();
+      if (this.heartbeatTimer) {
+        this._armInboundIdleDeadline(socket, generation);
+      }
+      if (!this.pendingTestRequest) {
+        this.livenessState = 'healthy';
+        this.lastLivenessReason = 'valid-inbound-activity';
+      }
+    }
     // Audit log inbound FIX if configured
     if (this.auditLogger && message && message.raw) {
       const redacted = this.redactRaw(message.raw);
@@ -999,7 +1111,7 @@ export class FIXConnection extends EventEmitter {
     // Handle specific message types
     switch (msgType) {
       case '0': // Heartbeat
-        this.handleHeartbeat(message);
+        this.handleHeartbeat(message, { transportIntegrityValid: validInboundFrame });
         break;
       case '1': // Test Request
         this._runInboundSessionControl(
@@ -1017,7 +1129,7 @@ export class FIXConnection extends EventEmitter {
         this.handleSequenceReset(message);
         break;
       case '5': // Logout
-        this.handleLogout(message);
+        this.handleLogout(message, socket, generation);
         break;
       default:
         // Emit message for application handling
@@ -1098,8 +1210,30 @@ export class FIXConnection extends EventEmitter {
   /**
    * Handle heartbeat message
    */
-  handleHeartbeat(message) {
-    this.lastHeartbeatReceived = Date.now();
+  handleHeartbeat(message, { transportIntegrityValid = true } = {}) {
+    if (!transportIntegrityValid) {
+      this.logger.warn(`[FIXConnection] Ignoring malformed Heartbeat for liveness from ${this.targetCompID}`);
+      return;
+    }
+    const now = this._now();
+    this.lastHeartbeatReceived = now;
+    this.lastInboundActivityAt = now;
+    this.lastInboundActivityMonotonic = this._monotonicNow();
+    const pending = this.pendingTestRequest;
+    if (pending && message.fields['112'] === pending.id &&
+        pending.socket === this.socket && pending.generation === this._connectionGeneration) {
+      this._clearPendingTestRequest(pending);
+      this.livenessState = 'healthy';
+      this.lastLivenessReason = 'test-request-response';
+      this.logger.info(`[FIXConnection] Correlated TestRequest response received from ${this.targetCompID}`);
+      this._emitContained('liveness', {
+        state: 'healthy', reason: 'test-request-response', testRequestId: pending.id,
+        generation: pending.generation, timestamp: now,
+      });
+    }
+    if (this.heartbeatTimer && !this.pendingTestRequest) {
+      this._armInboundIdleDeadline(this.socket, this._connectionGeneration);
+    }
     this.logger.debug(`[FIXConnection] Heartbeat received from ${this.targetCompID}`);
   }
   
@@ -1281,11 +1415,54 @@ export class FIXConnection extends EventEmitter {
   /**
    * Handle logout message
    */
-  handleLogout(message) {
+  handleLogout(message, socket = this.socket, generation = this._connectionGeneration) {
+    if (socket !== this.socket || generation !== this._connectionGeneration) return false;
     const text = message.fields['58'] || '';
     this.logger.info(`[FIXConnection] Logout received: ${text}`);
     this.isLoggedOn = false;
-    this.emit('logout', { text, message });
+    this.stopHeartbeat();
+    if (!socket || !this.isConnected) {
+      this.livenessState = 'disconnected';
+      this.lastLivenessReason = 'logout';
+      this._emitContained('logout', { text, message, reason: this.lastLivenessReason });
+      return true;
+    }
+    this.livenessState = 'disconnecting';
+    const intentionalClose = this._intentionalCloseGeneration === generation;
+    this.lastLivenessReason = intentionalClose ? 'intentional-disconnect' : 'peer-logout';
+
+    try {
+      // A Logout received without a locally initiated Logout must be
+      // acknowledged before transport teardown. Production sendMessage is a
+      // synchronous definitive enqueue contract; contain compatibility
+      // thenables without delaying the mandatory disconnect.
+      if (!intentionalClose) {
+        const fields = {
+          '8': this.beginString,
+          '35': '5',
+          '49': this.senderCompID,
+          '56': this.targetCompID,
+          '34': this.msgSeqNum.toString(),
+          '52': this.getUTCTimestamp(),
+        };
+        const accepted = this.sendMessage(fields);
+        if (accepted === false) {
+          this._reportSessionSendFailure('logout-response');
+        } else if (accepted?.then) {
+          void Promise.resolve(accepted)
+            .then((value) => {
+              if (value === false) this._reportSessionSendFailure('logout-response');
+            })
+            .catch((error) => this._reportSessionSendFailure('logout-response', error));
+        }
+      }
+    } catch (error) {
+      this._reportSessionSendFailure('logout-response', error);
+    } finally {
+      this._emitContained('logout', { text, message, reason: this.lastLivenessReason });
+      this.handleDisconnect(socket, generation);
+    }
+    return true;
   }
   
   /**
@@ -1293,42 +1470,227 @@ export class FIXConnection extends EventEmitter {
    */
   startHeartbeat() {
     this.stopHeartbeat();
-    
+
     const intervalMs = this.heartbeatInterval * 1000;
-    
-    this.heartbeatTimer = setInterval(async () => {
-      // Check if we've received a heartbeat recently
-      const now = Date.now();
-      if (this.lastHeartbeatReceived && (now - this.lastHeartbeatReceived) > intervalMs * 2) {
-        this.logger.error(`[FIXConnection] No heartbeat received for ${(now - this.lastHeartbeatReceived) / 1000}s`);
-        this.handleDisconnect();
-        return;
+    const socket = this.socket;
+    const generation = this._connectionGeneration;
+    const now = this._now();
+    const monotonicNow = this._monotonicNow();
+    if (this.lastInboundActivityAt === null) this.lastInboundActivityAt = now;
+    if (this.lastInboundActivityMonotonic === null) this.lastInboundActivityMonotonic = monotonicNow;
+    this._heartbeatStartedMonotonic = monotonicNow;
+    const checkEveryMs = Math.max(10, Math.floor(intervalMs * 0.2));
+
+    this.heartbeatTimer = setInterval(() => {
+      void this._scheduleHeartbeatTick(socket, generation);
+    }, checkEveryMs);
+    this._armInboundIdleDeadline(socket, generation);
+  }
+
+  _armInboundIdleDeadline(socket, generation) {
+    if (this.inboundIdleTimer) {
+      clearTimeout(this.inboundIdleTimer);
+      this.inboundIdleTimer = null;
+    }
+    if (!this._isCurrentHeartbeatSession(socket, generation) || this.pendingTestRequest) return;
+    const activityMonotonic = this.lastInboundActivityMonotonic ?? this._monotonicNow();
+    const idleDeadline = activityMonotonic +
+      this.heartbeatInterval * 1000 * this.testRequestIdleMultiplier;
+    const remainingMs = Math.max(0, idleDeadline - this._monotonicNow());
+    this.inboundIdleTimer = setTimeout(() => {
+      this.inboundIdleTimer = null;
+      this._onInboundIdleDeadline(socket, generation, activityMonotonic);
+    }, remainingMs);
+  }
+
+  _onInboundIdleDeadline(socket, generation, activityMonotonic) {
+    if (!this._isCurrentHeartbeatSession(socket, generation) || this.pendingTestRequest) return false;
+    if (this.lastInboundActivityMonotonic !== activityMonotonic) {
+      this._armInboundIdleDeadline(socket, generation);
+      return false;
+    }
+    const idleDeadline = activityMonotonic +
+      this.heartbeatInterval * 1000 * this.testRequestIdleMultiplier;
+    if (this._monotonicNow() < idleDeadline) {
+      this._armInboundIdleDeadline(socket, generation);
+      return false;
+    }
+    void this._scheduleHeartbeatTick(socket, generation);
+    return true;
+  }
+
+  _scheduleHeartbeatTick(socket, generation) {
+    const existing = this._heartbeatTickInFlight;
+    if (existing && existing.socket === socket && existing.generation === generation) {
+      return existing.promise;
+    }
+    const flight = { socket, generation, promise: null };
+    flight.promise = this._heartbeatTick(socket, generation)
+      .catch((error) => {
+        this._reportSessionSendFailure('heartbeat-tick', error);
+        return false;
+      })
+      .finally(() => {
+        if (this._heartbeatTickInFlight === flight) this._heartbeatTickInFlight = null;
+      });
+    this._heartbeatTickInFlight = flight;
+    return flight.promise;
+  }
+
+  async _awaitBoundedDispatch(result, timeoutMs) {
+    if (!result?.then) return result;
+    const timeoutMarker = Symbol('dispatch-timeout');
+    let timer;
+    try {
+      const value = await Promise.race([
+        Promise.resolve(result),
+        new Promise((resolve) => {
+          timer = setTimeout(() => resolve(timeoutMarker), timeoutMs);
+        }),
+      ]);
+      return value === timeoutMarker ? { timedOut: true } : value;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  _isCurrentHeartbeatSession(socket, generation) {
+    return socket === this.socket && generation === this._connectionGeneration &&
+      this.isConnected && this.isLoggedOn;
+  }
+
+  _failTestRequest(pending, reason, error = null, { reportDispatch = false } = {}) {
+    if (this.pendingTestRequest !== pending ||
+        !this._isCurrentHeartbeatSession(pending.socket, pending.generation)) return false;
+    this._clearPendingTestRequest(pending);
+    this.livenessState = 'failed';
+    this.lastLivenessReason = reason;
+    this.logger.error(`[FIXConnection] TestRequest failed for ${this.targetCompID}: ${reason}`);
+    this._emitContained('liveness', {
+      state: 'failed', reason, testRequestId: pending.id,
+      generation: pending.generation, timestamp: this._now(),
+    });
+    if (reportDispatch) this._reportSessionSendFailure('test-request', error);
+    this.handleDisconnect(pending.socket, pending.generation);
+    return true;
+  }
+
+  _expireTestRequest(pending, reason) {
+    return this._failTestRequest(pending, reason);
+  }
+
+  async _heartbeatTick(socket, generation) {
+    if (!this._isCurrentHeartbeatSession(socket, generation)) return false;
+    const now = this._now();
+    const monotonicNow = this._monotonicNow();
+    const intervalMs = this.heartbeatInterval * 1000;
+    const responseTimeoutMs = intervalMs * this.testRequestTimeoutMultiplier;
+    const pending = this.pendingTestRequest;
+    if (pending) {
+      if (pending.phase === 'dispatching') return false;
+      if (monotonicNow >= pending.deadlineMonotonic) this._expireTestRequest(pending, 'response-timeout');
+      return false;
+    }
+
+    const idleMs = monotonicNow - (this.lastInboundActivityMonotonic ?? monotonicNow);
+    if (idleMs >= intervalMs * this.testRequestIdleMultiplier) {
+      const idleDeadlineMonotonic =
+        (this.lastInboundActivityMonotonic ?? monotonicNow) +
+        intervalMs * this.testRequestIdleMultiplier;
+      const absoluteDeadlineMonotonic = idleDeadlineMonotonic + responseTimeoutMs;
+      const id = `TR${generation.toString(36)}-${(++this._testRequestSequence).toString(36)}`;
+      const probe = {
+        id, socket, generation, sentAt: now,
+        sentMonotonic: monotonicNow,
+        deadlineAt: now + Math.max(0, absoluteDeadlineMonotonic - monotonicNow),
+        deadlineMonotonic: absoluteDeadlineMonotonic,
+        phase: 'dispatching',
+      };
+      this.pendingTestRequest = probe;
+      if (monotonicNow >= probe.deadlineMonotonic) {
+        this._expireTestRequest(probe, 'response-timeout');
+        return false;
       }
-      
-      // Send heartbeat
       const fields = {
         '8': this.beginString,
-        '35': '0',                        // MsgType = Heartbeat
+        '35': '1',
+        '49': this.senderCompID,
+        '56': this.targetCompID,
+        '34': this.msgSeqNum.toString(),
+        '52': this.getUTCTimestamp(),
+        '112': id,
+      };
+      let accepted;
+      try {
+        accepted = await this._awaitBoundedDispatch(
+          this.sendMessage(fields),
+          Math.max(0, probe.deadlineMonotonic - this._monotonicNow()),
+        );
+      } catch (error) {
+        this._failTestRequest(probe, 'dispatch-error', error, { reportDispatch: true });
+        return false;
+      }
+      if (this.pendingTestRequest !== probe || !this._isCurrentHeartbeatSession(socket, generation)) return false;
+      if (accepted === false || accepted?.timedOut) {
+        this._failTestRequest(
+          probe,
+          accepted?.timedOut ? 'dispatch-timeout' : 'dispatch-declined',
+          accepted?.timedOut ? new Error('TestRequest dispatch timeout') : null,
+          { reportDispatch: true },
+        );
+        return false;
+      }
+      probe.phase = 'sent';
+      this.livenessState = 'probe-pending';
+      this.lastLivenessReason = 'inbound-idle';
+      const remainingMs = Math.max(0, probe.deadlineMonotonic - this._monotonicNow());
+      if (remainingMs === 0) {
+        this._expireTestRequest(probe, 'response-timeout');
+        return false;
+      }
+      this.testRequestTimeoutTimer = setTimeout(() => {
+        this._expireTestRequest(probe, 'response-timeout');
+      }, remainingMs);
+      this.logger.warn(`[FIXConnection] TestRequest ${id} sent after ${idleMs}ms inbound idleness`);
+      this._emitContained('liveness', {
+        state: 'probe-pending', reason: 'inbound-idle', testRequestId: id,
+        generation, idleMs, deadlineAt: probe.deadlineAt, timestamp: now,
+      });
+      return true;
+    }
+
+    const heartbeatBase = this.lastHeartbeatSentMonotonic ?? this._heartbeatStartedMonotonic;
+    const heartbeatDue = monotonicNow - heartbeatBase >= intervalMs;
+    if (heartbeatDue) {
+      const fields = {
+        '8': this.beginString,
+        '35': '0',
         '49': this.senderCompID,
         '56': this.targetCompID,
         '34': this.msgSeqNum.toString(),
         '52': this.getUTCTimestamp(),
       };
-      
       let accepted;
       try {
-        accepted = await this.sendMessage(fields);
+        accepted = await this._awaitBoundedDispatch(this.sendMessage(fields), responseTimeoutMs);
       } catch (error) {
         this._reportSessionSendFailure('heartbeat', error);
-        return;
+        return false;
       }
-      if (accepted === false) {
-        this._reportSessionSendFailure('heartbeat');
-        return;
+      if (accepted === false || accepted?.timedOut) {
+        this._reportSessionSendFailure(
+          'heartbeat',
+          accepted?.timedOut ? new Error('Heartbeat dispatch timeout') : null,
+        );
+        return false;
       }
-      this.lastHeartbeatSent = Date.now();
+      if (!this._isCurrentHeartbeatSession(socket, generation)) return false;
+      this.lastHeartbeatSent = this._now();
+      this.lastHeartbeatSentMonotonic = this._monotonicNow();
       this.logger.debug(`[FIXConnection] Heartbeat sent to ${this.targetCompID}`);
-    }, intervalMs);
+      return true;
+    }
+    return false;
   }
   
   /**
@@ -1339,6 +1701,11 @@ export class FIXConnection extends EventEmitter {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
     }
+    if (this.inboundIdleTimer) {
+      clearTimeout(this.inboundIdleTimer);
+      this.inboundIdleTimer = null;
+    }
+    this._clearPendingTestRequest();
   }
   
   /**
@@ -1348,9 +1715,17 @@ export class FIXConnection extends EventEmitter {
     if (socket && socket !== this.socket) return;
     if (generation !== this._connectionGeneration) return;
 
+    const intentionalClose = this._intentionalCloseGeneration === generation;
+    const livenessReason = intentionalClose
+      ? 'intentional-disconnect'
+      : (['disconnecting', 'failed'].includes(this.livenessState)
+        ? this.lastLivenessReason
+        : 'transport-disconnect');
     this.isConnected = false;
     this.isLoggedOn = false;
     this._clearLifecycleTimers();
+    this.livenessState = 'disconnected';
+    this.lastLivenessReason = livenessReason;
 
     // Cancel stable-connection timer so a quick drop doesn't reset the counter.
     if (this._stableTimer) {
@@ -1363,12 +1738,16 @@ export class FIXConnection extends EventEmitter {
       this.socket = null;
     }
 
-    this.emit('disconnect');
+    this._emitContained('disconnect', {
+      reason: this.lastLivenessReason,
+      livenessState: this.livenessState,
+      generation,
+    });
     
     // Attempt reconnection unless this was an explicit disconnect request
-    if (this.intentionalClose) {
-      // Reset flag and do not reconnect
-      this.intentionalClose = false;
+    if (intentionalClose) {
+      // Suppress reconnect only for the explicitly closed session generation.
+      this._intentionalCloseGeneration = null;
       return;
     }
     this.attemptReconnect();
@@ -1438,7 +1817,10 @@ export class FIXConnection extends EventEmitter {
    */
   async disconnect() {
     this.logger.info(`[FIXConnection] Disconnecting from ${this.targetCompID}`);
-    this.intentionalClose = true;
+    const socket = this.socket;
+    const generation = this._connectionGeneration;
+    const ownsAttempt = () => this.socket === socket && this._connectionGeneration === generation;
+    if (socket) this._intentionalCloseGeneration = generation;
     
     // Clear reconnect timer
     if (this.reconnectTimer) {
@@ -1449,7 +1831,7 @@ export class FIXConnection extends EventEmitter {
     try {
       // Send logout if logged on. Delivery failure is reported, but teardown is
       // mandatory and cannot be aborted by either synchronous or Promise APIs.
-      if (this.isLoggedOn) {
+      if (ownsAttempt() && this.isLoggedOn) {
         const fields = {
           '8': this.beginString,
           '35': '5',                        // MsgType = Logout
@@ -1467,16 +1849,24 @@ export class FIXConnection extends EventEmitter {
         }
       }
     } finally {
-      this.stopHeartbeat();
-      this.stopCleanupTimer();
-
-      if (this.socket) {
-        this.socket.destroy();
+      if (ownsAttempt()) {
+        this.stopHeartbeat();
+        this._resetLivenessState();
+        this.stopCleanupTimer();
+        if (socket && !socket.destroyed) socket.destroy();
         this.socket = null;
+        this.isConnected = false;
+        this.isLoggedOn = false;
+        this.livenessState = 'disconnected';
+        this.lastLivenessReason = 'intentional-disconnect';
+      } else if (socket && !socket.destroyed) {
+        // The awaited Logout outcome belongs to an old generation. Close only
+        // that captured transport; never touch the replacement session.
+        socket.destroy();
       }
-
-      this.isConnected = false;
-      this.isLoggedOn = false;
+      if (this._intentionalCloseGeneration === generation) {
+        this._intentionalCloseGeneration = null;
+      }
     }
   }
   
@@ -1519,7 +1909,11 @@ export class FIXConnection extends EventEmitter {
       expectedSeqNum: this.expectedSeqNum,
       reconnectAttempts: this.reconnectAttempts,
       lastHeartbeatReceived: this.lastHeartbeatReceived,
-      lastHeartbeatSent: this.lastHeartbeatSent
+      lastHeartbeatSent: this.lastHeartbeatSent,
+      lastInboundActivityAt: this.lastInboundActivityAt,
+      pendingTestRequestId: this.pendingTestRequest?.id || null,
+      livenessState: this.livenessState,
+      lastLivenessReason: this.lastLivenessReason,
     };
   }
 }
