@@ -23,6 +23,8 @@
  *   TRUEX_TARGET_COMP_ID   - Target comp ID (TRUEX_PROD_OE)
  *   TRUEX_REST_URL         - REST URL via proxy (http://178.156.230.110:3006)
  *   TRUEX_SENDER_COMP_ID   - SenderCompID (default: DAVID1)
+ *   TRUEX_INSTRUMENT_ID    - Exact TrueX instrument ID owned by this maker
+ *   TRUEX_ORDER_ID_NAMESPACE - Stable 4-6 character maker ClOrdID namespace
  *   DATABASE_URL            - PostgreSQL (optional)
  *   REDIS_URL               - Redis (optional)
  *   TARGET_INVENTORY_BTC     - Desired BTC allocation used for inventory skew (default: 0)
@@ -38,6 +40,9 @@ import { KrakenRestClient } from '../src/connectors/kraken/KrakenRestClient.ts';
 import { CoinbaseWsIngest } from '../src/data-pipeline/coinbase-ws-ingest.js';
 import { CoinbaseMarketDataAdapter } from '../src/data-pipeline/coinbase-market-data-adapter.js';
 import { buildReferenceMarkoutRolloutOptions } from './reference-markout-rollout-config.js';
+import { buildContinuityConfig } from './continuity-config.js';
+import { buildOrderReconciliationScope } from './order-reconciliation-scope-config.js';
+import { startProductionOrchestrator } from './production-orchestrator-startup.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -69,6 +74,15 @@ function parseBoolean(envVar, defaultVal) {
   return defaultVal;
 }
 
+function parsePositiveInteger(envVar, defaultVal) {
+  const raw = process.env[envVar];
+  const value = raw === undefined || raw === null || raw === '' ? defaultVal : Number(raw);
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`${envVar} must be a positive integer`);
+  }
+  return value;
+}
+
 const shadowPhase2Criteria = {
   minObservationDays: parseNumber('SHADOW_GO_MIN_OBSERVATION_DAYS', 3),
   minWouldTakeCount: parseNumber('SHADOW_GO_MIN_WOULD_TAKE_COUNT', 50),
@@ -80,6 +94,7 @@ const shadowPhase2Criteria = {
   maxP95AbsPyusdBasisBps: parseNumber('SHADOW_ABORT_MAX_P95_ABS_PYUSD_BASIS_BPS', 80),
 };
 const referenceMarkoutRolloutOptions = buildReferenceMarkoutRolloutOptions(process.env);
+const orderReconciliationScope = buildOrderReconciliationScope(process.env);
 
 // ---------------------------------------------------------------------------
 // Configuration — PRODUCTION
@@ -161,6 +176,8 @@ const config = {
 
   // REST URL for reconciliation + balance fetching
   restUrl: process.env.TRUEX_REST_URL || 'http://178.156.230.110:3006',
+  startupCancelVerifyTimeoutMs: parsePositiveInteger('TRUEX_STARTUP_CANCEL_VERIFY_TIMEOUT_MS', 30000),
+  startupCancelVerifyIntervalMs: parsePositiveInteger('TRUEX_STARTUP_CANCEL_VERIFY_INTERVAL_MS', 500),
   pyusdUsdPollIntervalMs: parseInt(process.env.PYUSD_USD_POLL_INTERVAL_MS || '5000', 10),
   pyusdUsdPollTimeoutMs: parseInt(process.env.PYUSD_USD_POLL_TIMEOUT_MS || '1000', 10),
   pyusdUsdStaleThresholdMs: parseInt(process.env.PYUSD_USD_STALE_THRESHOLD_MS || '15000', 10),
@@ -189,6 +206,11 @@ const config = {
   truexTapeMaxAgeMs: parseInt(process.env.SHADOW_SEND_TAPE_MAX_AGE_MS || '5000', 10),
   shadowPhase2Criteria,
 };
+config.continuityConfig = buildContinuityConfig(process.env, {
+  levels: config.levels,
+  baseSizeBTC: config.baseSizeBTC,
+  baseSpreadBps: config.baseSpreadBps,
+});
 
 // ---------------------------------------------------------------------------
 // Webhook Alerting
@@ -315,35 +337,6 @@ async function main() {
   logger.info('');
 
   krakenRestClient = new KrakenRestClient({});
-
-  // 0. Cancel orphaned orders from previous sessions via REST API
-  logger.info('[0/5] Cancelling orphaned orders via REST API...');
-  try {
-    const { TrueXRESTClient } = await import('../src/exchanges/truex/TrueXRESTClient.ts');
-    const restClient = new TrueXRESTClient({
-      baseURL: `${config.restUrl}/api/v1`,
-      apiKey: config.apiKey,
-      apiSecret: config.apiSecret,
-      userId: config.clientId,
-    });
-
-    const result = await restClient.cancelAllOrders();
-    if (result.failed.length > 0) {
-      logger.error(`Orphan cancel failures: ${result.failed.map(f => `${f.id}:${f.error}`).join(', ')}`);
-      logger.error('Cannot start with live orphaned orders — exiting');
-      process.exit(1);
-    }
-    if (result.canceled.length > 0) {
-      logger.info(`Cancelled ${result.canceled.length} orphaned orders`);
-    } else {
-      logger.info('No orphaned orders found');
-    }
-  } catch (err) {
-    logger.error(`REST orphan cancel failed: ${err.message}`);
-    logger.error('Cannot proceed without REST connectivity — exiting');
-    process.exit(1);
-  }
-  logger.info('');
 
   // 1. Data Pipeline (Memory → Redis → PostgreSQL)
   logger.info('[1/5] Setting up data pipeline...');
@@ -489,9 +482,13 @@ async function main() {
     // Data pipeline
     dataPipeline,
     ...referenceMarkoutRolloutOptions,
+    continuityConfig: config.continuityConfig,
+    ...orderReconciliationScope,
 
     // REST reconciliation + balance refresh
     restUrl: config.restUrl,
+    startupCancelVerifyTimeoutMs: config.startupCancelVerifyTimeoutMs,
+    startupCancelVerifyIntervalMs: config.startupCancelVerifyIntervalMs,
     pyusdUsdPollIntervalMs: config.pyusdUsdPollIntervalMs,
     pyusdUsdPollTimeoutMs: config.pyusdUsdPollTimeoutMs,
     pyusdUsdStaleThresholdMs: config.pyusdUsdStaleThresholdMs,
@@ -546,7 +543,7 @@ async function main() {
   apiSetOrchestrator?.(orchestrator);
 
   // 5. Start (connects FIX, fetches balances, begins quoting)
-  await orchestrator.start();
+  await startProductionOrchestrator(orchestrator);
 
   logger.info('');
   logger.info('╔════════════════════════════════════════╗');

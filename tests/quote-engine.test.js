@@ -2369,7 +2369,7 @@ describe('QuoteEngine', () => {
       // Order has a cancel in flight (status 'cancelling') when a partial fill lands
       engine.activeOrders.set('CLO008', { side: 'sell', price: 100250, size: 0.01, level: 1, status: 'cancelling', placedAt: Date.now() });
 
-      engine.onExecutionReport({ '11': 'CLO008', '39': '1', '54': '2', '31': '100250', '32': '0.004', '151': '0.006' });
+      engine.onExecutionReport({ '11': 'CLO008', '17': 'EXEC008', '39': '1', '54': '2', '31': '100250', '32': '0.004', '151': '0.006' });
 
       expect(fillEvents.length).toBe(1);                              // fill still recorded
       expect(engine.activeOrders.get('CLO008').size).toBeCloseTo(0.006, 8);
@@ -2380,40 +2380,42 @@ describe('QuoteEngine', () => {
       const engine = createEngine();
       // Partial fill arrives before a separate New ack — order still 'pending'
       engine.activeOrders.set('CLO009', { side: 'buy', price: 99750, size: 0.01, level: 1, status: 'pending', placedAt: Date.now() });
-      engine.onExecutionReport({ '11': 'CLO009', '39': '1', '54': '1', '31': '99750', '32': '0.003', '151': '0.007' });
+      engine.onExecutionReport({ '11': 'CLO009', '17': 'EXEC009', '39': '1', '54': '1', '31': '99750', '32': '0.003', '151': '0.007' });
       expect(engine.activeOrders.get('CLO009').status).toBe('active'); // not stuck pending
       expect(engine.activeOrders.get('CLO009').size).toBeCloseTo(0.007, 8);
     });
 
-    it('should reduce by LastQty when LeavesQty (151) is absent on a partial fill', () => {
+    it('should reduce by LastQty when LeavesQty (151) is absent on a legacy partial fill', () => {
       const engine = createEngine();
       engine.activeOrders.set('CLO007', { side: 'buy', price: 99750, size: 0.01, level: 1, status: 'active', placedAt: Date.now() });
-      engine.onExecutionReport({ '11': 'CLO007', '39': '1', '54': '1', '31': '99750', '32': '0.003' });
+      engine.onExecutionReport({ '11': 'CLO007', '17': 'EXEC007', '39': '1', '54': '1', '31': '99750', '32': '0.003' });
       expect(engine.activeOrders.get('CLO007').size).toBeCloseTo(0.007, 8);
     });
 
-    it('should fall back to size-LastQty when LeavesQty (151) is an empty/garbage string', () => {
+    it('should fail closed when LeavesQty (151) is empty in legacy mode', () => {
       const engine = createEngine();
       engine.activeOrders.set('CLO010', { side: 'buy', price: 99750, size: 0.01, level: 1, status: 'active', placedAt: Date.now() });
-      // tag 151 present but empty — Number('') is 0; must NOT be used, fall back to size-LastQty
-      engine.onExecutionReport({ '11': 'CLO010', '39': '1', '54': '1', '31': '99750', '32': '0.002', '151': '' });
+      // Without the authoritative manager, preserve the prior local-accounting fallback.
+      engine.onExecutionReport({ '11': 'CLO010', '17': 'EXEC010', '39': '1', '54': '1', '31': '99750', '32': '0.002', '151': '' });
       expect(Number.isFinite(engine.activeOrders.get('CLO010').size)).toBe(true);
-      expect(engine.activeOrders.get('CLO010').size).toBeCloseTo(0.008, 8);
+      expect(engine.activeOrders.get('CLO010').size).toBeCloseTo(0.01, 8);
+      expect(engine.quotingSuspended).toBe(true);
     });
 
-    it('should fall back when LeavesQty (151) is partially-numeric garbage like "0.007foo"', () => {
+    it('should fail closed when LeavesQty is partially-numeric garbage in legacy mode', () => {
       const engine = createEngine();
       engine.activeOrders.set('CLO011', { side: 'buy', price: 99750, size: 0.01, level: 1, status: 'active', placedAt: Date.now() });
-      // parseFloat would accept '0.007' from this; strict Number() rejects it → fall back to size-LastQty
-      engine.onExecutionReport({ '11': 'CLO011', '39': '1', '54': '1', '31': '99750', '32': '0.002', '151': '0.007foo' });
-      expect(engine.activeOrders.get('CLO011').size).toBeCloseTo(0.008, 8); // 0.01 - 0.002, NOT 0.007
+      // parseFloat would accept a prefix; strict validation fails closed instead.
+      engine.onExecutionReport({ '11': 'CLO011', '17': 'EXEC011', '39': '1', '54': '1', '31': '99750', '32': '0.002', '151': '0.007foo' });
+      expect(engine.activeOrders.get('CLO011').size).toBeCloseTo(0.01, 8);
+      expect(engine.quotingSuspended).toBe(true);
     });
 
     it('should reset consecutiveRejects on a partial fill', () => {
       const engine = createEngine();
       engine.consecutiveRejects = 2;
       engine.activeOrders.set('CLO006', { side: 'buy', price: 99750, size: 0.01, level: 1, status: 'active', placedAt: Date.now() });
-      engine.onExecutionReport({ '11': 'CLO006', '39': '1', '54': '1', '31': '99750', '32': '0.005', '151': '0.005' });
+      engine.onExecutionReport({ '11': 'CLO006', '17': 'EXEC006', '39': '1', '54': '1', '31': '99750', '32': '0.005', '151': '0.005' });
       expect(engine.consecutiveRejects).toBe(0);
     });
 

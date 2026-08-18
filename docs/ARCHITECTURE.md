@@ -166,13 +166,14 @@ Central coordinator that wires all components and manages the system lifecycle.
 **Startup sequence:**
 1. Wire event handlers (price, FIX, fills, hedges, emergencies)
 2. Fetch account balances via REST (mandatory when REST client configured)
-3. Connect FIX OE
-4. Connect market data feed (optional, non-blocking)
-5. Start data pipeline (optional, non-blocking)
-6. Start PnL periodic logging
-7. Start quote engine drain queue timer (every 200ms)
-8. Start REST reconciliation timer (every 5 minutes)
-9. Start balance refresh timer (every 60 seconds)
+3. Reconcile exchange orders and capital via REST; fail startup before FIX if the snapshot or orphan cancellation fails
+4. Connect FIX OE
+5. Connect market data feed (optional, non-blocking)
+6. Start data pipeline (optional, non-blocking)
+7. Start PnL periodic logging
+8. Start quote engine drain queue timer (every 200ms)
+9. Start REST reconciliation timer (every 5 minutes)
+10. Start balance refresh timer (every 60 seconds)
 
 **Shutdown sequence:**
 1. Cancel all active quotes
@@ -477,16 +478,35 @@ PostgreSQL-backed analytics server using `Bun.serve()` on port 3100.
 | `TRUEX_PROD_HOST` | No | `10.20.6.11` | TrueX production internal IP (reachable via WireGuard tunnel). Substituted into `TRUEX_UPSTREAM_HOST` for both FIX proxies and `TRUEX_REST_URL` in `docker-compose.prod.yml`. WireGuard `AllowedIPs` must include this `/32`. If TrueX migrates the endpoint, update this var **and** add the new `/32` to `/etc/wireguard/truemarkets.conf`. Empty string does not fall back to default — keep populated or unset. |
 | `TRUEX_REST_URL` | No | `http://10.20.6.11:9742` | TrueX REST URL — derived from `TRUEX_PROD_HOST` by `docker-compose.prod.yml`. Override only when accessing from outside Hetzner (e.g. `http://178.156.230.110:3006` socat tunnel for local development). |
 | `TRUEX_TARGET_COMP_ID` | No | `TRUEX_PROD_OE` | FIX TargetCompID |
+| `TRUEX_INSTRUMENT_ID` | Yes | -- | Exact TrueX REST `order_info.instrument_id`, commonly numeric—not the FIX symbol. Resolve it from the venue; clearly foreign instruments are ignored and never cancelled. |
+| `TRUEX_ORDER_ID_NAMESPACE` | Yes | -- | Operator-chosen, stable, account-unique 4-6 character URL-safe maker namespace; there is deliberately no shared default. Keep it unchanged across restarts. Generated IDs add a random 5-character boot segment and 6-character monotonic sequence while retaining this recognizable namespace; same-instrument orders from other namespaces are ignored. |
 | `TRUEX_SENDER_COMP_ID` | No | `DAVID1` | FIX SenderCompID |
+| `TRUEX_STARTUP_CANCEL_VERIFY_TIMEOUT_MS` | No | `30000` | Maximum positive-integer milliseconds to wait for pre-existing `CANCEL_PENDING` orders to become terminal or disappear before startup fails |
+| `TRUEX_STARTUP_CANCEL_VERIFY_INTERVAL_MS` | No | `500` | Positive-integer REST polling interval during strict startup cancel verification; must not exceed the timeout |
 | `DATABASE_URL` | No | -- | PostgreSQL connection string (Hetzner truex-pg-analytics 178.156.247.87:5432/truex_analytics) |
 | `REDIS_URL` | No | -- | Redis connection string (optional, auto-fallback) |
 | `REFERENCE_MARKOUT_ENABLED` | No | `false` | Explicitly enable restart-safe 1/5/60-minute reference collection; keep false for the inert rollout stage |
+| `MM_MIN_ACTIVE_LEVELS_PER_SIDE` | Yes | -- | Minimum distinct acknowledged and funded quote levels required on each side; cannot exceed normal quote levels |
+| `MM_MIN_FUNDED_QUOTE_SIZE_BTC` | Yes | -- | Smallest BTC quote size that counts toward maker presence |
+| `MM_L1_RESERVE_BASE_BTC` | Yes | -- | Base-asset capital reserved for the sell-side L1 obligation |
+| `MM_L1_RESERVE_QUOTE_PYUSD` | Yes | -- | Quote-asset capital reserved for the buy-side L1 obligation |
+| `MM_MAX_SIDE_GAP_MS` | Yes | -- | Maximum permitted duration without the configured acknowledged levels on either side |
+| `MM_SIDE_GAP_ALERT_THRESHOLD_MS` | Yes | -- | Side-gap duration that raises an alert; must not exceed `MM_MAX_SIDE_GAP_MS` |
+| `MM_SIDE_GAP_ALERT_RATE_LIMIT_MS` | Yes | -- | Minimum interval between repeated side-gap alerts |
+| `MM_DEGRADED_MAX_LEVELS` | Yes | -- | Maximum levels per side in degraded mode; must be below normal depth and at least the presence obligation |
+| `MM_DEGRADED_SIZE_FACTOR` | Yes | -- | Degraded-mode size multiplier in `(0,1)`; scaled L1 must remain at least the funded minimum |
+| `MM_DEFENSIVE_SPREAD_FLOOR_BPS` | Yes | -- | Minimum degraded-mode spread; must be wider than the normal base spread |
 | `TRUEX_MAKER_FEE_BPS` | No | `0` | TrueX maker fee in basis points |
 | `TRUEX_TAKER_FEE_BPS` | No | `0` | TrueX taker fee in basis points |
 | `HEDGE_MAKER_FEE_BPS` | No | `0` | Hedge venue maker fee in basis points |
 | `HEDGE_TAKER_FEE_BPS` | No | `0` | Hedge venue taker fee in basis points |
 | `LOG_LEVEL` | No | `info` | Log level (`info` or `debug`) |
 | `TRUEX_DEBUG_MODE` | No | -- | Set to `true` to log raw FIX messages |
+
+The ten `MM_*` continuity settings are deliberately required and have no runtime defaults. Copy
+their non-secret examples from `.env.example`, then validate reserves and thresholds against the
+funded account and current quote depth/size/spread. `docker-compose.prod.yml` fails during Compose
+resolution when any setting is absent, before the market-maker container is recreated.
 
 ### UAT
 

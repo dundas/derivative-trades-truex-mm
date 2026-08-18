@@ -32,19 +32,19 @@ measurement/promotion path after production telemetry is available.
   - [ ] 1.3 Run the delivery-truth repo validator and record its result.
   - [ ] 1.4 Obtain the required approval for this reviewer-policy PR before merge.
 
-- [ ] 2.0 Build the authoritative capital reservation and reconciliation model
-  - [ ] 2.1 Define an idempotent reservation state model for pending-new, active, cancel-in-flight,
+- [x] 2.0 Build the authoritative capital reservation and reconciliation model
+  - [x] 2.1 Define an idempotent reservation state model for pending-new, active, cancel-in-flight,
     replacement, rejected, cancelled, and filled orders.
-  - [ ] 2.2 Reconcile REST available/held/total balances with local reservations without double-counting.
-  - [ ] 2.3 Reserve before send; release/convert exactly once for every terminal execution path.
-  - [ ] 2.4 Resync and recompute a funded size after insufficient-funds rejects.
-  - [ ] 2.5 Add unit and integration coverage for duplicate, delayed, and out-of-order events.
+  - [x] 2.2 Reconcile REST available/held/total balances with local reservations without double-counting.
+  - [x] 2.3 Reserve before send; release/convert exactly once for every terminal execution path.
+  - [x] 2.4 Resync and recompute a funded size after insufficient-funds rejects.
+  - [x] 2.5 Add unit and integration coverage for duplicate, delayed, and out-of-order events.
 
 - [ ] 3.0 Deliver verified two-sided presence and fail-soft execution
-  - [ ] 3.1 Add acknowledged-live per-side presence state and configurable L1 reserve.
-  - [ ] 3.2 Add normal/degraded/unsafe state transitions with structured causes.
-  - [ ] 3.3 Preserve funded L1 when deeper levels are suppressed; restore an absent side safely.
-  - [ ] 3.4 Add side-gap/two-sided-uptime metrics, alerts, and health output.
+  - [x] 3.1 Add acknowledged-live per-side presence state and configurable L1 reserve.
+  - [x] 3.2 Add normal/degraded/unsafe state transitions with structured causes.
+  - [x] 3.3 Preserve funded L1 when deeper levels are suppressed; restore an absent side safely.
+  - [x] 3.4 Add side-gap/two-sided-uptime metrics, alerts, and health output.
   - [ ] 3.5 Add a focused smoke and production soak proving continuous L1 plus zero funding rejects.
 
 - [ ] 4.0 Deliver adaptive quote controls without reducing continuity
@@ -77,10 +77,10 @@ measurement/promotion path after production telemetry is available.
 
 ## Required Gate Checklist for Each Code PR
 
-- [ ] Create a fresh locked feature worktree from `origin/main`; never reuse a dusty branch.
-- [ ] Run the dialectical player/coach loop for non-trivial changes.
-- [ ] Commit small focused conventional commits.
-- [ ] Run adversarial review, then pre-push review, then focused smoke.
+- [x] Create a fresh locked feature worktree from `origin/main`; never reuse a dusty branch.
+- [x] Run the dialectical player/coach loop for non-trivial changes.
+- [x] Commit small focused conventional commits.
+- [x] Run adversarial review, then pre-push review, then focused smoke.
 - [ ] Push only after gates pass; solicit configured reviewers after every push and run the PR review loop.
 - [ ] Run docs generation and a separate docs PR when scripts, docs, or content pipeline surfaces change.
 - [ ] Merge only after CI, final reviewer approval, and valid smoke/soak evidence.

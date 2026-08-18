@@ -11,6 +11,54 @@ import { TrueXRESTClient } from '../exchanges/truex/TrueXRESTClient.js';
 import { AlertManager, normalizeAlertReason } from '../alerts/alert-manager.js';
 import { QuoteLifecycleTelemetry } from '../data-pipeline/quote-lifecycle-telemetry.js';
 import { ReferenceMarkoutCollector } from '../data-pipeline/reference-markout-collector.js';
+import { CapitalReservationManager } from './capital-reservation-manager.js';
+import { MakerPresenceController } from './maker-presence-controller.js';
+
+function strictPositiveRestNumber(value) {
+  if ((typeof value !== 'string' && typeof value !== 'number') ||
+      (typeof value === 'string' && value.trim() === '')) return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function captureLocalReconciliationOrder(orderId, order, capitalManager) {
+  const reservation = capitalManager?.getReservation?.(orderId) || null;
+  return Object.freeze({
+    ref: order,
+    status: order?.status,
+    acknowledgedLive: order?.acknowledgedLive,
+    side: order?.side,
+    size: order?.size,
+    price: order?.price,
+    level: order?.level,
+    capitalState: reservation?.state,
+    capitalAcknowledgedLive: reservation?.acknowledgedLive,
+    capitalRemainingSize: reservation?.remainingSize,
+    capitalMutationSequence: reservation?.lastMutationSequence,
+  });
+}
+
+function localReconciliationOrderUnchanged(snapshot, current, orderId, capitalManager) {
+  if (!snapshot || !current || current !== snapshot.ref) return false;
+  const latest = captureLocalReconciliationOrder(orderId, current, capitalManager);
+  return snapshot.status === latest.status &&
+    snapshot.acknowledgedLive === latest.acknowledgedLive &&
+    snapshot.side === latest.side && snapshot.size === latest.size &&
+    snapshot.price === latest.price && snapshot.level === latest.level &&
+    snapshot.capitalState === latest.capitalState &&
+    snapshot.capitalAcknowledgedLive === latest.capitalAcknowledgedLive &&
+    snapshot.capitalRemainingSize === latest.capitalRemainingSize &&
+    snapshot.capitalMutationSequence === latest.capitalMutationSequence;
+}
+
+function isStableLocalOrder(order) {
+  return order && order.status !== 'pending' && order.status !== 'cancelling';
+}
+
+function positiveIntegerOption(value, name) {
+  if (!Number.isInteger(value) || value <= 0) throw new Error(`${name} must be a positive integer`);
+  return value;
+}
 
 /**
  * MarketMakerOrchestrator - Wires all components and manages lifecycle.
@@ -66,6 +114,11 @@ export class MarketMakerOrchestrator extends EventEmitter {
       logger: this.logger,
     });
 
+    this.capitalReservationManager = options.capitalReservationManager ||
+      (options.continuityConfig ? new CapitalReservationManager(options.continuityConfig) : null);
+    this.presenceController = options.presenceController ||
+      (options.continuityConfig ? new MakerPresenceController(options.continuityConfig, { now: options.now || Date.now }) : null);
+
     this.pnlTracker = options.pnlTracker || new PnLTracker({
       truexMakerFeeBps: options.truexMakerFeeBps ?? 0,
       truexTakerFeeBps: options.truexTakerFeeBps ?? 0,
@@ -78,6 +131,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
 
     this.quoteEngine = options.quoteEngine || new QuoteEngine({
       inventoryManager: this.inventoryManager,
+      capitalReservationManager: this.capitalReservationManager,
       fixConnection: this.fixOE,
       levels: options.levels || 5,
       baseSpreadBps: options.baseSpreadBps || 50,
@@ -105,7 +159,11 @@ export class MarketMakerOrchestrator extends EventEmitter {
       pyusdUsdStaleThresholdMs: options.pyusdUsdStaleThresholdMs ?? 15000,
       marketablePostOnlyAction: options.marketablePostOnlyAction || 'skip',
       replaceMode: options.replaceMode || 'passive-safe',
-      minActiveLevelsPerSide: options.minActiveLevelsPerSide ?? 1,
+      minActiveLevelsPerSide: options.continuityConfig?.minActiveLevelsPerSide ?? options.minActiveLevelsPerSide ?? 1,
+      minimumFundedQuoteSize: options.continuityConfig?.minimumFundedQuoteSize ?? 0,
+      degradedMaxLevels: options.continuityConfig?.degradedMaxLevels ?? 1,
+      degradedSizeFactor: options.continuityConfig?.degradedSizeFactor ?? 1,
+      defensiveSpreadFloorBps: options.continuityConfig?.defensiveSpreadFloorBps ?? 0,
       maxReplacementsPerSidePerCycle: options.maxReplacementsPerSidePerCycle ?? 1,
       pendingReplacementTimeoutMs: options.pendingReplacementTimeoutMs || 5000,
       pendingSelfCrossGuardMs: options.pendingSelfCrossGuardMs ?? 5000,
@@ -129,8 +187,25 @@ export class MarketMakerOrchestrator extends EventEmitter {
       shadowDetectionTapeMaxAgeMs: options.shadowDetectionTapeMaxAgeMs ?? 30000,
       truexTapeOutlierThresholdBps: options.truexTapeOutlierThresholdBps ?? 50,
       marketDataProvider: () => this.marketDataFeed?.getBestBidAsk?.(),
+      orderIdNamespace: options.orderIdNamespace,
+      orderIdBootId: options.orderIdBootId,
       logger: this.logger,
     });
+    this.truexInstrumentId = options.truexInstrumentId ?? null;
+    this.orderIdNamespace = options.orderIdNamespace ?? null;
+    if ((this.truexInstrumentId === null) !== (this.orderIdNamespace === null)) {
+      throw new Error('truexInstrumentId and orderIdNamespace must be configured together');
+    }
+    if (this.truexInstrumentId !== null &&
+        !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(this.truexInstrumentId)) {
+      throw new Error('truexInstrumentId must be a valid nonempty identifier');
+    }
+    if (this.orderIdNamespace !== null && !/^[A-Za-z0-9_-]{4,6}$/.test(this.orderIdNamespace)) {
+      throw new Error('orderIdNamespace must contain 4-6 URL-safe characters');
+    }
+    if (options.continuityConfig) {
+      this.quoteEngine.setContinuityStateProvider?.(() => this._getContinuityStatus());
+    }
 
     this.hedgeExecutor = options.hedgeExecutor || new HedgeExecutor({
       krakenClient: options.krakenClient,
@@ -187,6 +262,19 @@ export class MarketMakerOrchestrator extends EventEmitter {
       });
     }
     this.reconcileIntervalMs = options.reconcileIntervalMs || 300000; // 5 min
+    this.startupCancelVerifyTimeoutMs = positiveIntegerOption(
+      options.startupCancelVerifyTimeoutMs ?? 30000,
+      'startupCancelVerifyTimeoutMs',
+    );
+    this.startupCancelVerifyIntervalMs = positiveIntegerOption(
+      options.startupCancelVerifyIntervalMs ?? 500,
+      'startupCancelVerifyIntervalMs',
+    );
+    if (this.startupCancelVerifyIntervalMs > this.startupCancelVerifyTimeoutMs) {
+      throw new Error('startupCancelVerifyIntervalMs must not exceed startupCancelVerifyTimeoutMs');
+    }
+    this._now = options.now || Date.now;
+    this._sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.balanceRefreshIntervalMs = options.balanceRefreshIntervalMs || 60000; // 1 min
     this.truexEbboPollIntervalMs = options.truexEbboPollIntervalMs ?? 1000;
     const configuredTruexEbboPollTimeoutMs =
@@ -223,6 +311,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     // State
     this.isRunning = false;
     this.startedAt = null;
+    this._emergencyUnsafe = false;
 
     // Watchdog state
     this._lastMdUpdateTime = 0;
@@ -298,17 +387,77 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this._onHedgeFill = this._onHedgeFill.bind(this);
     this._onEmergency = this._onEmergency.bind(this);
     this._onOEDisconnect = this._onOEDisconnect.bind(this);
+    this._onCapitalResyncRequired = this._onCapitalResyncRequired.bind(this);
+    this._onLogonResetFallback = this._onLogonResetFallback.bind(this);
+    this._onLogonResetFallbackExhausted = this._onLogonResetFallbackExhausted.bind(this);
+    this._eventsWired = false;
+    this._startInFlight = false;
+    this._fixConnectionOwned = false;
+    this._dirtyStartupResources = {
+      fix: null, marketData: null, pipeline: null, pnl: null, reference: null,
+    };
+    this._capitalResyncInFlight = null;
+    this._capitalResyncPending = false;
+    this._capitalResyncStrictPending = false;
+    this._capitalResyncStrictDrainSuppressed = false;
   }
 
   /**
    * Start the market maker: connect, wire events, begin quoting.
    */
   async start() {
+    if (this.isRunning) return false;
+    if (this._startInFlight) throw new Error('Market maker startup is already in progress');
+
+    this._startInFlight = true;
+    this._intentionalStop = false;
+    try {
+      await this._recoverDirtyStartupResources();
+    } catch (error) {
+      this._startInFlight = false;
+      throw error;
+    }
+    const attempt = {
+      eventsWired: false,
+      fixActivationAttempted: false,
+      marketDataActivationAttempted: false,
+      dataPipelineActivationAttempted: false,
+      pnlActivationAttempted: false,
+      referenceCollectorActivationAttempted: false,
+      timerHandles: [],
+    };
+    attempt.fixInitiallyActive = this._isStartupConnectionActive(this.fixOE);
+    attempt.marketDataInitiallyActive = this._isStartupConnectionActive(this.marketDataFeed);
+    attempt.dataPipelineState = this._capturePipelineStartupState(this.dataPipeline);
+    attempt.dataPipelineInitiallyRunning = this._pipelineStartupStateIsActive(attempt.dataPipelineState);
+    attempt.pnlState = this._captureStartupComponentState(this.pnlTracker);
+    attempt.referenceState = this._captureStartupComponentState(this.referenceMarkoutCollector);
+    attempt.pnlInitiallyRunning = Boolean(this.pnlTracker?._logTimer) ||
+      this._startupComponentStateIsActive(attempt.pnlState);
+    attempt.referenceCollectorInitiallyRunning = Boolean(this.referenceMarkoutCollector?._timer) ||
+      this._startupComponentStateIsActive(attempt.referenceState);
+    const rememberTimers = (owner, properties, clear, group) => {
+      if (!owner) return;
+      for (const property of properties) {
+        attempt.timerHandles.push({ owner, property, handle: owner[property] ?? null, clear, group });
+      }
+    };
+    rememberTimers(this, [
+      'drainQueueTimer', '_reconcileTimer', '_balanceRefreshTimer', '_watchdogTimer', '_snapshotTimer',
+    ], clearInterval, 'orchestrator');
+    rememberTimers(this, ['_truexEbboPollTimer', '_pyusdUsdPollTimer'], clearTimeout, 'orchestrator');
+    rememberTimers(this.pnlTracker, ['_logTimer'], clearInterval, 'pnl');
+    rememberTimers(this.dataPipeline, [
+      '_flushTimer', '_pgFlushTimer', '_migrationTimer', '_cleanupTimer',
+    ], clearInterval, 'pipeline');
+    rememberTimers(this.referenceMarkoutCollector, ['_timer'], clearInterval, 'reference');
+
+    try {
     this.logger.info(`[Orchestrator] Starting market maker session ${this.sessionId}`);
     this._validatePyusdUsdPollingConfig();
 
     // 1. Wire event handlers
-    this._wireEvents();
+    attempt.eventsWired = this._wireEvents();
 
     // 2. Fetch account balances via REST (before connecting FIX)
     //    This is MANDATORY when a REST client is configured — fail-open is too dangerous
@@ -321,26 +470,65 @@ export class MarketMakerOrchestrator extends EventEmitter {
       this.logger.warn('[Orchestrator] No REST client — skipping balance initialization (quoting both sides)');
     }
 
-    // 3. Connect FIX OE
-    this.logger.info('[Orchestrator] Connecting FIX OE...');
-    await this.fixOE.connect();
-    this.logger.info('[Orchestrator] FIX OE connected');
+    // 3. Strictly remove exchange orphans before FIX can connect or quoting can start.
+    // This explicit option is the only pre-start reconciliation path; ordinary
+    // periodic/manual calls remain gated on isRunning.
+    if (this.restClient) {
+      await this._restReconcile({ allowPreStart: true, strict: true });
+      // Orphan cancellation can release venue-held funds after the initial
+      // balance snapshot. Re-establish one coherent balance + scoped-live view
+      // before FIX can connect or any queued work can become executable.
+      await this._refreshBalances({
+        requireLiveOrders: true,
+        clearBlockedSides: true,
+        allowPreStart: true,
+        strict: true,
+      });
+      const capital = this.capitalReservationManager?.getStatus?.();
+      if (capital && (capital.state !== 'normal' || capital.blockedSides.length > 0)) {
+        throw new Error('capital reconciliation did not converge after strict startup cleanup');
+      }
+    }
 
-    // 4. Connect market data feed (optional, non-blocking) — TrueX MD FIX or e.g. Coinbase adapter
-    if (this.marketDataFeed) {
+    // 4. Connect FIX OE
+    if (!attempt.fixInitiallyActive) {
+      this.logger.info('[Orchestrator] Connecting FIX OE...');
+      attempt.fixActivationAttempted = true;
+      await this.fixOE.connect();
+      this.logger.info('[Orchestrator] FIX OE connected');
+    }
+    if (!this._isFixExecutionHealthy()) {
+      const ownership = attempt.fixInitiallyActive ? 'preexisting ' : '';
+      throw new Error(`${ownership}FIX transport is not logged on — refusing to start quoting`);
+    }
+
+    // 5. Connect market data feed (optional, non-blocking) — TrueX MD FIX or e.g. Coinbase adapter
+    if (this.marketDataFeed && !attempt.marketDataInitiallyActive) {
       try {
         this.logger.info('[Orchestrator] Connecting market data feed...');
+        attempt.marketDataActivationAttempted = true;
         await this.marketDataFeed.connect();
         await this.marketDataFeed.subscribe(this.symbol);
         this.logger.info('[Orchestrator] Market data feed connect/subscribe completed');
       } catch (err) {
         this.logger.warn(`[Orchestrator] Market data feed failed (non-fatal): ${err.message}`);
+        let cleaned = false;
+        if (attempt.marketDataActivationAttempted && this.marketDataFeed?.disconnect) {
+          cleaned = await this._runFailedStartCleanup('market data', () => this.marketDataFeed.disconnect());
+        }
+        if (!cleaned || this._isStartupConnectionActive(this.marketDataFeed)) {
+          throw err;
+        }
+        if (attempt.marketDataActivationAttempted) {
+          attempt.marketDataActivationAttempted = false;
+        }
       }
     }
 
-    // 5. Start data pipeline (optional, non-blocking)
-    if (this.dataPipeline) {
+    // 6. Start data pipeline (optional, non-blocking)
+    if (this.dataPipeline && !attempt.dataPipelineInitiallyRunning) {
       try {
+        attempt.dataPipelineActivationAttempted = true;
         await this.dataPipeline.start();
         // The pipeline initializes its PostgreSQL manager lazily. Bind it only
         // after a successful start so telemetry degrades gracefully with no DB.
@@ -353,29 +541,45 @@ export class MarketMakerOrchestrator extends EventEmitter {
         this.logger.info('[Orchestrator] Data pipeline started');
       } catch (err) {
         this.logger.warn(`[Orchestrator] Data pipeline start failed (non-fatal): ${err.message}`);
+        if (attempt.dataPipelineActivationAttempted) {
+          let cleaned = false;
+          if (this.dataPipeline.stop) {
+            cleaned = await this._runFailedStartCleanup('pipeline', () => this.dataPipeline.stop());
+          }
+          this._restoreStartupTimerHandles(attempt, 'pipeline');
+          const restored = this._startupTimerHandlesMatch(attempt, 'pipeline') &&
+            this._pipelineStartupStateMatches(this.dataPipeline, attempt.dataPipelineState);
+          if (!cleaned || !restored) {
+            throw err;
+          }
+          attempt.dataPipelineActivationAttempted = false;
+        }
+      }
+    } else if (this.dataPipeline) {
+      if (!this.quoteTelemetry.writer && this.dataPipeline.pgManager) {
+        this.quoteTelemetry.writer = this.dataPipeline.pgManager;
+      }
+      if (this.referenceMarkoutCollector && !this.referenceMarkoutCollector.writer && this.dataPipeline.pgManager) {
+        this.referenceMarkoutCollector.setWriter(this.dataPipeline.pgManager);
       }
     }
 
-    // 6. Start PnL periodic logging
-    this.pnlTracker.startPeriodicLogging();
+    // 7. Start PnL periodic logging
+    if (!attempt.pnlInitiallyRunning) {
+      attempt.pnlActivationAttempted = true;
+      this.pnlTracker.startPeriodicLogging();
+    }
 
-    // 7. Start quote engine drain queue timer
-    this.drainQueueTimer = setInterval(() => {
-      this.quoteEngine.drainQueue();
-    }, this.drainQueueIntervalMs);
-
-    // 8. Start REST reconciliation timer (if REST client configured)
+    // 9. Start REST reconciliation timer (if REST client configured)
     if (this.restClient) {
-      // Run immediately at startup to cancel any orphaned orders from previous session
-      this._restReconcile().catch(err =>
-        this.logger.warn(`[Orchestrator] Startup reconciliation failed (non-fatal): ${err.message}`)
-      );
-
       this._reconcileTimer = setInterval(() => this._restReconcile(), this.reconcileIntervalMs);
       this.logger.info(`[Orchestrator] REST reconciliation enabled (every ${this.reconcileIntervalMs / 1000}s)`);
 
-      // 9. Start periodic balance refresh (re-syncs tracked balances with exchange)
-      this._balanceRefreshTimer = setInterval(() => this._refreshBalances(), this.balanceRefreshIntervalMs);
+      // 10. Start periodic balance refresh (re-syncs tracked balances with exchange)
+      this._balanceRefreshTimer = setInterval(
+        () => this._periodicBalanceRefresh(),
+        this.balanceRefreshIntervalMs,
+      );
       this.logger.info(`[Orchestrator] Balance refresh enabled (every ${this.balanceRefreshIntervalMs / 1000}s)`);
     }
 
@@ -383,7 +587,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this._watchdogTimer = setInterval(() => this._runWatchdog(), 30000);
     this.logger.info('[Orchestrator] Watchdog started (30s interval)');
 
-    // 10. Take immediate balance snapshot and start periodic timer (if postgres available)
+    // 11. Take immediate balance snapshot and start periodic timer (if postgres available)
     if (this.postgresManager) {
       await this._takeBalanceSnapshot();
       this._snapshotTimer = setInterval(() => this._takeBalanceSnapshot(), this._snapshotIntervalMs);
@@ -392,14 +596,269 @@ export class MarketMakerOrchestrator extends EventEmitter {
 
     this.isRunning = true;
     this.startedAt = Date.now();
-    if (this.referenceMarkoutCollector?.writer) this.referenceMarkoutCollector.start();
+    if (this.referenceMarkoutCollector?.writer && !attempt.referenceCollectorInitiallyRunning) {
+      attempt.referenceCollectorActivationAttempted = true;
+      this.referenceMarkoutCollector.start();
+    }
     this._startTruexEbboPoller();
     this._startPyusdUsdPoller();
+    this._fixConnectionOwned = attempt.fixActivationAttempted;
+    // Queue execution begins only after all awaited startup work has completed
+    // and the session is explicitly eligible. The callback revalidates that
+    // gate on every tick so emergency/connection changes cannot dispatch work.
+    this.drainQueueTimer = setInterval(() => {
+      if (this._isQueueDrainExecutionEligible()) this.quoteEngine.drainQueue();
+    }, this.drainQueueIntervalMs);
+    this._drainDeferredAfterStartup();
 
     this.logger.info('[Orchestrator] Market maker started — waiting for price updates to begin quoting');
     this.emit('started', { sessionId: this.sessionId, timestamp: this.startedAt });
 
     return true;
+    } catch (error) {
+      await this._rollbackFailedStart(attempt);
+      throw error;
+    } finally {
+      this._startInFlight = false;
+    }
+  }
+
+  async _rollbackFailedStart(attempt) {
+    this.isRunning = false;
+    this.startedAt = null;
+    this._fixConnectionOwned = false;
+
+    if (attempt.referenceCollectorActivationAttempted && this.referenceMarkoutCollector?.stop) {
+      await this._runFailedStartCleanup('reference collector', () => this.referenceMarkoutCollector.stop());
+    }
+    if (attempt.pnlActivationAttempted) {
+      await this._runFailedStartCleanup('PnL tracker', () => this.pnlTracker.stopPeriodicLogging());
+    }
+    if (attempt.dataPipelineActivationAttempted && this.dataPipeline?.stop) {
+      await this._runFailedStartCleanup('pipeline', () => this.dataPipeline.stop());
+    }
+    if (attempt.marketDataActivationAttempted && this.marketDataFeed?.disconnect) {
+      await this._runFailedStartCleanup('market data', () => this.marketDataFeed.disconnect());
+    }
+    if (attempt.fixActivationAttempted && this.fixOE.disconnect) {
+      await this._runFailedStartCleanup('FIX', () => this.fixOE.disconnect());
+    }
+    this._restoreStartupTimerHandles(attempt);
+    if (attempt.fixActivationAttempted) {
+      this._dirtyStartupResources.fix = this._isStartupConnectionActive(this.fixOE) ? {} : null;
+    }
+    if (attempt.marketDataActivationAttempted) {
+      this._dirtyStartupResources.marketData =
+        this._isStartupConnectionActive(this.marketDataFeed) ? {} : null;
+    }
+    if (attempt.dataPipelineActivationAttempted) {
+      const pipelineTimerHandles = attempt.timerHandles.filter(snapshot => snapshot.group === 'pipeline');
+      const pipelineRestored = this._pipelineStartupStateMatches(
+        this.dataPipeline, attempt.dataPipelineState
+      ) && this._timerSnapshotsMatch(pipelineTimerHandles);
+      this._dirtyStartupResources.pipeline = pipelineRestored ? null : {
+        state: attempt.dataPipelineState,
+        timerHandles: pipelineTimerHandles,
+      };
+    }
+    if (attempt.pnlActivationAttempted) {
+      const timerHandles = attempt.timerHandles.filter(snapshot => snapshot.group === 'pnl');
+      const restored = this._timerSnapshotsMatch(timerHandles) &&
+        this._startupComponentStateMatches(this.pnlTracker, attempt.pnlState);
+      this._dirtyStartupResources.pnl = restored ? null : { timerHandles, state: attempt.pnlState };
+    }
+    if (attempt.referenceCollectorActivationAttempted) {
+      const timerHandles = attempt.timerHandles.filter(snapshot => snapshot.group === 'reference');
+      const restored = this._timerSnapshotsMatch(timerHandles) &&
+        this._startupComponentStateMatches(this.referenceMarkoutCollector, attempt.referenceState);
+      this._dirtyStartupResources.reference = restored ? null : {
+        timerHandles, state: attempt.referenceState,
+      };
+    }
+    if (attempt.eventsWired) {
+      await this._runFailedStartCleanup('event', () => this._unwireEvents());
+    }
+  }
+
+  _isStartupConnectionActive(resource) {
+    if (!resource) return false;
+    const hasTransportSignal =
+      'isConnected' in resource || 'socket' in resource || resource.ingest !== undefined;
+    const transportActive = Boolean(
+      resource.isConnected === true ||
+      (resource.socket && resource.socket.destroyed !== true) ||
+      resource.ingest?.connected === true
+    );
+    if (transportActive) return true;
+    if (!hasTransportSignal) return resource.isLoggedOn === true;
+    return false;
+  }
+
+  async _recoverDirtyStartupResources() {
+    const failures = [];
+    if (this._dirtyStartupResources.fix) {
+      if (this.fixOE?.disconnect) {
+        await this._runFailedStartCleanup('dirty FIX', () => this.fixOE.disconnect());
+      }
+      if (this._isStartupConnectionActive(this.fixOE)) failures.push('FIX');
+      else this._dirtyStartupResources.fix = null;
+    }
+    if (this._dirtyStartupResources.marketData) {
+      if (this.marketDataFeed?.disconnect) {
+        await this._runFailedStartCleanup('dirty market data', () => this.marketDataFeed.disconnect());
+      }
+      if (this._isStartupConnectionActive(this.marketDataFeed)) failures.push('market-data');
+      else this._dirtyStartupResources.marketData = null;
+    }
+    if (this._dirtyStartupResources.pipeline) {
+      const dirty = this._dirtyStartupResources.pipeline;
+      if (this.dataPipeline?.stop) {
+        await this._runFailedStartCleanup('dirty pipeline', () => this.dataPipeline.stop());
+      }
+      this._restoreStartupTimerSnapshots(dirty.timerHandles);
+      const restored = this._pipelineStartupStateMatches(this.dataPipeline, dirty.state) &&
+        this._timerSnapshotsMatch(dirty.timerHandles);
+      if (!restored) failures.push('pipeline');
+      else this._dirtyStartupResources.pipeline = null;
+    }
+    for (const [key, resource, label] of [
+      ['pnl', this.pnlTracker, 'PnL tracker'],
+      ['reference', this.referenceMarkoutCollector, 'reference collector'],
+    ]) {
+      const dirty = this._dirtyStartupResources[key];
+      if (!dirty) continue;
+      if (resource?.stop) await this._runFailedStartCleanup(`dirty ${label}`, () => resource.stop());
+      else if (key === 'pnl' && resource?.stopPeriodicLogging) {
+        await this._runFailedStartCleanup('dirty PnL tracker', () => resource.stopPeriodicLogging());
+      }
+      this._restoreStartupTimerSnapshots(dirty.timerHandles);
+      const restored = this._timerSnapshotsMatch(dirty.timerHandles) &&
+        this._startupComponentStateMatches(resource, dirty.state);
+      if (!restored) failures.push(key);
+      else this._dirtyStartupResources[key] = null;
+    }
+    if (failures.length > 0) {
+      throw new Error(`dirty startup resource cleanup incomplete: ${failures.join(', ')}`);
+    }
+  }
+
+  async _runFailedStartCleanup(label, action) {
+    try {
+      await action();
+      return true;
+    } catch (error) {
+      this.logger.warn(`[Orchestrator] Failed-start ${label} cleanup failed: ${error.message}`);
+      return false;
+    }
+  }
+
+  _restoreStartupTimerHandles(attempt, group = null) {
+    this._restoreStartupTimerSnapshots(
+      group ? attempt.timerHandles.filter(snapshot => snapshot.group === group) : attempt.timerHandles
+    );
+  }
+
+  _restoreStartupTimerSnapshots(snapshots) {
+    for (const snapshot of snapshots) {
+      const current = snapshot.owner[snapshot.property] ?? null;
+      if (current === snapshot.handle) continue;
+      if (current) snapshot.clear(current);
+      snapshot.owner[snapshot.property] = snapshot.handle;
+    }
+  }
+
+  _timerSnapshotsMatch(snapshots) {
+    return snapshots.every(
+      snapshot => (snapshot.owner[snapshot.property] ?? null) === snapshot.handle
+    );
+  }
+
+  _startupTimerHandlesMatch(attempt, group) {
+    return attempt.timerHandles
+      .filter(snapshot => snapshot.group === group)
+      .every(snapshot => (snapshot.owner[snapshot.property] ?? null) === snapshot.handle);
+  }
+
+  _capturePipelineStartupState(pipeline) {
+    if (!pipeline) return null;
+    const signalNames = [
+      'isRunning', 'isConnected', 'isLoggedOn', 'isActive', 'active', 'connected', 'destroyed', 'readyState',
+    ];
+    const captureSignals = (resource) => {
+      if (!resource) return null;
+      const signals = {};
+      for (const name of signalNames) {
+        if (name in resource) signals[name] = resource[name];
+      }
+      return signals;
+    };
+    const resources = {};
+    for (const property of ['ingest', 'socket', 'client', 'redisManager', 'pgManager']) {
+      const value = pipeline[property];
+      resources[property] = {
+        present: property in pipeline,
+        value,
+        signals: captureSignals(value),
+      };
+    }
+    return { component: captureSignals(pipeline), resources };
+  }
+
+  _captureStartupComponentState(component) {
+    if (!component) return null;
+    const state = {};
+    for (const name of ['isRunning', 'isConnected', 'isLoggedOn', 'isActive', 'active', 'connected']) {
+      if (name in component) state[name] = component[name];
+    }
+    return state;
+  }
+
+  _startupComponentStateMatches(component, expected) {
+    if (!component || !expected) return component === null && expected === null;
+    const actual = this._captureStartupComponentState(component);
+    const keys = Object.keys(expected);
+    return keys.length === Object.keys(actual).length &&
+      keys.every(key => Object.prototype.hasOwnProperty.call(actual, key) && Object.is(actual[key], expected[key]));
+  }
+
+  _startupComponentStateIsActive(state) {
+    return Boolean(state && Object.values(state).some(value => value === true));
+  }
+
+  _pipelineStartupStateMatches(pipeline, expected) {
+    if (!pipeline || !expected) return pipeline === null && expected === null;
+    const actual = this._capturePipelineStartupState(pipeline);
+    const sameSignals = (left, right) => {
+      if (left === null || right === null) return left === right;
+      const leftKeys = Object.keys(left);
+      const rightKeys = Object.keys(right);
+      return leftKeys.length === rightKeys.length &&
+        leftKeys.every(key => Object.prototype.hasOwnProperty.call(right, key) && Object.is(left[key], right[key]));
+    };
+    if (!sameSignals(actual.component, expected.component)) return false;
+    return Object.keys(expected.resources).every(property => {
+      const left = actual.resources[property];
+      const right = expected.resources[property];
+      return left.present === right.present && left.value === right.value &&
+        sameSignals(left.signals, right.signals);
+    });
+  }
+
+  _pipelineStartupStateIsActive(state) {
+    if (!state) return false;
+    const activeSignals = (signals) => Boolean(
+      signals && (
+        signals.isRunning === true || signals.isConnected === true || signals.isLoggedOn === true ||
+        signals.isActive === true || signals.active === true || signals.connected === true
+      )
+    );
+    if (activeSignals(state.component)) return true;
+    return ['ingest', 'socket', 'client'].some(property => {
+      const resource = state.resources[property];
+      if (!resource?.value) return false;
+      if (resource.signals?.destroyed === false) return true;
+      return activeSignals(resource.signals);
+    });
   }
 
   /**
@@ -482,9 +941,12 @@ export class MarketMakerOrchestrator extends EventEmitter {
     }
 
     // 6. Disconnect FIX OE
-    try {
-      await this.fixOE.disconnect();
-    } catch (_) { /* best effort */ }
+    if (this._fixConnectionOwned) {
+      try {
+        await this.fixOE.disconnect();
+      } catch (_) { /* best effort */ }
+    }
+    this._fixConnectionOwned = false;
 
     // 7. Log final session report
     const report = this.pnlTracker.getSessionReport();
@@ -540,6 +1002,8 @@ export class MarketMakerOrchestrator extends EventEmitter {
       pyusdUsdConsecutiveErrors: this._pyusdUsdConsecutiveErrors,
       dataPipeline: this.dataPipeline ? this.dataPipeline.getStats() : null,
       referenceMarkouts: this.referenceMarkoutCollector?.getStats?.() || null,
+      capital: this.capitalReservationManager?.getStatus() || null,
+      continuity: this._getContinuityStatus(),
     };
   }
 
@@ -617,6 +1081,8 @@ export class MarketMakerOrchestrator extends EventEmitter {
   // --- Event Wiring ---
 
   _wireEvents() {
+    if (this._eventsWired) return false;
+
     // Price → QuoteEngine
     if (this.priceAggregator) {
       this.priceAggregator.on('price', this._onPriceUpdate);
@@ -631,43 +1097,16 @@ export class MarketMakerOrchestrator extends EventEmitter {
 
     // OE logon-reset fallback fired (informational) — log + alert at info level
     // so ops can correlate with TrueX-side restarts.
-    this.fixOE.on('logon-reset-fallback', (info) => {
-      this.logger.warn(
-        `[Orchestrator] FIX logon-reset fallback fired for ${info.targetCompID} ` +
-        `(${info.fallbackAttempt}/${info.maxFallbacks}, after ${info.consecutiveTimeouts} timeouts)`
-      );
-      this.alertManager.sendAlert({
-        reason: 'FIX logon-reset fallback fired',
-        level: 'warn',
-        details: {
-          targetCompID: info.targetCompID,
-          fallbackAttempt: info.fallbackAttempt,
-          maxFallbacks: info.maxFallbacks,
-          consecutiveTimeouts: info.consecutiveTimeouts,
-        },
-      });
-    });
+    this.fixOE.on('logon-reset-fallback', this._onLogonResetFallback);
 
     // OE logon-reset fallback exhausted — loop guard tripped. Real cause is
     // elsewhere (creds, TrueX outage, network). Escalate hard.
-    this.fixOE.on('logon-reset-fallback-exhausted', (info) => {
-      this.logger.error(
-        `[Orchestrator] FIX logon-reset fallback exhausted for ${info.targetCompID} ` +
-        `after ${info.attempts} attempts — manual intervention likely required`
-      );
-      this.alertManager.sendAlert({
-        reason: 'FIX logon-reset fallback exhausted',
-        level: 'error',
-        details: {
-          targetCompID: info.targetCompID,
-          attempts: info.attempts,
-        },
-      });
-    });
+    this.fixOE.on('logon-reset-fallback-exhausted', this._onLogonResetFallbackExhausted);
 
     // QuoteEngine fills → Inventory + PnL
     this.quoteEngine.on('fill', this._onQuoteFill);
     this.quoteEngine.on('quote-lifecycle', this._onQuoteLifecycle);
+    this.quoteEngine.on('capital-resync-required', this._onCapitalResyncRequired);
 
     // Inventory hedge signal → HedgeExecutor
     this.inventoryManager.on('hedge-signal', this._onHedgeSignal);
@@ -677,20 +1116,62 @@ export class MarketMakerOrchestrator extends EventEmitter {
 
     // Emergency → cancel all
     this.inventoryManager.on('emergency', this._onEmergency);
+
+    this._eventsWired = true;
+    return true;
   }
 
   _unwireEvents() {
+    if (!this._eventsWired) return false;
+
     if (this.priceAggregator) {
       this.priceAggregator.removeListener('price', this._onPriceUpdate);
     }
     this.fixOE.removeListener('message', this._onFIXMessage);
     this.fixOE.removeListener('disconnect', this._onOEDisconnect);
     this.fixOE.removeListener('logout', this._onOEDisconnect);
+    this.fixOE.removeListener('logon-reset-fallback', this._onLogonResetFallback);
+    this.fixOE.removeListener('logon-reset-fallback-exhausted', this._onLogonResetFallbackExhausted);
     this.quoteEngine.removeListener('fill', this._onQuoteFill);
     this.quoteEngine.removeListener('quote-lifecycle', this._onQuoteLifecycle);
+    this.quoteEngine.removeListener('capital-resync-required', this._onCapitalResyncRequired);
     this.inventoryManager.removeListener('hedge-signal', this._onHedgeSignal);
     this.hedgeExecutor.removeListener('hedge-filled', this._onHedgeFill);
     this.inventoryManager.removeListener('emergency', this._onEmergency);
+    this._eventsWired = false;
+    return true;
+  }
+
+  _onLogonResetFallback(info) {
+    this.logger.warn(
+      `[Orchestrator] FIX logon-reset fallback fired for ${info.targetCompID} ` +
+      `(${info.fallbackAttempt}/${info.maxFallbacks}, after ${info.consecutiveTimeouts} timeouts)`
+    );
+    this.alertManager.sendAlert({
+      reason: 'FIX logon-reset fallback fired',
+      level: 'warn',
+      details: {
+        targetCompID: info.targetCompID,
+        fallbackAttempt: info.fallbackAttempt,
+        maxFallbacks: info.maxFallbacks,
+        consecutiveTimeouts: info.consecutiveTimeouts,
+      },
+    });
+  }
+
+  _onLogonResetFallbackExhausted(info) {
+    this.logger.error(
+      `[Orchestrator] FIX logon-reset fallback exhausted for ${info.targetCompID} ` +
+      `after ${info.attempts} attempts — manual intervention likely required`
+    );
+    this.alertManager.sendAlert({
+      reason: 'FIX logon-reset fallback exhausted',
+      level: 'error',
+      details: {
+        targetCompID: info.targetCompID,
+        attempts: info.attempts,
+      },
+    });
   }
 
   // --- Event Handlers ---
@@ -708,7 +1189,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       this.pnlTracker.markToMarket(aggregatedPrice.weightedMidpoint);
     }
 
-    if (!this.fixOE.isLoggedOn) {
+    if (!this._isFixExecutionHealthy()) {
       this.quoteEngine.suspendQuoting();
       this.quoteEngine.invalidateQueuedWork?.(true);
       this.logger.warn('[WATCHDOG] Quoting gate closed: OE not logged on');
@@ -737,6 +1218,8 @@ export class MarketMakerOrchestrator extends EventEmitter {
     if (this.marketDataFeed?.getBestBidAsk) {
       this.quoteEngine.updateTrueXBook(this.marketDataFeed.getBestBidAsk());
     }
+    const continuity = this._getContinuityStatus();
+    if (continuity) this.quoteEngine.setContinuityState(continuity);
     this.quoteEngine.onPriceUpdate(aggregatedPrice);
     this._lastRepriceTime = Date.now();
 
@@ -745,6 +1228,102 @@ export class MarketMakerOrchestrator extends EventEmitter {
         this.logger.warn(`[Orchestrator] Shadow coinbase reevaluation failed (non-fatal): ${err.message}`);
       });
     }
+  }
+
+  _onCapitalResyncRequired({ side, reason, strict = false }) {
+    if (this._capitalResyncInFlight) {
+      this._capitalResyncPending = true;
+      if (strict) {
+        this._capitalResyncStrictPending = true;
+        this._capitalResyncStrictDrainSuppressed = true;
+      }
+      return this._capitalResyncResult(this._capitalResyncInFlight, { side, reason, strict });
+    }
+    this.logger.warn(`[Orchestrator] Capital resync required for ${side}: ${reason}`);
+    if (strict) {
+      this._capitalResyncStrictPending = true;
+      this._capitalResyncStrictDrainSuppressed = true;
+    }
+    const operation = (async () => {
+      do {
+        this._capitalResyncPending = false;
+        const strictPass = this._capitalResyncStrictPending;
+        this._capitalResyncStrictPending = false;
+        const refreshOptions = { requireLiveOrders: true, clearBlockedSides: true };
+        if (strictPass) refreshOptions.allowPreStart = true;
+        await this._refreshBalances(refreshOptions);
+        if (strictPass && this.capitalReservationManager?.getStatus?.().state === 'failed') {
+          throw new Error('capital reconciliation remained failed after strict recovery');
+        }
+        // Re-derive from the reconciled balance snapshot; never replay the rejected size.
+        this.quoteEngine.deferredRepriceNeeded = true;
+        if (!this._capitalResyncStrictDrainSuppressed) this.quoteEngine.drainQueue();
+      } while (this._capitalResyncPending || this._capitalResyncStrictPending);
+    })();
+    const tracked = operation.finally(() => {
+      if (this._capitalResyncInFlight === tracked) {
+        this._capitalResyncInFlight = null;
+        this._capitalResyncStrictDrainSuppressed = false;
+      }
+    });
+    this._capitalResyncInFlight = tracked;
+    return this._capitalResyncResult(tracked, { side, reason, strict });
+  }
+
+  _capitalResyncResult(operation, { side, strict }) {
+    if (strict) {
+      return operation.then(() => {
+        if (this.capitalReservationManager?.getStatus?.().state === 'failed') {
+          throw new Error('capital reconciliation remained failed after strict recovery');
+        }
+      });
+    }
+    return operation.catch((error) => {
+      this.logger.error(`[Orchestrator] Capital resync failed for ${side}: ${error.message}`);
+    });
+  }
+
+  _drainDeferredAfterStartup() {
+    if (!this._isQueueDrainExecutionEligible() || !this.quoteEngine.deferredRepriceNeeded) return false;
+    this.quoteEngine.drainQueue();
+    return true;
+  }
+
+  _isQueueDrainExecutionEligible() {
+    return this.isRunning && this._emergencyUnsafe !== true &&
+      this._isFixExecutionHealthy();
+  }
+
+  _isFixExecutionHealthy() {
+    return !this.fixOE || !('isLoggedOn' in this.fixOE) || this.fixOE.isLoggedOn === true;
+  }
+
+  _getContinuityStatus() {
+    if (!this.presenceController || !this.capitalReservationManager) return null;
+    const reservations = this.capitalReservationManager.getReservations();
+    const capital = this.capitalReservationManager.getStatus();
+    const mid = Number(this._lastMidPrice || this.quoteEngine.lastMid || 0);
+    const status = this.presenceController.observe({
+      orders: reservations,
+      oeHealthy: this._isFixExecutionHealthy(),
+      referenceHealthy: this._lastMdUpdateTime > 0 &&
+        Date.now() - this._lastMdUpdateTime <= this._mdStaleThresholdMs,
+      reconciliationState: capital.state === 'uninitialized' ? 'failed' : capital.state,
+      fundedSizeBySide: {
+        buy: mid > 0 ? this.capitalReservationManager.getQuoteCapacity('buy') / mid : 0,
+        sell: this.capitalReservationManager.getQuoteCapacity('sell'),
+      },
+      blockedSides: capital.blockedSides,
+      emergency: this._emergencyUnsafe === true,
+    });
+    for (const alert of status.alerts) {
+      this.alertManager.sendAlert({
+        reason: `Market-maker ${alert.side} side gap`,
+        level: 'error',
+        details: alert,
+      }).catch((error) => this.logger.error(`[Orchestrator] Side-gap alert failed: ${error.message}`));
+    }
+    return status;
   }
 
   _onFIXMessage(message) {
@@ -820,7 +1399,10 @@ export class MarketMakerOrchestrator extends EventEmitter {
     }
   }
 
-  _onQuoteFill({ side, price, size, clOrdID, execID, orderIntent, liquidityRoleExpected, isMaker = true }) {
+  _onQuoteFill({
+    side, price, size, clOrdID, execID, orderIntent, liquidityRoleExpected,
+    isMaker = true, estimated = false, evidenceGap = false,
+  }) {
     // Route fill to InventoryManager
     this.inventoryManager.onFill({
       side,
@@ -828,6 +1410,8 @@ export class MarketMakerOrchestrator extends EventEmitter {
       price,
       venue: 'truex',
       execID,
+      ...(estimated ? { estimated: true } : {}),
+      ...(evidenceGap ? { evidenceGap: true } : {}),
     });
 
     // Route fill to PnLTracker
@@ -839,6 +1423,8 @@ export class MarketMakerOrchestrator extends EventEmitter {
       isMaker,
       execID,
       timestamp: Date.now(),
+      ...(estimated ? { estimated: true } : {}),
+      ...(evidenceGap ? { evidenceGap: true } : {}),
     });
 
     // Route fill to data pipeline (unified or legacy audit logger)
@@ -855,6 +1441,8 @@ export class MarketMakerOrchestrator extends EventEmitter {
       liquidityRoleExpected: liquidityRoleExpected || (isMaker ? 'maker' : 'taker'),
       isMaker,
       timestamp: Date.now(),
+      ...(estimated ? { estimated: true } : {}),
+      ...(evidenceGap ? { evidenceGap: true } : {}),
     };
     if (this.dataPipeline) {
       this._addPipelineFillOnce(this.dataPipeline, fillRecord);
@@ -862,7 +1450,12 @@ export class MarketMakerOrchestrator extends EventEmitter {
       this.auditLogger.logFillEvent(fillRecord);
     }
 
-    this.emit('fill', { side, price, size, clOrdID, execID, venue: 'truex', orderIntent, liquidityRoleExpected, isMaker });
+    this.emit('fill', {
+      side, price, size, clOrdID, execID, venue: 'truex', orderIntent,
+      liquidityRoleExpected, isMaker,
+      ...(estimated ? { estimated: true } : {}),
+      ...(evidenceGap ? { evidenceGap: true } : {}),
+    });
   }
 
   _onQuoteLifecycle(event) {
@@ -966,6 +1559,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
 
   _onEmergency({ netPosition, reason }) {
     this.logger.error(`[Orchestrator] EMERGENCY: ${reason}`);
+    this._emergencyUnsafe = true;
 
     // Cancel all quotes immediately
     this.quoteEngine.cancelAllQuotes(`emergency: ${reason}`);
@@ -1521,6 +2115,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
 
     // Initialize inventory manager (sets netPosition from base total)
     this.inventoryManager.initializeFromBalances({ baseBalance, quoteBalance });
+    this.capitalReservationManager?.reconcile({ baseBalance, quoteBalance, liveOrders: [] });
 
     // Log which sides we'll quote
     const [, quoteAsset] = this.symbol.split('-');
@@ -1531,19 +2126,197 @@ export class MarketMakerOrchestrator extends EventEmitter {
   }
 
   /**
+   * Periodic recovery is bounded by balanceRefreshIntervalMs. Healthy state
+   * keeps the lightweight balance-only refresh; failed/blocked capital state
+   * requires one coalesced, generation-safe balance + live-order snapshot.
+   */
+  _periodicBalanceRefresh() {
+    if (!this.restClient || !this.isRunning) return Promise.resolve();
+    const capital = this.capitalReservationManager?.getStatus();
+    const needsCoherentRecovery = capital &&
+      (capital.state === 'failed' || capital.blockedSides.length > 0);
+    if (!needsCoherentRecovery) return this._refreshBalances();
+    if (this._capitalResyncInFlight) {
+      return this._capitalResyncResult(this._capitalResyncInFlight, {
+        side: 'multiple', reason: 'periodic-capital-recovery', strict: false,
+      });
+    }
+    const side = capital.blockedSides.length === 1 ? capital.blockedSides[0] : 'multiple';
+    return this._onCapitalResyncRequired({
+      side,
+      reason: 'periodic-capital-recovery',
+    });
+  }
+
+  /**
    * Periodic balance refresh — re-syncs tracked balances from exchange.
    * Uses refreshBalances() which does NOT reset netPosition/VWAP.
    * Safe to call during active trading.
    */
-  async _refreshBalances() {
-    if (!this.restClient || !this.isRunning) return;
+  async _refreshBalances({
+    requireLiveOrders = false, clearBlockedSides = false, allowPreStart = false, strict = false,
+  } = {}) {
+    if (!this.restClient || (!this.isRunning && !allowPreStart)) return;
 
+    const generation = this.capitalReservationManager?.beginReconciliation();
     try {
-      const { baseBalance, quoteBalance } = await this._fetchBalances();
+      const [{ baseBalance, quoteBalance }, liveOrders] = await Promise.all([
+        this._fetchBalances(),
+        this.capitalReservationManager || requireLiveOrders ? this._fetchCapitalLiveOrders() : Promise.resolve([]),
+      ]);
+      const reconciledLiveOrders = liveOrders.map((live) => {
+        const local = this.quoteEngine.activeOrders.get(live?.orderId);
+        const localOrderMatches = Boolean(local &&
+          local.side === live?.side &&
+          Number.isFinite(Number(live?.price)) && Math.abs(Number(live.price) - Number(local.price)) <= 1e-10 &&
+          Number.isFinite(Number(live?.size)) && Math.abs(Number(live.size) - Number(local.size)) <= 1e-10);
+        return { ...live, localOrderMatches };
+      });
+      const absentLocalOrderIds = [];
+      if (this.capitalReservationManager && generation) {
+        const liveIds = new Set(reconciledLiveOrders.map((order) => order?.orderId).filter(Boolean));
+        for (const orderId of generation.knownOrders.keys()) {
+          if (liveIds.has(orderId)) continue;
+          const current = this.capitalReservationManager.getReservation(orderId);
+          // The absence snapshot is stale for any order mutated after the
+          // request began. Only remove an unchanged acknowledged-live order.
+          if (!current?.acknowledgedLive || current.lastMutationSequence > generation.eventSequence) continue;
+          const reconciled = typeof this.quoteEngine.reconcileRestAbsentOrder === 'function'
+            ? this.quoteEngine.reconcileRestAbsentOrder(orderId)
+            : (this.quoteEngine.activeOrders.has(orderId) && this.quoteEngine.removeStaleOrder(orderId));
+          if (reconciled?.changed || reconciled === true) {
+            absentLocalOrderIds.push(orderId);
+          }
+        }
+      }
       this.inventoryManager.refreshBalances({ baseBalance, quoteBalance });
+      const capitalResult = this.capitalReservationManager?.reconcile({
+        baseBalance,
+        quoteBalance,
+        liveOrders: reconciledLiveOrders,
+        clearBlockedSides,
+        generation,
+      });
+      if (capitalResult?.state === 'normal' && capitalResult.blockedSides?.length === 0) {
+        this.quoteEngine?.resolveAuthoritativeExecutionEvidenceGap?.();
+      }
+      for (const orderId of capitalResult?.promotedOrderIds || []) {
+        const local = this.quoteEngine.activeOrders.get(orderId);
+        if (local) {
+          local.status = 'active';
+          local.acknowledgedLive = true;
+        }
+      }
+      if (absentLocalOrderIds.length > 0) {
+        // removeStaleOrder created a conservative delta after this request
+        // began, so this snapshot cannot absorb/unblock it. Require one more
+        // coalesced fresh generation, then re-derive quotes from that state.
+        if (this._capitalResyncInFlight) {
+          this._capitalResyncPending = true;
+        } else {
+          await this._onCapitalResyncRequired({
+            side: 'multiple',
+            reason: 'rest-order-absence-local-state-reconciled',
+            strict,
+          });
+        }
+      }
     } catch (err) {
       this.logger.warn(`[Orchestrator] Balance refresh failed (non-fatal): ${err.message}`);
+      this.capitalReservationManager?.reconciliationFailed();
+      if (requireLiveOrders) throw err;
     }
+  }
+
+  async _fetchCapitalLiveOrders() {
+    const rawOrders = await this.restClient.getActiveOrders();
+    const liveOrders = [];
+    for (const raw of this._filterScopedRestOrders(rawOrders)) {
+      const parsed = TrueXRESTClient.parseOrder(raw);
+      if (!parsed.externalId || !['ACTIVE', 'CANCEL_PENDING'].includes(parsed.status)) continue;
+      // Promotion evidence is intentionally read from the raw fields. The
+      // general REST parser uses parseFloat and is suitable for display, but
+      // would accept partial garbage ("0.01junk"). A zero/malformed live row
+      // must remain visible to reconciliation as a mismatch; never substitute
+      // the original quantity for missing or invalid leaves.
+      const price = strictPositiveRestNumber(raw?.order_info?.price);
+      const size = strictPositiveRestNumber(raw?.leaves_qty);
+      liveOrders.push({
+        orderId: parsed.externalId,
+        status: parsed.status,
+        side: String(parsed.side).toLowerCase(),
+        price,
+        size,
+        promotionEvidenceValid: price !== null && size !== null,
+      });
+    }
+    return liveOrders;
+  }
+
+  _restOrderScope(raw, localOrderIds = null) {
+    // Backwards-compatible library mode has no REST ownership policy. The
+    // production entrypoint always supplies both fields and therefore always
+    // takes the scoped path below.
+    if (!this.truexInstrumentId || !this.orderIdNamespace) return 'owned';
+
+    const instrumentId = typeof raw?.order_info?.instrument_id === 'string'
+      ? raw.order_info.instrument_id.trim()
+      : '';
+    const externalId = typeof raw?.external_id === 'string' ? raw.external_id.trim() : '';
+    const validInstrument = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(instrumentId);
+    const validExternalId = /^[A-Za-z0-9_-]{1,64}$/.test(externalId);
+    const exactLocal = Boolean(externalId && (
+      localOrderIds?.has(externalId) || this.quoteEngine.activeOrders.has(externalId) ||
+      this.capitalReservationManager?.getReservation?.(externalId)
+    ));
+    const generatedNamespaceLength = externalId.length - 12; // Q + namespace + boot(5) + seq(6)
+    const validGeneratedId = validExternalId && externalId.startsWith('Q') &&
+      generatedNamespaceLength >= 4 && generatedNamespaceLength <= 6 &&
+      /^[A-Za-z0-9_-]{5}[0-9a-z]{6}$/.test(externalId.slice(1 + generatedNamespaceLength));
+    const generatedNamespace = validGeneratedId
+      ? externalId.slice(1, 1 + generatedNamespaceLength)
+      : null;
+    const makerPrefixCandidate = validExternalId && externalId.startsWith(`Q${this.orderIdNamespace}`);
+    const makerId = generatedNamespace === this.orderIdNamespace;
+
+    // A valid generated ID is parsed by its total length, so overlapping
+    // 4/5/6-character namespaces cannot masquerade as one another. Only an
+    // exact maker identity conflicting with its instrument is ambiguous.
+    if (validInstrument && instrumentId !== this.truexInstrumentId) {
+      if (exactLocal || makerId) return 'ambiguous';
+      if (validGeneratedId) return 'foreign';
+      return makerPrefixCandidate ? 'ambiguous' : 'foreign';
+    }
+    if (validInstrument && instrumentId === this.truexInstrumentId) {
+      if (exactLocal || makerId) return 'owned';
+      if (validGeneratedId) return 'foreign';
+      if (makerPrefixCandidate) return 'ambiguous';
+      if (validExternalId) return 'foreign';
+      return 'ambiguous';
+    }
+    // Missing/malformed instrument metadata is unsafe only when the identity
+    // otherwise points at this process or its durable namespace. A clearly
+    // foreign strategy ID remains untouched.
+    if (exactLocal || makerId) return 'ambiguous';
+    if (validGeneratedId) return 'foreign';
+    if (makerPrefixCandidate) return 'ambiguous';
+    return validExternalId ? 'foreign' : 'ambiguous';
+  }
+
+  _filterScopedRestOrders(rawOrders, { localOrderIds = null } = {}) {
+    if (!Array.isArray(rawOrders)) {
+      throw new Error('invalid active-order response during REST reconciliation');
+    }
+    const owned = [];
+    for (const raw of rawOrders) {
+      const scope = this._restOrderScope(raw, localOrderIds);
+      if (scope === 'foreign') continue;
+      if (scope === 'ambiguous') {
+        throw new Error('ambiguous order ownership scope during REST reconciliation');
+      }
+      owned.push(raw);
+    }
+    return owned;
   }
 
   /**
@@ -1666,12 +2439,15 @@ export class MarketMakerOrchestrator extends EventEmitter {
    */
   async _cancelAllOrdersViaRest(reason) {
     this.logger.info(`[WATCHDOG] Cancelling all orders via REST (reason: ${reason})`);
-    if (typeof this.restClient.cancelAllOrders === 'function') {
+    // The venue-wide endpoint is safe only in legacy unscoped mode. Production
+    // uses explicit ownership scope and must never cancel another instrument
+    // or strategy sharing the account.
+    if (!this.truexInstrumentId && typeof this.restClient.cancelAllOrders === 'function') {
       await this.restClient.cancelAllOrders();
       return;
     }
     // Fallback: iterate and cancel individually
-    const orders = await this.restClient.getActiveOrders();
+    const orders = this._filterScopedRestOrders(await this.restClient.getActiveOrders());
     for (const raw of orders) {
       try {
         await this.restClient.cancelOrder(raw.id);
@@ -1689,9 +2465,12 @@ export class MarketMakerOrchestrator extends EventEmitter {
     if (!this.isRunning || this._intentionalStop) return;
     const now = Date.now();
     const issues = [];
+    // Presence alerts are independently rate-limited and never feed the generic
+    // watchdog cancel-all path: a missing side must preserve the funded live side.
+    this._getContinuityStatus();
 
     // Check OE FIX
-    if (!this.fixOE.isLoggedOn) {
+    if (!this._isFixExecutionHealthy()) {
       issues.push('OE FIX not logged on');
     }
 
@@ -1748,7 +2527,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       }
 
       // Force-reconnect failed sessions (FR-2.2 step 4)
-      if (!this.fixOE.isLoggedOn) {
+      if (!this._isFixExecutionHealthy()) {
         this.logger.info('[WATCHDOG] Force-reconnecting OE FIX session...');
         this.fixOE.connect().catch(err =>
           this.logger.error(`[WATCHDOG] OE reconnect failed: ${err.message}`)
@@ -1776,9 +2555,11 @@ export class MarketMakerOrchestrator extends EventEmitter {
     const now = Date.now();
     const lastRepriceAge = this._lastRepriceTime > 0 ? now - this._lastRepriceTime : null;
     const lastMdAge = this._lastMdUpdateTime > 0 ? now - this._lastMdUpdateTime : null;
-    const oeConnected = this.fixOE.isLoggedOn;
+    const oeConnected = this._isFixExecutionHealthy();
     const mdConnected = this.marketDataFeed ? (this.marketDataFeed.isLoggedOn === true) : null;
     const uptime = this.startedAt ? now - this.startedAt : 0;
+
+    const continuity = this._getContinuityStatus();
 
     // Status logic
     const quotingIdle = lastRepriceAge !== null && lastRepriceAge > this._quotingIdleThresholdMs;
@@ -1787,7 +2568,11 @@ export class MarketMakerOrchestrator extends EventEmitter {
     const isUnhealthy = quotingIdle || !oeConnected || mdConnected === false;
 
     let status;
-    if (isHealthy) {
+    if (continuity?.executionState === 'unsafe') {
+      status = 'unhealthy';
+    } else if (continuity?.executionState === 'degraded') {
+      status = 'degraded';
+    } else if (isHealthy) {
       status = 'healthy';
     } else if (!isUnhealthy && this.isRunning) {
       status = 'degraded';
@@ -1814,41 +2599,311 @@ export class MarketMakerOrchestrator extends EventEmitter {
       pnl: this.pnlTracker.getSummary(),
       uptime,
       sessionId: this.sessionId,
+      continuity,
+      capital: this.capitalReservationManager?.getStatus() || null,
     };
   }
 
   // --- REST-based Order Reconciliation ---
 
-  async _restReconcile() {
-    if (!this.restClient || !this.isRunning) return;
+  _createStartupVerificationBudget() {
+    return {
+      startedAt: this._now(),
+      polls: 0,
+      maxPolls: Math.ceil(
+        this.startupCancelVerifyTimeoutMs / this.startupCancelVerifyIntervalMs
+      ),
+      cancellationTargets: [],
+    };
+  }
+
+  _assertStartupVerificationBudget(budget, timeoutMessage = 'startup verification timed out') {
+    const elapsed = this._now() - budget.startedAt;
+    if (!Number.isFinite(elapsed) || elapsed < 0 ||
+        elapsed > this.startupCancelVerifyTimeoutMs) {
+      throw new Error(`${timeoutMessage} during strict startup reconciliation`);
+    }
+  }
+
+  async _pollStartupOrders(budget, timeoutMessage) {
+    const elapsed = this._now() - budget.startedAt;
+    if (!Number.isFinite(elapsed) || elapsed < 0 ||
+        elapsed >= this.startupCancelVerifyTimeoutMs || budget.polls >= budget.maxPolls) {
+      throw new Error(`${timeoutMessage} during strict startup reconciliation`);
+    }
+    const waitMs = Math.min(
+      this.startupCancelVerifyIntervalMs,
+      this.startupCancelVerifyTimeoutMs - elapsed,
+    );
+    await this._sleep(waitMs);
+    budget.polls++;
+    const current = await this.restClient.getActiveOrders();
+    if (!Array.isArray(current)) {
+      throw new Error('invalid active-order response during strict startup reconciliation');
+    }
+    this._assertStartupVerificationBudget(budget, timeoutMessage);
+    return current;
+  }
+
+  _validateStartupOrphanTargets(current, targets) {
+    const byVenueId = new Map(targets.map((target) => [target.venueId, target]));
+    const byExternalId = new Map(targets.map((target) => [target.externalId, target]));
+    const terminalStatuses = new Set(['CANCELED', 'FILLED', 'REJECTED']);
+    const observed = new Set();
+    const unresolved = new Set();
+    for (const raw of current) {
+      const venueId = typeof raw?.id === 'string' ? raw.id.trim() : '';
+      const externalId = typeof raw?.external_id === 'string' ? raw.external_id.trim() : '';
+      const target = byVenueId.get(venueId) || byExternalId.get(externalId);
+      if (!target) continue;
+      if (!venueId || !externalId || venueId !== target.venueId ||
+          externalId !== target.externalId || observed.has(target.venueId)) {
+        throw new Error('invalid orphan cancellation identity during strict startup reconciliation');
+      }
+      observed.add(target.venueId);
+      if (!terminalStatuses.has(raw.status)) unresolved.add(target.venueId);
+    }
+    return unresolved;
+  }
+
+  _validateStartupPostScanSnapshot(current, cancellationTargets) {
+    const targetVenueIds = new Set(cancellationTargets.map((target) => target.venueId));
+    const targetExternalIds = new Set(cancellationTargets.map((target) => target.externalId));
+    const terminalStatuses = new Set(['CANCELED', 'FILLED', 'REJECTED']);
+    const transitionalStatuses = new Set(['NEW_PENDING', 'CANCEL_PENDING', 'MODIFY_PENDING']);
+    const venueIds = new Set();
+    const externalIds = new Set();
+    for (const raw of current) {
+      if (terminalStatuses.has(raw?.status) || transitionalStatuses.has(raw?.status)) continue;
+      const venueId = typeof raw?.id === 'string' ? raw.id.trim() : '';
+      const externalId = typeof raw?.external_id === 'string' ? raw.external_id.trim() : '';
+      // Sticky targets are validated separately, including exact identity and
+      // terminal-state requirements. They must not be treated as new orphans.
+      if (targetVenueIds.has(venueId) || targetExternalIds.has(externalId)) continue;
+      if (!venueId || !externalId || venueIds.has(venueId) || externalIds.has(externalId)) {
+        throw new Error('invalid unmatched order in post-scan snapshot during strict startup reconciliation');
+      }
+      venueIds.add(venueId);
+      externalIds.add(externalId);
+      if (this.quoteEngine.activeOrders.has(externalId)) continue;
+      throw new Error('new unmatched order in post-scan snapshot during strict startup reconciliation');
+    }
+  }
+
+  _mergeStrictLocalLiveEvidence(rawOrders, localGeneration, localClOrdIDs, exchangeClOrdIDs) {
+    const venueIds = new Set();
+    const externalIds = new Set();
+    let generationChanged = false;
+    for (const raw of rawOrders) {
+      if (!['ACTIVE', 'CANCEL_PENDING'].includes(raw?.status)) continue;
+      const venueId = typeof raw?.id === 'string' ? raw.id.trim() : '';
+      const externalId = typeof raw?.external_id === 'string' ? raw.external_id.trim() : '';
+      if (!venueId || !externalId || venueIds.has(venueId) || externalIds.has(externalId)) {
+        throw new Error('invalid local live-order identity during strict startup reconciliation');
+      }
+      venueIds.add(venueId);
+      externalIds.add(externalId);
+      if (!localClOrdIDs.has(externalId)) continue;
+
+      const snapshot = localGeneration.get(externalId);
+      const current = this.quoteEngine.activeOrders.get(externalId);
+      // A changed local identity belongs to the bounded generation follow-up;
+      // never use this older request to prove either presence or absence.
+      if (!localReconciliationOrderUnchanged(
+        snapshot, current, externalId, this.capitalReservationManager
+      )) {
+        generationChanged = true;
+        continue;
+      }
+      const side = typeof raw?.order_info?.side === 'string'
+        ? raw.order_info.side.trim().toLowerCase()
+        : '';
+      const price = strictPositiveRestNumber(raw?.order_info?.price);
+      const leaves = strictPositiveRestNumber(raw?.leaves_qty);
+      if (side !== snapshot.side || price === null || leaves === null ||
+          Math.abs(price - Number(snapshot.price)) > 1e-10 ||
+          Math.abs(leaves - Number(snapshot.size)) > 1e-10) {
+        throw new Error('invalid local live-order evidence during strict startup reconciliation');
+      }
+      exchangeClOrdIDs.add(externalId);
+    }
+    return { generationChanged };
+  }
+
+  _localReconciliationGenerationChanged(localGeneration, localClOrdIDs) {
+    const currentStableIds = new Set();
+    for (const [orderId, order] of this.quoteEngine.activeOrders) {
+      if (!isStableLocalOrder(order)) continue;
+      currentStableIds.add(orderId);
+      const snapshot = localGeneration.get(orderId);
+      if (!snapshot || !isStableLocalOrder(snapshot) ||
+          !localReconciliationOrderUnchanged(
+            snapshot, order, orderId, this.capitalReservationManager)) return true;
+    }
+    for (const orderId of localClOrdIDs) {
+      if (!currentStableIds.has(orderId)) return true;
+    }
+    return false;
+  }
+
+  async _verifyStartupCancelPending(
+    rawOrders,
+    budget,
+    cancellationTargets = [],
+    postScan = false,
+  ) {
+    let current = this._filterScopedRestOrders(rawOrders);
+    while (true) {
+      if (postScan) this._validateStartupPostScanSnapshot(current, cancellationTargets);
+      const pending = current.filter((raw) =>
+        raw?.status === 'CANCEL_PENDING' || raw?.status === 'MODIFY_PENDING'
+      );
+      const unresolvedTargets = cancellationTargets.length > 0
+        ? this._validateStartupOrphanTargets(current, cancellationTargets)
+        : new Set();
+      if (pending.length === 0 && unresolvedTargets.size === 0) return current;
+
+      const venueIds = new Set();
+      const externalIds = new Set();
+      const hasModifyPending = pending.some(raw => raw?.status === 'MODIFY_PENDING');
+      for (const raw of pending) {
+        const venueId = typeof raw?.id === 'string' ? raw.id.trim() : '';
+        const externalId = typeof raw?.external_id === 'string' ? raw.external_id.trim() : '';
+        if (!venueId || !externalId || venueIds.has(venueId) || externalIds.has(externalId)) {
+          throw new Error(
+            `${hasModifyPending ? 'invalid transitional-order' : 'invalid cancel-pending'} identity ` +
+            'during strict startup reconciliation'
+          );
+        }
+        venueIds.add(venueId);
+        externalIds.add(externalId);
+      }
+
+      current = this._filterScopedRestOrders(await this._pollStartupOrders(
+        budget,
+        cancellationTargets.length > 0
+          ? 'orphan cancellation verification timed out'
+          : (hasModifyPending
+            ? 'transitional-order verification timed out'
+            : 'cancel-pending verification timed out'),
+      ));
+    }
+  }
+
+  async _verifyStartupOrphanCancellations(targets, budget) {
+    let current = this._filterScopedRestOrders(await this._pollStartupOrders(
+      budget,
+      'orphan cancellation verification timed out',
+    ));
+
+    while (true) {
+      this._validateStartupPostScanSnapshot(current, targets);
+      const unresolved = this._validateStartupOrphanTargets(current, targets);
+
+      if (unresolved.size === 0) return current;
+      current = this._filterScopedRestOrders(await this._pollStartupOrders(
+        budget,
+        'orphan cancellation verification timed out',
+      ));
+    }
+  }
+
+  async _restReconcile({
+    allowPreStart = false,
+    strict = false,
+    _generationFollowup = false,
+    _startupVerificationBudget = null,
+  } = {}) {
+    if (!this.restClient || (!this.isRunning && !allowPreStart)) return;
 
     try {
+      const startupVerificationBudget = strict
+        ? (_startupVerificationBudget || this._createStartupVerificationBudget())
+        : null;
+      // The local side of the reconciliation must share the same request
+      // boundary as the REST snapshot. Never interpret an order born or
+      // mutated while the request is in flight through an older response.
+      const localGeneration = new Map();
+      for (const [orderId, order] of this.quoteEngine.activeOrders) {
+        localGeneration.set(orderId,
+          captureLocalReconciliationOrder(orderId, order, this.capitalReservationManager));
+      }
+
       // 1. Fetch active orders from exchange via REST
-      const exchangeOrders = await this.restClient.getActiveOrders();
+      let rawExchangeOrders = await this.restClient.getActiveOrders();
+      if (!Array.isArray(rawExchangeOrders)) {
+        throw new Error('invalid active-order response during REST reconciliation');
+      }
+      rawExchangeOrders = this._filterScopedRestOrders(rawExchangeOrders, {
+        localOrderIds: new Set(localGeneration.keys()),
+      });
+      if (strict) {
+        this._assertStartupVerificationBudget(startupVerificationBudget);
+        rawExchangeOrders = await this._verifyStartupCancelPending(
+          rawExchangeOrders,
+          startupVerificationBudget,
+          startupVerificationBudget.cancellationTargets,
+        );
+      }
+      let authoritativeRawOrders = rawExchangeOrders;
 
-      // 2. Build lookup of exchange orders by external_id (our clOrdID)
-      const exchangeByClOrdID = new Map();
-      for (const raw of exchangeOrders) {
+      // 2. Parse every non-transitional exchange order. Keep the array so even
+      // duplicate/missing external IDs cannot collapse distinct orphan cancels.
+      const exchangeOrders = [];
+      const exchangeClOrdIDs = new Set();
+      for (const raw of rawExchangeOrders) {
         const parsed = TrueXRESTClient.parseOrder(raw);
+        if (['CANCELED', 'FILLED', 'REJECTED'].includes(parsed.status)) continue;
         // Skip transitional states
-        if (parsed.status === 'NEW_PENDING' || parsed.status === 'CANCEL_PENDING') continue;
-        exchangeByClOrdID.set(parsed.externalId, { ...parsed, rawId: raw.id });
+        if (parsed.status === 'NEW_PENDING' || parsed.status === 'CANCEL_PENDING' ||
+            parsed.status === 'MODIFY_PENDING') continue;
+        exchangeOrders.push({ ...parsed, rawId: raw.id });
+        if (parsed.externalId) exchangeClOrdIDs.add(parsed.externalId);
       }
 
-      // 3. Build set of local clOrdIDs (skip in-flight orders)
+      // 3. Build the immutable request-generation local set (skip in-flight
+      // orders). Current local state is used only to prove the identity did not
+      // change after the request began.
       const localClOrdIDs = new Set();
-      for (const [clOrdID, order] of this.quoteEngine.activeOrders) {
-        if (order.status === 'pending' || order.status === 'cancelling') continue;
-        localClOrdIDs.add(clOrdID);
+      for (const [clOrdID, snapshot] of localGeneration) {
+        if (isStableLocalOrder(snapshot)) localClOrdIDs.add(clOrdID);
       }
+
+      let generationChanged = this._localReconciliationGenerationChanged(
+        localGeneration,
+        localClOrdIDs,
+      );
 
       // 4. Detect discrepancies
       let matched = 0;
       let orphansCancelled = 0;
       let ghostsRemoved = 0;
+      const ghostSides = new Set();
+      const strictCancelledOrphans = [];
+
+      if (strict) {
+        const venueIds = new Set(
+          startupVerificationBudget.cancellationTargets.map((target) => target.venueId)
+        );
+        const externalIds = new Set(
+          startupVerificationBudget.cancellationTargets.map((target) => target.externalId)
+        );
+        for (const order of exchangeOrders) {
+          const extId = order.externalId;
+          if (localClOrdIDs.has(extId) || this.quoteEngine.activeOrders.has(extId)) continue;
+          const venueId = typeof order.rawId === 'string' ? order.rawId.trim() : '';
+          const externalId = typeof extId === 'string' ? extId.trim() : '';
+          if (!venueId || !externalId || venueIds.has(venueId) || externalIds.has(externalId)) {
+            throw new Error('invalid orphan cancellation identity during strict startup reconciliation');
+          }
+          venueIds.add(venueId);
+          externalIds.add(externalId);
+        }
+      }
 
       // Orphans: on exchange but not in local state → cancel via REST
-      for (const [extId, order] of exchangeByClOrdID) {
+      for (const order of exchangeOrders) {
+        const extId = order.externalId;
         if (localClOrdIDs.has(extId) || this.quoteEngine.activeOrders.has(extId)) {
           matched++;
         } else {
@@ -1856,28 +2911,101 @@ export class MarketMakerOrchestrator extends EventEmitter {
           try {
             await this.restClient.cancelOrder(order.rawId);
             orphansCancelled++;
+            if (strict) {
+              const target = {
+                venueId: order.rawId.trim(),
+                externalId: order.externalId.trim(),
+              };
+              strictCancelledOrphans.push(target);
+              startupVerificationBudget.cancellationTargets.push(target);
+            }
           } catch (err) {
+            if (strict) throw err;
             this.logger.warn(`[Reconcile] Failed to cancel orphan ${extId}: ${err.message}`);
           }
         }
       }
 
+      if (strictCancelledOrphans.length > 0) {
+        const verifiedOrders = await this._verifyStartupOrphanCancellations(
+          startupVerificationBudget.cancellationTargets,
+          startupVerificationBudget,
+        );
+        // Transitional rows unrelated to our cancellation targets are never
+        // cancelled by this pass, but startup still waits for them to settle
+        // within the same total verification budget.
+        authoritativeRawOrders = await this._verifyStartupCancelPending(
+          verifiedOrders,
+          startupVerificationBudget,
+          startupVerificationBudget.cancellationTargets,
+          true,
+        );
+      }
+
+      if (strict) {
+        // Ghost absence must be decided from the same (or fresher) snapshot
+        // that passed strict startup verification, never from the initial
+        // pre-cancel scan alone.
+        const mergeResult = this._mergeStrictLocalLiveEvidence(
+          authoritativeRawOrders,
+          localGeneration,
+          localClOrdIDs,
+          exchangeClOrdIDs,
+        );
+        // Re-evaluate after all post-scan REST awaits. This catches a local or
+        // capital mutation that happened after the initial generation check,
+        // including one whose fresh venue evidence is otherwise exact.
+        const changedDuringVerification = this._localReconciliationGenerationChanged(
+          localGeneration,
+          localClOrdIDs,
+        );
+        generationChanged = generationChanged || mergeResult.generationChanged ||
+          changedDuringVerification;
+      }
+
       // Ghosts: in local state but not on exchange → remove from activeOrders
       for (const clOrdID of localClOrdIDs) {
-        if (!exchangeByClOrdID.has(clOrdID)) {
+        const snapshot = localGeneration.get(clOrdID);
+        const current = this.quoteEngine.activeOrders.get(clOrdID);
+        if (!localReconciliationOrderUnchanged(
+          snapshot, current, clOrdID, this.capitalReservationManager
+        )) continue;
+        if (!exchangeClOrdIDs.has(clOrdID)) {
           this.logger.warn(`[Reconcile] Ghost in local state: ${clOrdID} — removing`);
+          const ghostSide = this.quoteEngine.activeOrders.get(clOrdID)?.side;
+          if (ghostSide === 'buy' || ghostSide === 'sell') ghostSides.add(ghostSide);
           this.quoteEngine.removeStaleOrder(clOrdID);
           ghostsRemoved++;
         }
       }
 
+      // A manager-backed ghost has an unknown terminal outcome, not a proven
+      // cancel. Await one coalesced fresh balance/live-order reconciliation for
+      // the batch before any blocked capacity can become reusable.
+      if (ghostsRemoved > 0 && this.capitalReservationManager) {
+        const side = ghostSides.size === 1 ? [...ghostSides][0]
+          : (ghostSides.size > 1 ? 'multiple' : 'unknown');
+        const resyncRequest = { side, reason: 'rest-order-absence-unknown-outcome' };
+        if (strict) resyncRequest.strict = true;
+        await this._onCapitalResyncRequired(resyncRequest);
+      }
+
       const stats = {
-        exchange: exchangeByClOrdID.size,
+        exchange: exchangeOrders.length,
         local: localClOrdIDs.size,
         matched,
         orphansCancelled,
         ghostsRemoved,
+        generationChanged,
       };
+
+      if (strict && _generationFollowup && generationChanged) {
+        // One fresh generation is the bounded recovery allowance. If that
+        // immutable view also changes, there is no promotion-grade proof that
+        // local and venue state ever converged; abort startup without nesting
+        // another reconcile or enabling FIX/timers.
+        throw new Error('startup reconciliation remained unstable after bounded generation follow-up');
+      }
 
       this.logger.info(
         `[Reconcile] exchange=${stats.exchange} local=${stats.local} matched=${stats.matched} ` +
@@ -1885,9 +3013,31 @@ export class MarketMakerOrchestrator extends EventEmitter {
       );
 
       this.emit('reconcile', stats);
+      if (generationChanged && !_generationFollowup) {
+        // Exactly one awaited follow-up gives changed/born orders a snapshot
+        // whose request began after they became stable. Bounding this to one
+        // prevents a busy venue from creating an unbounded reconcile loop;
+        // the periodic job will cover any further concurrent mutation.
+        stats.followup = await this._restReconcile({
+          allowPreStart,
+          strict,
+          _generationFollowup: true,
+          _startupVerificationBudget: startupVerificationBudget,
+        });
+      }
+      if (strict) this._assertStartupVerificationBudget(startupVerificationBudget);
+      return stats;
     } catch (err) {
+      if (strict) throw err;
+      this.capitalReservationManager?.reconciliationFailed();
       this.logger.error(`[Reconcile] REST reconciliation failed: ${err.message}`);
-      this.emit('error', { phase: 'reconcile', error: err });
+      // EventEmitter treats an unhandled `error` event as a throw. Periodic
+      // reconciliation is intentionally nonfatal, while registered observers
+      // still receive the existing event contract.
+      if (this.listenerCount('error') > 0) {
+        this.emit('error', { phase: 'reconcile', error: err });
+      }
+      return undefined;
     }
   }
 }
