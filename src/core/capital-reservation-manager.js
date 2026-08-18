@@ -1,5 +1,6 @@
 const TERMINAL_STATES = new Set([
-  'rejected', 'cancelled', 'expired', 'filled', 'terminal-evidence-gap', 'rest-absence-evidence-gap',
+  'rejected', 'cancelled', 'expired', 'filled', 'terminal-evidence-gap',
+  'rest-absence-evidence-gap', 'cancel-unknown-evidence-gap',
 ]);
 const SIDES = new Set(['buy', 'sell']);
 const EPSILON = 1e-10;
@@ -251,6 +252,22 @@ export class CapitalReservationManager {
    * balance/live-order snapshot absorbs it.
    */
   restOrderAbsent(orderId) {
+    return this._unknownTerminal(
+      orderId,
+      'rest-absence-evidence-gap',
+      'rest-order-absence-unknown-outcome',
+    );
+  }
+
+  cancelRejectUnknown(orderId) {
+    return this._unknownTerminal(
+      orderId,
+      'cancel-unknown-evidence-gap',
+      'cancel-reject-unknown-order-outcome',
+    );
+  }
+
+  _unknownTerminal(orderId, terminalState, reason) {
     const order = this.reservations.get(orderId);
     if (!order || TERMINAL_STATES.has(order.state)) return false;
     const remainingCommitment = reservationAmount(order);
@@ -259,12 +276,12 @@ export class CapitalReservationManager {
     this.consumedEvents.push({ sequence, orderId, asset, amount: remainingCommitment });
     this.blockedSides.set(order.side, sequence);
     order.remainingSize = 0;
-    order.state = 'rest-absence-evidence-gap';
+    order.state = terminalState;
     order.acknowledgedLive = false;
     order.representedByHeld = false;
     order.lastMutationSequence = sequence;
     this.state = 'degraded';
-    this.reason = 'rest-order-absence-unknown-outcome';
+    this.reason = reason;
     this._recordTerminal(order);
     return {
       orderId,

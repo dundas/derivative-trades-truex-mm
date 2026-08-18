@@ -111,4 +111,72 @@ describe('QuoteEngine capital reservation binding', () => {
     expect(capital.consumedEvents).toHaveLength(1);
     expect(capital.getPresence()).toEqual({ buy: 0, sell: 0 });
   });
+
+  test('unknown-order cancel reject conservatively blocks capacity and delayed reports are idempotent', () => {
+    const { capital, engine } = setup(0.01);
+    const fills = [];
+    const resyncs = [];
+    const unknowns = [];
+    engine.on('fill', (fill) => fills.push(fill));
+    engine.on('capital-resync-required', (event) => resyncs.push(event));
+    engine.on('cancel-unknown-outcome', (event) => unknowns.push(event));
+    const orderId = engine._sendNewOrder({ side: 'sell', price: 100000, size: 0.01, level: 1 });
+    engine.onExecutionReport({ '11': orderId, '39': '0', '54': '2' });
+    engine._sendCancel(orderId, engine.activeOrders.get(orderId));
+    const reject = {
+      '11': 'cancel-request', '41': orderId, '58': 'Unknown order', '102': '1',
+    };
+
+    engine.onOrderCancelReject(reject);
+    engine.onOrderCancelReject(reject);
+    expect(capital.getReservation(orderId)).toMatchObject({
+      state: 'cancel-unknown-evidence-gap', acknowledgedLive: false, remainingSize: 0,
+    });
+    expect(capital.consumedEvents).toHaveLength(1);
+    expect(capital.getStatus()).toMatchObject({ blockedSides: ['sell'] });
+    expect(engine.activeOrders.has(orderId)).toBe(false);
+    expect(unknowns).toHaveLength(1);
+    expect(resyncs).toEqual([expect.objectContaining({
+      orderId, side: 'sell', reason: 'cancel-reject-unknown-order-outcome',
+    })]);
+    expect(engine._sendNewOrder({ side: 'sell', price: 100000, size: 0.001, level: 1 })).toBeNull();
+
+    engine.onExecutionReport({
+      '11': orderId, '39': '2', '54': '2', '17': 'late-terminal',
+      '31': '100000', '32': '0.01', '151': '0',
+    });
+    expect(capital.consumedEvents).toHaveLength(1);
+    expect(fills).toEqual([]);
+  });
+
+  test('authoritative terminal rejects supplied malformed or nonzero LeavesQty as evidence gaps', () => {
+    for (const leaves of ['bad', '0.001', '']) {
+      const { capital, engine } = setup(0.01);
+      const fills = [];
+      const resyncs = [];
+      engine.on('fill', (fill) => fills.push(fill));
+      engine.on('capital-resync-required', (event) => resyncs.push(event));
+      const orderId = engine._sendNewOrder({ side: 'sell', price: 100000, size: 0.01, level: 1 });
+      engine.onExecutionReport({ '11': orderId, '39': '0', '54': '2' });
+      const terminal = {
+        '11': orderId, '39': '2', '54': '2', '17': `terminal-${leaves}`,
+        '31': '100000', '32': '0.01', '151': leaves,
+      };
+
+      engine.onExecutionReport(terminal);
+      engine.onExecutionReport(terminal);
+      expect(capital.getReservation(orderId)).toMatchObject({
+        state: 'terminal-evidence-gap', acknowledgedLive: false,
+      });
+      expect(capital.getStatus()).toMatchObject({
+        reason: 'invalid-terminal-leaves-quantity', blockedSides: ['sell'],
+      });
+      expect(resyncs).toEqual([expect.objectContaining({
+        orderId, side: 'sell', reason: 'invalid-terminal-leaves-quantity',
+      })]);
+      expect(fills).toEqual([expect.objectContaining({
+        size: 0.01, estimated: true, evidenceGap: true,
+      })]);
+    }
+  });
 });

@@ -1246,13 +1246,27 @@ export class QuoteEngine extends EventEmitter {
           const fallbackPrice = Number(this.activeOrders.get(resolvedClOrdID)?.price) || Number(reservation?.price);
           const priceEstimated = !Number.isFinite(lastPx) || lastPx <= 0;
           const effectivePrice = priceEstimated ? fallbackPrice : lastPx;
-          const leavesProveTerminal = String(fields['151'] ?? '').trim() === '0';
+          const rawTerminalLeaves = fields['151'];
+          const terminalLeavesSupplied = rawTerminalLeaves !== undefined;
+          const parsedTerminalLeaves = terminalLeavesSupplied && String(rawTerminalLeaves).trim() !== ''
+            ? Number(rawTerminalLeaves)
+            : NaN;
+          const invalidSuppliedLeaves = terminalLeavesSupplied &&
+            (!Number.isFinite(parsedTerminalLeaves) || parsedTerminalLeaves !== 0);
+          const leavesProveTerminal = terminalLeavesSupplied && parsedTerminalLeaves === 0;
           const quantityProvesTerminal = lastQty && reservation &&
             Math.abs(lastQty - reservation.remainingSize) <= 1e-10;
           let applied = false;
           const quantityEvidenceGap = !Number.isFinite(lastQty) || lastQty <= 0 ||
             Math.abs(lastQty - preTerminalRemaining) > 1e-10;
-          if (!execID) {
+          let terminalEvidenceGap = false;
+          if (invalidSuppliedLeaves) {
+            terminalEvidenceGap = true;
+            applied = this.capitalReservationManager.terminalEvidenceGap(
+              resolvedClOrdID, 'invalid-terminal-leaves-quantity',
+            );
+          } else if (!execID) {
+            terminalEvidenceGap = true;
             applied = this.capitalReservationManager.terminalEvidenceGap(
               resolvedClOrdID, 'terminal-fill-execution-id-required',
             );
@@ -1262,6 +1276,7 @@ export class QuoteEngine extends EventEmitter {
               leavesQuantity: 0,
             });
           } else {
+            terminalEvidenceGap = true;
             this.logger.warn(`[QuoteEngine] Ignoring unproven full fill without LastQty or LeavesQty=0: clOrdID=${resolvedClOrdID}`);
             applied = this.capitalReservationManager.terminalEvidenceGap(
               resolvedClOrdID, 'unproven-terminal-fill',
@@ -1270,7 +1285,7 @@ export class QuoteEngine extends EventEmitter {
           this._emitCapitalEvidenceGap(resolvedClOrdID);
           if (!applied) break;
           if (preTerminalRemaining > 0 && effectivePrice > 0) {
-            const estimatedEvidence = !execID || quantityEvidenceGap || priceEstimated;
+            const estimatedEvidence = terminalEvidenceGap || !execID || quantityEvidenceGap || priceEstimated;
             const tracked = this._emitFillEvent(
               resolvedClOrdID, side, effectivePrice, preTerminalRemaining,
               execID || `estimated-terminal:${resolvedClOrdID}`,
@@ -1433,9 +1448,20 @@ export class QuoteEngine extends EventEmitter {
 
     if (resolvedOrigClOrdID) {
       if (cxlRejReason === '1') {
-        // Unknown order — it's gone from the exchange, remove from tracking
+        // Unknown order proves only absence, not cancellation: it may have
+        // filled before the cancel arrived. Consume the remaining commitment
+        // conservatively and require a fresh balance/live-order reconcile.
         this.activeOrders.delete(resolvedOrigClOrdID);
-        this.capitalReservationManager?.cancelled(resolvedOrigClOrdID);
+        if (this.capitalReservationManager) {
+          const evidence = this.capitalReservationManager.cancelRejectUnknown(resolvedOrigClOrdID);
+          if (evidence) {
+            const event = { ...evidence, orderId: resolvedOrigClOrdID, executionState: 'degraded' };
+            this.emit('cancel-unknown-outcome', event);
+            this.emit('capital-resync-required', event);
+          }
+        }
+        this.pendingReplacements.delete(resolvedOrigClOrdID);
+        this._clearExecutionIdentity(resolvedOrigClOrdID);
       } else {
         // Cancel failed but original order still lives — restore to 'active'
         const origOrder = this.activeOrders.get(resolvedOrigClOrdID);
