@@ -260,7 +260,7 @@ Tracks net position, computes quote skew, enforces position limits, and manages 
 - `inventoryDeviationBTC = netPosition - targetInventoryBTC`. Positive deviation (above target) widens bids and tightens asks, encouraging inventory reduction. Negative deviation (below target) tightens bids and widens asks, encouraging inventory rebuilding.
 - `deviationUtilizationPct = min(1, |inventoryDeviationBTC| / maxPositionBTC)` and `rawSkew = deviationUtilizationPct^skewExponent * maxSkewTicks`. The clamp makes `maxSkewTicks` a true cap even when a nonzero target makes deviation exceed the absolute position band.
 - Absolute position limits, emergency checks, hedge thresholds, and balance caps remain based on `netPosition`; changing the target does not change those guards.
-- Startup balance initialization logs the configured target and initial deviation. Runtime status exposes `targetInventoryBTC`, `inventoryDeviationBTC`, and whether position is above, below, or at target. Persistent quote lifecycle telemetry is deferred to Task 2.
+- Startup balance initialization logs the configured target and initial deviation. Runtime status exposes `targetInventoryBTC`, `inventoryDeviationBTC`, and whether position is above, below, or at target. Quote lifecycle and reference mark-out telemetry are additive observability paths and do not alter inventory controls.
 
 **Events emitted:** `fill`, `limit-warning` (at 80% utilization), `emergency` (at emergencyLimitBTC), `hedge-signal`
 
@@ -367,6 +367,27 @@ non-fatal and releases the in-process dedupe marker for retry. This records inpu
 for later markout, fill-probability, and P&L evaluation; it does not calculate or
 change a live policy.
 
+### Reference mark-out evidence (`src/data-pipeline/reference-markout-collector.js`)
+
+Reference collection is a separate, observability-only path gated by
+`REFERENCE_MARKOUT_ENABLED` (default `false`). When enabled, create/replace decisions and
+fills schedule durable 1/5/60-minute work. A one-second sampler stores point-in-time Coinbase
+BTC-USD top-of-book observations with distinct source, receipt, observation, and PYUSD/USD basis
+timestamps. The earliest valid observation at or after each horizon is claimed with an
+overlap-safe lease and persisted as immutable evidence; missing or invalid evidence is terminally
+classified after the configured lateness window.
+
+PostgreSQL stores decisions, sampled observations, pending work, and terminal evidence in four
+additive tables. Claims use `FOR UPDATE ... SKIP LOCKED`, expired leases are recoverable after
+restart, and retention cannot delete samples needed by unfinished work. Selector and retention
+indexes are aligned to observation and receipt time respectively. The bounded coverage audit is
+available through `bun scripts/report-reference-markout-coverage.js`; full operating and rollout
+instructions are in [REFERENCE_MARKOUTS.md](REFERENCE_MARKOUTS.md).
+
+Collector and persistence failures are logged and counted but never block, cancel, resize,
+reprice, or dispatch an order. The feature changes no strategy parameters and cannot authorize a
+candidate produced by the offline regime validator.
+
 ### TrueXRESTClient (`src/exchanges/truex/TrueXRESTClient.ts`)
 
 REST API client for TrueX with HMAC-SHA256 authentication.
@@ -459,6 +480,7 @@ PostgreSQL-backed analytics server using `Bun.serve()` on port 3100.
 | `TRUEX_SENDER_COMP_ID` | No | `DAVID1` | FIX SenderCompID |
 | `DATABASE_URL` | No | -- | PostgreSQL connection string (Hetzner truex-pg-analytics 178.156.247.87:5432/truex_analytics) |
 | `REDIS_URL` | No | -- | Redis connection string (optional, auto-fallback) |
+| `REFERENCE_MARKOUT_ENABLED` | No | `false` | Explicitly enable restart-safe 1/5/60-minute reference collection; keep false for the inert rollout stage |
 | `TRUEX_MAKER_FEE_BPS` | No | `0` | TrueX maker fee in basis points |
 | `TRUEX_TAKER_FEE_BPS` | No | `0` | TrueX taker fee in basis points |
 | `HEDGE_MAKER_FEE_BPS` | No | `0` | Hedge venue maker fee in basis points |

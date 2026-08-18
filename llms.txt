@@ -41,6 +41,9 @@ to Kraken. DataPipelineManager: audit JSONL → Redis → PG.
 - `scripts/daily-perf-review.ts` — Read-only daily PnL/adverse-selection review (see `docs/DAILY_PERF_REVIEW.md`)
 - `scripts/daily-perf-review-job.sh` — Scheduled wrapper: archives report, appends daily log, ADMP-alerts on WARN/ERROR, chains the email digest
 - `scripts/daily-perf-email.ts` — Daily email digest: HTML report + 7-day trend published to Cloudflare Pages (truex-mm-reports.pages.dev), summary emailed via CircleInbox from truex-mm@derivative.email to DAILY_REPORT_EMAIL (flags: --date --to --send --skip-deploy --dry-run; archive persists in TRUEX_PERF_DATA_ROOT/logs/reports-site)
+- `src/data-pipeline/reference-markout-collector.js` — Default-off, restart-safe 1/5/60m Coinbase mark-out evidence collector; no order/FIX capability
+- `scripts/report-reference-markout-coverage.js` — Bounded grouped coverage audit (`--from`, `--to`, `--limit`)
+- `docs/REFERENCE_MARKOUTS.md` — Rollout, evidence semantics, configuration, verification, and rollback
 - `ops/launchd/install-daily-perf-review.sh` — Idempotent LaunchAgent installer (DRY_RUN=1 supported)
 
 ## FIX Protocol (FIXT.1.1 / FIX.5.0SP2)
@@ -226,6 +229,20 @@ initialized PostgreSQL manager is the optional writer for additive
 is non-fatal and remains retryable. Telemetry is observation only: markouts,
 fill-probability, and P&L scoring belong to the offline evaluator.
 
+## Reference Mark-outs
+
+Production collection is opt-in: `REFERENCE_MARKOUT_ENABLED=true`. Unset/false means no
+collector, sampling, or mark-out writes, although additive reference tables are still initialized
+with the normal PostgreSQL schema. Enabled collection schedules 60s/300s/3600s work per fill and
+persists the earliest fresh, non-crossed Coinbase BTC-USD observation inside each due/lateness
+window. Source, receipt, observation, and PYUSD/USD basis timestamps are independently validated;
+unavailable evidence is explicit and never converted to zero edge. Claims are lease-owned,
+overlap-safe, and restart-recoverable. The collector is fail-soft and has no quote/FIX/order path.
+
+Run `bun run test:reference-markouts`, `bun scripts/report-reference-markout-coverage.js`, and see
+`docs/REFERENCE_MARKOUTS.md`. Do not mark PRD tasks 5.1/5.2 complete until production schema,
+query plans, sampling, coverage, and two-sided quote health have been verified.
+
 ## REST Reconciliation (every 5 min)
 
 1. Fetch active orders from exchange via getActiveOrders()
@@ -340,5 +357,6 @@ bun scripts/analyze-shadow-takes.js    # Summarize shadow logs / Phase-2 decisio
 bun scripts/kill-switch.js --prod      # Emergency cancel all orders
 bun scripts/daily-perf-review.ts       # Daily PnL/adverse-selection review (read-only)
 bash ops/launchd/install-daily-perf-review.sh # Install scheduled daily review + alerting
-bun test                               # Run test suite (712 tests)
+bun run test                           # Full configured suite; legacy Node/Bun phase has known baseline failures
+bun run test:reference-markouts        # Mark-out unit/integration tests plus zero-order smokes
 ```
