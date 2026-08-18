@@ -78,6 +78,10 @@ services:
       - REDIS_URL=redis://127.0.0.1:6379
       - LOG_LEVEL=info
       - LOG_FILE=/app/logs/market-maker.log
+      # REST reconciliation owns only this instrument and durable maker ID
+      # namespace. Both are non-secret and must remain stable across restarts.
+      - TRUEX_INSTRUMENT_ID=${TRUEX_INSTRUMENT_ID:?required}
+      - TRUEX_ORDER_ID_NAMESPACE=${TRUEX_ORDER_ID_NAMESPACE:?required}
       # Required, non-secret maker-continuity obligations. Compose fails before
       # restart if any value is absent from the operator-managed .env file.
       - MM_MIN_ACTIVE_LEVELS_PER_SIDE=${MM_MIN_ACTIVE_LEVELS_PER_SIDE:?required}

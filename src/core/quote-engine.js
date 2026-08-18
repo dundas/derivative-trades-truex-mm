@@ -143,9 +143,13 @@ export class QuoteEngine extends EventEmitter {
     this.quotingSuspended = false;
     this.orderSequence = 0;
     this.orderIdNamespace = options.orderIdNamespace || randomBytes(5).toString('base64url').slice(0, 6);
+    this.orderIdBootId = options.orderIdBootId || randomBytes(4).toString('base64url').slice(0, 5);
     this.continuityState = Object.freeze({ executionState: 'normal', reasons: [] });
     if (!/^[A-Za-z0-9_-]{4,6}$/.test(this.orderIdNamespace)) {
       throw new Error('orderIdNamespace must contain 4-6 URL-safe characters');
+    }
+    if (!/^[A-Za-z0-9_-]{5}$/.test(this.orderIdBootId)) {
+      throw new Error('orderIdBootId must contain exactly 5 URL-safe characters');
     }
 
     // Rate limiting
@@ -1536,9 +1540,12 @@ export class QuoteEngine extends EventEmitter {
    * Generate a unique ClOrdID that fits within 18 characters.
    */
   generateClOrdID() {
-    const ts = Date.now().toString(36).slice(-7).padStart(7, '0');
-    const seq = (++this.orderSequence % 46655).toString(36).padStart(3, '0').slice(-3);
-    return `Q${this.orderIdNamespace}${ts}${seq}`;
+    const maxSequence = 36 ** 6 - 1;
+    if (this.orderSequence >= maxSequence) {
+      throw new Error('ClOrdID sequence exhausted for this engine boot');
+    }
+    const seq = (++this.orderSequence).toString(36).padStart(6, '0');
+    return `Q${this.orderIdNamespace}${this.orderIdBootId}${seq}`;
   }
 
   /**

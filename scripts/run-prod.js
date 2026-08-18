@@ -23,6 +23,8 @@
  *   TRUEX_TARGET_COMP_ID   - Target comp ID (TRUEX_PROD_OE)
  *   TRUEX_REST_URL         - REST URL via proxy (http://178.156.230.110:3006)
  *   TRUEX_SENDER_COMP_ID   - SenderCompID (default: DAVID1)
+ *   TRUEX_INSTRUMENT_ID    - Exact TrueX instrument ID owned by this maker
+ *   TRUEX_ORDER_ID_NAMESPACE - Stable 4-6 character maker ClOrdID namespace
  *   DATABASE_URL            - PostgreSQL (optional)
  *   REDIS_URL               - Redis (optional)
  *   TARGET_INVENTORY_BTC     - Desired BTC allocation used for inventory skew (default: 0)
@@ -39,6 +41,7 @@ import { CoinbaseWsIngest } from '../src/data-pipeline/coinbase-ws-ingest.js';
 import { CoinbaseMarketDataAdapter } from '../src/data-pipeline/coinbase-market-data-adapter.js';
 import { buildReferenceMarkoutRolloutOptions } from './reference-markout-rollout-config.js';
 import { buildContinuityConfig } from './continuity-config.js';
+import { buildOrderReconciliationScope } from './order-reconciliation-scope-config.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -90,6 +93,7 @@ const shadowPhase2Criteria = {
   maxP95AbsPyusdBasisBps: parseNumber('SHADOW_ABORT_MAX_P95_ABS_PYUSD_BASIS_BPS', 80),
 };
 const referenceMarkoutRolloutOptions = buildReferenceMarkoutRolloutOptions(process.env);
+const orderReconciliationScope = buildOrderReconciliationScope(process.env);
 
 // ---------------------------------------------------------------------------
 // Configuration — PRODUCTION
@@ -507,6 +511,7 @@ async function main() {
     dataPipeline,
     ...referenceMarkoutRolloutOptions,
     continuityConfig: config.continuityConfig,
+    ...orderReconciliationScope,
 
     // REST reconciliation + balance refresh
     restUrl: config.restUrl,

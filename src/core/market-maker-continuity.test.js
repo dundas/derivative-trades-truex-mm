@@ -171,6 +171,208 @@ describe('MarketMakerOrchestrator strict startup reconciliation', () => {
     pending_qty: '0', leaves_qty: '0.01', exeuted_qty: '0', executed_vwap: '0',
   });
 
+  test('scopes strict reconciliation to the configured instrument and maker namespace', async () => {
+    const own = rawOrder('venue-own', 'QMM001abcde000001', 'ACTIVE');
+    const otherInstrument = rawOrder('venue-other-product', 'FOREIGN_PRODUCT_1', 'ACTIVE');
+    otherInstrument.order_info.instrument_id = 'eth-pyusd';
+    const otherStrategy = rawOrder('venue-other-strategy', 'FOREIGN_STRATEGY_1', 'ACTIVE');
+    const foreignPending = rawOrder('venue-foreign-pending', 'FOREIGN_STRATEGY_2', 'MODIFY_PENDING');
+    const cancelOrder = mock(async () => {});
+    const orchestrator = makeStartupOrchestrator({
+      truexInstrumentId: 'btc-pyusd', orderIdNamespace: 'MM001',
+      startupCancelVerifyTimeoutMs: 20, startupCancelVerifyIntervalMs: 10,
+      now: () => 0, sleep: async () => {},
+    });
+    orchestrator.restClient = {
+      getActiveOrders: mock()
+        .mockResolvedValueOnce([otherInstrument, otherStrategy, foreignPending, own])
+        .mockResolvedValueOnce([rawOrder('venue-own', 'QMM001abcde000001', 'CANCELED')]),
+      cancelOrder,
+    };
+
+    const stats = await orchestrator._restReconcile({ allowPreStart: true, strict: true });
+    expect(cancelOrder).toHaveBeenCalledTimes(1);
+    expect(cancelOrder).toHaveBeenCalledWith('venue-own');
+    expect(stats).toMatchObject({ exchange: 1, orphansCancelled: 1 });
+  });
+
+  test('fails closed on malformed scope evidence that could identify our order', async () => {
+    const missingInstrument = rawOrder('venue-own', 'QMM001abcde000001', 'ACTIVE');
+    delete missingInstrument.order_info.instrument_id;
+    const malformedExternalId = rawOrder('venue-ambiguous', '', 'ACTIVE');
+    const cancelOrder = mock(async () => {});
+    for (const candidate of [missingInstrument, malformedExternalId]) {
+      const orchestrator = makeStartupOrchestrator({
+        truexInstrumentId: 'btc-pyusd', orderIdNamespace: 'MM001',
+      });
+      orchestrator.restClient = { getActiveOrders: mock(async () => [candidate]), cancelOrder };
+      await expect(orchestrator._restReconcile({ allowPreStart: true, strict: true }))
+        .rejects.toThrow('ambiguous order ownership scope');
+    }
+    expect(cancelOrder).not.toHaveBeenCalled();
+  });
+
+  test('conflicting foreign-instrument evidence for our identity fails closed in every manager path', async () => {
+    const orderId = 'QMM001abcde000001';
+    const contradictory = rawOrder('venue-conflict', orderId, 'ACTIVE');
+    contradictory.order_info.instrument_id = 'eth-pyusd';
+    const capital = new CapitalReservationManager();
+    capital.reconcile({ ...balances, liveOrders: [] });
+    capital.reserve({ orderId, side: 'sell', size: 0.01, price: 100000, level: 1 });
+    capital.accept(orderId);
+    const orchestrator = makeStartupOrchestrator({
+      truexInstrumentId: 'btc-pyusd', orderIdNamespace: 'MM001',
+      capitalReservationManager: capital,
+    });
+    orchestrator.quoteEngine.activeOrders.set(orderId, {
+      clOrdID: orderId, side: 'sell', size: 0.01, price: 100000, level: 1,
+      status: 'active', acknowledgedLive: true,
+    });
+    orchestrator.quoteEngine.removeStaleOrder = mock(() => true);
+    orchestrator.restClient = {
+      getActiveOrders: mock(async () => [contradictory]), cancelOrder: mock(async () => {}),
+    };
+
+    await expect(orchestrator._restReconcile({ allowPreStart: true, strict: true }))
+      .rejects.toThrow('ambiguous order ownership scope');
+    orchestrator.isRunning = true;
+    expect(await orchestrator._restReconcile()).toBeUndefined();
+    await expect(orchestrator._fetchCapitalLiveOrders())
+      .rejects.toThrow('ambiguous order ownership scope');
+    expect(orchestrator.quoteEngine.activeOrders.has(orderId)).toBe(true);
+    expect(orchestrator.quoteEngine.removeStaleOrder).not.toHaveBeenCalled();
+    expect(orchestrator.restClient.cancelOrder).not.toHaveBeenCalled();
+    expect(capital.getReservation(orderId)).toMatchObject({ acknowledgedLive: true });
+    expect(capital.getStatus().state).toBe('failed');
+  });
+
+  test('restart scope accepts any exact boot segment under the stable namespace', () => {
+    const orchestrator = makeStartupOrchestrator({
+      truexInstrumentId: 'btc-pyusd', orderIdNamespace: 'MM001',
+    });
+    expect(orchestrator._restOrderScope(rawOrder(
+      'old-venue', 'QMM001old_B000001', 'ACTIVE'
+    ))).toBe('owned');
+    expect(orchestrator._restOrderScope(rawOrder(
+      'foreign-venue', 'QOTHERold_B000001', 'ACTIVE'
+    ))).toBe('foreign');
+    expect(orchestrator._restOrderScope(rawOrder(
+      'malformed-venue', 'QMM001short', 'ACTIVE'
+    ))).toBe('ambiguous');
+  });
+
+  test('full-layout parsing keeps overlapping 4, 5, and 6 character namespaces foreign in every path', async () => {
+    const namespace5 = rawOrder('venue-five', 'QMM001abcde000001', 'ACTIVE');
+    const namespace6 = rawOrder('venue-six', 'QMM001Xabcde000001', 'ACTIVE');
+    for (const raw of [namespace5, namespace6]) raw.order_info.instrument_id = '12345';
+    const capital = new CapitalReservationManager();
+    capital.reconcile({ ...balances, liveOrders: [] });
+    const orchestrator = makeStartupOrchestrator({
+      truexInstrumentId: '12345', orderIdNamespace: 'MM00',
+      capitalReservationManager: capital,
+    });
+    orchestrator.restClient = {
+      getActiveOrders: mock(async () => [namespace5, namespace6]),
+      cancelAllOrders: mock(async () => {}), cancelOrder: mock(async () => {}),
+    };
+
+    await expect(orchestrator._restReconcile({ allowPreStart: true, strict: true }))
+      .resolves.toMatchObject({ exchange: 0, orphansCancelled: 0 });
+    orchestrator.isRunning = true;
+    await expect(orchestrator._restReconcile()).resolves.toMatchObject({ exchange: 0 });
+    expect(await orchestrator._fetchCapitalLiveOrders()).toEqual([]);
+    await orchestrator._cancelAllOrdersViaRest('overlap-test');
+    expect(orchestrator.restClient.cancelAllOrders).not.toHaveBeenCalled();
+    expect(orchestrator.restClient.cancelOrder).not.toHaveBeenCalled();
+    expect(capital.getStatus().state).toBe('normal');
+  });
+
+  test('malformed exact namespace remains ambiguous across strict, runtime, capital, and watchdog paths', async () => {
+    const malformed = rawOrder('venue-malformed', 'QMM00short', 'ACTIVE');
+    malformed.order_info.instrument_id = '12345';
+    const capital = new CapitalReservationManager();
+    capital.reconcile({ ...balances, liveOrders: [] });
+    const orchestrator = makeStartupOrchestrator({
+      truexInstrumentId: '12345', orderIdNamespace: 'MM00',
+      capitalReservationManager: capital,
+    });
+    orchestrator.restClient = {
+      getActiveOrders: mock(async () => [malformed]),
+      cancelAllOrders: mock(async () => {}), cancelOrder: mock(async () => {}),
+    };
+
+    await expect(orchestrator._restReconcile({ allowPreStart: true, strict: true }))
+      .rejects.toThrow('ambiguous order ownership scope');
+    orchestrator.isRunning = true;
+    expect(await orchestrator._restReconcile()).toBeUndefined();
+    await expect(orchestrator._fetchCapitalLiveOrders())
+      .rejects.toThrow('ambiguous order ownership scope');
+    await expect(orchestrator._cancelAllOrdersViaRest('malformed-test'))
+      .rejects.toThrow('ambiguous order ownership scope');
+    expect(orchestrator.restClient.cancelAllOrders).not.toHaveBeenCalled();
+    expect(orchestrator.restClient.cancelOrder).not.toHaveBeenCalled();
+    expect(capital.getStatus().state).toBe('failed');
+  });
+
+  test('recognizes a configured namespace across restart and exact local legacy identities', async () => {
+    const priorSession = makeStartupOrchestrator({
+      truexInstrumentId: 'btc-pyusd', orderIdNamespace: 'MM001',
+    });
+    expect(priorSession.orderIdNamespace).toBe('MM001');
+
+    const local = {
+      clOrdID: 'legacy-local-id', side: 'sell', price: 100000, size: 0.01,
+      status: 'active', acknowledgedLive: true,
+    };
+    const restarted = makeStartupOrchestrator({
+      truexInstrumentId: 'btc-pyusd', orderIdNamespace: 'MM001',
+    });
+    restarted.quoteEngine.activeOrders.set(local.clOrdID, local);
+    restarted.quoteEngine.removeStaleOrder = mock(() => true);
+    restarted.restClient = {
+      getActiveOrders: mock(async () => [rawOrder('venue-legacy', local.clOrdID, 'ACTIVE')]),
+      cancelOrder: mock(async () => {}),
+    };
+
+    const stats = await restarted._restReconcile({ allowPreStart: true, strict: true });
+    expect(stats).toMatchObject({ matched: 1, ghostsRemoved: 0, orphansCancelled: 0 });
+    expect(restarted.restClient.cancelOrder).not.toHaveBeenCalled();
+  });
+
+  test('capital live-order evidence excludes foreign products and strategies', async () => {
+    const own = rawOrder('venue-own', 'QMM001abcde000001', 'ACTIVE');
+    const foreignProduct = rawOrder('venue-product', 'FOREIGN_PRODUCT_1', 'ACTIVE');
+    foreignProduct.order_info.instrument_id = 'eth-pyusd';
+    const foreignStrategy = rawOrder('venue-strategy', 'OTHER_STRATEGY', 'ACTIVE');
+    const orchestrator = makeStartupOrchestrator({
+      truexInstrumentId: 'btc-pyusd', orderIdNamespace: 'MM001',
+    });
+    orchestrator.restClient = { getActiveOrders: mock(async () => [own, foreignProduct, foreignStrategy]) };
+
+    expect(await orchestrator._fetchCapitalLiveOrders()).toEqual([expect.objectContaining({
+      orderId: own.external_id, promotionEvidenceValid: true,
+    })]);
+  });
+
+  test('scoped watchdog cancellation never calls venue-wide cancel or touches foreign orders', async () => {
+    const own = rawOrder('venue-own', 'QMM001abcde000001', 'ACTIVE');
+    const foreignProduct = rawOrder('venue-product', 'FOREIGN_PRODUCT_1', 'ACTIVE');
+    foreignProduct.order_info.instrument_id = 'eth-pyusd';
+    const foreignStrategy = rawOrder('venue-strategy', 'OTHER_STRATEGY', 'ACTIVE');
+    const orchestrator = makeStartupOrchestrator({
+      truexInstrumentId: 'btc-pyusd', orderIdNamespace: 'MM001',
+    });
+    orchestrator.restClient = {
+      getActiveOrders: mock(async () => [own, foreignProduct, foreignStrategy]),
+      cancelAllOrders: mock(async () => {}), cancelOrder: mock(async () => {}),
+    };
+
+    await orchestrator._cancelAllOrdersViaRest('test');
+    expect(orchestrator.restClient.cancelAllOrders).not.toHaveBeenCalled();
+    expect(orchestrator.restClient.cancelOrder).toHaveBeenCalledTimes(1);
+    expect(orchestrator.restClient.cancelOrder).toHaveBeenCalledWith('venue-own');
+  });
+
   test('strictly validates configurable startup cancel verification bounds', () => {
     expect(makeStartupOrchestrator({
       startupCancelVerifyTimeoutMs: 20,

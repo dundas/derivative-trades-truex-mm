@@ -187,8 +187,22 @@ export class MarketMakerOrchestrator extends EventEmitter {
       shadowDetectionTapeMaxAgeMs: options.shadowDetectionTapeMaxAgeMs ?? 30000,
       truexTapeOutlierThresholdBps: options.truexTapeOutlierThresholdBps ?? 50,
       marketDataProvider: () => this.marketDataFeed?.getBestBidAsk?.(),
+      orderIdNamespace: options.orderIdNamespace,
+      orderIdBootId: options.orderIdBootId,
       logger: this.logger,
     });
+    this.truexInstrumentId = options.truexInstrumentId ?? null;
+    this.orderIdNamespace = options.orderIdNamespace ?? null;
+    if ((this.truexInstrumentId === null) !== (this.orderIdNamespace === null)) {
+      throw new Error('truexInstrumentId and orderIdNamespace must be configured together');
+    }
+    if (this.truexInstrumentId !== null &&
+        !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(this.truexInstrumentId)) {
+      throw new Error('truexInstrumentId must be a valid nonempty identifier');
+    }
+    if (this.orderIdNamespace !== null && !/^[A-Za-z0-9_-]{4,6}$/.test(this.orderIdNamespace)) {
+      throw new Error('orderIdNamespace must contain 4-6 URL-safe characters');
+    }
     if (options.continuityConfig) {
       this.quoteEngine.setContinuityStateProvider?.(() => this._getContinuityStatus());
     }
@@ -2195,7 +2209,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
   async _fetchCapitalLiveOrders() {
     const rawOrders = await this.restClient.getActiveOrders();
     const liveOrders = [];
-    for (const raw of rawOrders) {
+    for (const raw of this._filterScopedRestOrders(rawOrders)) {
       const parsed = TrueXRESTClient.parseOrder(raw);
       if (!parsed.externalId || !['ACTIVE', 'CANCEL_PENDING'].includes(parsed.status)) continue;
       // Promotion evidence is intentionally read from the raw fields. The
@@ -2215,6 +2229,72 @@ export class MarketMakerOrchestrator extends EventEmitter {
       });
     }
     return liveOrders;
+  }
+
+  _restOrderScope(raw, localOrderIds = null) {
+    // Backwards-compatible library mode has no REST ownership policy. The
+    // production entrypoint always supplies both fields and therefore always
+    // takes the scoped path below.
+    if (!this.truexInstrumentId || !this.orderIdNamespace) return 'owned';
+
+    const instrumentId = typeof raw?.order_info?.instrument_id === 'string'
+      ? raw.order_info.instrument_id.trim()
+      : '';
+    const externalId = typeof raw?.external_id === 'string' ? raw.external_id.trim() : '';
+    const validInstrument = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(instrumentId);
+    const validExternalId = /^[A-Za-z0-9_-]{1,64}$/.test(externalId);
+    const exactLocal = Boolean(externalId && (
+      localOrderIds?.has(externalId) || this.quoteEngine.activeOrders.has(externalId) ||
+      this.capitalReservationManager?.getReservation?.(externalId)
+    ));
+    const generatedNamespaceLength = externalId.length - 12; // Q + namespace + boot(5) + seq(6)
+    const validGeneratedId = validExternalId && externalId.startsWith('Q') &&
+      generatedNamespaceLength >= 4 && generatedNamespaceLength <= 6 &&
+      /^[A-Za-z0-9_-]{5}[0-9a-z]{6}$/.test(externalId.slice(1 + generatedNamespaceLength));
+    const generatedNamespace = validGeneratedId
+      ? externalId.slice(1, 1 + generatedNamespaceLength)
+      : null;
+    const makerPrefixCandidate = validExternalId && externalId.startsWith(`Q${this.orderIdNamespace}`);
+    const makerId = generatedNamespace === this.orderIdNamespace;
+
+    // A valid generated ID is parsed by its total length, so overlapping
+    // 4/5/6-character namespaces cannot masquerade as one another. Only an
+    // exact maker identity conflicting with its instrument is ambiguous.
+    if (validInstrument && instrumentId !== this.truexInstrumentId) {
+      if (exactLocal || makerId) return 'ambiguous';
+      if (validGeneratedId) return 'foreign';
+      return makerPrefixCandidate ? 'ambiguous' : 'foreign';
+    }
+    if (validInstrument && instrumentId === this.truexInstrumentId) {
+      if (exactLocal || makerId) return 'owned';
+      if (validGeneratedId) return 'foreign';
+      if (makerPrefixCandidate) return 'ambiguous';
+      if (validExternalId) return 'foreign';
+      return 'ambiguous';
+    }
+    // Missing/malformed instrument metadata is unsafe only when the identity
+    // otherwise points at this process or its durable namespace. A clearly
+    // foreign strategy ID remains untouched.
+    if (exactLocal || makerId) return 'ambiguous';
+    if (validGeneratedId) return 'foreign';
+    if (makerPrefixCandidate) return 'ambiguous';
+    return validExternalId ? 'foreign' : 'ambiguous';
+  }
+
+  _filterScopedRestOrders(rawOrders, { localOrderIds = null } = {}) {
+    if (!Array.isArray(rawOrders)) {
+      throw new Error('invalid active-order response during REST reconciliation');
+    }
+    const owned = [];
+    for (const raw of rawOrders) {
+      const scope = this._restOrderScope(raw, localOrderIds);
+      if (scope === 'foreign') continue;
+      if (scope === 'ambiguous') {
+        throw new Error('ambiguous order ownership scope during REST reconciliation');
+      }
+      owned.push(raw);
+    }
+    return owned;
   }
 
   /**
@@ -2337,12 +2417,15 @@ export class MarketMakerOrchestrator extends EventEmitter {
    */
   async _cancelAllOrdersViaRest(reason) {
     this.logger.info(`[WATCHDOG] Cancelling all orders via REST (reason: ${reason})`);
-    if (typeof this.restClient.cancelAllOrders === 'function') {
+    // The venue-wide endpoint is safe only in legacy unscoped mode. Production
+    // uses explicit ownership scope and must never cancel another instrument
+    // or strategy sharing the account.
+    if (!this.truexInstrumentId && typeof this.restClient.cancelAllOrders === 'function') {
       await this.restClient.cancelAllOrders();
       return;
     }
     // Fallback: iterate and cancel individually
-    const orders = await this.restClient.getActiveOrders();
+    const orders = this._filterScopedRestOrders(await this.restClient.getActiveOrders());
     for (const raw of orders) {
       try {
         await this.restClient.cancelOrder(raw.id);
@@ -2647,7 +2730,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     cancellationTargets = [],
     postScan = false,
   ) {
-    let current = rawOrders;
+    let current = this._filterScopedRestOrders(rawOrders);
     while (true) {
       if (postScan) this._validateStartupPostScanSnapshot(current, cancellationTargets);
       const pending = current.filter((raw) =>
@@ -2674,32 +2757,32 @@ export class MarketMakerOrchestrator extends EventEmitter {
         externalIds.add(externalId);
       }
 
-      current = await this._pollStartupOrders(
+      current = this._filterScopedRestOrders(await this._pollStartupOrders(
         budget,
         cancellationTargets.length > 0
           ? 'orphan cancellation verification timed out'
           : (hasModifyPending
             ? 'transitional-order verification timed out'
             : 'cancel-pending verification timed out'),
-      );
+      ));
     }
   }
 
   async _verifyStartupOrphanCancellations(targets, budget) {
-    let current = await this._pollStartupOrders(
+    let current = this._filterScopedRestOrders(await this._pollStartupOrders(
       budget,
       'orphan cancellation verification timed out',
-    );
+    ));
 
     while (true) {
       this._validateStartupPostScanSnapshot(current, targets);
       const unresolved = this._validateStartupOrphanTargets(current, targets);
 
       if (unresolved.size === 0) return current;
-      current = await this._pollStartupOrders(
+      current = this._filterScopedRestOrders(await this._pollStartupOrders(
         budget,
         'orphan cancellation verification timed out',
-      );
+      ));
     }
   }
 
@@ -2729,6 +2812,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
       if (!Array.isArray(rawExchangeOrders)) {
         throw new Error('invalid active-order response during REST reconciliation');
       }
+      rawExchangeOrders = this._filterScopedRestOrders(rawExchangeOrders, {
+        localOrderIds: new Set(localGeneration.keys()),
+      });
       if (strict) {
         this._assertStartupVerificationBudget(startupVerificationBudget);
         rawExchangeOrders = await this._verifyStartupCancelPending(
@@ -2921,6 +3007,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       return stats;
     } catch (err) {
       if (strict) throw err;
+      this.capitalReservationManager?.reconciliationFailed();
       this.logger.error(`[Reconcile] REST reconciliation failed: ${err.message}`);
       // EventEmitter treats an unhandled `error` event as a throw. Periodic
       // reconciliation is intentionally nonfatal, while registered observers

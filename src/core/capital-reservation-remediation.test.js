@@ -616,4 +616,29 @@ describe('presence and dispatch remediation', () => {
     });
     expect(fixConnection.sendMessage.mock.calls.some(([fields]) => fields['35'] === 'F')).toBe(false);
   });
+
+  test('stable namespace IDs use boot entropy, remain bounded, and never wrap into reuse', () => {
+    const originalNow = Date.now;
+    Date.now = () => 123456789;
+    try {
+      const first = new QuoteEngine({
+        orderIdNamespace: 'MM001', orderIdBootId: 'bootA', logger,
+      });
+      const second = new QuoteEngine({
+        orderIdNamespace: 'MM001', orderIdBootId: 'bootB', logger,
+      });
+      const firstId = first.generateClOrdID();
+      const secondId = second.generateClOrdID();
+      expect(firstId).toBe('QMM001bootA000001');
+      expect(secondId).toBe('QMM001bootB000001');
+      expect(firstId).not.toBe(secondId);
+      expect(firstId.length).toBeLessThanOrEqual(18);
+
+      first.orderSequence = 36 ** 6 - 2;
+      expect(first.generateClOrdID()).toBe('QMM001bootAzzzzzz');
+      expect(() => first.generateClOrdID()).toThrow('sequence exhausted');
+    } finally {
+      Date.now = originalNow;
+    }
+  });
 });
