@@ -78,6 +78,18 @@ services:
       - REDIS_URL=redis://127.0.0.1:6379
       - LOG_LEVEL=info
       - LOG_FILE=/app/logs/market-maker.log
+      # Required, non-secret maker-continuity obligations. Compose fails before
+      # restart if any value is absent from the operator-managed .env file.
+      - MM_MIN_ACTIVE_LEVELS_PER_SIDE=${MM_MIN_ACTIVE_LEVELS_PER_SIDE:?required}
+      - MM_MIN_FUNDED_QUOTE_SIZE_BTC=${MM_MIN_FUNDED_QUOTE_SIZE_BTC:?required}
+      - MM_L1_RESERVE_BASE_BTC=${MM_L1_RESERVE_BASE_BTC:?required}
+      - MM_L1_RESERVE_QUOTE_PYUSD=${MM_L1_RESERVE_QUOTE_PYUSD:?required}
+      - MM_MAX_SIDE_GAP_MS=${MM_MAX_SIDE_GAP_MS:?required}
+      - MM_SIDE_GAP_ALERT_THRESHOLD_MS=${MM_SIDE_GAP_ALERT_THRESHOLD_MS:?required}
+      - MM_SIDE_GAP_ALERT_RATE_LIMIT_MS=${MM_SIDE_GAP_ALERT_RATE_LIMIT_MS:?required}
+      - MM_DEGRADED_MAX_LEVELS=${MM_DEGRADED_MAX_LEVELS:?required}
+      - MM_DEGRADED_SIZE_FACTOR=${MM_DEGRADED_SIZE_FACTOR:?required}
+      - MM_DEFENSIVE_SPREAD_FLOOR_BPS=${MM_DEFENSIVE_SPREAD_FLOOR_BPS:?required}
     volumes:
       - mm-logs:/app/logs
     command: ["bun", "scripts/run-prod.js"]
