@@ -47,6 +47,7 @@ export class QuoteEngine extends EventEmitter {
     this.terminalExecutionOrders = new Set();
     this.executionEvidenceGap = null;
     this.logger = options.logger || console;
+    this.now = typeof options.now === 'function' ? options.now : Date.now;
 
     // Config
     this.config = {
@@ -86,6 +87,10 @@ export class QuoteEngine extends EventEmitter {
       clientId: options.clientId || null, // TrueX PartyID (tag 448) — required for order entry
       selfMatchPreventionInstruction: normalizeSelfMatchPreventionInstruction(options.selfMatchPreventionInstruction),
       truexBookStaleThresholdMs: options.truexBookStaleThresholdMs || 10000,
+      strictTruexMakerSafety: options.strictTruexMakerSafety ?? false,
+      truexMakerEbboMaxAgeMs: options.truexMakerEbboMaxAgeMs ?? 10000,
+      truexAloRetryCooldownMs: options.truexAloRetryCooldownMs ?? 5000,
+      truexAloRetryMaxEntries: options.truexAloRetryMaxEntries ?? 256,
       pyusdUsdStaleThresholdMs: options.pyusdUsdStaleThresholdMs || 15000,
       marketablePostOnlyAction: options.marketablePostOnlyAction || 'skip',
       replaceMode: options.replaceMode || 'passive-safe',
@@ -134,6 +139,23 @@ export class QuoteEngine extends EventEmitter {
     if (!Number.isFinite(this.config.defensiveSpreadFloorBps) || this.config.defensiveSpreadFloorBps < 0) {
       throw new Error('defensiveSpreadFloorBps must be a finite non-negative number');
     }
+    if (typeof this.config.strictTruexMakerSafety !== 'boolean') {
+      throw new Error('strictTruexMakerSafety must be boolean');
+    }
+    if (this.config.strictTruexMakerSafety) {
+      if (!['skip', 'slide'].includes(this.config.marketablePostOnlyAction)) {
+        throw new Error('marketablePostOnlyAction must be skip or slide');
+      }
+      if (!Number.isFinite(this.config.truexMakerEbboMaxAgeMs) || this.config.truexMakerEbboMaxAgeMs <= 0) {
+        throw new Error('truexMakerEbboMaxAgeMs must be a finite positive number');
+      }
+      if (!Number.isFinite(this.config.truexAloRetryCooldownMs) || this.config.truexAloRetryCooldownMs <= 0) {
+        throw new Error('truexAloRetryCooldownMs must be a finite positive number');
+      }
+      if (!Number.isInteger(this.config.truexAloRetryMaxEntries) || this.config.truexAloRetryMaxEntries < 1) {
+        throw new Error('truexAloRetryMaxEntries must be a positive integer');
+      }
+    }
 
     // State
     this.activeOrders = new Map(); // clOrdID -> { side, price, size, level, status, placedAt }
@@ -165,6 +187,7 @@ export class QuoteEngine extends EventEmitter {
 
     // Cancel tracking: newClOrdID → origClOrdID (for matching cancel acks back to activeOrders)
     this.cancelToOrigMap = new Map();
+    this.resolvedCancelIds = new Set();
     this.pendingReplacements = new Map(); // origClOrdID -> { quote, createdAt }
     this.suppressedLevels = new Map(); // side:level -> { reason, timestamp, quote }
     this.recentRejectsByReason = new Map();
@@ -186,6 +209,9 @@ export class QuoteEngine extends EventEmitter {
     this.heldPlacementsPending = false;
     this.truexBook = null;
     this.truexEbbo = null;
+    this.truexEbboGeneration = { buy: 0, sell: 0 };
+    this.lastValidTruexEbboTouch = null;
+    this.aloRetryInhibitions = new Map();
     this.pyusdUsd = null;
     this.takerWindowStartedAt = Date.now();
     this.takerOrdersThisWindow = 0;
@@ -215,9 +241,15 @@ export class QuoteEngine extends EventEmitter {
 
   updateTruexEbbo(book) {
     if (!book) return;
-    this.truexEbbo = {
-      bestBid: book.bestBid ?? null,
-      bestAsk: book.bestAsk ?? null,
+    const prior = this.truexEbbo;
+    const receivedAt = this.now();
+    const observationNumber = (value) =>
+      value === null || value === undefined || String(value).trim() === '' ? null : Number(value);
+    const bestBid = observationNumber(book.bestBid);
+    const bestAsk = observationNumber(book.bestAsk);
+    const candidate = {
+      bestBid,
+      bestAsk,
       bestBidQty: book.bestBidQty ?? null,
       bestAskQty: book.bestAskQty ?? null,
       bestBidOrderCount: book.bestBidOrderCount ?? null,
@@ -225,8 +257,26 @@ export class QuoteEngine extends EventEmitter {
       lastTradePrice: book.lastTradePrice ?? null,
       lastTradeQty: book.lastTradeQty ?? null,
       lastTradeTs: book.lastTradeTs ?? null,
-      timestamp: book.timestamp ?? null,
+      // Venue/source time is retained for provenance. Receipt/observation time is always
+      // stamped here; a caller-supplied receivedAt is intentionally ignored.
+      timestamp: book.timestamp,
+      sourceTimestamp: book.timestamp,
+      receivedAt,
+      observationTimestamp: receivedAt,
     };
+    const validObservation = this._validateStrictEbboObservation(candidate);
+    const bidChanged = validObservation &&
+      (!this.lastValidTruexEbboTouch || this.lastValidTruexEbboTouch.bestBid !== bestBid);
+    const askChanged = validObservation &&
+      (!this.lastValidTruexEbboTouch || this.lastValidTruexEbboTouch.bestAsk !== bestAsk);
+    if (askChanged) this.truexEbboGeneration.buy++;
+    if (bidChanged) this.truexEbboGeneration.sell++;
+    if (validObservation) this.lastValidTruexEbboTouch = { bestBid, bestAsk };
+    this.truexEbbo = candidate;
+    if (this.config.strictTruexMakerSafety &&
+        (bidChanged || askChanged || (!this._strictEbboState(prior).usable && validObservation))) {
+      this.deferredRepriceNeeded = true;
+    }
   }
 
   updatePyusdUsd(reference) {
@@ -673,7 +723,8 @@ export class QuoteEngine extends EventEmitter {
       orderedActions.push({ type: 'cancel', clOrdID: c.clOrdID, order: c.order });
     }
 
-    if (this.config.replaceMode === 'place-before-cancel' && !hasAuthoritativePresence) {
+    if (this.config.replaceMode === 'place-before-cancel' && !hasAuthoritativePresence &&
+        !this.config.strictTruexMakerSafety) {
       for (const r of actions.toReplace) {
         orderedActions.push({ type: 'place', quote: { ...r.place, replacesQuoteId: r.cancel } });
         orderedActions.push({ type: 'cancel', clOrdID: r.cancel, order: r.cancelOrder });
@@ -767,6 +818,14 @@ export class QuoteEngine extends EventEmitter {
     let dispatched = false;
     let deferredThisCycle = 0;
     for (const action of orderedActions) {
+      if (action.type === 'replacement-cancel' && this.config.strictTruexMakerSafety) {
+        const ebboState = this._strictEbboState();
+        if (!ebboState.usable) {
+          this._recordSuppression(action.quote || action.order, ebboState.reason);
+          this.deferredRepriceNeeded = true;
+          continue;
+        }
+      }
       if (this.continuityState.executionState === 'unsafe' && action.type !== 'cancel') {
         this._recordSuppression(action.quote || action.order, 'unsafe-execution-gate');
         this.deferredRepriceNeeded = false;
@@ -810,7 +869,7 @@ export class QuoteEngine extends EventEmitter {
         continue;
       }
 
-      this._dispatchAction(action);
+      if (this._dispatchAction(action) === false) continue;
       this.actionsThisSecond++;
       dispatched = true;
     }
@@ -831,22 +890,52 @@ export class QuoteEngine extends EventEmitter {
    */
   _dispatchAction(action) {
     this._refreshContinuityState();
+    if (action.type === 'replacement-cancel' &&
+        this.activeOrders.get(action.clOrdID)?.dispatchOutcomeUnknown) return false;
     if (this.continuityState.executionState === 'unsafe' && action.type !== 'cancel') {
       this._recordSuppression(action.quote || action.order, 'unsafe-execution-gate');
-      return;
+      return false;
     }
     if (action.type === 'cancel') {
-      this._sendCancel(action.clOrdID, action.order);
+      return this._sendCancel(action.clOrdID, action.order) !== false;
     } else if (action.type === 'replacement-cancel') {
+      if (this.config.strictTruexMakerSafety && !this._prepareStrictMakerQuote(action.quote)) {
+        this.deferredRepriceNeeded = true;
+        return false;
+      }
+      const hadPending = this.pendingReplacements.has(action.clOrdID);
+      const priorPending = this.pendingReplacements.get(action.clOrdID);
+      const priorReplacementSide = this.lastReplacementSide;
+      const replacementSide = action.order?.side;
+      const hadReplacementLevel = this.lastReplacementLevelBySide.has(replacementSide);
+      const priorReplacementLevel = this.lastReplacementLevelBySide.get(replacementSide);
+      const restoreReplacementIntent = () => {
+        if (hadPending) this.pendingReplacements.set(action.clOrdID, priorPending);
+        else this.pendingReplacements.delete(action.clOrdID);
+        this.lastReplacementSide = priorReplacementSide;
+        if (hadReplacementLevel) this.lastReplacementLevelBySide.set(replacementSide, priorReplacementLevel);
+        else this.lastReplacementLevelBySide.delete(replacementSide);
+        this.deferredRepriceNeeded = true;
+      };
       this.pendingReplacements.set(action.clOrdID, {
         quote: { ...action.quote, replacesQuoteId: action.clOrdID }, createdAt: Date.now(),
       });
-      this.lastReplacementSide = action.order?.side || null;
-      this.lastReplacementLevelBySide.set(action.order?.side, action.order?.level || 0);
-      this._sendCancel(action.clOrdID, action.order);
+      this.lastReplacementSide = replacementSide || null;
+      this.lastReplacementLevelBySide.set(replacementSide, action.order?.level || 0);
+      try {
+        if (this._sendCancel(action.clOrdID, action.order) === false) {
+          restoreReplacementIntent();
+          return false;
+        }
+      } catch (error) {
+        restoreReplacementIntent();
+        throw error;
+      }
+      return true;
     } else if (action.type === 'place') {
-      this._sendNewOrder(action.quote);
+      return Boolean(this._sendNewOrder(action.quote));
     }
+    return false;
   }
 
   /**
@@ -934,33 +1023,109 @@ export class QuoteEngine extends EventEmitter {
       orderIntent: prepared.orderIntent || (prepared.postOnly === false ? 'taker_opportunity' : 'maker_quote'),
       liquidityRoleExpected: prepared.postOnly === false ? 'taker' : 'maker',
     });
+    // Everything above may invoke injected synchronous code (notably capital reserve). Recheck
+    // the exact prepared price immediately at the transport boundary; never re-slide here because
+    // fields and capital were built for this price.
+    if (!this._isPreparedQuoteSendableNow(prepared)) {
+      this._rollbackUnsentNewOrder(clOrdID);
+      this.deferredRepriceNeeded = true;
+      return null;
+    }
+
+    if (this.fixConnection) {
+      let dispatchAccepted;
+      try {
+        dispatchAccepted = this.fixConnection.sendMessage(fields);
+      } catch (error) {
+        this._rollbackUnsentNewOrder(clOrdID);
+        throw error;
+      }
+      if (dispatchAccepted === false) {
+        this._rollbackUnsentNewOrder(clOrdID);
+        this.deferredRepriceNeeded = true;
+        return null;
+      }
+      if (this.config.strictTruexMakerSafety && dispatchAccepted?.then) {
+        // Strict production adapters must implement the synchronous FIX enqueue
+        // contract. Contain a legacy Promise rejection and retain the reservation
+        // conservatively because dispatch outcome is unknowable at this boundary.
+        void Promise.resolve(dispatchAccepted).catch((error) => {
+          try { this.logger.error(`[QuoteEngine] Async FIX dispatch contract violation: ${error.message}`); } catch (_) {}
+        });
+        const reason = 'async-new-dispatch-outcome-unknown';
+        const transitioned = this.capitalReservationManager?.dispatchOutcomeUnknown
+          ? this.capitalReservationManager.dispatchOutcomeUnknown(clOrdID, reason)
+          : (this.capitalReservationManager?.failClosedForEvidenceGap?.(clOrdID, reason) || false);
+        this._failClosedExecutionEvidence(clOrdID, reason, {
+          authoritative: Boolean(this.capitalReservationManager),
+        });
+        if (!transitioned || !this._emitCapitalEvidenceGap(clOrdID)) {
+          this._emitCapitalResyncRequired({ side: prepared.side, reason, orderId: clOrdID });
+        }
+        this.deferredRepriceNeeded = true;
+        return null;
+      }
+    }
+    this.lastActionByClOrdID.set(clOrdID, Date.now());
     this.emit('quote-lifecycle', {
       eventType: prepared.replacesQuoteId ? 'replace' : 'create', quoteId: clOrdID,
       replacesQuoteId: prepared.replacesQuoteId || null, side: prepared.side, price: prepared.price,
       size: prepared.size, level: prepared.level, action: prepared.replacesQuoteId ? 'replace' : 'place',
     });
-
-    this.lastActionByClOrdID.set(clOrdID, Date.now());
-
-    if (this.fixConnection) {
-      try {
-        this.fixConnection.sendMessage(fields);
-      } catch (error) {
-        this.activeOrders.delete(clOrdID);
-        this.capitalReservationManager?.rejected(clOrdID);
-        throw error;
-      }
-    }
     if (prepared.postOnly === false) {
       this._recordTakerOrder(prepared.size * prepared.price);
     }
     return clOrdID;
   }
 
+  _rollbackUnsentNewOrder(clOrdID) {
+    this.activeOrders.delete(clOrdID);
+    this.lastActionByClOrdID.delete(clOrdID);
+    this._clearExecutionIdentity(clOrdID);
+    if (this.capitalReservationManager?.newDispatchAborted) {
+      this.capitalReservationManager.newDispatchAborted(clOrdID);
+    } else {
+      this.capitalReservationManager?.rejected(clOrdID);
+    }
+  }
+
+  _isPreparedQuoteSendableNow(prepared) {
+    this._refreshContinuityState();
+    if (this.continuityState.executionState === 'unsafe') {
+      this._recordSuppression(prepared, 'unsafe-execution-gate');
+      return false;
+    }
+    if (!this.config.strictTruexMakerSafety) return true;
+    const state = this._strictEbboState();
+    if (!state.usable) {
+      this._recordSuppression(prepared, state.reason);
+      return false;
+    }
+    if (prepared.postOnly === false) return true;
+    if (this._isAloRetryInhibited(prepared)) {
+      this._recordSuppression(prepared, 'alo-retry-inhibited');
+      return false;
+    }
+    const marketable = prepared.side === 'buy'
+      ? prepared.price >= state.book.bestAsk
+      : prepared.price <= state.book.bestBid;
+    if (marketable) {
+      this._recordSuppression(prepared, 'marketable-post-only');
+      return false;
+    }
+    if (this._wouldSelfCrossTrackedOrder(prepared)) {
+      this._recordSuppression(prepared, 'self-cross-tracked-order');
+      return false;
+    }
+    return true;
+  }
+
   /**
    * Send a FIX Order Cancel Request (35=F).
    */
   _sendCancel(origClOrdID, order) {
+    const alreadyUnknown = this.activeOrders.get(origClOrdID)?.dispatchOutcomeUnknown;
+    if (alreadyUnknown) return false;
     const newClOrdID = this.generateClOrdID();
     // TrueX cancel via 35=F (OrderCancelRequest). No tag 54 (Side).
     const fields = {
@@ -998,22 +1163,50 @@ export class QuoteEngine extends EventEmitter {
     const priorCancelMapping = this.cancelToOrigMap.get(newClOrdID);
     this.cancelToOrigMap.set(newClOrdID, origClOrdID);
 
+    const rollbackDispatch = () => {
+      if (activeOrder && this.activeOrders.get(origClOrdID) === activeOrder) {
+        if (priorLocal.hadStatus) activeOrder.status = priorLocal.status;
+        else delete activeOrder.status;
+        if (priorLocal.hadCancellingAt) activeOrder.cancellingAt = priorLocal.cancellingAt;
+        else delete activeOrder.cancellingAt;
+      }
+      if (capitalTransitioned) {
+        this.capitalReservationManager.cancelDispatchFailed(origClOrdID, priorCapital?.state);
+      }
+      if (hadCancelMapping) this.cancelToOrigMap.set(newClOrdID, priorCancelMapping);
+      else this.cancelToOrigMap.delete(newClOrdID);
+    };
     if (this.fixConnection) {
+      let dispatchAccepted;
       try {
-        this.fixConnection.sendMessage(fields);
+        dispatchAccepted = this.fixConnection.sendMessage(fields);
       } catch (error) {
-        if (activeOrder && this.activeOrders.get(origClOrdID) === activeOrder) {
-          if (priorLocal.hadStatus) activeOrder.status = priorLocal.status;
-          else delete activeOrder.status;
-          if (priorLocal.hadCancellingAt) activeOrder.cancellingAt = priorLocal.cancellingAt;
-          else delete activeOrder.cancellingAt;
-        }
-        if (capitalTransitioned) {
-          this.capitalReservationManager.cancelDispatchFailed(origClOrdID, priorCapital?.state);
-        }
-        if (hadCancelMapping) this.cancelToOrigMap.set(newClOrdID, priorCancelMapping);
-        else this.cancelToOrigMap.delete(newClOrdID);
+        rollbackDispatch();
         throw error;
+      }
+      if (dispatchAccepted === false) {
+        rollbackDispatch();
+        return false;
+      }
+      if (this.config.strictTruexMakerSafety && dispatchAccepted?.then) {
+        void Promise.resolve(dispatchAccepted).catch((error) => {
+          try {
+            this.logger.error(`[QuoteEngine] Async FIX cancel outcome unknown: ${error.message}`);
+          } catch (_) {}
+        });
+        if (activeOrder) activeOrder.dispatchOutcomeUnknown = true;
+        const reason = 'async-cancel-dispatch-outcome-unknown';
+        const transitioned = this.capitalReservationManager?.failClosedForEvidenceGap?.(
+          origClOrdID, reason,
+        ) || false;
+        this._failClosedExecutionEvidence(origClOrdID, reason, {
+          authoritative: Boolean(this.capitalReservationManager),
+        });
+        if (!transitioned || !this._emitCapitalEvidenceGap(origClOrdID)) {
+          this._emitCapitalResyncRequired({ side: order?.side, reason, orderId: origClOrdID });
+        }
+        this.deferredRepriceNeeded = true;
+        return true;
       }
     }
 
@@ -1023,6 +1216,7 @@ export class QuoteEngine extends EventEmitter {
       side: order?.side, price: order?.price, size: order?.size, level: order?.level,
       action: 'cancel', reason: 'reprice_or_cancel',
     });
+    return true;
   }
 
   /**
@@ -1045,9 +1239,19 @@ export class QuoteEngine extends EventEmitter {
   }
 
   _emitCapitalEvidenceGap(orderId) {
-    const gap = this.capitalReservationManager?.takeEvidenceGap();
-    if (!gap) return;
-    this.emit('capital-resync-required', { ...gap, orderId });
+    const gap = this.capitalReservationManager?.takeEvidenceGap?.();
+    if (!gap) return false;
+    return this._emitCapitalResyncRequired({ ...gap, orderId });
+  }
+
+  _emitCapitalResyncRequired(event) {
+    try {
+      this.emit('capital-resync-required', event);
+      return true;
+    } catch (error) {
+      try { this.logger.error(`[QuoteEngine] Capital resync observer failed: ${error.message}`); } catch (_) {}
+      return false;
+    }
   }
 
   setContinuityState(status = {}) {
@@ -1099,6 +1303,21 @@ export class QuoteEngine extends EventEmitter {
     const lastQty = fields['32'] ? parseFloat(fields['32']) : null;
     // Resolve cancel ClOrdID → original ClOrdID if this is a cancel ack
     const origClOrdID = this.cancelToOrigMap.get(clOrdID);
+    const reportedOrigClOrdID = typeof fields['41'] === 'string' && fields['41'] ? fields['41'] : null;
+    if (origClOrdID && reportedOrigClOrdID && reportedOrigClOrdID !== origClOrdID) {
+      this.capitalReservationManager?.failClosedForEvidenceGap?.(
+        origClOrdID, 'cancel-ack-identity-mismatch',
+      );
+      this._failClosedExecutionEvidence(origClOrdID, 'cancel-ack-identity-mismatch', {
+        authoritative: Boolean(this.capitalReservationManager),
+      });
+      this._emitCapitalResyncRequired({
+        orderId: origClOrdID,
+        side: this.activeOrders.get(origClOrdID)?.side,
+        reason: 'cancel-ack-identity-mismatch',
+      });
+      return;
+    }
     const resolvedClOrdID = origClOrdID || clOrdID;
     const side = this.activeOrders.get(resolvedClOrdID)?.side || (fields['54'] === '1' ? 'buy' : 'sell');
     if (!this.capitalReservationManager && (ordStatus === '1' || ordStatus === '2')) {
@@ -1330,7 +1549,8 @@ export class QuoteEngine extends EventEmitter {
           }
           this.activeOrders.delete(resolvedClOrdID);
           this.unknownStatusDedupeByOrder.delete(resolvedClOrdID);
-          this.cancelToOrigMap.delete(clOrdID);
+          this._retireCancelId(clOrdID);
+          this._retireCancelMappings(resolvedClOrdID);
           break;
         }
         if (execID) {
@@ -1357,7 +1577,8 @@ export class QuoteEngine extends EventEmitter {
           this._recordExecutionIdentity(resolvedClOrdID, execID, { terminal: true });
         }
         this.activeOrders.delete(resolvedClOrdID);
-        this.cancelToOrigMap.delete(clOrdID);
+        this._retireCancelId(clOrdID);
+        this._retireCancelMappings(resolvedClOrdID);
         break;
 
       case '4': // Cancelled
@@ -1370,6 +1591,7 @@ export class QuoteEngine extends EventEmitter {
           const selfInitiated = !!origClOrdID || cancelled?.status === 'cancelling';
           if (cancelled && !selfInitiated) {
             const reason = fields['58'] || 'unsolicited';
+            if (/ALO would trade/i.test(reason)) this._recordAloRetryInhibition(cancelled);
             this.logger.warn(
               `[QuoteEngine] Venue-cancelled ${cancelled.side} L${cancelled.level} @ ${cancelled.price} size=${cancelled.size}: ${reason}`
             );
@@ -1385,7 +1607,8 @@ export class QuoteEngine extends EventEmitter {
           price: cancelled?.price, size: cancelled?.size, level: cancelled?.level,
           action: 'cancelled', reason: fields['58'] || null,
         });
-        this.cancelToOrigMap.delete(clOrdID);
+        this._retireCancelId(clOrdID);
+        this._retireCancelMappings(resolvedClOrdID);
         this.capitalReservationManager?.cancelled(resolvedClOrdID);
         this._clearExecutionIdentity(resolvedClOrdID);
         this._releasePendingReplacement(resolvedClOrdID);
@@ -1407,7 +1630,7 @@ export class QuoteEngine extends EventEmitter {
             origOrder.acknowledgedLive = true;
           }
           this.capitalReservationManager?.cancelRejected(origClOrdID);
-          this.cancelToOrigMap.delete(clOrdID);
+          this._retireCancelId(clOrdID);
         } else {
           // New order was rejected — remove from tracking (never made it to exchange)
           this.activeOrders.delete(resolvedClOrdID);
@@ -1498,10 +1721,34 @@ export class QuoteEngine extends EventEmitter {
     const reason = fields['58'] || 'unknown';
     const cxlRejReason = fields['102'];  // 0=Too late, 1=Unknown order, etc.
 
+    if (typeof clOrdID === 'string' && clOrdID && this.resolvedCancelIds.has(clOrdID)) return;
+
     this.logger.warn(`[QuoteEngine] OrderCancelReject: cancel=${clOrdID} orig=${origClOrdID} reason=${reason} cxlRejReason=${cxlRejReason}`);
 
     // Resolve via cancelToOrigMap if origClOrdID not in the message
-    const resolvedOrigClOrdID = origClOrdID || this.cancelToOrigMap.get(clOrdID);
+    const mappedOrigClOrdID = typeof clOrdID === 'string' && clOrdID
+      ? this.cancelToOrigMap.get(clOrdID)
+      : null;
+    const explicitOrigClOrdID = typeof origClOrdID === 'string' && origClOrdID ? origClOrdID : null;
+    const unknownCandidate = [explicitOrigClOrdID, mappedOrigClOrdID].find((orderId) =>
+      this.activeOrders.get(orderId)?.dispatchOutcomeUnknown);
+    if (unknownCandidate && (!clOrdID || mappedOrigClOrdID !== unknownCandidate ||
+        (explicitOrigClOrdID && explicitOrigClOrdID !== unknownCandidate))) {
+      this.capitalReservationManager?.failClosedForEvidenceGap?.(
+        unknownCandidate, 'async-cancel-dispatch-outcome-unknown',
+      );
+      this._failClosedExecutionEvidence(
+        unknownCandidate, 'async-cancel-dispatch-outcome-unknown',
+        { authoritative: Boolean(this.capitalReservationManager) },
+      );
+      this._emitCapitalResyncRequired({
+        orderId: unknownCandidate,
+        side: this.activeOrders.get(unknownCandidate)?.side,
+        reason: 'uncorrelated-cancel-reject',
+      });
+      return;
+    }
+    const resolvedOrigClOrdID = explicitOrigClOrdID || mappedOrigClOrdID;
 
     if (resolvedOrigClOrdID) {
       if (cxlRejReason === '1') {
@@ -1519,20 +1766,17 @@ export class QuoteEngine extends EventEmitter {
         }
         this.pendingReplacements.delete(resolvedOrigClOrdID);
         this._clearExecutionIdentity(resolvedOrigClOrdID);
+        this._retireCancelMappings(resolvedOrigClOrdID);
       } else {
         // Cancel failed but original order still lives — restore to 'active'
-        const origOrder = this.activeOrders.get(resolvedOrigClOrdID);
-        if (origOrder) {
-          origOrder.status = 'active';
-          origOrder.acknowledgedLive = true;
-        }
-        this.capitalReservationManager?.cancelRejected(resolvedOrigClOrdID);
-        this.pendingReplacements.delete(resolvedOrigClOrdID);
+        this.resolveUnknownCancelAsActive(resolvedOrigClOrdID, {
+          replacement: 'drop', evidenceAuthority: true, evidenceSource: 'fix-cancel-reject',
+        });
       }
     }
 
     // Clean up cancel tracking
-    this.cancelToOrigMap.delete(clOrdID);
+    this._retireCancelId(clOrdID);
 
     // Count as a reject for backoff purposes
     this.consecutiveRejects++;
@@ -1605,9 +1849,7 @@ export class QuoteEngine extends EventEmitter {
       });
     }
     this.pendingReplacements.delete(clOrdID);
-    for (const [cancelId, originalId] of this.cancelToOrigMap) {
-      if (originalId === clOrdID) this.cancelToOrigMap.delete(cancelId);
-    }
+    this._retireCancelMappings(clOrdID);
     this.deferredRepriceNeeded = true;
     this._clearExecutionIdentity(clOrdID);
     return { changed: Boolean(tracked || evidence), removedLocal: Boolean(tracked), evidence };
@@ -1643,6 +1885,9 @@ export class QuoteEngine extends EventEmitter {
       recentRejectsByReason: Object.fromEntries(this.recentRejectsByReason),
       truexEbbo: this.truexEbbo ? { ...this.truexEbbo } : null,
       truexEbboFresh: this._isTruexEbboFresh(),
+      strictTruexMakerSafety: this.config.strictTruexMakerSafety,
+      truexMakerEbboFresh: this.config.strictTruexMakerSafety ? this._strictEbboState().usable : null,
+      aloRetryInhibitions: Array.from(this.aloRetryInhibitions.values()).map((entry) => ({ ...entry })),
       pyusdUsd: this.pyusdUsd ? { ...this.pyusdUsd } : null,
       pyusdUsdFresh: this._isPyusdBasisFresh(),
       pyusdBasisSuppressed: this.shouldSuppressBasisDependentDetection(),
@@ -1751,7 +1996,7 @@ export class QuoteEngine extends EventEmitter {
         this.heldPlacementsPending = true;
         continue;
       }
-      this._dispatchAction(action);
+      if (this._dispatchAction(action) === false) continue;
       this.actionsThisSecond++;
     }
     if (droppedStalePlacements > 0) {
@@ -1772,6 +2017,42 @@ export class QuoteEngine extends EventEmitter {
       if (provided) this.updateTrueXBook(provided);
     }
     return this.truexBook;
+  }
+
+  _strictEbboState(book = this.truexEbbo) {
+    if (!book) return { usable: false, reason: 'truex-ebbo-missing' };
+    if (!this._validateStrictEbboObservation(book)) {
+      return { usable: false, reason: 'truex-ebbo-invalid' };
+    }
+    if (this.now() - Number(book.receivedAt) > this.config.truexMakerEbboMaxAgeMs) {
+      return { usable: false, reason: 'truex-ebbo-stale' };
+    }
+    return { usable: true, book };
+  }
+
+  _validateStrictEbboObservation(book) {
+    if (!book) return false;
+    const bid = Number(book.bestBid);
+    const ask = Number(book.bestAsk);
+    const rawSourceTimestamp = book.sourceTimestamp ?? book.timestamp;
+    if (rawSourceTimestamp === null || rawSourceTimestamp === undefined ||
+        String(rawSourceTimestamp).trim() === '') return false;
+    if (typeof rawSourceTimestamp !== 'number') return false;
+    const sourceTimestamp = rawSourceTimestamp;
+    const receivedAt = Number(book.receivedAt);
+    return Number.isFinite(bid) && bid > 0 && Number.isFinite(ask) && ask > 0 && bid <= ask &&
+      Number.isSafeInteger(sourceTimestamp) && sourceTimestamp > 0 &&
+      Number.isSafeInteger(receivedAt) && receivedAt >= 0 &&
+      sourceTimestamp <= receivedAt && receivedAt <= this.now() &&
+      Number(book.observationTimestamp ?? receivedAt) === receivedAt;
+  }
+
+  _makerSafetyBookState() {
+    if (this.config.strictTruexMakerSafety) return this._strictEbboState();
+    const book = this._getTrueXBook();
+    return this._isBookFresh(book)
+      ? { usable: true, book }
+      : { usable: false, reason: 'legacy-book-unavailable' };
   }
 
   _isBookFresh(book = this._getTrueXBook()) {
@@ -2202,8 +2483,8 @@ export class QuoteEngine extends EventEmitter {
   }
 
   _isMarketablePostOnly(quote) {
-    const book = this._getTrueXBook();
-    if (!this._isBookFresh(book)) return false;
+    const { usable, book } = this._makerSafetyBookState();
+    if (!usable) return false;
     if (quote.side === 'buy' && book.bestAsk !== null && book.bestAsk !== undefined) {
       return quote.price >= book.bestAsk;
     }
@@ -2279,8 +2560,8 @@ export class QuoteEngine extends EventEmitter {
     this.executionEvidenceGap = { orderId, reason, executionState: 'unsafe', authoritative };
     this.setContinuityState({ executionState: 'unsafe', reasons: ['execution-evidence-gap', reason] });
     this.suspendQuoting();
-    this.emit('execution-evidence-gap', { ...this.executionEvidenceGap });
-    this.logger.error(`[QuoteEngine] Execution evidence failed closed: orderId=${orderId} reason=${reason}`);
+    try { this.emit('execution-evidence-gap', { ...this.executionEvidenceGap }); } catch (_) {}
+    try { this.logger.error(`[QuoteEngine] Execution evidence failed closed: orderId=${orderId} reason=${reason}`); } catch (_) {}
     return false;
   }
 
@@ -2293,6 +2574,14 @@ export class QuoteEngine extends EventEmitter {
 
   _prepareQuoteForSend(quote) {
     const prepared = { ...quote };
+    let strictEbboState = null;
+    if (this.config.strictTruexMakerSafety) {
+      strictEbboState = this._strictEbboState();
+      if (!strictEbboState.usable) {
+        this._recordSuppression(prepared, strictEbboState.reason);
+        return null;
+      }
+    }
     const isPostOnly = prepared.postOnly !== false;
     if (!isPostOnly) {
       const takerQuote = this._prepareTakerQuote(prepared);
@@ -2301,6 +2590,8 @@ export class QuoteEngine extends EventEmitter {
       }
       return takerQuote;
     }
+
+    if (strictEbboState) return this._prepareStrictMakerQuote(prepared, strictEbboState);
 
     if (!this._isMarketablePostOnly(prepared)) {
       if (!this._wouldSelfCrossTrackedOrder(prepared)) {
@@ -2311,9 +2602,13 @@ export class QuoteEngine extends EventEmitter {
     }
 
     if (this.config.marketablePostOnlyAction === 'slide') {
-      const book = this._getTrueXBook();
+      const book = this._makerSafetyBookState().book;
       if (prepared.side === 'buy' && book?.bestAsk !== null && book?.bestAsk !== undefined) {
         prepared.price = this.snapToTick(book.bestAsk - this.config.tickSize);
+        if (this.config.strictTruexMakerSafety && this._isAloRetryInhibited(prepared)) {
+          this._recordSuppression(prepared, 'alo-retry-inhibited');
+          return null;
+        }
         if (this._wouldSelfCrossTrackedOrder(prepared)) {
           this._recordSuppression(prepared, 'self-cross-tracked-order');
           return null;
@@ -2322,6 +2617,10 @@ export class QuoteEngine extends EventEmitter {
       }
       if (prepared.side === 'sell' && book?.bestBid !== null && book?.bestBid !== undefined) {
         prepared.price = this.snapToTick(book.bestBid + this.config.tickSize);
+        if (this.config.strictTruexMakerSafety && this._isAloRetryInhibited(prepared)) {
+          this._recordSuppression(prepared, 'alo-retry-inhibited');
+          return null;
+        }
         if (this._wouldSelfCrossTrackedOrder(prepared)) {
           this._recordSuppression(prepared, 'self-cross-tracked-order');
           return null;
@@ -2332,6 +2631,81 @@ export class QuoteEngine extends EventEmitter {
 
     this._recordSuppression(prepared, 'marketable-post-only');
     return null;
+  }
+
+  _prepareStrictMakerQuote(quote, capturedState = this._strictEbboState()) {
+    const prepared = { ...quote };
+    if (!capturedState.usable) {
+      this._recordSuppression(prepared, capturedState.reason);
+      return null;
+    }
+    if (this._isAloRetryInhibited(prepared)) {
+      this._recordSuppression(prepared, 'alo-retry-inhibited');
+      return null;
+    }
+    const book = capturedState.book;
+    const marketable = prepared.side === 'buy'
+      ? prepared.price >= book.bestAsk
+      : prepared.price <= book.bestBid;
+    if (!marketable) {
+      if (!this._wouldSelfCrossTrackedOrder(prepared)) return prepared;
+      this._recordSuppression(prepared, 'self-cross-tracked-order');
+      return null;
+    }
+    if (this.config.marketablePostOnlyAction === 'slide') {
+      prepared.price = prepared.side === 'buy'
+        ? this.snapToTick(book.bestAsk - this.config.tickSize)
+        : this.snapToTick(book.bestBid + this.config.tickSize);
+      if (!Number.isFinite(prepared.price) || prepared.price <= 0) {
+        this._recordSuppression(prepared, 'marketable-slide-invalid');
+        return null;
+      }
+      if (this._isAloRetryInhibited(prepared)) {
+        this._recordSuppression(prepared, 'alo-retry-inhibited');
+        return null;
+      }
+      if (this._wouldSelfCrossTrackedOrder(prepared)) {
+        this._recordSuppression(prepared, 'self-cross-tracked-order');
+        return null;
+      }
+      return prepared;
+    }
+    this._recordSuppression(prepared, 'marketable-post-only');
+    return null;
+  }
+
+  _aloRetryKey(side, price) {
+    return `${side}:${Number(price).toFixed(8)}`;
+  }
+
+  _isAloRetryInhibited(quote) {
+    if (quote?.postOnly === false) return false;
+    const key = this._aloRetryKey(quote.side, quote.price);
+    const inhibition = this.aloRetryInhibitions.get(key);
+    if (!inhibition) return false;
+    const generation = this.truexEbboGeneration[quote.side] || 0;
+    if (generation !== inhibition.generation ||
+        this.now() - inhibition.createdAt >= this.config.truexAloRetryCooldownMs) {
+      this.aloRetryInhibitions.delete(key);
+      return false;
+    }
+    return true;
+  }
+
+  _recordAloRetryInhibition(order) {
+    if (!this.config.strictTruexMakerSafety || order?.postOnly === false ||
+        order?.liquidityRoleExpected === 'taker' || !order?.side || !Number.isFinite(Number(order.price))) return;
+    const key = this._aloRetryKey(order.side, order.price);
+    this.aloRetryInhibitions.delete(key);
+    this.aloRetryInhibitions.set(key, {
+      side: order.side,
+      price: Number(order.price),
+      generation: this.truexEbboGeneration[order.side] || 0,
+      createdAt: this.now(),
+    });
+    while (this.aloRetryInhibitions.size > this.config.truexAloRetryMaxEntries) {
+      this.aloRetryInhibitions.delete(this.aloRetryInhibitions.keys().next().value);
+    }
   }
 
   _wouldSelfCrossTrackedOrder(quote) {
@@ -2447,6 +2821,59 @@ export class QuoteEngine extends EventEmitter {
     this._dispatchAction({ type: 'place', quote: pending.quote });
   }
 
+  resolveUnknownCancelAsActive(origClOrdID, {
+    replacement = 'drop', evidenceAuthority = false, evidenceSource = 'local-timeout',
+  } = {}) {
+    const original = this.activeOrders.get(origClOrdID);
+    if (!original || (original.status !== 'cancelling' && !original.dispatchOutcomeUnknown)) return false;
+    const wasUnknown = Boolean(original.dispatchOutcomeUnknown);
+    original.status = 'active';
+    original.acknowledgedLive = true;
+    delete original.dispatchOutcomeUnknown;
+    delete original.cancellingAt;
+    if (wasUnknown && evidenceAuthority && this.capitalReservationManager?.resolveUnknownCancelAsActive) {
+      this.capitalReservationManager.resolveUnknownCancelAsActive(origClOrdID);
+    } else if (!wasUnknown) {
+      this.capitalReservationManager?.cancelRejected(origClOrdID);
+    }
+    this._retireCancelMappings(origClOrdID);
+    if (replacement === 'preserve') {
+      const pending = this.pendingReplacements.get(origClOrdID);
+      if (pending) pending.createdAt = Date.now();
+    } else {
+      this.pendingReplacements.delete(origClOrdID);
+    }
+    if (evidenceAuthority && this.executionEvidenceGap?.orderId === origClOrdID &&
+        this.executionEvidenceGap.reason === 'async-cancel-dispatch-outcome-unknown') {
+      this.executionEvidenceGap = null;
+      this.setContinuityState({ executionState: 'normal', reasons: [] });
+    }
+    this.deferredRepriceNeeded = true;
+    if (!evidenceAuthority) {
+      try {
+        this.logger.warn(`[QuoteEngine] Unknown cancel locally reset without authoritative evidence: ${evidenceSource}`);
+      } catch (_) {}
+    }
+    return true;
+  }
+
+  _retireCancelMappings(origClOrdID) {
+    for (const [cancelId, orderId] of this.cancelToOrigMap) {
+      if (orderId !== origClOrdID) continue;
+      this._retireCancelId(cancelId);
+    }
+  }
+
+  _retireCancelId(cancelId) {
+    if (!this.cancelToOrigMap.has(cancelId)) return false;
+    this.cancelToOrigMap.delete(cancelId);
+    this.resolvedCancelIds.add(cancelId);
+    while (this.resolvedCancelIds.size > this.maxExecutionDedupeOrders) {
+      this.resolvedCancelIds.delete(this.resolvedCancelIds.values().next().value);
+    }
+    return true;
+  }
+
   _expirePendingReplacements() {
     const now = Date.now();
     for (const [origClOrdID, pending] of this.pendingReplacements.entries()) {
@@ -2454,9 +2881,7 @@ export class QuoteEngine extends EventEmitter {
       this.pendingReplacements.delete(origClOrdID);
       const original = this.activeOrders.get(origClOrdID);
       if (original?.status === 'cancelling') {
-        original.status = 'active';
-        original.acknowledgedLive = true;
-        this.capitalReservationManager?.cancelRejected(origClOrdID);
+        this.resolveUnknownCancelAsActive(origClOrdID, { replacement: 'drop' });
       }
       this._recordSuppression(pending.quote, 'pending-replacement-expired');
     }

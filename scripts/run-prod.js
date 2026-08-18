@@ -43,6 +43,7 @@ import { buildReferenceMarkoutRolloutOptions } from './reference-markout-rollout
 import { buildContinuityConfig } from './continuity-config.js';
 import { buildOrderReconciliationScope } from './order-reconciliation-scope-config.js';
 import { startProductionOrchestrator } from './production-orchestrator-startup.js';
+import { buildTruexMakerSafetyConfig } from './truex-maker-safety-config.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -124,16 +125,10 @@ const config = {
   // anchoring our quotes to Coinbase best bid/ask (offset by a 1-tick buffer) makes TrueX show
   // a Coinbase-tight market. baseSpreadBps is the fallback if the Coinbase book is absent.
   //
-  // ACCEPTED RISK: prod has no TrueX top-of-book feed, so the marketable/slide guard is inert.
-  // Because we are the only resting liquidity there is effectively nothing to cross; the rare
-  // case (a third party rests inside our quote) is caught reactively by the reject-backoff
-  // (3 rejects → 5s pause). Revisit when a real TrueX book feed and/or hedge venue is wired.
+  // Coinbase supplies pricing only. The separately polled TrueX EBBO is the strict send-time
+  // marketability authority configured below; missing/stale evidence fails closed for D sends.
   quoteAnchorMode: 'coinbase-mirror',
   coinbaseAnchorBufferTicks: 1,      // 1 tick ($0.50) outside Coinbase touch
-  // marketablePostOnlyAction stays at the default 'skip': the prod marketDataFeed (Coinbase
-  // adapter) does not expose getBestBidAsk(), so no TrueX top-of-book is available and the
-  // marketable/slide guard is inert. We are effectively the book, so this is acceptable;
-  // revisit if a real TrueX book feed is wired.
   baseSpreadBps: 30,                 // fallback spread (15bps/side) when Coinbase book is absent
   levelSpacingTicks: 2,
   randomLevelSpacingBpsMin: 0.8,
@@ -210,6 +205,10 @@ config.continuityConfig = buildContinuityConfig(process.env, {
   levels: config.levels,
   baseSizeBTC: config.baseSizeBTC,
   baseSpreadBps: config.baseSpreadBps,
+});
+config.truexMakerSafety = buildTruexMakerSafetyConfig(process.env, {
+  ebboPollIntervalMs: config.truexEbboPollIntervalMs,
+  maxOrdersPerSecond: config.maxOrdersPerSecond,
 });
 
 // ---------------------------------------------------------------------------
@@ -483,6 +482,7 @@ async function main() {
     dataPipeline,
     ...referenceMarkoutRolloutOptions,
     continuityConfig: config.continuityConfig,
+    ...config.truexMakerSafety,
     ...orderReconciliationScope,
 
     // REST reconciliation + balance refresh

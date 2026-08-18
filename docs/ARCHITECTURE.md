@@ -209,11 +209,22 @@ Computes bid/ask ladder quotes with inventory skew, manages order lifecycle thro
 - Rate limited: `maxOrdersPerSecond` (prod 6), overflow queued. Queued placements and pending replacement releases are rechecked immediately before FIX send.
 
 **TrueX book and ALO safety:**
-- The orchestrator injects the latest TrueX best bid/ask into QuoteEngine through `marketDataProvider` / `updateTrueXBook()`.
-- `truexBookStaleThresholdMs` controls whether the book is fresh enough for marketability decisions.
-- Post-only quotes use `18=6` and are checked at send time. A buy at or above fresh best ask, or a sell at or below fresh best bid, is suppressed by default with reason `marketable-post-only`.
-- `marketablePostOnlyAction='skip'` is the default. `slide` can move a marketable ALO one tick away from the opposite side, but should be enabled only after venue behavior is confirmed.
-- Missing or stale TrueX book means marketability is unknown; existing maker quoting remains allowed, but intentional taker orders require explicit fair value/execution inputs and remain disabled unless configured.
+- Production maker sends use the REST-polled `truexEbbo` as their sole venue marketability
+  authority. Coinbase remains the pricing anchor; it is not venue marketability evidence.
+- Missing, stale, crossed, or invalid TrueX EBBO suppresses new and replacement `D` messages while
+  pure cancels and acknowledged live quotes remain untouched.
+- Freshness is measured from the locally stamped REST receipt time; the venue source timestamp is
+  retained and must not be later than receipt. The max age is constrained to one-to-three EBBO
+  poll intervals, so an unchanged but currently observed book stays usable and a stopped poll
+  fails closed promptly.
+- `TRUEX_MAKER_MARKETABLE_ACTION=skip` withholds a marketable ALO. `slide` moves it one tick away
+  from the TrueX opposite touch and reruns self-cross and capital checks; use `slide` only after an
+  evidence-backed canary because it changes quote economics.
+- An unsolicited `ALO would trade` cancellation inhibits an identical side/price retry until the
+  relevant TrueX touch changes or `TRUEX_ALO_RETRY_COOLDOWN_MS` expires. The cache is bounded by
+  `TRUEX_ALO_RETRY_MAX_ENTRIES`.
+  Cooldown is bounded to one-to-sixty poll intervals, and cache capacity must cover the configured
+  maximum send rate for the full cooldown window.
 
 **FIX messages sent:**
 - New Order Single (`35=D`): tags 11, 18 (ALO, omitted only for intentional taker orders), 55, 54, 38, 44, 40=2 (Limit), 59=1 (GTC), Party ID block (453/448/452)

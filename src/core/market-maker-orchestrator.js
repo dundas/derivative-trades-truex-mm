@@ -156,6 +156,10 @@ export class MarketMakerOrchestrator extends EventEmitter {
       clientId: options.clientId || null,
       selfMatchPreventionInstruction: options.selfMatchPreventionInstruction ?? process.env.TRUEX_SELF_MATCH_PREVENTION_INSTRUCTION,
       truexBookStaleThresholdMs: options.truexBookStaleThresholdMs || 10000,
+      strictTruexMakerSafety: options.strictTruexMakerSafety ?? false,
+      truexMakerEbboMaxAgeMs: options.truexMakerEbboMaxAgeMs ?? 10000,
+      truexAloRetryCooldownMs: options.truexAloRetryCooldownMs ?? 5000,
+      truexAloRetryMaxEntries: options.truexAloRetryMaxEntries ?? 256,
       pyusdUsdStaleThresholdMs: options.pyusdUsdStaleThresholdMs ?? 15000,
       marketablePostOnlyAction: options.marketablePostOnlyAction || 'skip',
       replaceMode: options.replaceMode || 'passive-safe',
@@ -2198,7 +2202,38 @@ export class MarketMakerOrchestrator extends EventEmitter {
         generation,
       });
       if (capitalResult?.state === 'normal' && capitalResult.blockedSides?.length === 0) {
-        this.quoteEngine?.resolveAuthoritativeExecutionEvidenceGap?.();
+        const liveCandidatesById = new Map();
+        for (const live of reconciledLiveOrders) {
+          const candidates = liveCandidatesById.get(live?.orderId) || [];
+          candidates.push(live);
+          liveCandidatesById.set(live?.orderId, candidates);
+        }
+        const activeOrders = this.quoteEngine?.activeOrders instanceof Map
+          ? this.quoteEngine.activeOrders
+          : new Map();
+        for (const [orderId, local] of activeOrders) {
+          if (!local?.dispatchOutcomeUnknown) continue;
+          const candidates = liveCandidatesById.get(orderId) || [];
+          const live = candidates[0];
+          if (candidates.length === 1 && live?.status === 'ACTIVE' &&
+              live.promotionEvidenceValid === true && live.localOrderMatches === true) {
+            this.quoteEngine.resolveUnknownCancelAsActive?.(orderId, {
+              replacement: 'preserve', evidenceAuthority: true, evidenceSource: 'rest-active',
+            });
+          }
+        }
+        const unresolvedUnknownCancels = [...activeOrders.entries()]
+          .filter(([, local]) => local?.dispatchOutcomeUnknown);
+        for (const [orderId] of unresolvedUnknownCancels) {
+          this.capitalReservationManager?.failClosedForEvidenceGap?.(
+            orderId, 'async-cancel-dispatch-outcome-unknown',
+          );
+        }
+        const currentCapital = this.capitalReservationManager?.getStatus?.() || capitalResult;
+        if (unresolvedUnknownCancels.length === 0 && currentCapital?.state === 'normal' &&
+            currentCapital.blockedSides?.length === 0) {
+          this.quoteEngine?.resolveAuthoritativeExecutionEvidenceGap?.();
+        }
       }
       for (const orderId of capitalResult?.promotedOrderIds || []) {
         const local = this.quoteEngine.activeOrders.get(orderId);
@@ -2206,6 +2241,10 @@ export class MarketMakerOrchestrator extends EventEmitter {
           local.status = 'active';
           local.acknowledgedLive = true;
         }
+      }
+      for (const orderId of capitalResult?.dispatchUnknownAbsentOrderIds || []) {
+        this.quoteEngine.reconcileRestAbsentOrder?.(orderId);
+        if (!absentLocalOrderIds.includes(orderId)) absentLocalOrderIds.push(orderId);
       }
       if (absentLocalOrderIds.length > 0) {
         // removeStaleOrder created a conservative delta after this request

@@ -1981,6 +1981,113 @@ describe('MarketMakerOrchestrator strict startup reconciliation', () => {
     expect(capital.getAvailable('sell')).toBeCloseTo(0.0068, 8);
   });
 
+  test('unknown new dispatch absent from REST is removed and absorbed only by a second fresh generation', async () => {
+    const capital = new CapitalReservationManager();
+    capital.reconcile({ ...balances, liveOrders: [] });
+    capital.reserve({ orderId: 'unknown-new', side: 'sell', size: 0.01, price: 100000, level: 1 });
+    capital.dispatchOutcomeUnknown('unknown-new', 'async-new-dispatch-outcome-unknown');
+    const engine = new QuoteEngine({
+      capitalReservationManager: capital,
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+    });
+    engine.activeOrders.set('unknown-new', {
+      side: 'sell', size: 0.01, price: 100000, level: 1,
+      status: 'pending', acknowledgedLive: false,
+    });
+    const fetchLive = mock(async () => []);
+    const orchestrator = Object.assign(Object.create(MarketMakerOrchestrator.prototype), {
+      isRunning: true,
+      restClient: {},
+      capitalReservationManager: capital,
+      quoteEngine: engine,
+      inventoryManager: { refreshBalances: mock(() => {}) },
+      _capitalResyncInFlight: null,
+      _capitalResyncPending: false,
+      _capitalResyncStrictPending: false,
+      _capitalResyncStrictDrainSuppressed: false,
+      _fetchBalances: mock(async () => balances),
+      _fetchCapitalLiveOrders: fetchLive,
+      logger: { info() {}, warn() {}, error() {} },
+    });
+
+    await orchestrator._refreshBalances({ requireLiveOrders: true, clearBlockedSides: true });
+    expect(fetchLive).toHaveBeenCalledTimes(2);
+    expect(engine.activeOrders.has('unknown-new')).toBe(false);
+    expect(capital.getReservation('unknown-new')).toMatchObject({
+      state: 'rest-absence-evidence-gap', remainingSize: 0, acknowledgedLive: false,
+    });
+    expect(capital.consumedEvents).toEqual([]);
+    expect(capital.getStatus()).toMatchObject({ state: 'normal', blockedSides: [] });
+  });
+
+  test.each(['ACTIVE', 'CANCEL_PENDING', 'ACTIVE_DUPLICATE'])(
+    'fresh coherent %s REST evidence resolves only the appropriate unknown cancel state',
+    async (status) => {
+      const capital = new CapitalReservationManager();
+      const coherentBalances = {
+        baseBalance: balances.baseBalance,
+        quoteBalance: { available: 999.02, held: 0.98, total: 1000 },
+      };
+      capital.reconcile({ ...coherentBalances, liveOrders: [] });
+      capital.reserve({ orderId: 'old', side: 'buy', size: 0.01, price: 98, level: 1 });
+      capital.accept('old');
+      capital.cancelRequested('old');
+      capital.failClosedForEvidenceGap('old', 'async-cancel-dispatch-outcome-unknown');
+      const fixConnection = { sendMessage: mock(() => true) };
+      const engine = new QuoteEngine({
+        capitalReservationManager: capital, fixConnection,
+        logger: { info() {}, warn() {}, error() {}, debug() {} },
+      });
+      engine.activeOrders.set('old', {
+        side: 'buy', size: 0.01, price: 98, level: 1, status: 'cancelling',
+        acknowledgedLive: true, cancellingAt: 1, dispatchOutcomeUnknown: true,
+      });
+      engine.pendingReplacements.set('old', {
+        quote: { side: 'buy', size: 0.01, price: 97, level: 1 }, createdAt: 1,
+      });
+      engine.cancelToOrigMap.set('cancel-old', 'old');
+      engine._failClosedExecutionEvidence('old', 'async-cancel-dispatch-outcome-unknown', { authoritative: true });
+      const orchestrator = Object.assign(Object.create(MarketMakerOrchestrator.prototype), {
+        isRunning: true,
+        restClient: {}, capitalReservationManager: capital, quoteEngine: engine,
+        inventoryManager: { refreshBalances: mock(() => {}) },
+        _capitalResyncInFlight: null,
+        _fetchBalances: mock(async () => coherentBalances),
+        _fetchCapitalLiveOrders: mock(async () => {
+          const candidate = {
+            orderId: 'old', status: status === 'ACTIVE_DUPLICATE' ? 'ACTIVE' : status,
+            side: 'buy', price: 98, size: 0.01, promotionEvidenceValid: true,
+          };
+          return status === 'ACTIVE_DUPLICATE' ? [candidate, { ...candidate }] : [candidate];
+        }),
+        logger: { info() {}, warn() {}, error() {} },
+      });
+
+      await orchestrator._refreshBalances({ requireLiveOrders: true, clearBlockedSides: true });
+      if (status === 'ACTIVE') {
+        expect(engine.activeOrders.get('old')).toMatchObject({ status: 'active', acknowledgedLive: true });
+        expect(engine.activeOrders.get('old')).not.toHaveProperty('dispatchOutcomeUnknown');
+        expect(engine.activeOrders.get('old')).not.toHaveProperty('cancellingAt');
+        expect(engine.cancelToOrigMap.size).toBe(0);
+        expect(engine.pendingReplacements.has('old')).toBe(true);
+        expect(capital.getReservation('old')).toMatchObject({ state: 'active' });
+        expect(engine._sendCancel('old', engine.activeOrders.get('old'))).toBe(true);
+        expect(fixConnection.sendMessage).toHaveBeenCalledTimes(1);
+      } else {
+        expect(engine.activeOrders.get('old')).toMatchObject({
+          status: 'cancelling', dispatchOutcomeUnknown: true,
+        });
+        expect(capital.getReservation('old')).toMatchObject({ state: 'cancel-in-flight' });
+        expect(engine.executionEvidenceGap).toMatchObject({
+          orderId: 'old', reason: 'async-cancel-dispatch-outcome-unknown',
+        });
+        expect(engine.cancelToOrigMap.size).toBe(1);
+        expect(engine._sendCancel('old', engine.activeOrders.get('old'))).toBe(false);
+        expect(fixConnection.sendMessage).not.toHaveBeenCalled();
+      }
+    },
+  );
+
   test('mismatched or ambiguous REST rows cannot promote a pending reservation', async () => {
     for (const liveRows of [
       [{ orderId: 'pending', status: 'ACTIVE', side: 'buy', price: 100000, size: 0.01 }],

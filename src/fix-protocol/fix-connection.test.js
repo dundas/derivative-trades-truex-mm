@@ -558,6 +558,86 @@ describe('FIXConnection', () => {
       expect(sentMessage).toContain('10='); // CheckSum
     });
 
+    it('returns synchronous definitive enqueue acceptance without waiting for socket drain', () => {
+      mockSocketInstance.write.mockReturnValue(false); // net.Socket backpressure, bytes still enqueued
+      const result = connection.sendMessage({ '35': 'D', '11': 'ORDER123' });
+
+      expect(result).not.toBeInstanceOf(Promise);
+      expect(result).toBe(true);
+      expect(mockSocketInstance.write).toHaveBeenCalledTimes(1);
+      expect(connection.msgSeqNum).toBe(2);
+    });
+
+    it('throws synchronously without recording dispatch when socket enqueue throws', () => {
+      mockSocketInstance.write.mockImplementation(() => { throw new Error('enqueue failed'); });
+      expect(() => connection.sendMessage({ '35': 'D', '11': 'ORDER123' })).toThrow('enqueue failed');
+      expect(connection.msgSeqNum).toBe(1);
+      expect(connection.sentMessages.size).toBe(0);
+    });
+
+    it('does not turn post-enqueue telemetry failure into a dispatch rejection', () => {
+      connection.auditLogger = { logFIXMessage: jest.fn(() => { throw new Error('audit failed'); }) };
+      mockSocketInstance.write.mockReturnValue(true);
+      expect(connection.sendMessage({ '35': 'D', '11': 'ORDER123' })).toBe(true);
+      expect(connection.msgSeqNum).toBe(2);
+      expect(connection.sentMessages.has(1)).toBe(true);
+    });
+
+    it('reserves sequence and resend bookkeeping before reentrant debug observers', () => {
+      mockSocketInstance.write.mockReturnValue(true);
+      let reentered = false;
+      connection.logger.debug.mockImplementation(() => {
+        if (reentered) return;
+        reentered = true;
+        connection.sendMessage({ '35': '0', '11': 'SECOND' });
+      });
+
+      expect(connection.sendMessage({ '35': '0', '11': 'FIRST' })).toBe(true);
+      const sequences = mockSocketInstance.write.mock.calls.map(([raw]) =>
+        Number(raw.match(/\x0134=(\d+)\x01/)[1]));
+      expect(sequences).toEqual([1, 2]);
+      expect([...connection.sentMessages.keys()]).toEqual([1, 2]);
+      expect(connection.msgSeqNum).toBe(3);
+    });
+
+    it('never publishes a reentrant N+1 when the outer socket write fails', () => {
+      const nestedResults = [];
+      mockSocketInstance.write.mockImplementation(() => {
+        nestedResults.push(connection.sendMessage({ '35': '0', '11': 'INNER' }));
+        throw new Error('outer enqueue failed');
+      });
+
+      expect(() => connection.sendMessage({ '35': 'D', '11': 'OUTER' })).toThrow('outer enqueue failed');
+      expect(nestedResults).toEqual([false]);
+      expect(connection.msgSeqNum).toBe(1);
+      expect([...connection.sentMessages.keys()]).toEqual([]);
+      expect(mockSocketInstance.write).toHaveBeenCalledTimes(1);
+    });
+
+    it('contains every synchronous post-enqueue failure, including warning logger failure', () => {
+      mockSocketInstance.write.mockReturnValue(true);
+      connection.redisClient = { set: jest.fn(() => { throw new Error('redis invoke'); }) };
+      connection.auditLogger = { logFIXMessage: jest.fn(() => { throw new Error('audit invoke'); }) };
+      connection.logger.warn.mockImplementation(() => { throw new Error('warn invoke'); });
+      connection.on('sent', () => { throw new Error('sent invoke'); });
+
+      expect(connection.sendMessage({ '35': 'D', '11': 'ORDER123' })).toBe(true);
+      expect(connection.msgSeqNum).toBe(2);
+      expect(connection.sentMessages.has(1)).toBe(true);
+    });
+
+    it('contains asynchronous post-enqueue persistence, audit, and sent-listener rejections', async () => {
+      mockSocketInstance.write.mockReturnValue(true);
+      connection.redisClient = { set: jest.fn(() => Promise.reject(new Error('redis async'))) };
+      connection.auditLogger = { logFIXMessage: jest.fn(() => Promise.reject(new Error('audit async'))) };
+      connection.on('sent', async () => { throw new Error('sent async'); });
+
+      expect(connection.sendMessage({ '35': 'D', '11': 'ORDER123' })).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(connection.msgSeqNum).toBe(2);
+      expect(connection.sentMessages.has(1)).toBe(true);
+    });
+
     it('should serialize self-match prevention before order body fields', async () => {
       await connection.sendMessage({
         '35': 'D',

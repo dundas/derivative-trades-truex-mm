@@ -186,4 +186,27 @@ describe('CapitalReservationManager', () => {
       state: 'rest-absence-evidence-gap', acknowledgedLive: false,
     });
   });
+
+  test('unknown new dispatch absent from REST retains commitment until a second fresh generation', () => {
+    const capital = new CapitalReservationManager();
+    capital.reconcile({ ...snapshot(0.01), liveOrders: [] });
+    capital.reserve({ orderId: 'unknown-new', side: 'sell', price: 100000, size: 0.01, level: 1 });
+    expect(capital.dispatchOutcomeUnknown('unknown-new', 'async-new-dispatch-outcome-unknown')).toBe(true);
+
+    const first = capital.beginReconciliation();
+    const firstResult = capital.reconcile({
+      ...snapshot(0.01), liveOrders: [], clearBlockedSides: true, generation: first,
+    });
+    expect(firstResult.dispatchUnknownAbsentOrderIds).toEqual(['unknown-new']);
+    expect(capital.getReservation('unknown-new')).toMatchObject({
+      state: 'rest-absence-evidence-gap', remainingSize: 0, acknowledgedLive: false,
+    });
+    expect(capital.getAvailable('sell')).toBe(0);
+    expect(capital.getStatus().blockedSides).toEqual(['sell']);
+
+    const second = capital.beginReconciliation();
+    capital.reconcile({ ...snapshot(0.01), liveOrders: [], clearBlockedSides: true, generation: second });
+    expect(capital.getStatus()).toMatchObject({ state: 'normal', blockedSides: [] });
+    expect(capital.getAvailable('sell')).toBe(0.01);
+  });
 });

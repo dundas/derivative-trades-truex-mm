@@ -78,7 +78,8 @@ export class CapitalReservationManager {
           acknowledgedLive: true,
         });
       } else if (!TERMINAL_STATES.has(order.state) &&
-          (order.state === 'pending-new' || order.state === 'replacement-pending-new')) {
+          (order.state === 'pending-new' || order.state === 'replacement-pending-new' ||
+           order.state === 'dispatch-outcome-unknown')) {
         knownPendingOrders.set(order.orderId, {
           orderId: order.orderId,
           side: order.side,
@@ -118,7 +119,7 @@ export class CapitalReservationManager {
       for (const [orderId, known] of generation.knownPendingOrders) {
         const current = this.reservations.get(orderId);
         if (!current || current.acknowledgedLive || current.lastMutationSequence > generation.eventSequence ||
-            !['pending-new', 'replacement-pending-new'].includes(current.state)) continue;
+            !['pending-new', 'replacement-pending-new', 'dispatch-outcome-unknown'].includes(current.state)) continue;
         const candidates = liveByOrderId.get(orderId) || [];
         if (candidates.length === 0) continue;
         const live = candidates[0];
@@ -197,6 +198,16 @@ export class CapitalReservationManager {
           event.sequence > generation.eventSequence && !coveredAtRequest.has(event.orderId))
       : [];
 
+    const dispatchUnknownAbsentOrderIds = [];
+    if (generation?.knownPendingOrders) {
+      for (const orderId of generation.knownPendingOrders.keys()) {
+        const current = this.reservations.get(orderId);
+        if (!current || current.state !== 'dispatch-outcome-unknown' ||
+            current.lastMutationSequence > generation.eventSequence || liveIds.has(orderId)) continue;
+        if (this.restOrderAbsent(orderId)) dispatchUnknownAbsentOrderIds.push(orderId);
+      }
+    }
+
     if (clearBlockedSides) {
       const coveredSequence = generation?.eventSequence ?? this.eventSequence;
       for (const [side, blockedAt] of this.blockedSides) {
@@ -224,7 +235,7 @@ export class CapitalReservationManager {
       for (const order of this.reservations.values()) delete order.evidenceGapReason;
     }
     if (generation) this.lastAppliedReconciliation = generation.id;
-    return { ...this.getStatus(), promotedOrderIds, promotionMismatches };
+    return { ...this.getStatus(), promotedOrderIds, promotionMismatches, dispatchUnknownAbsentOrderIds };
   }
 
   reserve({ orderId, side, price, size, level = null, replacesOrderId = null }) {
@@ -304,12 +315,51 @@ export class CapitalReservationManager {
     return true;
   }
 
+  resolveUnknownCancelAsActive(orderId, reason = 'async-cancel-dispatch-outcome-unknown') {
+    const order = this.reservations.get(orderId);
+    if (!order || order.state !== 'cancel-in-flight') return false;
+    const evidenceSequence = order.lastMutationSequence;
+    const evidenceMatches = order.evidenceGapReason === reason;
+    if (!this.cancelRejected(orderId)) return false;
+    delete order.evidenceGapReason;
+    if (evidenceMatches && this.blockedSides.get(order.side) === evidenceSequence) {
+      this.blockedSides.delete(order.side);
+    }
+    if (this.pendingEvidenceGap?.side === order.side && this.pendingEvidenceGap?.reason === reason) {
+      this.pendingEvidenceGap = null;
+    }
+    if (evidenceMatches && this.state !== 'failed' && this.blockedSides.size === 0) {
+      this.state = 'normal';
+      this.reason = null;
+    }
+    return true;
+  }
+
   cancelled(orderId) {
     return this._terminal(orderId, 'cancelled');
   }
 
   rejected(orderId) {
     return this._terminal(orderId, 'rejected');
+  }
+
+  newDispatchAborted(orderId) {
+    const order = this.reservations.get(orderId);
+    if (!order || (order.state !== 'pending-new' && order.state !== 'replacement-pending-new') ||
+        order.acknowledgedLive) return false;
+    this.reservations.delete(orderId);
+    this._nextEvent();
+    return true;
+  }
+
+  dispatchOutcomeUnknown(orderId, reason = 'new-dispatch-outcome-unknown') {
+    const order = this.reservations.get(orderId);
+    if (!order || !['pending-new', 'replacement-pending-new'].includes(order.state)) return false;
+    order.state = 'dispatch-outcome-unknown';
+    order.evidenceGapReason = reason;
+    this._evidenceGap(order, reason, { block: true });
+    order.lastMutationSequence = this.eventSequence;
+    return true;
   }
 
   expired(orderId) {

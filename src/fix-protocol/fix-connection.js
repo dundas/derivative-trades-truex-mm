@@ -645,7 +645,11 @@ export class FIXConnection extends EventEmitter {
   /**
    * Send FIX message
    */
-  async sendMessage(fields) {
+  sendMessage(fields) {
+    // A nested send from inside socket.write cannot be declared accepted before
+    // the outer sequence is known to be enqueued. Reject it synchronously; its
+    // caller can defer/retry through the normal queue without publishing N+1 first.
+    if (this._socketWriteInProgress) return false;
     // Ensure standard header fields are present
     const completeFields = {
       '34': this.msgSeqNum.toString(),       // MsgSeqNum (auto-increment)
@@ -698,63 +702,95 @@ export class FIXConnection extends EventEmitter {
     const checksum = this.calculateChecksum(message);
     message += `10=${checksum}${this.SOH}`;
     
-    // Store message for potential resend requests (before sending)
-    const currentSeqNum = this.msgSeqNum;
-    this.sentMessages.set(currentSeqNum, {
-      seqNum: currentSeqNum,
-      fields: { ...fields }, // Clone fields to avoid mutations
-      rawMessage: message,
-      sentAt: Date.now()
-    });
-    
-    // Debug log message storage
-    if (this.logger.debug) {
-      this.logger.debug(`[FIXConnection] Stored message seq ${currentSeqNum} (total: ${this.sentMessages.size})`);
-    }
-
-    // Debug: Log raw message being sent
-    if (process.env.TRUEX_DEBUG_MODE === 'true') {
-      const preview = message.replace(/\x01/g, '|').substring(0, 300);
-      this.logger.info(`[FIXConnection] Sending raw: ${preview}${message.length > 300 ? '...' : ''}`);
-    }
-    
     // Send message with basic precondition checks
     if (!this.socket || this.socket.destroyed) {
       throw new Error('Socket is not writable');
     }
-    const wrote = this.socket.write(message);
-    if (wrote === false) {
-      await new Promise((resolve) => this.socket.once('drain', resolve));
+    // Reserve the sequence and resend record before socket.write or any observer:
+    // injected sockets/loggers may synchronously reenter sendMessage.
+    const currentSeqNum = this.msgSeqNum;
+    this.msgSeqNum = currentSeqNum + 1;
+    this.sentMessages.set(currentSeqNum, {
+      seqNum: currentSeqNum,
+      fields: { ...fields },
+      rawMessage: message,
+      sentAt: Date.now()
+    });
+    this._socketWriteInProgress = true;
+    try {
+      this.socket.write(message);
+    } catch (error) {
+      this.sentMessages.delete(currentSeqNum);
+      // Roll back only when no reentrant dispatch has consumed the next sequence.
+      if (this.msgSeqNum === currentSeqNum + 1) this.msgSeqNum = currentSeqNum;
+      throw error;
+    } finally {
+      this._socketWriteInProgress = false;
     }
-    // Audit log outbound FIX if configured
+    // net.Socket.write(false) means the bytes were accepted into the socket's
+    // user-space queue and backpressure is active; it is not a dispatch reject.
+    // Callers need a synchronous enqueue contract so order lifecycle state cannot
+    // race an asynchronously rejected Promise. A thrown write is the only local
+    // enqueue failure after the precondition above.
+    const safeWarn = (text) => {
+      try {
+        const result = this.logger.warn?.(text);
+        if (result?.then) void Promise.resolve(result).catch(() => {});
+      } catch (_) {
+        // Warning telemetry is itself fail-soft after enqueue.
+      }
+    };
+    const containAfterEnqueue = (label, invoke) => {
+      try {
+        const result = invoke();
+        if (result?.then) {
+          void Promise.resolve(result).catch((error) => safeWarn(
+            `[FIXConnection] ${label} failed after enqueue: ${error?.message || error}`
+          ));
+        }
+      } catch (error) {
+        safeWarn(`[FIXConnection] ${label} failed after enqueue: ${error?.message || error}`);
+      }
+    };
+    containAfterEnqueue('debug logging', () => {
+      this.logger.debug?.(`[FIXConnection] Stored message seq ${currentSeqNum} (total: ${this.sentMessages.size})`);
+      if (process.env.TRUEX_DEBUG_MODE === 'true') {
+        const preview = message.replace(/\x01/g, '|').substring(0, 300);
+        return this.logger.info?.(`[FIXConnection] Sending raw: ${preview}${message.length > 300 ? '...' : ''}`);
+      }
+      return undefined;
+    });
     if (this.auditLogger) {
-      const currentSeq = this.msgSeqNum; // before increment
-      const redacted = this.redactRaw(message);
-      this.auditLogger.logFIXMessage(redacted, {
-        direction: 'OUTBOUND',
-        msgType: fields['35'],
-        msgSeqNum: currentSeq,
-        senderCompID: this.senderCompID,
-        targetCompID: this.targetCompID
+      containAfterEnqueue('outbound audit logging', () => {
+        const redacted = this.redactRaw(message);
+        return this.auditLogger.logFIXMessage(redacted, {
+          direction: 'OUTBOUND',
+          msgType: fields['35'],
+          msgSeqNum: currentSeqNum,
+          senderCompID: this.senderCompID,
+          targetCompID: this.targetCompID
+        });
       });
     }
-    
-    // Increment sequence number
-    this.msgSeqNum++;
 
     // Fire-and-forget: persist outbound sequence number to Redis (must not block)
     if (this.redisClient) {
-      void this.redisClient.set(this._seqKeyOut, this.msgSeqNum)
-        .catch(err => this.logger.warn(`[FIXConnection] Failed to persist outbound seqnum: ${err.message}`));
+      containAfterEnqueue('outbound sequence persistence', () =>
+        this.redisClient.set(this._seqKeyOut, this.msgSeqNum));
     }
 
     // Emit sent event with redacted sensitive fields
-    const redactedFields = { ...fields };
-    if (redactedFields['553']) redactedFields['553'] = '[REDACTED]';
-    if (redactedFields['554']) redactedFields['554'] = '[REDACTED]';
-    this.emit('sent', { raw: message, fields: redactedFields, msgSeqNum: this.msgSeqNum - 1 });
+    containAfterEnqueue('outbound sent observer', () => {
+      const redactedFields = { ...fields };
+      if (redactedFields['553']) redactedFields['553'] = '[REDACTED]';
+      if (redactedFields['554']) redactedFields['554'] = '[REDACTED]';
+      const event = { raw: message, fields: redactedFields, msgSeqNum: currentSeqNum };
+      for (const listener of this.rawListeners('sent')) {
+        containAfterEnqueue('outbound sent listener', () => listener.call(this, event));
+      }
+    });
     
-    return { raw: message, fields, msgSeqNum: this.msgSeqNum - 1 };
+    return true;
   }
   
   /**
