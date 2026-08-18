@@ -248,7 +248,10 @@ export class MarketMakerOrchestrator extends EventEmitter {
         writer: this.postgresManager,
         logger: this.logger,
         config: options.referenceMarkoutConfig,
-        marketProvider: () => this.lastAggregatedPrice,
+        sourceFeed: options.referenceBookFeed || null,
+        marketProvider: options.referenceMarkoutConfig.referenceMode === 'cryptocom-direct'
+          ? () => options.referenceBookFeed?.getBook?.() || null
+          : () => this.lastAggregatedPrice,
         basisProvider: () => this.pyusdUsd,
       }) : null);
     this.policyVector = {

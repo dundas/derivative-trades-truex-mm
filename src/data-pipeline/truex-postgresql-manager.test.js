@@ -150,6 +150,10 @@ describe('TrueXPostgreSQLManager', () => {
       expect(sql).toContain('(product, quote_currency, source_exchange, source_type, observation_timestamp');
       expect(sql).toContain('CREATE INDEX IF NOT EXISTS idx_reference_market_retention_v3');
       expect(sql).toContain('(received_timestamp, observation_timestamp, observation_id)');
+      expect(sql).toContain('reference_market_observations ALTER COLUMN basis_timestamp DROP NOT NULL');
+      expect(sql).toContain('reference_market_observations ALTER COLUMN basis_price DROP NOT NULL');
+      expect(sql).not.toContain('basis_timestamp BIGINT NOT NULL');
+      expect(sql).not.toContain('basis_price NUMERIC NOT NULL');
       expect(sql).toContain('idx_reference_decision_retention_v3');
       expect(sql).toContain('(decision_timestamp, decision_id, session_id, quote_id)');
       expect(sql).toContain('idx_reference_markout_retention_v2');
@@ -323,12 +327,12 @@ describe('TrueXPostgreSQLManager', () => {
       ];
 
       await pgManager.recordReferenceQuoteDecision(diagnostic);
-      expect(mockDb.query.mock.calls.at(-1)[1].slice(-20)).toEqual(expectedProvenance);
+      expect(mockDb.query.mock.calls.at(-1)[1].slice(-34, -14)).toEqual(expectedProvenance);
 
       await pgManager.recordReferenceMarketObservation({
         ...diagnostic, observationTimestamp: 1000,
       });
-      expect(mockDb.query.mock.calls.at(-1)[1].slice(-20)).toEqual(expectedProvenance);
+      expect(mockDb.query.mock.calls.at(-1)[1].slice(-34, -14)).toEqual(expectedProvenance);
 
       await pgManager.completeReferenceMarkout(
         { fillId: 'F-diagnostic', horizonMs: 60_000 }, 'owner-diagnostic',
@@ -336,7 +340,49 @@ describe('TrueXPostgreSQLManager', () => {
       );
       const [sql, values] = mockDb.query.mock.calls.at(-1);
       expect(sql).toContain('promotion_grade');
-      expect(values.slice(-20)).toEqual(expectedProvenance);
+      expect(values.slice(-34, -14)).toEqual(expectedProvenance);
+    });
+
+    it('persists and selects only complete direct Crypto.com provenance', async () => {
+      const direct = { ...decision, referenceMode: 'cryptocom-direct', product: 'BTC-PYUSD',
+        quoteCurrency: 'PYUSD', sourceExchange: 'cryptocom', sourceType: 'public-ws-book',
+        sourceInstrument: 'BTC_PYUSD', sourceChannel: 'book.BTC_PYUSD.10',
+        sourceSequence: 41, sourceGeneration: 2, sourceSessionId: 'session-123',
+        sourceEndpoint: 'wss://stream.crypto.com/exchange/v1/market',
+        sourceBookHash: 'a'.repeat(64), sourceDepth: 10, sourceBidQty: 2, sourceAskQty: 3,
+        sourceBidCount: 1, sourceAskCount: 1, sourceBookUpdateTimestamp: 900,
+        basisTimestamp: null, basisPrice: null, basisAdjustmentBps: 0, promotionGrade: true,
+        observationTimestamp: 1000 };
+      await pgManager.recordReferenceMarketObservation(direct);
+      expect(mockDb.query.mock.calls.at(-1)[1].slice(-14)).toEqual([
+        'cryptocom-direct', 'BTC_PYUSD', 'book.BTC_PYUSD.10', 41, 2, 'session-123',
+        'wss://stream.crypto.com/exchange/v1/market', 'a'.repeat(64), 10, 2, 3, 1, 1, 900,
+      ]);
+      await pgManager.recordReferenceMarketObservation({ ...direct, referenceMode: undefined });
+      expect(mockDb.query.mock.calls.at(-1)[1].slice(-14)).toEqual(Array(14).fill(null));
+      mockDb.query.mockResolvedValueOnce({ rows: [] });
+      await pgManager.getFirstReferenceMarketObservation({ referenceMode: 'cryptocom-direct',
+        dueTimestamp: 900, deadlineTimestamp: 1100, product: 'BTC-PYUSD',
+        quoteCurrency: 'PYUSD', sourceExchange: 'cryptocom', sourceType: 'public-ws-book',
+        maxSourceAgeMs: 5000, sourceInstrument: 'BTC_PYUSD',
+        sourceChannel: 'book.BTC_PYUSD.10',
+        sourceEndpointAllowlist: ['wss://stream.crypto.com/exchange/v1/market'] });
+      const [sql, values] = mockDb.query.mock.calls.at(-1);
+      expect(sql).toContain("reference_mode = 'cryptocom-direct'");
+      expect(sql).toContain('source_endpoint = ANY($10::text[])');
+      expect(sql).toContain("source_book_hash ~ '^[a-f0-9]{64}$'");
+      expect(sql).toContain('observation_timestamp - source_timestamp <= $7');
+      expect(sql).toContain('promotion_grade IS TRUE');
+      expect(sql).not.toContain('basis_source =');
+      expect(values.at(-1)).toEqual(['wss://stream.crypto.com/exchange/v1/market']);
+
+      await pgManager.completeReferenceMarkout({ fillId: 'F-direct', horizonMs: 60_000 },
+        'owner-direct', { ...direct, adjustedMidpoint: 100, observedEdgeBps: 100 });
+      const [completionSql, completionValues] = mockDb.query.mock.calls.at(-1);
+      expect(completionSql).toContain('INSERT INTO fill_reference_markout_evidence');
+      expect(completionValues).toEqual(expect.arrayContaining([
+        'F-direct', 60_000, null, 100, 100,
+      ]));
     });
 
     it('binds release and terminal evidence completion to the claim owner', async () => {

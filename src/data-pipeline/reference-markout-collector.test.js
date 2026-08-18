@@ -34,6 +34,13 @@ const VALID_CONFIG = {
   maxBasisRttMs: 1_000,
 };
 
+const DIRECT_CONFIG = {
+  ...VALID_CONFIG, referenceMode: 'cryptocom-direct', product: 'BTC-PYUSD',
+  quoteCurrency: 'PYUSD', sourceExchange: 'cryptocom', sourceType: 'public-ws-book',
+  sourceInstrument: 'BTC_PYUSD', sourceChannel: 'book.BTC_PYUSD.10',
+  sourceEndpointAllowlist: ['wss://stream.crypto.com/exchange/v1/market'],
+};
+
 function market({ sourceTimestamp = 9_900, receivedTimestamp = 9_950, bid = 99, ask = 101 } = {}) {
   return {
     sources: [{
@@ -56,6 +63,17 @@ function basis({ timestamp = 9_900, price = 1.0001, ...overrides } = {}) {
 }
 
 describe('reference mark-out configuration', () => {
+  test('validates the exact direct PYUSD source identity without requiring basis', () => {
+    const config = validateReferenceMarkoutConfig(DIRECT_CONFIG);
+    expect(config).toMatchObject({ referenceMode: 'cryptocom-direct', product: 'BTC-PYUSD',
+      quoteCurrency: 'PYUSD', sourceInstrument: 'BTC_PYUSD' });
+    expect(config.basisVenueAllowlist).toEqual([]);
+    expect(() => validateReferenceMarkoutConfig({ ...DIRECT_CONFIG, sourceInstrument: 'BTC_USD' }))
+      .toThrow('Crypto.com BTC_PYUSD');
+    expect(() => validateReferenceMarkoutConfig({ ...DIRECT_CONFIG,
+      sourceEndpointAllowlist: ['wss://operator.example/exchange/v1/market'] }))
+      .toThrow('exact official Crypto.com endpoint');
+  });
   test('normalizes unique sorted horizons and rejects unsafe values', () => {
     expect(validateReferenceMarkoutConfig({ ...VALID_CONFIG, horizonsMs: [300_000, 60_000] }).horizonsMs)
       .toEqual([60_000, 300_000]);
@@ -108,6 +126,50 @@ describe('reference mark-out configuration', () => {
 });
 
 describe('ReferenceMarkoutCollector', () => {
+  test('records direct PYUSD evidence with t authority and no synthetic basis', async () => {
+    const writer = { recordReferenceQuoteDecision: jest.fn(async () => true) };
+    const directBook = { exchange: 'cryptocom', sourceType: 'public-ws-book',
+      instrument: 'BTC_PYUSD', channel: 'book.BTC_PYUSD.10', bid: 99, ask: 101,
+      sourceTimestamp: 9_900, bookUpdateTimestamp: 8_000, receivedTimestamp: 9_950,
+      sequence: 41, generation: 2, sourceSessionId: 'session-123' };
+    Object.assign(directBook, { sourceEndpoint: 'wss://stream.crypto.com/exchange/v1/market',
+      sourceBookHash: 'a'.repeat(64), depth: 10, bidQty: 2, askQty: 3,
+      bidCount: 1, askCount: 1 });
+    const collector = new ReferenceMarkoutCollector({ writer, config: DIRECT_CONFIG,
+      now: () => 10_000, marketProvider: () => directBook });
+    await collector.recordQuoteDecision({ quoteId: 'Q-direct', decisionTimestamp: 10_000 });
+    expect(writer.recordReferenceQuoteDecision).toHaveBeenCalledWith(expect.objectContaining({
+      available: true, product: 'BTC-PYUSD', quoteCurrency: 'PYUSD', bid: 99, ask: 101,
+      sourceTimestamp: 9_900, receivedTimestamp: 9_950, sourceBookUpdateTimestamp: 8_000,
+      sourceSequence: 41, sourceGeneration: 2, basisPrice: null,
+      basisAdjustmentBps: 0, promotionGrade: true,
+    }));
+  });
+
+  test('fails direct evidence closed on identity, provenance, receipt, and observation violations', async () => {
+    const base = { exchange: 'cryptocom', sourceType: 'public-ws-book',
+      instrument: 'BTC_PYUSD', channel: 'book.BTC_PYUSD.10', bid: 99, ask: 101,
+      sourceTimestamp: 9_900, bookUpdateTimestamp: 8_000, receivedTimestamp: 9_950,
+      sequence: 41, generation: 2, sourceSessionId: 'session-123' };
+    Object.assign(base, { sourceEndpoint: 'wss://stream.crypto.com/exchange/v1/market',
+      sourceBookHash: 'a'.repeat(64), depth: 10, bidQty: 2, askQty: 3,
+      bidCount: 1, askCount: 1 });
+    for (const [override, reason] of [
+      [{ instrument: 'BTC_USD' }, 'source-identity-mismatch'],
+      [{ sequence: -1 }, 'invalid-source-provenance'],
+      [{ bookUpdateTimestamp: 9_901 }, 'invalid-source-provenance'],
+      [{ receivedTimestamp: 10_001 }, 'lookahead-source'],
+      [{ sourceTimestamp: 4_000, receivedTimestamp: 9_950 }, 'stale-source'],
+    ]) {
+      const writer = { recordReferenceQuoteDecision: jest.fn(async () => true) };
+      const collector = new ReferenceMarkoutCollector({ writer, config: DIRECT_CONFIG,
+        now: () => 10_000, marketProvider: () => ({ ...base, ...override }) });
+      await collector.recordQuoteDecision({ quoteId: `Q-${reason}`, decisionTimestamp: 10_000 });
+      expect(writer.recordReferenceQuoteDecision).toHaveBeenCalledWith(
+        expect.objectContaining({ available: false, unavailableReason: reason }),
+      );
+    }
+  });
   test('reports running counters and a safe immutable configuration identity', () => {
     const collector = new ReferenceMarkoutCollector({ config: VALID_CONFIG });
     collector.stats.decisionsRecorded = 7;
@@ -141,6 +203,17 @@ describe('ReferenceMarkoutCollector', () => {
     collector._timer = 1;
     expect(collector.getStats().running).toBe(true);
     collector._timer = null;
+  });
+
+  test('exposes safe source operational identity without affecting collector health', () => {
+    const sourceStatus = Object.freeze({ running: true, eligible: false, generation: 4,
+      lastSourceTimestamp: null, config: Object.freeze({ endpoint: 'wss://stream.crypto.com/exchange/v1/market',
+        instrument: 'BTC_PYUSD', channel: 'book.BTC_PYUSD.10', depth: 10,
+        maxAgeMs: 5000, reconnectDelayMs: 750, subscribeDelayMs: 1000,
+        heartbeatTimeoutMs: 15000, reconnectJitterMs: 250 }) });
+    const collector = new ReferenceMarkoutCollector({ config: DIRECT_CONFIG,
+      sourceFeed: { getStats: () => sourceStatus } });
+    expect(collector.getStats()).toMatchObject({ running: false, source: sourceStatus });
   });
 
   test('reports persisted sampling activity and only a sanitized bounded error summary', async () => {
@@ -630,6 +703,41 @@ describe('ReferenceMarkoutCollector', () => {
     const observation = writer.completeReferenceMarkout.mock.calls.at(-1)[2];
     expect(observation.adjustedMidpoint).toBeCloseTo(100 / 1.002, 8);
     expect(observation.observedEdgeBps).toBeCloseTo(-19.96007984, 6);
+  });
+
+  test('completes a direct persisted horizon with the BTC-PYUSD midpoint and no basis division', async () => {
+    const now = 70_000;
+    const work = { fillId: 'F-direct', horizonMs: 60_000, dueTimestamp: 60_000,
+      deadlineTimestamp: 90_000, quoteId: 'Q-direct', decisionTimestamp: 9_000,
+      side: 'buy', level: 1, policyId: 'maker-v1', price: 100 };
+    let persisted;
+    const writer = {
+      hasOpenReferenceMarkoutWindow: jest.fn(async () => true),
+      recordReferenceMarketObservation: jest.fn(async observation => {
+        persisted = observation; return true;
+      }),
+      claimDueReferenceMarkouts: jest.fn(async () => [work]),
+      getFirstReferenceMarketObservation: jest.fn(async () => persisted),
+      completeReferenceMarkout: jest.fn(async () => true),
+      releaseReferenceMarkoutClaim: jest.fn(async () => true),
+    };
+    const directBook = { exchange: 'cryptocom', sourceType: 'public-ws-book',
+      instrument: 'BTC_PYUSD', channel: 'book.BTC_PYUSD.10', bid: 100, ask: 102,
+      sourceTimestamp: 69_950, bookUpdateTimestamp: 69_000, receivedTimestamp: 69_975,
+      sequence: 41, generation: 2, sourceSessionId: 'session-123',
+      sourceEndpoint: 'wss://stream.crypto.com/exchange/v1/market',
+      sourceBookHash: 'a'.repeat(64), depth: 10, bidQty: 2, askQty: 3,
+      bidCount: 1, askCount: 1 };
+    const collector = new ReferenceMarkoutCollector({ writer, config: DIRECT_CONFIG,
+      now: () => now, marketProvider: () => directBook });
+
+    await collector.processDue();
+
+    expect(persisted).toMatchObject({ midpoint: 101, basisPrice: null,
+      basisTimestamp: null, promotionGrade: true });
+    expect(writer.completeReferenceMarkout).toHaveBeenCalledWith(work, expect.any(String),
+      expect.objectContaining({ adjustedMidpoint: 101, observedEdgeBps: 100,
+        basisPrice: null, referenceMode: 'cryptocom-direct' }));
   });
 
   test('bounds coverage groups and runs retention outside due processing', async () => {

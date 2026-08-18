@@ -381,19 +381,22 @@ change a live policy.
 
 ### Reference mark-out evidence (`src/data-pipeline/reference-markout-collector.js`)
 
+The promotion path consumes an isolated, default-off Crypto.com `BTC_PYUSD` public-book
+snapshot feed. It is wired only into `ReferenceMarkoutCollector`; pricing and execution continue
+to consume Coinbase/TrueX paths unchanged. Durable direct-source provenance includes `t`, `tt`,
+local receipt, sequence, connection generation, and process-session identity.
+
 Reference collection is a separate, observability-only path gated by
 `REFERENCE_MARKOUT_ENABLED` (default `false`). When enabled, create/replace decisions and
 fills schedule durable 1/5/60-minute work. At the one-second cadence, the collector stores
-point-in-time Coinbase BTC-USD top-of-book observations only while an unfinished horizon window is
-open, with distinct source, receipt, observation, and promotion-grade Kraken PreTrade PYUSD/USD
-provenance. Basis evidence retains both side submission/publication timestamps, request/receipt,
-requested/resolved symbol, assets, system, and an operator-allowlisted venue; the conservative basis
-timestamp is the older publication time and is never synthesized from local receipt. The earliest
-valid observation at or after each horizon is claimed with an
+point-in-time Crypto.com BTC_PYUSD full-book observations only while an unfinished horizon window
+is open. Promotion-grade direct evidence requires the exact endpoint, channel, instrument, depth,
+publication/receipt/observation ordering, canonical book hash, sequence, connection generation,
+and process-session identity. Legacy Coinbase observations with Kraken PreTrade PYUSD/USD basis
+remain readable diagnostic evidence but cannot satisfy the v4 direct selector. The earliest valid
+observation at or after each horizon is claimed with an
 overlap-safe lease and persisted as immutable evidence; missing or invalid evidence is terminally
 classified after the configured lateness window.
-PreTrade publication timestamps are required. Optional/missing venue submission timestamps remain
-nullable diagnostic provenance and are never synthesized or selected as promotion-grade.
 
 PostgreSQL stores decisions, sampled observations, pending work, and terminal evidence in four
 additive tables. Claims use `FOR UPDATE ... SKIP LOCKED`, expired leases are recoverable after
@@ -415,8 +418,8 @@ persisted-observation counters, open-window/sampling state, queue/pool pressure,
 invalid-sample reasons, retention backlog, last cycle/observation timestamps, and a sanitized last
 persistence error reason/time. Idle zero-observation state is healthy when no window is open. These
 fields are observability only and do not participate in top-level health classification. Production
-enablement remains blocked until PYUSD/USD basis evidence has distinct, auditable source and receipt
-provenance; see [REFERENCE_MARKOUTS.md](REFERENCE_MARKOUTS.md).
+enablement remains a separate operational canary decision after source-soak, database-plan, and
+maker-isolation gates; see [REFERENCE_MARKOUTS.md](REFERENCE_MARKOUTS.md).
 
 ### TrueXRESTClient (`src/exchanges/truex/TrueXRESTClient.ts`)
 

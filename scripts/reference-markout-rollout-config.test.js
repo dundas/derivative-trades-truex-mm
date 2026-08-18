@@ -3,7 +3,8 @@ import { buildReferenceMarkoutRolloutOptions } from './reference-markout-rollout
 
 const ENABLED = {
   REFERENCE_MARKOUT_ENABLED: 'true',
-  REFERENCE_MARKOUT_BASIS_VENUE_ALLOWLIST: 'PDSL',
+  REFERENCE_MARKOUT_SOURCE_WS_URL: 'wss://stream.crypto.com/exchange/v1/market',
+  REFERENCE_MARKOUT_SOURCE_ENDPOINT_ALLOWLIST: 'wss://stream.crypto.com/exchange/v1/market',
 };
 
 describe('reference mark-out production rollout options', () => {
@@ -29,18 +30,21 @@ describe('reference mark-out production rollout options', () => {
       REFERENCE_MARKOUT_RETENTION_MAX_BATCHES_PER_SWEEP: '25',
       REFERENCE_MARKOUT_MAX_QUOTE_DECISIONS_PER_SECOND: '1',
       REFERENCE_MARKOUT_PLANNING_FILL_EVENTS_PER_SECOND: '1',
-      REFERENCE_MARKOUT_BASIS_VENUE_ALLOWLIST: 'PDSL,ALT1',
-      REFERENCE_MARKOUT_MAX_BASIS_RTT_MS: '750',
+      REFERENCE_MARKOUT_SOURCE_RECONNECT_DELAY_MS: '750',
     });
     expect(options).toEqual({
       referenceMarkoutConfig: expect.objectContaining({
-        product: 'BTC-USD', quoteCurrency: 'USD', sourceExchange: 'coinbase',
-        sourceType: 'top-of-book', horizonsMs: [60_000, 300_000], batchSize: 25,
+        referenceMode: 'cryptocom-direct', product: 'BTC-PYUSD', quoteCurrency: 'PYUSD',
+        sourceExchange: 'cryptocom', sourceType: 'public-ws-book',
+        sourceInstrument: 'BTC_PYUSD', sourceChannel: 'book.BTC_PYUSD.10',
+        horizonsMs: [60_000, 300_000], batchSize: 25,
         retentionBatchSize: 321,
         retentionMaxBatchesPerSweep: 25, maxQuoteDecisionsPerSecond: 1,
-        planningFillEventsPerSecond: 1,
-        basisVenueAllowlist: ['PDSL', 'ALT1'], maxBasisRttMs: 750,
+        planningFillEventsPerSecond: 1, basisVenueAllowlist: [],
       }),
+      referenceBookFeedConfig: { url: 'wss://stream.crypto.com/exchange/v1/market', instrument: 'BTC_PYUSD',
+        depth: 10, maxAgeMs: 5000, reconnectDelayMs: 750, subscribeDelayMs: 1000,
+        heartbeatTimeoutMs: 15000, reconnectJitterMs: 250 },
     });
     expect(Object.isFrozen(options.referenceMarkoutConfig)).toBe(true);
   });
@@ -65,9 +69,9 @@ describe('reference mark-out production rollout options', () => {
       ...ENABLED, REFERENCE_MARKOUT_HORIZONS_MS: '60000,nope',
     })).toThrow('REFERENCE_MARKOUT_HORIZONS_MS');
     expect(() => buildReferenceMarkoutRolloutOptions({ REFERENCE_MARKOUT_ENABLED: 'true' }))
-      .toThrow('REFERENCE_MARKOUT_BASIS_VENUE_ALLOWLIST');
+      .toThrow('REFERENCE_MARKOUT_SOURCE_WS_URL');
     expect(() => buildReferenceMarkoutRolloutOptions({
-      ...ENABLED, REFERENCE_MARKOUT_MAX_BASIS_RTT_MS: '1001',
-    }, { basisPollTimeoutMs: 1000 })).toThrow('PYUSD_USD_POLL_TIMEOUT_MS');
+      ...ENABLED, REFERENCE_MARKOUT_SOURCE_RECONNECT_DELAY_MS: '1',
+    })).toThrow('depth/reconnect');
   });
 });
