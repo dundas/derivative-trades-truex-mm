@@ -79,8 +79,8 @@ measurement/promotion path after production telemetry is available.
 
 - [x] Create a fresh locked feature worktree from `origin/main`; never reuse a dusty branch.
 - [x] Run the dialectical player/coach loop for non-trivial changes.
-- [ ] Commit small focused conventional commits.
-- [ ] Run adversarial review, then pre-push review, then focused smoke.
+- [x] Commit small focused conventional commits.
+- [x] Run adversarial review, then pre-push review, then focused smoke.
 - [ ] Push only after gates pass; solicit configured reviewers after every push and run the PR review loop.
 - [ ] Run docs generation and a separate docs PR when scripts, docs, or content pipeline surfaces change.
 - [ ] Merge only after CI, final reviewer approval, and valid smoke/soak evidence.
