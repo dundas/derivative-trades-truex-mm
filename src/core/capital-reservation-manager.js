@@ -1,4 +1,6 @@
-const TERMINAL_STATES = new Set(['rejected', 'cancelled', 'expired', 'filled', 'terminal-evidence-gap']);
+const TERMINAL_STATES = new Set([
+  'rejected', 'cancelled', 'expired', 'filled', 'terminal-evidence-gap', 'rest-absence-evidence-gap',
+]);
 const SIDES = new Set(['buy', 'sell']);
 const EPSILON = 1e-10;
 
@@ -240,6 +242,37 @@ export class CapitalReservationManager {
 
   expired(orderId) {
     return this._terminal(orderId, 'expired');
+  }
+
+  /**
+   * REST absence does not prove cancellation: a delayed/lost fill may have
+   * consumed the order. Remove venue-live presence while retaining the full
+   * remaining commitment as a conservative delta until a newer coherent
+   * balance/live-order snapshot absorbs it.
+   */
+  restOrderAbsent(orderId) {
+    const order = this.reservations.get(orderId);
+    if (!order || TERMINAL_STATES.has(order.state)) return false;
+    const remainingCommitment = reservationAmount(order);
+    const asset = order.side === 'sell' ? 'base' : 'quote';
+    const sequence = this._nextEvent();
+    this.consumedEvents.push({ sequence, orderId, asset, amount: remainingCommitment });
+    this.blockedSides.set(order.side, sequence);
+    order.remainingSize = 0;
+    order.state = 'rest-absence-evidence-gap';
+    order.acknowledgedLive = false;
+    order.representedByHeld = false;
+    order.lastMutationSequence = sequence;
+    this.state = 'degraded';
+    this.reason = 'rest-order-absence-unknown-outcome';
+    this._recordTerminal(order);
+    return {
+      orderId,
+      side: order.side,
+      outcome: 'unknown',
+      reason: this.reason,
+      remainingCommitment,
+    };
   }
 
   fill({ orderId, executionId, quantity, leavesQuantity }) {

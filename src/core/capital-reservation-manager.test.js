@@ -120,4 +120,53 @@ describe('CapitalReservationManager', () => {
       orderId: 'ask-l2', side: 'sell', price: 100001, size: 0.001, level: 2,
     }).accepted).toBe(true);
   });
+
+  test('REST absence conservatively consumes stale capacity until a fresh coherent snapshot', () => {
+    const capital = new CapitalReservationManager();
+    capital.reconcile({ ...snapshot(0.01), liveOrders: [] });
+    capital.reserve({ orderId: 'missing-ask', side: 'sell', price: 100000, size: 0.01, level: 1 });
+    capital.accept('missing-ask');
+
+    expect(capital.restOrderAbsent('missing-ask')).toMatchObject({
+      orderId: 'missing-ask', side: 'sell', outcome: 'unknown', remainingCommitment: 0.01,
+    });
+    expect(capital.getReservation('missing-ask')).toMatchObject({
+      state: 'rest-absence-evidence-gap', acknowledgedLive: false, remainingSize: 0,
+    });
+    expect(capital.getAvailable('sell')).toBe(0);
+    expect(capital.reserve({
+      orderId: 'unsafe-reuse', side: 'sell', price: 100000, size: 0.01, level: 1,
+    })).toMatchObject({ accepted: false });
+
+    capital.reconciliationFailed();
+    expect(capital.getStatus()).toMatchObject({ state: 'failed', blockedSides: ['sell'] });
+    expect(capital.reserve({
+      orderId: 'still-blocked', side: 'sell', price: 100000, size: 0.01, level: 1,
+    })).toMatchObject({ accepted: false, reason: 'capital-reconciliation-failed' });
+
+    const generation = capital.beginReconciliation();
+    capital.reconcile({ ...snapshot(0.01), liveOrders: [], clearBlockedSides: true, generation });
+    expect(capital.getStatus()).toMatchObject({ state: 'normal', blockedSides: [] });
+    expect(capital.reserve({
+      orderId: 'safe-after-fresh-snapshot', side: 'sell', price: 100000, size: 0.01, level: 1,
+    }).accepted).toBe(true);
+  });
+
+  test('delayed terminal after REST absence cannot consume twice or resurrect presence', () => {
+    const capital = new CapitalReservationManager();
+    capital.reconcile({ ...snapshot(0.01), liveOrders: [] });
+    capital.reserve({ orderId: 'missing-ask', side: 'sell', price: 100000, size: 0.01, level: 1 });
+    capital.accept('missing-ask');
+    capital.restOrderAbsent('missing-ask');
+    const consumedBefore = capital.consumedEvents.map((event) => ({ ...event }));
+
+    expect(capital.fullFill('missing-ask', 'late-terminal', {
+      lastQuantity: 0.01, leavesQuantity: 0,
+    })).toBe(false);
+    expect(capital.consumedEvents).toEqual(consumedBefore);
+    expect(capital.getPresence()).toEqual({ buy: 0, sell: 0 });
+    expect(capital.getReservation('missing-ask')).toMatchObject({
+      state: 'rest-absence-evidence-gap', acknowledgedLive: false,
+    });
+  });
 });

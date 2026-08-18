@@ -214,4 +214,79 @@ describe('MarketMakerOrchestrator strict startup reconciliation', () => {
     expect(await orchestrator._restReconcile()).toBeUndefined();
     expect(orchestrator.restClient.getActiveOrders).not.toHaveBeenCalled();
   });
+
+  test('runtime ghost removal awaits the coalesced capital resync', async () => {
+    let releaseResync;
+    let reconcileFinished = false;
+    const quoteEngine = {
+      activeOrders: new Map([['ghost', { status: 'active' }]]),
+      removeStaleOrder: mock(() => {
+        quoteEngine.activeOrders.delete('ghost');
+        return true;
+      }),
+    };
+    const orchestrator = Object.assign(Object.create(MarketMakerOrchestrator.prototype), {
+      isRunning: true,
+      restClient: { getActiveOrders: mock(async () => []) },
+      quoteEngine,
+      capitalReservationManager: {},
+      _onCapitalResyncRequired: mock(() => new Promise((resolve) => { releaseResync = resolve; })),
+      logger: { info() {}, warn() {}, error() {} },
+      emit() {}, listenerCount: () => 0,
+    });
+
+    const reconciling = orchestrator._restReconcile().then(() => { reconcileFinished = true; });
+    for (let turn = 0; turn < 5 && !releaseResync; turn++) await Promise.resolve();
+    expect(typeof releaseResync).toBe('function');
+    expect(reconcileFinished).toBe(false);
+    expect(orchestrator._onCapitalResyncRequired).toHaveBeenCalledWith({
+      side: 'unknown', reason: 'rest-order-absence-unknown-outcome',
+    });
+    releaseResync();
+    await reconciling;
+    expect(reconcileFinished).toBe(true);
+  });
+
+  test('failed runtime ghost resync leaves the affected side blocked and failed', async () => {
+    const capital = new CapitalReservationManager();
+    capital.reconcile({
+      baseBalance: { available: 0.01, held: 0, total: 0.01 },
+      quoteBalance: { available: 1000, held: 0, total: 1000 }, liveOrders: [],
+    });
+    capital.reserve({ orderId: 'ghost', side: 'sell', size: 0.01, price: 100000, level: 1 });
+    capital.accept('ghost');
+    const quoteEngine = {
+      activeOrders: new Map([['ghost', { side: 'sell', status: 'active' }]]),
+      removeStaleOrder(orderId) {
+        this.activeOrders.delete(orderId);
+        capital.restOrderAbsent(orderId);
+        return true;
+      },
+      drainQueue: mock(() => {}),
+      deferredRepriceNeeded: false,
+    };
+    const orchestrator = Object.assign(Object.create(MarketMakerOrchestrator.prototype), {
+      isRunning: true,
+      restClient: { getActiveOrders: mock(async () => []) },
+      quoteEngine,
+      capitalReservationManager: capital,
+      _capitalResyncInFlight: null,
+      _capitalResyncPending: false,
+      _refreshBalances: mock(async () => {
+        capital.reconciliationFailed();
+        throw new Error('fresh snapshot unavailable');
+      }),
+      logger: { info() {}, warn() {}, error() {} },
+      emit() {}, listenerCount: () => 0,
+    });
+
+    await orchestrator._restReconcile();
+    expect(orchestrator._refreshBalances).toHaveBeenCalledWith({
+      requireLiveOrders: true, clearBlockedSides: true,
+    });
+    expect(capital.getStatus()).toMatchObject({ state: 'failed', blockedSides: ['sell'] });
+    expect(capital.reserve({
+      orderId: 'unsafe-reuse', side: 'sell', size: 0.01, price: 100000, level: 1,
+    })).toMatchObject({ accepted: false, reason: 'capital-reconciliation-failed' });
+  });
 });

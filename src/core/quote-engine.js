@@ -1496,9 +1496,19 @@ export class QuoteEngine extends EventEmitter {
    * Returns true if the order existed and was removed.
    */
   removeStaleOrder(clOrdID) {
-    if (this.activeOrders.has(clOrdID)) {
+    const tracked = this.activeOrders.get(clOrdID);
+    if (tracked) {
       this.activeOrders.delete(clOrdID);
-      this.capitalReservationManager?.cancelled(clOrdID);
+      if (this.capitalReservationManager) {
+        const evidence = this.capitalReservationManager.restOrderAbsent(clOrdID);
+        if (evidence) {
+          this.emit('rest-order-absence', {
+            ...evidence,
+            level: tracked.level,
+            executionState: 'degraded',
+          });
+        }
+      }
       this._clearExecutionIdentity(clOrdID);
       return true;
     }

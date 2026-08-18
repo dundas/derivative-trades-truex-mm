@@ -1979,6 +1979,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       let matched = 0;
       let orphansCancelled = 0;
       let ghostsRemoved = 0;
+      const ghostSides = new Set();
 
       // Orphans: on exchange but not in local state → cancel via REST
       for (const order of exchangeOrders) {
@@ -2001,9 +2002,23 @@ export class MarketMakerOrchestrator extends EventEmitter {
       for (const clOrdID of localClOrdIDs) {
         if (!exchangeClOrdIDs.has(clOrdID)) {
           this.logger.warn(`[Reconcile] Ghost in local state: ${clOrdID} — removing`);
+          const ghostSide = this.quoteEngine.activeOrders.get(clOrdID)?.side;
+          if (ghostSide === 'buy' || ghostSide === 'sell') ghostSides.add(ghostSide);
           this.quoteEngine.removeStaleOrder(clOrdID);
           ghostsRemoved++;
         }
+      }
+
+      // A manager-backed ghost has an unknown terminal outcome, not a proven
+      // cancel. Await one coalesced fresh balance/live-order reconciliation for
+      // the batch before any blocked capacity can become reusable.
+      if (ghostsRemoved > 0 && this.capitalReservationManager) {
+        const side = ghostSides.size === 1 ? [...ghostSides][0]
+          : (ghostSides.size > 1 ? 'multiple' : 'unknown');
+        await this._onCapitalResyncRequired({
+          side,
+          reason: 'rest-order-absence-unknown-outcome',
+        });
       }
 
       const stats = {

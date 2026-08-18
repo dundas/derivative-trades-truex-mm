@@ -85,4 +85,30 @@ describe('QuoteEngine capital reservation binding', () => {
     expect(capital.getReservation(orderId)).toMatchObject({ state: 'expired', acknowledgedLive: false });
     expect(engine.activeOrders.has(orderId)).toBe(false);
   });
+
+  test('REST absence surfaces unknown outcome without fill/PnL emission and late terminal is inert', () => {
+    const { capital, engine } = setup(0.01);
+    const fills = [];
+    const absences = [];
+    engine.on('fill', (fill) => fills.push(fill));
+    engine.on('rest-order-absence', (event) => absences.push(event));
+    const orderId = engine._sendNewOrder({ side: 'sell', price: 100000, size: 0.01, level: 1 });
+    engine.onExecutionReport({ '11': orderId, '39': '0', '54': '2' });
+
+    expect(engine.removeStaleOrder(orderId)).toBe(true);
+    expect(absences).toEqual([expect.objectContaining({
+      orderId, side: 'sell', outcome: 'unknown',
+      reason: 'rest-order-absence-unknown-outcome', remainingCommitment: 0.01,
+    })]);
+    expect(fills).toEqual([]);
+    expect(capital.getStatus()).toMatchObject({ blockedSides: ['sell'] });
+
+    engine.onExecutionReport({
+      '11': orderId, '39': '2', '54': '2', '17': 'late-terminal',
+      '31': '100000', '32': '0.01', '151': '0',
+    });
+    expect(fills).toEqual([]);
+    expect(capital.consumedEvents).toHaveLength(1);
+    expect(capital.getPresence()).toEqual({ buy: 0, sell: 0 });
+  });
 });
