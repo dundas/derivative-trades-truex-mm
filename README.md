@@ -169,6 +169,7 @@ Comprehensive documentation available in `/docs`:
 - **Integration Guide**: Step-by-step integration instructions
 - **Testing Summary**: Test results and validation
 - **Troubleshooting**: Common issues and solutions
+- **Reference Mark-outs**: [rollout, evidence semantics, coverage audit, and rollback](./docs/REFERENCE_MARKOUTS.md)
 
 ## 🔒 Security
 
