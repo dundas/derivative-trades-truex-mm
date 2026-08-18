@@ -124,6 +124,22 @@ inventory controls to improve profitability. It does not authorize taker trading
     least 50% observed fill survival, and a 95% cluster-bootstrap lower bound above +2bps at the
     configured primary horizon. Every default is validated configuration rather than an embedded
     production-policy authorization.
+13. Treat reference mark-outs as append-only, idempotent evidence. Each unique fill must create
+    durable pending observations for the configured horizons so process restarts can recover and
+    complete them; an in-memory timer alone is insufficient. Duplicate or out-of-order execution
+    reports must not create duplicate evidence.
+14. A promotion-grade decision or horizon observation must contain the configured product and quote
+    currency, a configured source type, source and receipt timestamps, and positive non-crossed
+    Coinbase bid and ask prices. A horizon may use only the first valid observation at or after its
+    due timestamp and within a configurable maximum lateness; otherwise it must persist an explicit
+    unavailable reason. No future observation may be joined to a quote decision.
+15. Reference collection and persistence are observability-only and fail soft: failures must be
+    logged and counted but must never block, cancel, resize, reprice, or dispatch an order. Product,
+    quote currency, source type, horizons, freshness/lateness bounds, batch size, poll interval, and
+    retention must be validated configuration rather than embedded strategy constants.
+16. Provide a bounded coverage audit grouped by side, quote level, policy version, horizon, and
+    availability reason. It must report missing quote attribution and invalid or stale market data
+    honestly and must never convert unavailable evidence into a neutral or favorable return.
 
 ## 5. Non-Goals
 
@@ -146,6 +162,9 @@ inventory controls to improve profitability. It does not authorize taker trading
   must verify the effective configuration and acknowledged quotes.
 - Reconciliation must be idempotent under duplicate execution reports, out-of-order cancels, and
   REST snapshots that lag FIX messages.
+- Mark-out recovery must claim due work safely across overlapping pollers and restart without
+  duplicate completion. Retention may remove only completed/terminal evidence older than the
+  configured cutoff; pending work remains recoverable.
 
 ## 7. Rollout and Gates
 
