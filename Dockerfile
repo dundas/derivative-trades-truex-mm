@@ -1,5 +1,5 @@
 # TrueX Market Maker - Production Dockerfile
-FROM oven/bun:1.1-alpine
+FROM oven/bun:1.3.3-alpine@sha256:d2bc1fbc3afcd3d70afc2bb2544235bf559caae2a3084e9abed126e233797511
 
 WORKDIR /app
 
@@ -7,8 +7,8 @@ WORKDIR /app
 RUN apk add --no-cache curl
 
 # Install dependencies first (for better caching)
-COPY package.json ./
-RUN bun install --production
+COPY package.json bun.lock ./
+RUN bun install --production --frozen-lockfile
 
 # Copy source code
 COPY src/ ./src/

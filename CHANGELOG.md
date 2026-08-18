@@ -24,6 +24,10 @@ with enhanced attribution to track which AI model/CLI made each change.
 ### Removed
 
 ### Security
+- Pinned the production Bun base image and frozen dependency graph, patched Axios/WebSocket,
+  removed unused vulnerable dependencies, and replaced the accidental transitive UUID runtime
+  dependency with `node:crypto` (Codex, 2026-08-17)
+  - **Context:** Production release preflight for PRD 0014 tasks 2.0, 3.0, and 5.1-5.2
 
 ---
 
