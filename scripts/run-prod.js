@@ -42,6 +42,7 @@ import { CoinbaseMarketDataAdapter } from '../src/data-pipeline/coinbase-market-
 import { buildReferenceMarkoutRolloutOptions } from './reference-markout-rollout-config.js';
 import { buildContinuityConfig } from './continuity-config.js';
 import { buildOrderReconciliationScope } from './order-reconciliation-scope-config.js';
+import { startProductionOrchestrator } from './production-orchestrator-startup.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -337,35 +338,6 @@ async function main() {
 
   krakenRestClient = new KrakenRestClient({});
 
-  // 0. Cancel orphaned orders from previous sessions via REST API
-  logger.info('[0/5] Cancelling orphaned orders via REST API...');
-  try {
-    const { TrueXRESTClient } = await import('../src/exchanges/truex/TrueXRESTClient.ts');
-    const restClient = new TrueXRESTClient({
-      baseURL: `${config.restUrl}/api/v1`,
-      apiKey: config.apiKey,
-      apiSecret: config.apiSecret,
-      userId: config.clientId,
-    });
-
-    const result = await restClient.cancelAllOrders();
-    if (result.failed.length > 0) {
-      logger.error(`Orphan cancel failures: ${result.failed.map(f => `${f.id}:${f.error}`).join(', ')}`);
-      logger.error('Cannot start with live orphaned orders — exiting');
-      process.exit(1);
-    }
-    if (result.canceled.length > 0) {
-      logger.info(`Cancelled ${result.canceled.length} orphaned orders`);
-    } else {
-      logger.info('No orphaned orders found');
-    }
-  } catch (err) {
-    logger.error(`REST orphan cancel failed: ${err.message}`);
-    logger.error('Cannot proceed without REST connectivity — exiting');
-    process.exit(1);
-  }
-  logger.info('');
-
   // 1. Data Pipeline (Memory → Redis → PostgreSQL)
   logger.info('[1/5] Setting up data pipeline...');
   dataPipeline = new DataPipelineManager({
@@ -571,7 +543,7 @@ async function main() {
   apiSetOrchestrator?.(orchestrator);
 
   // 5. Start (connects FIX, fetches balances, begins quoting)
-  await orchestrator.start();
+  await startProductionOrchestrator(orchestrator);
 
   logger.info('');
   logger.info('╔════════════════════════════════════════╗');
