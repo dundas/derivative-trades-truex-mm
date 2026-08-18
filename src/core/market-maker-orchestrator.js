@@ -21,6 +21,40 @@ function strictPositiveRestNumber(value) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
+function captureLocalReconciliationOrder(orderId, order, capitalManager) {
+  const reservation = capitalManager?.getReservation?.(orderId) || null;
+  return Object.freeze({
+    ref: order,
+    status: order?.status,
+    acknowledgedLive: order?.acknowledgedLive,
+    side: order?.side,
+    size: order?.size,
+    price: order?.price,
+    level: order?.level,
+    capitalState: reservation?.state,
+    capitalAcknowledgedLive: reservation?.acknowledgedLive,
+    capitalRemainingSize: reservation?.remainingSize,
+    capitalMutationSequence: reservation?.lastMutationSequence,
+  });
+}
+
+function localReconciliationOrderUnchanged(snapshot, current, orderId, capitalManager) {
+  if (!snapshot || !current || current !== snapshot.ref) return false;
+  const latest = captureLocalReconciliationOrder(orderId, current, capitalManager);
+  return snapshot.status === latest.status &&
+    snapshot.acknowledgedLive === latest.acknowledgedLive &&
+    snapshot.side === latest.side && snapshot.size === latest.size &&
+    snapshot.price === latest.price && snapshot.level === latest.level &&
+    snapshot.capitalState === latest.capitalState &&
+    snapshot.capitalAcknowledgedLive === latest.capitalAcknowledgedLive &&
+    snapshot.capitalRemainingSize === latest.capitalRemainingSize &&
+    snapshot.capitalMutationSequence === latest.capitalMutationSequence;
+}
+
+function isStableLocalOrder(order) {
+  return order && order.status !== 'pending' && order.status !== 'cancelling';
+}
+
 /**
  * MarketMakerOrchestrator - Wires all components and manages lifecycle.
  *
@@ -2037,10 +2071,19 @@ export class MarketMakerOrchestrator extends EventEmitter {
 
   // --- REST-based Order Reconciliation ---
 
-  async _restReconcile({ allowPreStart = false, strict = false } = {}) {
+  async _restReconcile({ allowPreStart = false, strict = false, _generationFollowup = false } = {}) {
     if (!this.restClient || (!this.isRunning && !allowPreStart)) return;
 
     try {
+      // The local side of the reconciliation must share the same request
+      // boundary as the REST snapshot. Never interpret an order born or
+      // mutated while the request is in flight through an older response.
+      const localGeneration = new Map();
+      for (const [orderId, order] of this.quoteEngine.activeOrders) {
+        localGeneration.set(orderId,
+          captureLocalReconciliationOrder(orderId, order, this.capitalReservationManager));
+      }
+
       // 1. Fetch active orders from exchange via REST
       const rawExchangeOrders = await this.restClient.getActiveOrders();
 
@@ -2056,11 +2099,28 @@ export class MarketMakerOrchestrator extends EventEmitter {
         if (parsed.externalId) exchangeClOrdIDs.add(parsed.externalId);
       }
 
-      // 3. Build set of local clOrdIDs (skip in-flight orders)
+      // 3. Build the immutable request-generation local set (skip in-flight
+      // orders). Current local state is used only to prove the identity did not
+      // change after the request began.
       const localClOrdIDs = new Set();
-      for (const [clOrdID, order] of this.quoteEngine.activeOrders) {
-        if (order.status === 'pending' || order.status === 'cancelling') continue;
-        localClOrdIDs.add(clOrdID);
+      for (const [clOrdID, snapshot] of localGeneration) {
+        if (isStableLocalOrder(snapshot)) localClOrdIDs.add(clOrdID);
+      }
+
+      let generationChanged = false;
+      const currentStableIds = new Set();
+      for (const [orderId, order] of this.quoteEngine.activeOrders) {
+        if (!isStableLocalOrder(order)) continue;
+        currentStableIds.add(orderId);
+        const snapshot = localGeneration.get(orderId);
+        if (!snapshot || !isStableLocalOrder(snapshot) ||
+            !localReconciliationOrderUnchanged(
+              snapshot, order, orderId, this.capitalReservationManager)) {
+          generationChanged = true;
+        }
+      }
+      for (const orderId of localClOrdIDs) {
+        if (!currentStableIds.has(orderId)) generationChanged = true;
       }
 
       // 4. Detect discrepancies
@@ -2088,6 +2148,11 @@ export class MarketMakerOrchestrator extends EventEmitter {
 
       // Ghosts: in local state but not on exchange → remove from activeOrders
       for (const clOrdID of localClOrdIDs) {
+        const snapshot = localGeneration.get(clOrdID);
+        const current = this.quoteEngine.activeOrders.get(clOrdID);
+        if (!localReconciliationOrderUnchanged(
+          snapshot, current, clOrdID, this.capitalReservationManager
+        )) continue;
         if (!exchangeClOrdIDs.has(clOrdID)) {
           this.logger.warn(`[Reconcile] Ghost in local state: ${clOrdID} — removing`);
           const ghostSide = this.quoteEngine.activeOrders.get(clOrdID)?.side;
@@ -2115,6 +2180,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
         matched,
         orphansCancelled,
         ghostsRemoved,
+        generationChanged,
       };
 
       this.logger.info(
@@ -2123,6 +2189,17 @@ export class MarketMakerOrchestrator extends EventEmitter {
       );
 
       this.emit('reconcile', stats);
+      if (generationChanged && !_generationFollowup) {
+        // Exactly one awaited follow-up gives changed/born orders a snapshot
+        // whose request began after they became stable. Bounding this to one
+        // prevents a busy venue from creating an unbounded reconcile loop;
+        // the periodic job will cover any further concurrent mutation.
+        stats.followup = await this._restReconcile({
+          allowPreStart,
+          strict,
+          _generationFollowup: true,
+        });
+      }
       return stats;
     } catch (err) {
       if (strict) throw err;

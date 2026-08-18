@@ -216,6 +216,72 @@ describe('MarketMakerOrchestrator strict startup reconciliation', () => {
     expect(orchestrator.restClient.getActiveOrders).not.toHaveBeenCalled();
   });
 
+  test('New acknowledgement during a REST request is excluded from the stale snapshot and checked fresh', async () => {
+    let releaseFirst;
+    const getActiveOrders = mock()
+      .mockImplementationOnce(() => new Promise((resolve) => { releaseFirst = () => resolve([]); }))
+      .mockResolvedValueOnce([rawOrder('venue-new-ack', 'new-ack')]);
+    const order = {
+      side: 'sell', size: 0.01, price: 100000, level: 1,
+      status: 'pending', acknowledgedLive: false,
+    };
+    const quoteEngine = {
+      activeOrders: new Map([['new-ack', order]]),
+      removeStaleOrder: mock(() => { quoteEngine.activeOrders.delete('new-ack'); return true; }),
+    };
+    const orchestrator = Object.assign(Object.create(MarketMakerOrchestrator.prototype), {
+      isRunning: true,
+      restClient: { getActiveOrders, cancelOrder: mock(async () => {}) },
+      quoteEngine,
+      capitalReservationManager: null,
+      logger: { info() {}, warn() {}, error() {} },
+      emit() {}, listenerCount: () => 0,
+    });
+
+    const reconciling = orchestrator._restReconcile();
+    while (!releaseFirst) await Promise.resolve();
+    order.status = 'active';
+    order.acknowledgedLive = true;
+    releaseFirst();
+    await reconciling;
+
+    expect(getActiveOrders).toHaveBeenCalledTimes(2);
+    expect(quoteEngine.removeStaleOrder).not.toHaveBeenCalled();
+    expect(quoteEngine.activeOrders.has('new-ack')).toBe(true);
+  });
+
+  test('active order born during a REST request is excluded from the stale snapshot and checked fresh', async () => {
+    let releaseFirst;
+    const getActiveOrders = mock()
+      .mockImplementationOnce(() => new Promise((resolve) => { releaseFirst = () => resolve([]); }))
+      .mockResolvedValueOnce([rawOrder('venue-born', 'born-during-request')]);
+    const quoteEngine = {
+      activeOrders: new Map(),
+      removeStaleOrder: mock((orderId) => { quoteEngine.activeOrders.delete(orderId); return true; }),
+    };
+    const orchestrator = Object.assign(Object.create(MarketMakerOrchestrator.prototype), {
+      isRunning: true,
+      restClient: { getActiveOrders, cancelOrder: mock(async () => {}) },
+      quoteEngine,
+      capitalReservationManager: null,
+      logger: { info() {}, warn() {}, error() {} },
+      emit() {}, listenerCount: () => 0,
+    });
+
+    const reconciling = orchestrator._restReconcile();
+    while (!releaseFirst) await Promise.resolve();
+    quoteEngine.activeOrders.set('born-during-request', {
+      side: 'sell', size: 0.01, price: 100000, level: 1,
+      status: 'active', acknowledgedLive: true,
+    });
+    releaseFirst();
+    await reconciling;
+
+    expect(getActiveOrders).toHaveBeenCalledTimes(2);
+    expect(quoteEngine.removeStaleOrder).not.toHaveBeenCalled();
+    expect(quoteEngine.activeOrders.has('born-during-request')).toBe(true);
+  });
+
   test('runtime ghost removal awaits the coalesced capital resync', async () => {
     let releaseResync;
     let reconcileFinished = false;
