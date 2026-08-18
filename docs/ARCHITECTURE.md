@@ -550,10 +550,11 @@ PostgreSQL-backed analytics server using `Bun.serve()` on port 3100.
 
 ### Dockerfile (`Dockerfile`)
 
-- Base image: `oven/bun:1.1-alpine`
+- Base image: Bun 1.3.3 Alpine pinned to a reviewed multi-architecture digest
 - Non-root user (`nodejs:1001`)
-- Production dependencies only (`bun install --production`)
-- Health check: `bun --version` every 30s
+- Production JavaScript dependencies installed from checked-in `bun.lock` with frozen resolution (`bun install --production --frozen-lockfile`)
+- Alpine packages remain resolved by `apk` at build time and are outside the JavaScript/base-image pinning guarantee
+- Health check: `curl` against the local `/api/v1/health` endpoint every 30s
 
 ### Docker Compose — Production (`docker-compose.prod.yml`)
 
