@@ -10,6 +10,7 @@ import { TrueXMarketDataFeed } from './truex-market-data.js';
 import { TrueXRESTClient } from '../exchanges/truex/TrueXRESTClient.js';
 import { AlertManager, normalizeAlertReason } from '../alerts/alert-manager.js';
 import { QuoteLifecycleTelemetry } from '../data-pipeline/quote-lifecycle-telemetry.js';
+import { ReferenceMarkoutCollector } from '../data-pipeline/reference-markout-collector.js';
 
 /**
  * MarketMakerOrchestrator - Wires all components and manages lifecycle.
@@ -160,6 +161,14 @@ export class MarketMakerOrchestrator extends EventEmitter {
       logger: this.logger,
       policyId: options.policyId || 'default',
     });
+    this.referenceMarkoutCollector = options.referenceMarkoutCollector ||
+      (options.referenceMarkoutConfig ? new ReferenceMarkoutCollector({
+        writer: this.postgresManager,
+        logger: this.logger,
+        config: options.referenceMarkoutConfig,
+        marketProvider: () => this.lastAggregatedPrice,
+        basisProvider: () => this.pyusdUsd,
+      }) : null);
     this.policyVector = {
       targetInventoryBTC: Number(options.targetInventoryBTC ?? 0), maxSkewTicks: Number(options.maxSkewTicks ?? 3),
       anchorBufferTicks: Number(options.coinbaseAnchorBufferTicks ?? 1), baseSpreadBps: Number(options.baseSpreadBps ?? 50),
@@ -338,6 +347,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
         if (!this.quoteTelemetry.writer && this.dataPipeline.pgManager) {
           this.quoteTelemetry.writer = this.dataPipeline.pgManager;
         }
+        if (this.referenceMarkoutCollector && !this.referenceMarkoutCollector.writer && this.dataPipeline.pgManager) {
+          this.referenceMarkoutCollector.setWriter(this.dataPipeline.pgManager);
+        }
         this.logger.info('[Orchestrator] Data pipeline started');
       } catch (err) {
         this.logger.warn(`[Orchestrator] Data pipeline start failed (non-fatal): ${err.message}`);
@@ -380,6 +392,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
 
     this.isRunning = true;
     this.startedAt = Date.now();
+    if (this.referenceMarkoutCollector?.writer) this.referenceMarkoutCollector.start();
     this._startTruexEbboPoller();
     this._startPyusdUsdPoller();
 
@@ -442,6 +455,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       clearInterval(this._snapshotTimer);
       this._snapshotTimer = null;
     }
+    this.referenceMarkoutCollector?.stop();
     this._intentionalStop = true;
     this.pnlTracker.stopPeriodicLogging();
 
@@ -525,6 +539,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       pyusdUsdLastSuccessAt: this._pyusdUsdLastSuccessAt || null,
       pyusdUsdConsecutiveErrors: this._pyusdUsdConsecutiveErrors,
       dataPipeline: this.dataPipeline ? this.dataPipeline.getStats() : null,
+      referenceMarkouts: this.referenceMarkoutCollector?.getStats?.() || null,
     };
   }
 
@@ -865,8 +880,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
     const coinbase = Array.isArray(market.sources)
       ? market.sources.find(source => source?.exchange === 'coinbase') || null
       : null;
-    this.quoteTelemetry.record({
+    const enrichedEvent = {
       ...event,
+      decisionTimestamp: now,
       sessionId: this.sessionId,
       symbol: this.symbol,
       targetInventoryBTC: summary.targetInventoryBTC ?? this.inventoryManager.targetInventoryBTC,
@@ -875,7 +891,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
       committedExposureBTC,
       context: {
         coinbase: coinbase ? {
-          bestBid: coinbase.bid, bestAsk: coinbase.ask, timestamp: market.timestamp,
+          bestBid: coinbase.bid, bestAsk: coinbase.ask,
+          timestamp: coinbase.sourceTimestamp ?? null,
+          receivedTimestamp: coinbase.receivedTimestamp ?? null,
         } : null,
         truexEbbo: quoteStatus.truexEbbo || null,
         fairValue: market.weightedMidpoint ?? quoteStatus.lastMid ?? null,
@@ -883,7 +901,26 @@ export class MarketMakerOrchestrator extends EventEmitter {
         volatility: market.volatility ?? null,
         marketState: market.marketState ?? null,
       },
-    }).catch(err => this.logger.warn(`[Orchestrator] Quote telemetry failed: ${err.message}`));
+    };
+    this.quoteTelemetry.record(enrichedEvent)
+      .catch(err => this.logger.warn(`[Orchestrator] Quote telemetry failed: ${err.message}`));
+    if (event.eventType === 'create' || event.eventType === 'replace') {
+      this.referenceMarkoutCollector?.recordQuoteDecision(enrichedEvent);
+    } else if ((event.eventType === 'partial_fill' || event.eventType === 'full_fill') && event.executionId) {
+      this.referenceMarkoutCollector?.scheduleFill({
+        fillId: `${event.quoteId}-${event.executionId}`,
+        executionId: event.executionId,
+        quoteId: event.quoteId,
+        sessionId: this.sessionId,
+        fillTimestamp: now,
+        decisionTimestamp: null,
+        side: event.side,
+        level: event.level,
+        policyId: this.quoteTelemetry.policyId,
+        price: event.price,
+        size: event.size,
+      });
+    }
   }
 
   _addPipelineFillOnce(pipeline, fill) {

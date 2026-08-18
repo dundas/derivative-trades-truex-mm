@@ -59,6 +59,30 @@ describe('mapToCoinbaseProductId / mapFromCoinbaseProductId', () => {
   });
 });
 
+describe('CoinbaseWsIngest ticker provenance', () => {
+  it('preserves a valid exchange timestamp', () => {
+    const received = [];
+    const { ingest } = makeIngest({ onTicker: (_symbol, ticker) => received.push(ticker) });
+    ingest.handleMessage(JSON.stringify({
+      type: 'ticker', product_id: 'BTC-USD', best_bid: '100', best_ask: '101',
+      price: '100.5', time: '2026-08-17T12:00:00.000Z',
+    }));
+    expect(received[0].timestamp).toBe(Date.parse('2026-08-17T12:00:00.000Z'));
+  });
+
+  it('does not manufacture an exchange timestamp when Coinbase omits or corrupts it', () => {
+    const received = [];
+    const { ingest } = makeIngest({ onTicker: (_symbol, ticker) => received.push(ticker) });
+    for (const time of [undefined, 'not-a-time']) {
+      ingest.handleMessage(JSON.stringify({
+        type: 'ticker', product_id: 'BTC-USD', best_bid: '100', best_ask: '101',
+        price: '100.5', ...(time === undefined ? {} : { time }),
+      }));
+    }
+    expect(received.map(ticker => ticker.timestamp)).toEqual([null, null]);
+  });
+});
+
 describe('CoinbaseWsIngest reconnect logic', () => {
   let ingest;
   let getWs;

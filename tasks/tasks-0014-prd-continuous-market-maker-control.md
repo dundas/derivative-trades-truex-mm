@@ -56,8 +56,12 @@ measurement/promotion path after production telemetry is available.
   - [ ] 4.6 Add shadow and canary coverage proving zero taker dispatch.
 
 - [ ] 5.0 Close the profitability iteration loop
-  - [ ] 5.1 Deploy/verify quote lifecycle telemetry and its coverage audit.
-  - [ ] 5.2 Persist 1/5/60-minute side-specific Coinbase reference mark-outs.
+  - [ ] 5.1 Deploy/verify quote lifecycle telemetry and a bounded coverage audit grouped by side,
+    quote level, policy version, horizon, and explicit availability reason.
+  - [ ] 5.2 Persist configurable 1/5/60-minute side-specific Coinbase reference mark-outs using
+    durable, restart-safe, idempotent pending work; require positive non-crossed point-in-time
+    bid/ask evidence with source/receipt timestamps, strict no-lookahead joins, bounded lateness,
+    explicit unavailable outcomes, and fail-soft zero-order-impact behavior.
   - [x] 5.3 Implement a pure regime validator with strict no-lookahead reference joins and configurable
     clean/directional/high-volatility/stale classification, positive non-crossed market-data checks,
     bounded basis adjustment, and permanently diagnostic-only candles.

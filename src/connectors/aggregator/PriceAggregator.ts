@@ -20,7 +20,9 @@ export interface ExchangeFeed {
   exchange: string;
   lastUpdate: number;
   ticker?: TickerUpdate;
+  tickerReceivedAt?: number;
   orderbook?: OrderBookUpdate;
+  orderbookReceivedAt?: number;
   weight: number; // Relative weight for averaging (based on volume/reliability)
   isStale: boolean;
 }
@@ -42,6 +44,8 @@ export interface AggregatedPrice {
     weight: number;
     isStale: boolean;
     latencyMs: number;
+    sourceTimestamp: number | null;
+    receivedTimestamp: number;
   }[];
   confidence: number; // 0-1, based on number of active feeds
 }
@@ -105,7 +109,8 @@ export class PriceAggregator extends EventEmitter {
 
     const currentFeed = this.feeds.get(ticker.exchange)!;
     currentFeed.ticker = ticker;
-    currentFeed.lastUpdate = Date.now();
+    currentFeed.tickerReceivedAt = Date.now();
+    currentFeed.lastUpdate = currentFeed.tickerReceivedAt;
     currentFeed.isStale = false;
 
     this.emit("ticker", ticker);
@@ -123,7 +128,8 @@ export class PriceAggregator extends EventEmitter {
 
     const currentFeed = this.feeds.get(orderbook.exchange)!;
     currentFeed.orderbook = orderbook;
-    currentFeed.lastUpdate = Date.now();
+    currentFeed.orderbookReceivedAt = Date.now();
+    currentFeed.lastUpdate = currentFeed.orderbookReceivedAt;
     currentFeed.isStale = false;
 
     this.emit("orderbook", orderbook);
@@ -211,6 +217,12 @@ export class PriceAggregator extends EventEmitter {
         weight: feed.weight,
         isStale,
         latencyMs,
+        sourceTimestamp: Number.isSafeInteger(feed.ticker?.timestamp)
+          ? feed.ticker!.timestamp
+          : Number.isSafeInteger(feed.orderbook?.timestamp) ? feed.orderbook!.timestamp : null,
+        receivedTimestamp: feed.ticker
+          ? feed.tickerReceivedAt ?? feed.lastUpdate
+          : feed.orderbookReceivedAt ?? feed.lastUpdate,
       });
     }
 

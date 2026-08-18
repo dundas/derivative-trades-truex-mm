@@ -104,6 +104,21 @@ describe('TrueXPostgreSQLManager', () => {
       expect(sql).toContain('idx_quote_lifecycle_quote_ts');
       expect(sql).not.toContain('ALTER TABLE fills ADD COLUMN');
     });
+
+    it('adds restart-safe reference decision, work, and immutable evidence storage', async () => {
+      await pgManager.initialize();
+      const sql = mockDb.query.mock.calls.map(([query]) => String(query)).join('\n');
+      expect(sql).toContain('CREATE TABLE IF NOT EXISTS reference_quote_decisions');
+      expect(sql).toContain('CREATE TABLE IF NOT EXISTS reference_market_observations');
+      expect(sql).toContain('CREATE TABLE IF NOT EXISTS fill_reference_markout_work');
+      expect(sql).toContain('CREATE TABLE IF NOT EXISTS fill_reference_markout_evidence');
+      expect(sql).toContain("CHECK (state IN ('pending', 'claimed', 'completed'))");
+      expect(sql).toContain('idx_reference_markout_due');
+      expect(sql).toContain('CREATE INDEX IF NOT EXISTS idx_reference_market_selector_v2');
+      expect(sql).toContain('(product, quote_currency, source_exchange, source_type, observation_timestamp');
+      expect(sql).toContain('CREATE INDEX IF NOT EXISTS idx_reference_market_retention_v2');
+      expect(sql).toContain('(received_timestamp, observation_timestamp)');
+    });
     
     it('should create TrueX-specific schema', async () => {
       await pgManager.initialize();
@@ -144,6 +159,113 @@ describe('TrueXPostgreSQLManager', () => {
       mockDb.query.mockRejectedValueOnce(new Error('isolated db unavailable'));
       await expect(pgManager.recordQuoteLifecycleEvent(event)).rejects.toThrow('isolated db unavailable');
       expect(mockLogger.warn).toHaveBeenCalledWith(expect.stringContaining('quote telemetry write failed'));
+    });
+  });
+
+  describe('reference mark-out persistence', () => {
+    const decision = {
+      eventId: 'event-1', decisionTimestamp: 1000, sessionId: 's-1', quoteId: 'Q-1',
+      symbol: 'BTC-PYUSD', side: 'buy', level: 1, policyId: 'maker-v1', price: 100,
+      size: 0.1, product: 'BTC-USD', quoteCurrency: 'USD', sourceExchange: 'coinbase',
+      sourceType: 'top-of-book', sourceTimestamp: 990, receivedTimestamp: 995,
+      bid: 99, ask: 101, midpoint: 100, basisTimestamp: 990, basisPrice: 1,
+      basisAdjustmentBps: 0, available: true, unavailableReason: null,
+    };
+
+    it('stores decisions and schedules every horizon idempotently', async () => {
+      await pgManager.recordReferenceQuoteDecision(decision);
+      expect(mockDb.query).toHaveBeenLastCalledWith(
+        expect.stringContaining('ON CONFLICT (decision_id) DO NOTHING'),
+        expect.arrayContaining(['event-1', 'Q-1', 'BTC-USD']),
+      );
+      await pgManager.scheduleReferenceMarkouts({
+        fillId: 'F-1', executionId: 'E-1', quoteId: 'Q-1', sessionId: 's-1',
+        fillTimestamp: 2000, decisionTimestamp: 1000, side: 'buy', level: 1,
+        policyId: 'maker-v1', price: 100, size: 0.1, product: 'BTC-USD',
+        quoteCurrency: 'USD', sourceExchange: 'coinbase', sourceType: 'top-of-book',
+        horizonsMs: [60_000, 300_000], dueTimestamps: [62_000, 302_000],
+        deadlineTimestamps: [92_000, 332_000],
+      });
+      expect(mockDb.query).toHaveBeenLastCalledWith(
+        expect.stringContaining('ON CONFLICT (fill_id, horizon_ms) DO NOTHING'),
+        expect.arrayContaining([[60_000, 300_000], [62_000, 302_000]]),
+      );
+    });
+
+    it('claims due work atomically with expired-lease recovery and skip-locked overlap safety', async () => {
+      mockDb.query.mockResolvedValueOnce({ rows: [{
+        fill_id: 'F-1', horizon_ms: '60000', fill_timestamp: '2000', due_timestamp: '62000',
+        deadline_timestamp: '92000', fill_price: '100', fill_size: '0.1', level: 1,
+      }] });
+      const rows = await pgManager.claimDueReferenceMarkouts({
+        now: 62_001, claimToken: 'owner-1', leaseMs: 5000, batchSize: 10,
+      });
+      expect(mockDb.query).toHaveBeenLastCalledWith(
+        expect.stringMatching(/session_id = work\.session_id[\s\S]*FOR UPDATE OF work SKIP LOCKED[\s\S]*state = 'claimed'/),
+        [62_001, 10, 'owner-1', 5000],
+      );
+      expect(rows[0]).toMatchObject({ fillId: 'F-1', horizonMs: 60_000, dueTimestamp: 62_000 });
+    });
+
+    it('persists immutable market samples and selects the earliest sample in the due window', async () => {
+      await pgManager.recordReferenceMarketObservation({ ...decision, observationTimestamp: 995 });
+      const firstObservationId = mockDb.query.mock.calls.at(-1)[1][0];
+      await pgManager.recordReferenceMarketObservation({ ...decision, observationTimestamp: 996 });
+      const secondObservationId = mockDb.query.mock.calls.at(-1)[1][0];
+      expect(firstObservationId).not.toBe(secondObservationId);
+      expect(mockDb.query).toHaveBeenLastCalledWith(
+        expect.stringContaining('ON CONFLICT (observation_id) DO NOTHING'),
+        expect.arrayContaining(['BTC-USD', 990, 995]),
+      );
+      mockDb.query.mockResolvedValueOnce({ rows: [{
+        observation_timestamp: '995', product: 'BTC-USD', quote_currency: 'USD',
+        source_exchange: 'coinbase', source_type: 'top-of-book', source_timestamp: '990',
+        received_timestamp: '995', bid: '99', ask: '101', midpoint: '100',
+        basis_timestamp: '990', basis_price: '1', basis_adjustment_bps: '0',
+      }] });
+      const sample = await pgManager.getFirstReferenceMarketObservation({
+        dueTimestamp: 980, deadlineTimestamp: 1000, product: 'BTC-USD',
+        quoteCurrency: 'USD', sourceExchange: 'coinbase', sourceType: 'top-of-book',
+        maxSourceAgeMs: 100, maxAbsBasisAdjustmentBps: 25,
+      });
+      expect(mockDb.query).toHaveBeenLastCalledWith(
+        expect.stringMatching(/observation_timestamp <= \$6[\s\S]*observation_timestamp >= 0 AND source_timestamp >= 0[\s\S]*received_timestamp >= 0 AND basis_timestamp >= 0[\s\S]*bid::text NOT IN \('NaN', 'Infinity', '-Infinity'\)[\s\S]*ask::text NOT IN \('NaN', 'Infinity', '-Infinity'\)[\s\S]*midpoint::text NOT IN \('NaN', 'Infinity', '-Infinity'\)[\s\S]*basis_price::text NOT IN \('NaN', 'Infinity', '-Infinity'\)[\s\S]*basis_adjustment_bps::text NOT IN \('NaN', 'Infinity', '-Infinity'\)[\s\S]*bid > 0 AND ask > 0 AND bid <= ask[\s\S]*basis_price > 0[\s\S]*source_timestamp <= received_timestamp[\s\S]*received_timestamp <= observation_timestamp[\s\S]*basis_timestamp <= observation_timestamp[\s\S]*ABS\(basis_adjustment_bps\) <= \$8[\s\S]*ORDER BY observation_timestamp ASC,[\s\S]*GREATEST\(source_timestamp, received_timestamp, basis_timestamp\) ASC/),
+        ['BTC-USD', 'USD', 'coinbase', 'top-of-book', 980, 1000, 100, 25],
+      );
+      expect(sample).toMatchObject({ available: true, sourceTimestamp: 990, receivedTimestamp: 995 });
+    });
+
+    it('binds release and terminal evidence completion to the claim owner', async () => {
+      await pgManager.releaseReferenceMarkoutClaim({ fillId: 'F-1', horizonMs: 60_000 }, 'owner-1', 'before-due');
+      expect(mockDb.query).toHaveBeenLastCalledWith(
+        expect.stringContaining("state = 'claimed' AND claim_token = $3"),
+        ['F-1', 60_000, 'owner-1', 'before-due'],
+      );
+      await pgManager.completeReferenceMarkout(
+        { fillId: 'F-1', horizonMs: 60_000 }, 'owner-1',
+        { ...decision, observationTimestamp: 62_001 },
+      );
+      const sql = String(mockDb.query.mock.calls.at(-1)[0]);
+      expect(sql).toContain('INSERT INTO fill_reference_markout_evidence');
+      expect(sql).toContain("state = 'claimed' AND claim_token = $3");
+      expect(sql).toContain("SET state = 'completed'");
+    });
+
+    it('prunes only terminal evidence and returns a bounded grouped coverage audit', async () => {
+      await pgManager.pruneReferenceMarkoutEvidence(1000);
+      const pruneSql = String(mockDb.query.mock.calls.at(-1)[0]);
+      expect(pruneSql).toContain("work.state = 'completed'");
+      expect(pruneSql).toContain("WHERE state = 'completed'");
+      await pgManager.pruneReferenceQuoteDecisions(1000);
+      expect(mockDb.query).toHaveBeenLastCalledWith(expect.stringContaining("work.state <> 'completed'"), [1000]);
+      await pgManager.pruneReferenceMarketObservations(1000);
+      expect(mockDb.query).toHaveBeenLastCalledWith(
+        expect.stringMatching(/work\.state <> 'completed'[\s\S]*observation\.observation_timestamp BETWEEN work\.due_timestamp AND work\.deadline_timestamp/),
+        [1000],
+      );
+      const audit = await pgManager.getReferenceMarkoutCoverage({ fromTimestamp: 1, toTimestamp: 2, limit: 5000 });
+      expect(mockDb.query).toHaveBeenLastCalledWith(expect.stringContaining('availability_reason'), [1, 2, 1001]);
+      expect(audit).toEqual({ groups: [], truncated: false, limit: 1000 });
     });
   });
   
