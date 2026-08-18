@@ -173,6 +173,130 @@ export class TrueXPostgreSQLManager {
         await this.db.query(`CREATE INDEX IF NOT EXISTS idx_quote_lifecycle_type_ts ON quote_lifecycle_events(event_type, event_timestamp DESC)`);
         await this.db.query(`ALTER TABLE quote_lifecycle_events ADD COLUMN IF NOT EXISTS policy_vector JSONB`);
 
+        await this.db.query(`
+          CREATE TABLE IF NOT EXISTS reference_quote_decisions (
+            decision_id TEXT PRIMARY KEY,
+            event_id TEXT,
+            decision_timestamp BIGINT NOT NULL,
+            session_id TEXT,
+            quote_id TEXT NOT NULL,
+            symbol TEXT,
+            side TEXT,
+            level INTEGER,
+            policy_id TEXT,
+            quote_price NUMERIC,
+            quote_size NUMERIC,
+            product TEXT NOT NULL,
+            quote_currency TEXT NOT NULL,
+            source_exchange TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            source_timestamp BIGINT,
+            received_timestamp BIGINT,
+            bid NUMERIC,
+            ask NUMERIC,
+            midpoint NUMERIC,
+            basis_timestamp BIGINT,
+            basis_price NUMERIC,
+            basis_adjustment_bps NUMERIC,
+            observed_edge_bps NUMERIC,
+            available BOOLEAN NOT NULL,
+            unavailable_reason TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+          )
+        `);
+        await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_decision_quote_ts ON reference_quote_decisions(quote_id, decision_timestamp DESC)`);
+        await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_decision_session_quote_ts ON reference_quote_decisions(session_id, quote_id, decision_timestamp DESC)`);
+
+        await this.db.query(`
+          CREATE TABLE IF NOT EXISTS reference_market_observations (
+            observation_id TEXT PRIMARY KEY,
+            observation_timestamp BIGINT NOT NULL,
+            product TEXT NOT NULL,
+            quote_currency TEXT NOT NULL,
+            source_exchange TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            source_timestamp BIGINT NOT NULL,
+            received_timestamp BIGINT NOT NULL,
+            bid NUMERIC NOT NULL,
+            ask NUMERIC NOT NULL,
+            midpoint NUMERIC NOT NULL,
+            basis_timestamp BIGINT NOT NULL,
+            basis_price NUMERIC NOT NULL,
+            basis_adjustment_bps NUMERIC NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+          )
+        `);
+        await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_market_window ON reference_market_observations(product, quote_currency, source_exchange, source_type, source_timestamp, received_timestamp)`);
+        // New names are intentional migration hooks: changing the definition of
+        // idx_reference_market_window in place would be ignored by IF NOT EXISTS
+        // on databases that already created the original index.
+        await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_market_selector_v2 ON reference_market_observations(product, quote_currency, source_exchange, source_type, observation_timestamp, source_timestamp, received_timestamp, basis_timestamp)`);
+        await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_market_retention_v2 ON reference_market_observations(received_timestamp, observation_timestamp)`);
+
+        await this.db.query(`
+          CREATE TABLE IF NOT EXISTS fill_reference_markout_work (
+            fill_id TEXT NOT NULL,
+            horizon_ms BIGINT NOT NULL,
+            execution_id TEXT,
+            quote_id TEXT,
+            session_id TEXT,
+            fill_timestamp BIGINT NOT NULL,
+            decision_timestamp BIGINT,
+            side TEXT,
+            level INTEGER,
+            policy_id TEXT,
+            fill_price NUMERIC,
+            fill_size NUMERIC,
+            product TEXT NOT NULL,
+            quote_currency TEXT NOT NULL,
+            source_exchange TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            due_timestamp BIGINT NOT NULL,
+            deadline_timestamp BIGINT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'claimed', 'completed')),
+            claim_token TEXT,
+            claim_expires_at BIGINT,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            last_unavailable_reason TEXT,
+            completed_at BIGINT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (fill_id, horizon_ms)
+          )
+        `);
+        await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_markout_due ON fill_reference_markout_work(state, due_timestamp, claim_expires_at)`);
+        await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_markout_grouping ON fill_reference_markout_work(side, level, policy_id, horizon_ms)`);
+
+        await this.db.query(`
+          CREATE TABLE IF NOT EXISTS fill_reference_markout_evidence (
+            fill_id TEXT NOT NULL,
+            horizon_ms BIGINT NOT NULL,
+            observation_timestamp BIGINT NOT NULL,
+            product TEXT NOT NULL,
+            quote_currency TEXT NOT NULL,
+            source_exchange TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            source_timestamp BIGINT,
+            received_timestamp BIGINT,
+            bid NUMERIC,
+            ask NUMERIC,
+            midpoint NUMERIC,
+            basis_timestamp BIGINT,
+            basis_price NUMERIC,
+            basis_adjustment_bps NUMERIC,
+            adjusted_midpoint NUMERIC,
+            observed_edge_bps NUMERIC,
+            available BOOLEAN NOT NULL,
+            unavailable_reason TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (fill_id, horizon_ms),
+            FOREIGN KEY (fill_id, horizon_ms)
+              REFERENCES fill_reference_markout_work(fill_id, horizon_ms)
+          )
+        `);
+        await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_evidence_availability ON fill_reference_markout_evidence(available, unavailable_reason)`);
+        await this.db.query(`ALTER TABLE fill_reference_markout_evidence ADD COLUMN IF NOT EXISTS observed_edge_bps NUMERIC`);
+        await this.db.query(`ALTER TABLE fill_reference_markout_evidence ADD COLUMN IF NOT EXISTS adjusted_midpoint NUMERIC`);
+
         // Create index on exec_id for fills deduplication
         await this.db.query(`
           CREATE INDEX IF NOT EXISTS idx_fills_execid 
@@ -226,6 +350,275 @@ export class TrueXPostgreSQLManager {
   async pruneQuoteLifecycleEventsBefore(cutoffTimestamp) {
     if (!Number.isFinite(cutoffTimestamp)) throw new Error('cutoffTimestamp must be a finite epoch millisecond value');
     return this.db.query('DELETE FROM quote_lifecycle_events WHERE event_timestamp < $1', [cutoffTimestamp]);
+  }
+
+  async recordReferenceQuoteDecision(decision) {
+    const decisionId = decision.eventId ||
+      `${decision.sessionId || 'unknown'}:${decision.quoteId}:${decision.decisionTimestamp}`;
+    return this.db.query(`INSERT INTO reference_quote_decisions (
+      decision_id, event_id, decision_timestamp, session_id, quote_id, symbol, side, level,
+      policy_id, quote_price, quote_size, product, quote_currency, source_exchange, source_type,
+      source_timestamp, received_timestamp, bid, ask, midpoint, basis_timestamp, basis_price,
+      basis_adjustment_bps, available, unavailable_reason
+    ) VALUES (${Array.from({ length: 25 }, (_, index) => `$${index + 1}`).join(',')})
+    ON CONFLICT (decision_id) DO NOTHING`, [
+      decisionId, decision.eventId || null, decision.decisionTimestamp, decision.sessionId || null,
+      decision.quoteId, decision.symbol || null, decision.side || null, decision.level ?? null,
+      decision.policyId || null, decision.price ?? null, decision.size ?? null, decision.product,
+      decision.quoteCurrency, decision.sourceExchange, decision.sourceType,
+      decision.sourceTimestamp, decision.receivedTimestamp, decision.bid, decision.ask,
+      decision.midpoint, decision.basisTimestamp, decision.basisPrice,
+      decision.basisAdjustmentBps, decision.available, decision.unavailableReason,
+    ]);
+  }
+
+  async scheduleReferenceMarkouts(fill) {
+    const count = fill.horizonsMs.length;
+    const repeat = value => Array(count).fill(value ?? null);
+    const result = await this.db.query(`WITH input AS (
+      SELECT * FROM UNNEST(
+        $1::text[], $2::bigint[], $3::text[], $4::text[], $5::text[], $6::bigint[],
+        $7::bigint[], $8::text[], $9::integer[], $10::text[], $11::numeric[],
+        $12::numeric[], $13::text[], $14::text[], $15::text[], $16::text[],
+        $17::bigint[], $18::bigint[]
+      ) AS row(fill_id, horizon_ms, execution_id, quote_id, session_id, fill_timestamp,
+        decision_timestamp, side, level, policy_id, fill_price, fill_size, product,
+        quote_currency, source_exchange, source_type, due_timestamp, deadline_timestamp)
+    ) INSERT INTO fill_reference_markout_work (
+      fill_id, horizon_ms, execution_id, quote_id, session_id, fill_timestamp,
+      decision_timestamp, side, level, policy_id, fill_price, fill_size, product,
+      quote_currency, source_exchange, source_type, due_timestamp, deadline_timestamp
+    ) SELECT input.fill_id, input.horizon_ms, input.execution_id, input.quote_id,
+      input.session_id, input.fill_timestamp,
+      COALESCE(input.decision_timestamp, decision.decision_timestamp), input.side, input.level,
+      COALESCE(input.policy_id, decision.policy_id), input.fill_price, input.fill_size,
+      input.product, input.quote_currency, input.source_exchange, input.source_type,
+      input.due_timestamp, input.deadline_timestamp
+    FROM input
+    LEFT JOIN LATERAL (
+      SELECT decision_timestamp, policy_id FROM reference_quote_decisions
+      WHERE session_id = input.session_id AND quote_id = input.quote_id
+        AND decision_timestamp <= input.fill_timestamp
+      ORDER BY decision_timestamp DESC LIMIT 1
+    ) decision ON TRUE
+    ON CONFLICT (fill_id, horizon_ms) DO NOTHING`, [
+      repeat(fill.fillId), fill.horizonsMs, repeat(fill.executionId), repeat(fill.quoteId),
+      repeat(fill.sessionId), repeat(fill.fillTimestamp), repeat(fill.decisionTimestamp),
+      repeat(fill.side), repeat(fill.level), repeat(fill.policyId), repeat(fill.price),
+      repeat(fill.size), repeat(fill.product), repeat(fill.quoteCurrency),
+      repeat(fill.sourceExchange), repeat(fill.sourceType), fill.dueTimestamps,
+      fill.deadlineTimestamps,
+    ]);
+    return result.rowCount ?? 0;
+  }
+
+  async recordReferenceMarketObservation(observation) {
+    const observationId = [
+      observation.sourceExchange, observation.product, observation.observationTimestamp,
+      observation.sourceTimestamp,
+      observation.receivedTimestamp, observation.bid, observation.ask,
+      observation.basisTimestamp, observation.basisPrice,
+    ].join(':');
+    const result = await this.db.query(`INSERT INTO reference_market_observations (
+      observation_id, observation_timestamp, product, quote_currency, source_exchange,
+      source_type, source_timestamp, received_timestamp, bid, ask, midpoint,
+      basis_timestamp, basis_price, basis_adjustment_bps
+    ) VALUES (${Array.from({ length: 14 }, (_, index) => `$${index + 1}`).join(',')})
+    ON CONFLICT (observation_id) DO NOTHING`, [
+      observationId, observation.observationTimestamp, observation.product,
+      observation.quoteCurrency, observation.sourceExchange, observation.sourceType,
+      observation.sourceTimestamp, observation.receivedTimestamp, observation.bid,
+      observation.ask, observation.midpoint, observation.basisTimestamp,
+      observation.basisPrice, observation.basisAdjustmentBps,
+    ]);
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  async getFirstReferenceMarketObservation({ dueTimestamp, deadlineTimestamp, product,
+    quoteCurrency, sourceExchange, sourceType, maxSourceAgeMs, maxAbsBasisAdjustmentBps }) {
+    const result = await this.db.query(`SELECT * FROM reference_market_observations
+      WHERE product = $1 AND quote_currency = $2 AND source_exchange = $3 AND source_type = $4
+        AND observation_timestamp >= $5 AND observation_timestamp <= $6
+        AND observation_timestamp >= 0 AND source_timestamp >= 0
+        AND received_timestamp >= 0 AND basis_timestamp >= 0
+        AND bid::text NOT IN ('NaN', 'Infinity', '-Infinity')
+        AND ask::text NOT IN ('NaN', 'Infinity', '-Infinity')
+        AND midpoint::text NOT IN ('NaN', 'Infinity', '-Infinity')
+        AND basis_price::text NOT IN ('NaN', 'Infinity', '-Infinity')
+        AND basis_adjustment_bps::text NOT IN ('NaN', 'Infinity', '-Infinity')
+        AND bid > 0 AND ask > 0 AND bid <= ask AND midpoint > 0
+        AND basis_price > 0
+        AND source_timestamp <= received_timestamp
+        AND received_timestamp <= observation_timestamp
+        AND source_timestamp <= observation_timestamp
+        AND basis_timestamp <= observation_timestamp
+        AND observation_timestamp - source_timestamp <= $7
+        AND observation_timestamp - basis_timestamp <= $7
+        AND ABS(basis_adjustment_bps) <= $8
+      ORDER BY observation_timestamp ASC,
+        GREATEST(source_timestamp, received_timestamp, basis_timestamp) ASC,
+        observation_id ASC
+      LIMIT 1`, [product, quoteCurrency, sourceExchange, sourceType, dueTimestamp,
+      deadlineTimestamp, maxSourceAgeMs, maxAbsBasisAdjustmentBps]);
+    const row = result.rows?.[0];
+    if (!row) return null;
+    return {
+      available: true, unavailableReason: null,
+      observationTimestamp: Number(row.observation_timestamp), product: row.product,
+      quoteCurrency: row.quote_currency, sourceExchange: row.source_exchange,
+      sourceType: row.source_type, sourceTimestamp: Number(row.source_timestamp),
+      receivedTimestamp: Number(row.received_timestamp), bid: Number(row.bid),
+      ask: Number(row.ask), midpoint: Number(row.midpoint),
+      basisTimestamp: Number(row.basis_timestamp), basisPrice: Number(row.basis_price),
+      basisAdjustmentBps: Number(row.basis_adjustment_bps),
+    };
+  }
+
+  async claimDueReferenceMarkouts({ now, claimToken, leaseMs, batchSize }) {
+    const result = await this.db.query(`WITH candidates AS (
+      SELECT work.fill_id, work.horizon_ms,
+        COALESCE(work.decision_timestamp, decision.decision_timestamp) AS recovered_decision_timestamp,
+        COALESCE(work.policy_id, decision.policy_id) AS recovered_policy_id
+      FROM fill_reference_markout_work work
+      LEFT JOIN LATERAL (
+        SELECT decision_timestamp, policy_id FROM reference_quote_decisions
+        WHERE session_id = work.session_id AND quote_id = work.quote_id
+          AND decision_timestamp <= work.fill_timestamp
+        ORDER BY decision_timestamp DESC LIMIT 1
+      ) decision ON TRUE
+      WHERE due_timestamp <= $1
+        AND (state = 'pending' OR (state = 'claimed' AND claim_expires_at <= $1))
+      ORDER BY due_timestamp ASC, fill_id ASC, horizon_ms ASC
+      LIMIT $2
+      FOR UPDATE OF work SKIP LOCKED
+    )
+    UPDATE fill_reference_markout_work AS work
+    SET state = 'claimed', claim_token = $3, claim_expires_at = $1 + $4,
+        attempt_count = work.attempt_count + 1,
+        decision_timestamp = candidates.recovered_decision_timestamp,
+        policy_id = candidates.recovered_policy_id
+    FROM candidates
+    WHERE work.fill_id = candidates.fill_id AND work.horizon_ms = candidates.horizon_ms
+    RETURNING work.*`, [now, batchSize, claimToken, leaseMs]);
+    return (result.rows || []).map(row => ({
+      fillId: row.fill_id, horizonMs: Number(row.horizon_ms), executionId: row.execution_id,
+      quoteId: row.quote_id, sessionId: row.session_id, fillTimestamp: Number(row.fill_timestamp),
+      decisionTimestamp: row.decision_timestamp === null ? null : Number(row.decision_timestamp),
+      side: row.side, level: row.level, policyId: row.policy_id,
+      price: row.fill_price === null ? null : Number(row.fill_price),
+      size: row.fill_size === null ? null : Number(row.fill_size),
+      dueTimestamp: Number(row.due_timestamp), deadlineTimestamp: Number(row.deadline_timestamp),
+    }));
+  }
+
+  async releaseReferenceMarkoutClaim(work, claimToken, reason) {
+    const result = await this.db.query(`UPDATE fill_reference_markout_work
+      SET state = 'pending', claim_token = NULL, claim_expires_at = NULL,
+          last_unavailable_reason = $4
+      WHERE fill_id = $1 AND horizon_ms = $2 AND state = 'claimed' AND claim_token = $3`,
+    [work.fillId, work.horizonMs, claimToken, reason]);
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  async completeReferenceMarkout(work, claimToken, observation) {
+    const result = await this.db.query(`WITH eligible AS (
+      SELECT fill_id, horizon_ms FROM fill_reference_markout_work
+      WHERE fill_id = $1 AND horizon_ms = $2 AND state = 'claimed' AND claim_token = $3
+      FOR UPDATE
+    ), inserted AS (
+      INSERT INTO fill_reference_markout_evidence (
+        fill_id, horizon_ms, observation_timestamp, product, quote_currency,
+        source_exchange, source_type, source_timestamp, received_timestamp, bid, ask,
+        midpoint, basis_timestamp, basis_price, basis_adjustment_bps, adjusted_midpoint,
+        observed_edge_bps, available, unavailable_reason
+      ) SELECT $1,$2,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20
+        FROM eligible
+      ON CONFLICT (fill_id, horizon_ms) DO NOTHING
+    )
+    UPDATE fill_reference_markout_work AS work
+    SET state = 'completed', completed_at = $4, claim_token = NULL, claim_expires_at = NULL,
+        last_unavailable_reason = $20
+    FROM eligible
+    WHERE work.fill_id = eligible.fill_id AND work.horizon_ms = eligible.horizon_ms
+    RETURNING work.fill_id`, [
+      work.fillId, work.horizonMs, claimToken, observation.observationTimestamp,
+      observation.product, observation.quoteCurrency, observation.sourceExchange,
+      observation.sourceType, observation.sourceTimestamp, observation.receivedTimestamp,
+      observation.bid, observation.ask, observation.midpoint, observation.basisTimestamp,
+      observation.basisPrice, observation.basisAdjustmentBps, observation.adjustedMidpoint,
+      observation.observedEdgeBps, observation.available,
+      observation.unavailableReason,
+    ]);
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  async pruneReferenceMarkoutEvidence(cutoffTimestamp) {
+    if (!Number.isFinite(cutoffTimestamp)) throw new Error('cutoffTimestamp must be finite');
+    return this.db.query(`WITH deleted_evidence AS (
+      DELETE FROM fill_reference_markout_evidence evidence
+      USING fill_reference_markout_work work
+      WHERE evidence.fill_id = work.fill_id AND evidence.horizon_ms = work.horizon_ms
+        AND work.state = 'completed' AND work.completed_at < $1
+    ) DELETE FROM fill_reference_markout_work
+      WHERE state = 'completed' AND completed_at < $1`, [cutoffTimestamp]);
+  }
+
+  async pruneReferenceQuoteDecisions(cutoffTimestamp) {
+    if (!Number.isFinite(cutoffTimestamp)) throw new Error('cutoffTimestamp must be finite');
+    return this.db.query(`DELETE FROM reference_quote_decisions decision
+      WHERE decision.decision_timestamp < $1
+        AND NOT EXISTS (
+          SELECT 1 FROM fill_reference_markout_work work
+          WHERE work.state <> 'completed' AND work.session_id = decision.session_id
+            AND work.quote_id = decision.quote_id
+        )`, [cutoffTimestamp]);
+  }
+
+  async pruneReferenceMarketObservations(cutoffTimestamp) {
+    if (!Number.isFinite(cutoffTimestamp)) throw new Error('cutoffTimestamp must be finite');
+    return this.db.query(`DELETE FROM reference_market_observations observation
+      WHERE observation.received_timestamp < $1
+        AND NOT EXISTS (
+          SELECT 1 FROM fill_reference_markout_work work
+          WHERE work.state <> 'completed'
+            AND observation.observation_timestamp BETWEEN work.due_timestamp AND work.deadline_timestamp
+        )`, [cutoffTimestamp]);
+  }
+
+  async getReferenceMarkoutCoverage({ fromTimestamp, toTimestamp, limit = 100 } = {}) {
+    const boundedLimit = Math.max(1, Math.min(Number(limit) || 100, 1000));
+    const result = await this.db.query(`WITH classified AS (
+      SELECT work.side, work.level, work.policy_id, work.horizon_ms,
+        CASE
+          WHEN evidence.fill_id IS NOT NULL AND evidence.available THEN 'available'
+          WHEN evidence.fill_id IS NOT NULL THEN 'unavailable'
+          WHEN work.state = 'claimed' THEN 'claimed'
+          ELSE 'pending'
+        END AS availability_status,
+        CASE
+          WHEN evidence.fill_id IS NOT NULL AND evidence.available THEN 'available'
+          WHEN evidence.fill_id IS NOT NULL THEN COALESCE(evidence.unavailable_reason, 'unavailable-unspecified')
+          WHEN work.last_unavailable_reason IS NOT NULL THEN work.last_unavailable_reason
+          WHEN work.state = 'claimed' THEN 'claim-in-progress'
+          ELSE 'awaiting-horizon'
+        END AS availability_reason
+      FROM fill_reference_markout_work work
+      LEFT JOIN fill_reference_markout_evidence evidence
+        ON evidence.fill_id = work.fill_id AND evidence.horizon_ms = work.horizon_ms
+      WHERE ($1::bigint IS NULL OR work.fill_timestamp >= $1)
+        AND ($2::bigint IS NULL OR work.fill_timestamp <= $2)
+    ) SELECT side, level, policy_id, horizon_ms, availability_status,
+      availability_reason, COUNT(*)::bigint AS observation_count
+      FROM classified
+      GROUP BY side, level, policy_id, horizon_ms, availability_status, availability_reason
+      ORDER BY side, level, policy_id, horizon_ms, availability_status, availability_reason
+      LIMIT $3`, [fromTimestamp ?? null, toTimestamp ?? null, boundedLimit + 1]);
+    const rows = result.rows || [];
+    return {
+      groups: rows.slice(0, boundedLimit),
+      truncated: rows.length > boundedLimit,
+      limit: boundedLimit,
+    };
   }
   
   /**

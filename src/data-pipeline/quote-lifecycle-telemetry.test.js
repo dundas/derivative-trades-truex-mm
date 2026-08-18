@@ -35,6 +35,16 @@ describe('QuoteLifecycleTelemetry', () => {
     const event = await telemetry.record({ eventType: 'cancel', quoteId: 'Q-3', context: { fairValue: undefined, truexEbbo: null } });
     expect(event.context.fairValue).toBeNull();
     expect(event.context.truexEbbo).toBeNull();
+    expect(event.context.coinbase).toBeNull();
+  });
+
+  test('does not coerce absent source timestamps to epoch zero', async () => {
+    const telemetry = new QuoteLifecycleTelemetry({ now: () => 3000 });
+    const event = await telemetry.record({
+      eventType: 'create', quoteId: 'Q-no-source-time',
+      context: { coinbase: { bestBid: 99, bestAsk: 101, timestamp: null } },
+    });
+    expect(event.context.coinbase.timestamp).toBeNull();
   });
 
   test('generates distinct ids for legitimate events in the same millisecond', async () => {

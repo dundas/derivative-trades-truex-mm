@@ -342,7 +342,8 @@ export class CoinbaseWsIngest {
     if (type === 'ticker') {
       const symbol = mapFromCoinbaseProductId(msg.product_id);
       if (this.onTicker) {
-        const ts = new Date(msg.time || Date.now()).getTime();
+        const parsedTimestamp = msg.time ? new Date(msg.time).getTime() : null;
+        const ts = Number.isSafeInteger(parsedTimestamp) ? parsedTimestamp : null;
         this.onTicker(symbol, {
           bid: Number(msg.best_bid),
           ask: Number(msg.best_ask),
@@ -354,5 +355,4 @@ export class CoinbaseWsIngest {
     }
   }
 }
-
 

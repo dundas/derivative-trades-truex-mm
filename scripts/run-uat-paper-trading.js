@@ -245,7 +245,8 @@ async function main() {
           bid: bids[0][0],
           ask: asks[0][0],
           last: (bids[0][0] + asks[0][0]) / 2,
-          timestamp: Date.now(),
+          // Coinbase level2 snapshots do not carry an exchange timestamp.
+          timestamp: null,
         });
       }
     },

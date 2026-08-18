@@ -45,12 +45,15 @@ export class QuoteLifecycleTelemetry {
   }
 
   _normalize(input) {
-    const numberOrNull = value => Number.isFinite(Number(value)) ? Number(value) : null;
+    const numberOrNull = value =>
+      value === null || value === undefined || value === '' ? null :
+        Number.isFinite(Number(value)) ? Number(value) : null;
     const allowBook = book => book ? {
       bestBid: numberOrNull(book.bestBid), bestAsk: numberOrNull(book.bestAsk),
       bestBidSize: numberOrNull(book.bestBidSize ?? book.bestBidQty),
       bestAskSize: numberOrNull(book.bestAskSize ?? book.bestAskQty),
       timestamp: numberOrNull(book.timestamp),
+      receivedTimestamp: numberOrNull(book.receivedTimestamp),
     } : null;
     return {
       schemaVersion: '1.0', eventId: input.eventId, eventType: input.eventType,

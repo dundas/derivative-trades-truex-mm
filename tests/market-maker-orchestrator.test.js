@@ -1708,16 +1708,58 @@ describe('MarketMakerOrchestrator', () => {
       orchestrator.lastAggregatedPrice = {
         timestamp: 1000,
         weightedMidpoint: 100,
-        sources: [{ exchange: 'coinbase', bid: 99.5, ask: 100.5 }],
+        sources: [{ exchange: 'coinbase', bid: 99.5, ask: 100.5, sourceTimestamp: 995, receivedTimestamp: 999 }],
       };
 
       orchestrator._onQuoteLifecycle({ eventType: 'create', quoteId: 'Q-telemetry', side: 'buy' });
 
       expect(quoteTelemetry.record).toHaveBeenCalledWith(expect.objectContaining({
         context: expect.objectContaining({
-          coinbase: expect.objectContaining({ bestBid: 99.5, bestAsk: 100.5, timestamp: 1000 }),
+          coinbase: expect.objectContaining({
+            bestBid: 99.5, bestAsk: 100.5, timestamp: 995, receivedTimestamp: 999,
+          }),
         }),
       }));
+    });
+
+    test('binds, starts, and stops the fail-soft reference collector with pipeline PostgreSQL', async () => {
+      const pgManager = {};
+      const dataPipeline = createMockDataPipeline();
+      dataPipeline.pgManager = pgManager;
+      const referenceMarkoutCollector = {
+        writer: null, setWriter: jest.fn(function setWriter(writer) { this.writer = writer; }),
+        start: jest.fn(), stop: jest.fn(), getStats: jest.fn(() => ({ running: true })),
+        recordQuoteDecision: jest.fn(async () => true), scheduleFill: jest.fn(async () => true),
+      };
+      const { orchestrator } = createOrchestrator({ dataPipeline, referenceMarkoutCollector });
+      await orchestrator.start();
+      expect(referenceMarkoutCollector.setWriter).toHaveBeenCalledWith(pgManager);
+      expect(referenceMarkoutCollector.start).toHaveBeenCalledTimes(1);
+      expect(orchestrator.getStatus().referenceMarkouts).toEqual({ running: true });
+      await orchestrator.stop();
+      expect(referenceMarkoutCollector.stop).toHaveBeenCalledTimes(1);
+    });
+
+    test('records decisions and schedules fill horizons without dispatching an order', () => {
+      const referenceMarkoutCollector = {
+        writer: {}, recordQuoteDecision: jest.fn(async () => true),
+        scheduleFill: jest.fn(async () => true), getStats: jest.fn(() => ({})),
+      };
+      const quoteTelemetry = { writer: {}, policyId: 'maker-v1', record: jest.fn(async () => ({})) };
+      const { orchestrator, mocks } = createOrchestrator({ referenceMarkoutCollector, quoteTelemetry });
+      orchestrator.lastAggregatedPrice = {
+        sources: [{ exchange: 'coinbase', bid: 99, ask: 101, sourceTimestamp: 900, receivedTimestamp: 950 }],
+      };
+      orchestrator._onQuoteLifecycle({ eventType: 'create', quoteId: 'Q-1', side: 'buy', level: 1 });
+      orchestrator._onQuoteLifecycle({
+        eventType: 'full_fill', quoteId: 'Q-1', executionId: 'E-1',
+        side: 'buy', level: 1, price: 100, size: 0.01,
+      });
+      expect(referenceMarkoutCollector.recordQuoteDecision).toHaveBeenCalledTimes(1);
+      expect(referenceMarkoutCollector.scheduleFill).toHaveBeenCalledWith(expect.objectContaining({
+        fillId: 'Q-1-E-1', quoteId: 'Q-1', executionId: 'E-1', policyId: 'maker-v1',
+      }));
+      expect(mocks.fixConnection.sendMessage).not.toHaveBeenCalled();
     });
 
     test('calls dataPipeline.stop() on stop', async () => {
