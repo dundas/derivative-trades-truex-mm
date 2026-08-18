@@ -280,6 +280,402 @@ describe('MarketMakerOrchestrator strict startup reconciliation', () => {
     }
   });
 
+  test('strict startup verifies newly cancelled ACTIVE orphan terminal before succeeding', async () => {
+    let now = 0;
+    const getActiveOrders = mock()
+      .mockResolvedValueOnce([rawOrder('venue-active', 'prior-active', 'ACTIVE')])
+      .mockResolvedValueOnce([rawOrder('venue-active', 'prior-active', 'CANCEL_PENDING')])
+      .mockResolvedValueOnce([rawOrder('venue-active', 'prior-active', 'CANCELED')]);
+    const cancelOrder = mock(async () => {});
+    const orchestrator = makeStartupOrchestrator({
+      startupCancelVerifyTimeoutMs: 20,
+      startupCancelVerifyIntervalMs: 10,
+      now: () => now,
+      sleep: async (ms) => { now += ms; },
+    });
+    orchestrator.restClient = { getActiveOrders, cancelOrder };
+
+    const stats = await orchestrator._restReconcile({ allowPreStart: true, strict: true });
+    expect(cancelOrder).toHaveBeenCalledTimes(1);
+    expect(cancelOrder).toHaveBeenCalledWith('venue-active');
+    expect(getActiveOrders).toHaveBeenCalledTimes(3);
+    expect(stats).toMatchObject({ orphansCancelled: 1, ghostsRemoved: 0 });
+  });
+
+  test('strict startup aborts when newly cancelled orphan stays ACTIVE through the shared bound', async () => {
+    let now = 0;
+    const active = rawOrder('venue-active', 'prior-active', 'ACTIVE');
+    const orchestrator = makeStartupOrchestrator({
+      startupCancelVerifyTimeoutMs: 20,
+      startupCancelVerifyIntervalMs: 10,
+      now: () => now,
+      sleep: async (ms) => { now += ms; },
+    });
+    orchestrator.restClient = {
+      getActiveOrders: mock(async () => [active]),
+      cancelOrder: mock(async () => {}),
+    };
+
+    await expect(orchestrator._restReconcile({ allowPreStart: true, strict: true }))
+      .rejects.toThrow('orphan cancellation verification timed out');
+    expect(orchestrator.restClient.cancelOrder).toHaveBeenCalledTimes(1);
+    expect(orchestrator.restClient.getActiveOrders).toHaveBeenCalledTimes(3);
+  });
+
+  test('strict startup rejects mismatched, duplicate, or malformed targeted cancellation evidence', async () => {
+    const initial = rawOrder('venue-active', 'prior-active', 'ACTIVE');
+    const evidenceCases = [
+      [rawOrder('venue-active', 'different-external', 'CANCEL_PENDING')],
+      [
+        rawOrder('venue-active', 'prior-active', 'CANCEL_PENDING'),
+        rawOrder('venue-active', 'prior-active', 'CANCEL_PENDING'),
+      ],
+      [{ ...rawOrder('venue-active', 'prior-active', 'CANCEL_PENDING'), external_id: '' }],
+    ];
+    for (const evidence of evidenceCases) {
+      let now = 0;
+      const orchestrator = makeStartupOrchestrator({
+        startupCancelVerifyTimeoutMs: 20,
+        startupCancelVerifyIntervalMs: 10,
+        now: () => now,
+        sleep: async (ms) => { now += ms; },
+      });
+      orchestrator.restClient = {
+        getActiveOrders: mock()
+          .mockResolvedValueOnce([initial])
+          .mockResolvedValueOnce(evidence),
+        cancelOrder: mock(async () => {}),
+      };
+      await expect(orchestrator._restReconcile({ allowPreStart: true, strict: true }))
+        .rejects.toThrow('invalid orphan cancellation identity');
+      expect(orchestrator.restClient.cancelOrder).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  test('strict startup rejects malformed or duplicate ACTIVE orphan identities before cancellation', async () => {
+    const malformed = rawOrder('venue-active', '', 'ACTIVE');
+    const duplicateA = rawOrder('venue-a', 'duplicate-active', 'ACTIVE');
+    const duplicateB = rawOrder('venue-b', 'duplicate-active', 'ACTIVE');
+    for (const rows of [[malformed], [duplicateA, duplicateB]]) {
+      const cancelOrder = mock(async () => {});
+      const orchestrator = makeStartupOrchestrator();
+      orchestrator.restClient = { getActiveOrders: mock(async () => rows), cancelOrder };
+      await expect(orchestrator._restReconcile({ allowPreStart: true, strict: true }))
+        .rejects.toThrow('invalid orphan cancellation identity');
+      expect(cancelOrder).not.toHaveBeenCalled();
+    }
+  });
+
+  test('strict startup waits for unrelated transitional rows without cancelling them', async () => {
+    let now = 0;
+    const getActiveOrders = mock()
+      .mockResolvedValueOnce([rawOrder('venue-active', 'prior-active', 'ACTIVE')])
+      .mockResolvedValueOnce([
+        rawOrder('venue-active', 'prior-active', 'CANCELED'),
+        rawOrder('venue-other', 'unrelated', 'CANCEL_PENDING'),
+      ])
+      .mockResolvedValueOnce([rawOrder('venue-other', 'unrelated', 'CANCELED')]);
+    const cancelOrder = mock(async () => {});
+    const orchestrator = makeStartupOrchestrator({
+      startupCancelVerifyTimeoutMs: 20,
+      startupCancelVerifyIntervalMs: 10,
+      now: () => now,
+      sleep: async (ms) => { now += ms; },
+    });
+    orchestrator.restClient = { getActiveOrders, cancelOrder };
+
+    await orchestrator._restReconcile({ allowPreStart: true, strict: true });
+    expect(cancelOrder).toHaveBeenCalledTimes(1);
+    expect(cancelOrder).toHaveBeenCalledWith('venue-active');
+    expect(getActiveOrders).toHaveBeenCalledTimes(3);
+  });
+
+  test('strict startup rejects an initial REST response that completes beyond the shared deadline', async () => {
+    let now = 0;
+    const orchestrator = makeStartupOrchestrator({
+      startupCancelVerifyTimeoutMs: 20,
+      startupCancelVerifyIntervalMs: 10,
+      now: () => now,
+      sleep: async (ms) => { now += ms; },
+    });
+    orchestrator.restClient = {
+      getActiveOrders: mock(async () => { now = 21; return []; }),
+      cancelOrder: mock(async () => {}),
+    };
+
+    await expect(orchestrator._restReconcile({ allowPreStart: true, strict: true }))
+      .rejects.toThrow('startup verification timed out');
+    expect(orchestrator.restClient.getActiveOrders).toHaveBeenCalledTimes(1);
+  });
+
+  test('strict startup applies the same deadline to a generation follow-up REST response', async () => {
+    let now = 0;
+    const activeOrders = new Map();
+    const getActiveOrders = mock()
+      .mockImplementationOnce(async () => {
+        activeOrders.set('born-during-request', {
+          side: 'sell', size: 0.01, price: 100000, level: 1,
+          status: 'active', acknowledgedLive: true,
+        });
+        return [];
+      })
+      .mockImplementationOnce(async () => {
+        now = 21;
+        return [rawOrder('venue-born', 'born-during-request', 'ACTIVE')];
+      });
+    const orchestrator = makeStartupOrchestrator({
+      startupCancelVerifyTimeoutMs: 20,
+      startupCancelVerifyIntervalMs: 10,
+      now: () => now,
+      sleep: async (ms) => { now += ms; },
+    });
+    orchestrator.quoteEngine.activeOrders = activeOrders;
+    orchestrator.quoteEngine.removeStaleOrder = mock(() => false);
+    orchestrator.restClient = { getActiveOrders, cancelOrder: mock(async () => {}) };
+
+    await expect(orchestrator._restReconcile({ allowPreStart: true, strict: true }))
+      .rejects.toThrow('startup verification timed out');
+    expect(getActiveOrders).toHaveBeenCalledTimes(2);
+    expect(activeOrders.has('born-during-request')).toBe(true);
+  });
+
+  test('strict startup carries orphan cancellation targets into a generation follow-up', async () => {
+    let now = 0;
+    const activeOrders = new Map();
+    const reappeared = () => [
+      rawOrder('venue-a', 'orphan-a', 'ACTIVE'),
+      rawOrder('venue-born', 'born-during-request', 'ACTIVE'),
+    ];
+    const getActiveOrders = mock()
+      .mockImplementationOnce(async () => {
+        activeOrders.set('born-during-request', {
+          side: 'sell', size: 0.01, price: 100000, level: 1,
+          status: 'active', acknowledgedLive: true,
+        });
+        return [rawOrder('venue-a', 'orphan-a', 'ACTIVE')];
+      })
+      .mockResolvedValueOnce([
+        rawOrder('venue-a', 'orphan-a', 'CANCELED'),
+        rawOrder('venue-born', 'born-during-request', 'ACTIVE'),
+      ])
+      .mockImplementation(async () => reappeared());
+    const cancelOrder = mock(async () => {});
+    const orchestrator = makeStartupOrchestrator({
+      startupCancelVerifyTimeoutMs: 30,
+      startupCancelVerifyIntervalMs: 10,
+      now: () => now,
+      sleep: async (ms) => { now += ms; },
+    });
+    orchestrator.quoteEngine.activeOrders = activeOrders;
+    orchestrator.quoteEngine.removeStaleOrder = mock(() => false);
+    orchestrator.restClient = { getActiveOrders, cancelOrder };
+
+    await expect(orchestrator._restReconcile({ allowPreStart: true, strict: true }))
+      .rejects.toThrow('orphan cancellation verification timed out');
+    expect(cancelOrder).toHaveBeenCalledTimes(1);
+    expect(cancelOrder).toHaveBeenCalledWith('venue-a');
+    expect(activeOrders.has('born-during-request')).toBe(true);
+  });
+
+  test('strict startup keeps cancelled targets sticky through unrelated transitional settlement', async () => {
+    let now = 0;
+    const getActiveOrders = mock()
+      .mockResolvedValueOnce([rawOrder('venue-a', 'orphan-a', 'ACTIVE')])
+      .mockResolvedValueOnce([
+        rawOrder('venue-a', 'orphan-a', 'CANCELED'),
+        rawOrder('venue-b', 'unrelated-b', 'CANCEL_PENDING'),
+      ])
+      .mockResolvedValueOnce([
+        rawOrder('venue-a', 'orphan-a', 'ACTIVE'),
+        rawOrder('venue-b', 'unrelated-b', 'CANCELED'),
+      ]);
+    const cancelOrder = mock(async () => {});
+    const orchestrator = makeStartupOrchestrator({
+      startupCancelVerifyTimeoutMs: 20,
+      startupCancelVerifyIntervalMs: 10,
+      now: () => now,
+      sleep: async (ms) => { now += ms; },
+    });
+    orchestrator.restClient = { getActiveOrders, cancelOrder };
+
+    await expect(orchestrator._restReconcile({ allowPreStart: true, strict: true }))
+      .rejects.toThrow('orphan cancellation verification timed out');
+    expect(cancelOrder).toHaveBeenCalledTimes(1);
+    expect(getActiveOrders).toHaveBeenCalledTimes(3);
+  });
+
+  test('strict startup rejects an unrelated order that becomes ACTIVE during post-cancel polling', async () => {
+    let now = 0;
+    const getActiveOrders = mock()
+      .mockResolvedValueOnce([rawOrder('venue-a', 'orphan-a', 'ACTIVE')])
+      .mockResolvedValueOnce([
+        rawOrder('venue-a', 'orphan-a', 'CANCELED'),
+        rawOrder('venue-b', 'unrelated-b', 'CANCEL_PENDING'),
+      ])
+      .mockResolvedValueOnce([
+        rawOrder('venue-a', 'orphan-a', 'CANCELED'),
+        rawOrder('venue-b', 'unrelated-b', 'ACTIVE'),
+      ]);
+    const cancelOrder = mock(async () => {});
+    const orchestrator = makeStartupOrchestrator({
+      startupCancelVerifyTimeoutMs: 20,
+      startupCancelVerifyIntervalMs: 10,
+      now: () => now,
+      sleep: async (ms) => { now += ms; },
+    });
+    orchestrator.restClient = { getActiveOrders, cancelOrder };
+
+    await expect(orchestrator._restReconcile({ allowPreStart: true, strict: true }))
+      .rejects.toThrow('new unmatched order in post-scan snapshot');
+    expect(cancelOrder).toHaveBeenCalledTimes(1);
+    expect(cancelOrder).toHaveBeenCalledWith('venue-a');
+    expect(cancelOrder).not.toHaveBeenCalledWith('venue-b');
+    expect(getActiveOrders).toHaveBeenCalledTimes(3);
+  });
+
+  test('strict startup uses the validated post-cancel snapshot for stable local ghost decisions', async () => {
+    let now = 0;
+    const capital = new CapitalReservationManager();
+    capital.reconcile({ ...balances, liveOrders: [] });
+    const engine = new QuoteEngine({
+      capitalReservationManager: capital,
+      fixConnection: { sendMessage: mock(() => {}) },
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+    });
+    const localId = engine._sendNewOrder({ side: 'sell', size: 0.01, price: 100000, level: 1 });
+    engine.onExecutionReport({ '11': localId, '39': '0', '54': '2' });
+    const localRaw = rawOrder('venue-local', localId, 'ACTIVE');
+    const getActiveOrders = mock()
+      .mockResolvedValueOnce([rawOrder('venue-a', 'orphan-a', 'ACTIVE')])
+      .mockResolvedValueOnce([
+        rawOrder('venue-a', 'orphan-a', 'CANCELED'),
+        localRaw,
+      ]);
+    const cancelOrder = mock(async () => {});
+    engine.drainQueue = mock(() => {});
+    const orchestrator = Object.assign(Object.create(MarketMakerOrchestrator.prototype), {
+      isRunning: false,
+      startupCancelVerifyTimeoutMs: 20,
+      startupCancelVerifyIntervalMs: 10,
+      _now: () => now,
+      _sleep: async (ms) => { now += ms; },
+      restClient: { getActiveOrders, cancelOrder },
+      quoteEngine: engine,
+      capitalReservationManager: capital,
+      _onCapitalResyncRequired: mock(async () => {}),
+      logger: { info() {}, warn() {}, error() {} },
+      emit() {}, listenerCount: () => 0,
+    });
+
+    const stats = await orchestrator._restReconcile({ allowPreStart: true, strict: true });
+    expect(cancelOrder).toHaveBeenCalledWith('venue-a');
+    expect(stats.ghostsRemoved).toBe(0);
+    expect(engine.activeOrders.has(localId)).toBe(true);
+    expect(capital.getReservation(localId)).toMatchObject({
+      state: 'active', acknowledgedLive: true,
+    });
+    expect(capital.getPresence()).toEqual({ buy: 0, sell: 1 });
+    expect(orchestrator._onCapitalResyncRequired).not.toHaveBeenCalled();
+  });
+
+  test('strict startup follows a local mutation that occurs during post-cancel verification', async () => {
+    let now = 0;
+    const capital = new CapitalReservationManager();
+    capital.reconcile({ ...balances, liveOrders: [] });
+    const engine = new QuoteEngine({
+      capitalReservationManager: capital,
+      fixConnection: { sendMessage: mock(() => {}) },
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+    });
+    const localId = engine._sendNewOrder({ side: 'sell', size: 0.01, price: 100000, level: 1 });
+    engine.onExecutionReport({ '11': localId, '39': '0', '54': '2' });
+    const freshLocal = () => {
+      const raw = rawOrder('venue-local', localId, 'ACTIVE');
+      raw.order_info.price = '100001';
+      return raw;
+    };
+    const getActiveOrders = mock()
+      .mockResolvedValueOnce([rawOrder('venue-a', 'orphan-a', 'ACTIVE')])
+      .mockImplementationOnce(async () => {
+        engine.activeOrders.get(localId).price = 100001;
+        return [rawOrder('venue-a', 'orphan-a', 'CANCELED'), freshLocal()];
+      })
+      .mockResolvedValueOnce([rawOrder('venue-a', 'orphan-a', 'CANCELED'), freshLocal()]);
+    const cancelOrder = mock(async () => {});
+    engine.drainQueue = mock(() => {});
+    const orchestrator = Object.assign(Object.create(MarketMakerOrchestrator.prototype), {
+      isRunning: false,
+      startupCancelVerifyTimeoutMs: 30,
+      startupCancelVerifyIntervalMs: 10,
+      _now: () => now,
+      _sleep: async (ms) => { now += ms; },
+      restClient: { getActiveOrders, cancelOrder },
+      quoteEngine: engine,
+      capitalReservationManager: capital,
+      _onCapitalResyncRequired: mock(async () => {}),
+      logger: { info() {}, warn() {}, error() {} },
+      emit() {}, listenerCount: () => 0,
+    });
+
+    const stats = await orchestrator._restReconcile({ allowPreStart: true, strict: true });
+    expect(getActiveOrders).toHaveBeenCalledTimes(3);
+    expect(stats.generationChanged).toBe(true);
+    expect(stats.followup).toMatchObject({ generationChanged: false, ghostsRemoved: 0 });
+    expect(engine.activeOrders.get(localId)).toMatchObject({ price: 100001, acknowledgedLive: true });
+    expect(capital.getReservation(localId)).toMatchObject({ state: 'active', acknowledgedLive: true });
+    expect(capital.getPresence()).toEqual({ buy: 0, sell: 1 });
+    expect(orchestrator._onCapitalResyncRequired).not.toHaveBeenCalled();
+  });
+
+  test('strict startup aborts if the single bounded generation follow-up mutates again', async () => {
+    let now = 0;
+    const capital = new CapitalReservationManager();
+    capital.reconcile({ ...balances, liveOrders: [] });
+    const engine = new QuoteEngine({
+      capitalReservationManager: capital,
+      fixConnection: { sendMessage: mock(() => {}) },
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+    });
+    const localId = engine._sendNewOrder({ side: 'sell', size: 0.01, price: 100000, level: 1 });
+    engine.onExecutionReport({ '11': localId, '39': '0', '54': '2' });
+    const localRaw = (price) => {
+      const raw = rawOrder('venue-local', localId, 'ACTIVE');
+      raw.order_info.price = String(price);
+      return raw;
+    };
+    const getActiveOrders = mock()
+      .mockResolvedValueOnce([rawOrder('venue-a', 'orphan-a', 'ACTIVE')])
+      .mockImplementationOnce(async () => {
+        engine.activeOrders.get(localId).price = 100001;
+        return [rawOrder('venue-a', 'orphan-a', 'CANCELED'), localRaw(100001)];
+      })
+      .mockImplementationOnce(async () => {
+        engine.activeOrders.get(localId).price = 100002;
+        return [rawOrder('venue-a', 'orphan-a', 'CANCELED'), localRaw(100002)];
+      });
+    const orchestrator = Object.assign(Object.create(MarketMakerOrchestrator.prototype), {
+      isRunning: false,
+      startupCancelVerifyTimeoutMs: 30,
+      startupCancelVerifyIntervalMs: 10,
+      _now: () => now,
+      _sleep: async (ms) => { now += ms; },
+      restClient: { getActiveOrders, cancelOrder: mock(async () => {}) },
+      quoteEngine: engine,
+      capitalReservationManager: capital,
+      _onCapitalResyncRequired: mock(async () => {}),
+      logger: { info() {}, warn() {}, error() {} },
+      emit() {}, listenerCount: () => 0,
+    });
+
+    await expect(orchestrator._restReconcile({ allowPreStart: true, strict: true }))
+      .rejects.toThrow('startup reconciliation remained unstable');
+    expect(getActiveOrders).toHaveBeenCalledTimes(3);
+    expect(engine.activeOrders.get(localId)).toMatchObject({ price: 100002, acknowledgedLive: true });
+    expect(capital.getReservation(localId)).toMatchObject({ state: 'active', acknowledgedLive: true });
+    expect(capital.getPresence()).toEqual({ buy: 0, sell: 1 });
+    expect(orchestrator._onCapitalResyncRequired).not.toHaveBeenCalled();
+  });
+
   test('ordinary reconciliation remains a pre-start no-op', async () => {
     const orchestrator = makeStartupOrchestrator();
     orchestrator.restClient = { getActiveOrders: mock(async () => []) };

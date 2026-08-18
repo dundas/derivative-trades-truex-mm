@@ -2089,16 +2089,160 @@ export class MarketMakerOrchestrator extends EventEmitter {
 
   // --- REST-based Order Reconciliation ---
 
-  async _verifyStartupCancelPending(rawOrders) {
-    let current = rawOrders;
-    const startedAt = this._now();
-    const maxPolls = Math.ceil(
-      this.startupCancelVerifyTimeoutMs / this.startupCancelVerifyIntervalMs
+  _createStartupVerificationBudget() {
+    return {
+      startedAt: this._now(),
+      polls: 0,
+      maxPolls: Math.ceil(
+        this.startupCancelVerifyTimeoutMs / this.startupCancelVerifyIntervalMs
+      ),
+      cancellationTargets: [],
+    };
+  }
+
+  _assertStartupVerificationBudget(budget, timeoutMessage = 'startup verification timed out') {
+    const elapsed = this._now() - budget.startedAt;
+    if (!Number.isFinite(elapsed) || elapsed < 0 ||
+        elapsed > this.startupCancelVerifyTimeoutMs) {
+      throw new Error(`${timeoutMessage} during strict startup reconciliation`);
+    }
+  }
+
+  async _pollStartupOrders(budget, timeoutMessage) {
+    const elapsed = this._now() - budget.startedAt;
+    if (!Number.isFinite(elapsed) || elapsed < 0 ||
+        elapsed >= this.startupCancelVerifyTimeoutMs || budget.polls >= budget.maxPolls) {
+      throw new Error(`${timeoutMessage} during strict startup reconciliation`);
+    }
+    const waitMs = Math.min(
+      this.startupCancelVerifyIntervalMs,
+      this.startupCancelVerifyTimeoutMs - elapsed,
     );
-    let polls = 0;
+    await this._sleep(waitMs);
+    budget.polls++;
+    const current = await this.restClient.getActiveOrders();
+    if (!Array.isArray(current)) {
+      throw new Error('invalid active-order response during strict startup reconciliation');
+    }
+    this._assertStartupVerificationBudget(budget, timeoutMessage);
+    return current;
+  }
+
+  _validateStartupOrphanTargets(current, targets) {
+    const byVenueId = new Map(targets.map((target) => [target.venueId, target]));
+    const byExternalId = new Map(targets.map((target) => [target.externalId, target]));
+    const terminalStatuses = new Set(['CANCELED', 'FILLED', 'REJECTED']);
+    const observed = new Set();
+    const unresolved = new Set();
+    for (const raw of current) {
+      const venueId = typeof raw?.id === 'string' ? raw.id.trim() : '';
+      const externalId = typeof raw?.external_id === 'string' ? raw.external_id.trim() : '';
+      const target = byVenueId.get(venueId) || byExternalId.get(externalId);
+      if (!target) continue;
+      if (!venueId || !externalId || venueId !== target.venueId ||
+          externalId !== target.externalId || observed.has(target.venueId)) {
+        throw new Error('invalid orphan cancellation identity during strict startup reconciliation');
+      }
+      observed.add(target.venueId);
+      if (!terminalStatuses.has(raw.status)) unresolved.add(target.venueId);
+    }
+    return unresolved;
+  }
+
+  _validateStartupPostScanSnapshot(current, cancellationTargets) {
+    const targetVenueIds = new Set(cancellationTargets.map((target) => target.venueId));
+    const targetExternalIds = new Set(cancellationTargets.map((target) => target.externalId));
+    const terminalStatuses = new Set(['CANCELED', 'FILLED', 'REJECTED']);
+    const transitionalStatuses = new Set(['NEW_PENDING', 'CANCEL_PENDING', 'MODIFY_PENDING']);
+    const venueIds = new Set();
+    const externalIds = new Set();
+    for (const raw of current) {
+      if (terminalStatuses.has(raw?.status) || transitionalStatuses.has(raw?.status)) continue;
+      const venueId = typeof raw?.id === 'string' ? raw.id.trim() : '';
+      const externalId = typeof raw?.external_id === 'string' ? raw.external_id.trim() : '';
+      // Sticky targets are validated separately, including exact identity and
+      // terminal-state requirements. They must not be treated as new orphans.
+      if (targetVenueIds.has(venueId) || targetExternalIds.has(externalId)) continue;
+      if (!venueId || !externalId || venueIds.has(venueId) || externalIds.has(externalId)) {
+        throw new Error('invalid unmatched order in post-scan snapshot during strict startup reconciliation');
+      }
+      venueIds.add(venueId);
+      externalIds.add(externalId);
+      if (this.quoteEngine.activeOrders.has(externalId)) continue;
+      throw new Error('new unmatched order in post-scan snapshot during strict startup reconciliation');
+    }
+  }
+
+  _mergeStrictLocalLiveEvidence(rawOrders, localGeneration, localClOrdIDs, exchangeClOrdIDs) {
+    const venueIds = new Set();
+    const externalIds = new Set();
+    let generationChanged = false;
+    for (const raw of rawOrders) {
+      if (!['ACTIVE', 'CANCEL_PENDING'].includes(raw?.status)) continue;
+      const venueId = typeof raw?.id === 'string' ? raw.id.trim() : '';
+      const externalId = typeof raw?.external_id === 'string' ? raw.external_id.trim() : '';
+      if (!venueId || !externalId || venueIds.has(venueId) || externalIds.has(externalId)) {
+        throw new Error('invalid local live-order identity during strict startup reconciliation');
+      }
+      venueIds.add(venueId);
+      externalIds.add(externalId);
+      if (!localClOrdIDs.has(externalId)) continue;
+
+      const snapshot = localGeneration.get(externalId);
+      const current = this.quoteEngine.activeOrders.get(externalId);
+      // A changed local identity belongs to the bounded generation follow-up;
+      // never use this older request to prove either presence or absence.
+      if (!localReconciliationOrderUnchanged(
+        snapshot, current, externalId, this.capitalReservationManager
+      )) {
+        generationChanged = true;
+        continue;
+      }
+      const side = typeof raw?.order_info?.side === 'string'
+        ? raw.order_info.side.trim().toLowerCase()
+        : '';
+      const price = strictPositiveRestNumber(raw?.order_info?.price);
+      const leaves = strictPositiveRestNumber(raw?.leaves_qty);
+      if (side !== snapshot.side || price === null || leaves === null ||
+          Math.abs(price - Number(snapshot.price)) > 1e-10 ||
+          Math.abs(leaves - Number(snapshot.size)) > 1e-10) {
+        throw new Error('invalid local live-order evidence during strict startup reconciliation');
+      }
+      exchangeClOrdIDs.add(externalId);
+    }
+    return { generationChanged };
+  }
+
+  _localReconciliationGenerationChanged(localGeneration, localClOrdIDs) {
+    const currentStableIds = new Set();
+    for (const [orderId, order] of this.quoteEngine.activeOrders) {
+      if (!isStableLocalOrder(order)) continue;
+      currentStableIds.add(orderId);
+      const snapshot = localGeneration.get(orderId);
+      if (!snapshot || !isStableLocalOrder(snapshot) ||
+          !localReconciliationOrderUnchanged(
+            snapshot, order, orderId, this.capitalReservationManager)) return true;
+    }
+    for (const orderId of localClOrdIDs) {
+      if (!currentStableIds.has(orderId)) return true;
+    }
+    return false;
+  }
+
+  async _verifyStartupCancelPending(
+    rawOrders,
+    budget,
+    cancellationTargets = [],
+    postScan = false,
+  ) {
+    let current = rawOrders;
     while (true) {
+      if (postScan) this._validateStartupPostScanSnapshot(current, cancellationTargets);
       const pending = current.filter((raw) => raw?.status === 'CANCEL_PENDING');
-      if (pending.length === 0) return current;
+      const unresolvedTargets = cancellationTargets.length > 0
+        ? this._validateStartupOrphanTargets(current, cancellationTargets)
+        : new Set();
+      if (pending.length === 0 && unresolvedTargets.size === 0) return current;
 
       const venueIds = new Set();
       const externalIds = new Set();
@@ -2112,28 +2256,45 @@ export class MarketMakerOrchestrator extends EventEmitter {
         externalIds.add(externalId);
       }
 
-      const elapsed = this._now() - startedAt;
-      if (!Number.isFinite(elapsed) || elapsed < 0 ||
-          elapsed >= this.startupCancelVerifyTimeoutMs || polls >= maxPolls) {
-        throw new Error('cancel-pending verification timed out during strict startup reconciliation');
-      }
-      const waitMs = Math.min(
-        this.startupCancelVerifyIntervalMs,
-        this.startupCancelVerifyTimeoutMs - elapsed,
+      current = await this._pollStartupOrders(
+        budget,
+        cancellationTargets.length > 0
+          ? 'orphan cancellation verification timed out'
+          : 'cancel-pending verification timed out',
       );
-      await this._sleep(waitMs);
-      polls++;
-      current = await this.restClient.getActiveOrders();
-      if (!Array.isArray(current)) {
-        throw new Error('invalid active-order response during strict startup reconciliation');
-      }
     }
   }
 
-  async _restReconcile({ allowPreStart = false, strict = false, _generationFollowup = false } = {}) {
+  async _verifyStartupOrphanCancellations(targets, budget) {
+    let current = await this._pollStartupOrders(
+      budget,
+      'orphan cancellation verification timed out',
+    );
+
+    while (true) {
+      this._validateStartupPostScanSnapshot(current, targets);
+      const unresolved = this._validateStartupOrphanTargets(current, targets);
+
+      if (unresolved.size === 0) return current;
+      current = await this._pollStartupOrders(
+        budget,
+        'orphan cancellation verification timed out',
+      );
+    }
+  }
+
+  async _restReconcile({
+    allowPreStart = false,
+    strict = false,
+    _generationFollowup = false,
+    _startupVerificationBudget = null,
+  } = {}) {
     if (!this.restClient || (!this.isRunning && !allowPreStart)) return;
 
     try {
+      const startupVerificationBudget = strict
+        ? (_startupVerificationBudget || this._createStartupVerificationBudget())
+        : null;
       // The local side of the reconciliation must share the same request
       // boundary as the REST snapshot. Never interpret an order born or
       // mutated while the request is in flight through an older response.
@@ -2148,7 +2309,15 @@ export class MarketMakerOrchestrator extends EventEmitter {
       if (!Array.isArray(rawExchangeOrders)) {
         throw new Error('invalid active-order response during REST reconciliation');
       }
-      if (strict) rawExchangeOrders = await this._verifyStartupCancelPending(rawExchangeOrders);
+      if (strict) {
+        this._assertStartupVerificationBudget(startupVerificationBudget);
+        rawExchangeOrders = await this._verifyStartupCancelPending(
+          rawExchangeOrders,
+          startupVerificationBudget,
+          startupVerificationBudget.cancellationTargets,
+        );
+      }
+      let authoritativeRawOrders = rawExchangeOrders;
 
       // 2. Parse every non-transitional exchange order. Keep the array so even
       // duplicate/missing external IDs cannot collapse distinct orphan cancels.
@@ -2171,27 +2340,37 @@ export class MarketMakerOrchestrator extends EventEmitter {
         if (isStableLocalOrder(snapshot)) localClOrdIDs.add(clOrdID);
       }
 
-      let generationChanged = false;
-      const currentStableIds = new Set();
-      for (const [orderId, order] of this.quoteEngine.activeOrders) {
-        if (!isStableLocalOrder(order)) continue;
-        currentStableIds.add(orderId);
-        const snapshot = localGeneration.get(orderId);
-        if (!snapshot || !isStableLocalOrder(snapshot) ||
-            !localReconciliationOrderUnchanged(
-              snapshot, order, orderId, this.capitalReservationManager)) {
-          generationChanged = true;
-        }
-      }
-      for (const orderId of localClOrdIDs) {
-        if (!currentStableIds.has(orderId)) generationChanged = true;
-      }
+      let generationChanged = this._localReconciliationGenerationChanged(
+        localGeneration,
+        localClOrdIDs,
+      );
 
       // 4. Detect discrepancies
       let matched = 0;
       let orphansCancelled = 0;
       let ghostsRemoved = 0;
       const ghostSides = new Set();
+      const strictCancelledOrphans = [];
+
+      if (strict) {
+        const venueIds = new Set(
+          startupVerificationBudget.cancellationTargets.map((target) => target.venueId)
+        );
+        const externalIds = new Set(
+          startupVerificationBudget.cancellationTargets.map((target) => target.externalId)
+        );
+        for (const order of exchangeOrders) {
+          const extId = order.externalId;
+          if (localClOrdIDs.has(extId) || this.quoteEngine.activeOrders.has(extId)) continue;
+          const venueId = typeof order.rawId === 'string' ? order.rawId.trim() : '';
+          const externalId = typeof extId === 'string' ? extId.trim() : '';
+          if (!venueId || !externalId || venueIds.has(venueId) || externalIds.has(externalId)) {
+            throw new Error('invalid orphan cancellation identity during strict startup reconciliation');
+          }
+          venueIds.add(venueId);
+          externalIds.add(externalId);
+        }
+      }
 
       // Orphans: on exchange but not in local state → cancel via REST
       for (const order of exchangeOrders) {
@@ -2203,11 +2382,56 @@ export class MarketMakerOrchestrator extends EventEmitter {
           try {
             await this.restClient.cancelOrder(order.rawId);
             orphansCancelled++;
+            if (strict) {
+              const target = {
+                venueId: order.rawId.trim(),
+                externalId: order.externalId.trim(),
+              };
+              strictCancelledOrphans.push(target);
+              startupVerificationBudget.cancellationTargets.push(target);
+            }
           } catch (err) {
             if (strict) throw err;
             this.logger.warn(`[Reconcile] Failed to cancel orphan ${extId}: ${err.message}`);
           }
         }
+      }
+
+      if (strictCancelledOrphans.length > 0) {
+        const verifiedOrders = await this._verifyStartupOrphanCancellations(
+          startupVerificationBudget.cancellationTargets,
+          startupVerificationBudget,
+        );
+        // Transitional rows unrelated to our cancellation targets are never
+        // cancelled by this pass, but startup still waits for them to settle
+        // within the same total verification budget.
+        authoritativeRawOrders = await this._verifyStartupCancelPending(
+          verifiedOrders,
+          startupVerificationBudget,
+          startupVerificationBudget.cancellationTargets,
+          true,
+        );
+      }
+
+      if (strict) {
+        // Ghost absence must be decided from the same (or fresher) snapshot
+        // that passed strict startup verification, never from the initial
+        // pre-cancel scan alone.
+        const mergeResult = this._mergeStrictLocalLiveEvidence(
+          authoritativeRawOrders,
+          localGeneration,
+          localClOrdIDs,
+          exchangeClOrdIDs,
+        );
+        // Re-evaluate after all post-scan REST awaits. This catches a local or
+        // capital mutation that happened after the initial generation check,
+        // including one whose fresh venue evidence is otherwise exact.
+        const changedDuringVerification = this._localReconciliationGenerationChanged(
+          localGeneration,
+          localClOrdIDs,
+        );
+        generationChanged = generationChanged || mergeResult.generationChanged ||
+          changedDuringVerification;
       }
 
       // Ghosts: in local state but not on exchange → remove from activeOrders
@@ -2247,6 +2471,14 @@ export class MarketMakerOrchestrator extends EventEmitter {
         generationChanged,
       };
 
+      if (strict && _generationFollowup && generationChanged) {
+        // One fresh generation is the bounded recovery allowance. If that
+        // immutable view also changes, there is no promotion-grade proof that
+        // local and venue state ever converged; abort startup without nesting
+        // another reconcile or enabling FIX/timers.
+        throw new Error('startup reconciliation remained unstable after bounded generation follow-up');
+      }
+
       this.logger.info(
         `[Reconcile] exchange=${stats.exchange} local=${stats.local} matched=${stats.matched} ` +
         `orphans=${stats.orphansCancelled} ghosts=${stats.ghostsRemoved}`
@@ -2262,8 +2494,10 @@ export class MarketMakerOrchestrator extends EventEmitter {
           allowPreStart,
           strict,
           _generationFollowup: true,
+          _startupVerificationBudget: startupVerificationBudget,
         });
       }
+      if (strict) this._assertStartupVerificationBudget(startupVerificationBudget);
       return stats;
     } catch (err) {
       if (strict) throw err;
