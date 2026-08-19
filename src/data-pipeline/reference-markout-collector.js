@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto';
 
+const CRYPTOCOM_PUBLIC_MARKET_ENDPOINT = 'wss://stream.crypto.com/exchange/v1/market';
+
 const STRING_FIELDS = [
-  'product', 'quoteCurrency', 'sourceExchange', 'sourceType', 'basisSource',
-  'basisRequestedPair', 'basisResolvedPair', 'basisBase', 'basisQuote', 'basisSystem',
+  'product', 'quoteCurrency', 'sourceExchange', 'sourceType',
 ];
 const NONNEGATIVE_INTEGER_FIELDS = [
   'maxSourceAgeMs', 'maxLatenessMs', 'maxAbsBasisAdjustmentBps',
@@ -17,6 +18,14 @@ const POSITIVE_INTEGER_FIELDS = [
   'telemetryWriteConcurrency', 'maxConsecutiveFillStarts',
   'fillHorizonSafetyMarginMs', 'auditMaxGroups', 'maxBasisRttMs',
 ];
+const isOfficialCryptoComEndpoint = value => {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'wss:' && url.hostname === 'stream.crypto.com' &&
+      (url.port === '' || url.port === '443') && url.pathname === '/exchange/v1/market' &&
+      !url.username && !url.password && !url.search && !url.hash;
+  } catch { return false; }
+};
 
 function requireSafeInteger(name, value, { positive = false } = {}) {
   if (!Number.isSafeInteger(value) || (positive ? value <= 0 : value < 0)) {
@@ -30,6 +39,10 @@ export function validateReferenceMarkoutConfig(input) {
     throw new Error('reference mark-out config must be an object');
   }
   const config = { ...input };
+  if (config.referenceMode === undefined) config.referenceMode = 'coinbase-basis';
+  if (config.sourceInstrument === undefined) config.sourceInstrument = null;
+  if (config.sourceChannel === undefined) config.sourceChannel = null;
+  if (config.sourceEndpointAllowlist === undefined) config.sourceEndpointAllowlist = [];
   if (config.retentionBatchSize === undefined) config.retentionBatchSize = 10_000;
   if (config.retentionMaxBatchesPerSweep === undefined) config.retentionMaxBatchesPerSweep = 12;
   if (config.maxQuoteDecisionsPerSecond === undefined) config.maxQuoteDecisionsPerSecond = 10;
@@ -50,20 +63,43 @@ export function validateReferenceMarkoutConfig(input) {
     }
     config[field] = config[field].trim();
   }
-  if (config.product !== 'BTC-USD' || config.quoteCurrency !== 'USD' ||
-      config.sourceExchange !== 'coinbase' || config.sourceType !== 'top-of-book') {
-    throw new Error('reference source must be Coinbase BTC-USD top-of-book quoted in USD');
+  if (config.referenceMode === 'cryptocom-direct') {
+    if (config.product !== 'BTC-PYUSD' || config.quoteCurrency !== 'PYUSD' ||
+        config.sourceExchange !== 'cryptocom' || config.sourceType !== 'public-ws-book' ||
+        config.sourceInstrument !== 'BTC_PYUSD' || config.sourceChannel !== 'book.BTC_PYUSD.10') {
+      throw new Error('direct reference source must be Crypto.com BTC_PYUSD book depth 10');
+    }
+    if (!Array.isArray(config.sourceEndpointAllowlist) || config.sourceEndpointAllowlist.length < 1 ||
+        config.sourceEndpointAllowlist.some(value => !isOfficialCryptoComEndpoint(value))) {
+      throw new Error('sourceEndpointAllowlist must contain only the exact official Crypto.com endpoint');
+    }
+    config.sourceEndpointAllowlist = Object.freeze([CRYPTOCOM_PUBLIC_MARKET_ENDPOINT]);
+    config.basisVenueAllowlist = Object.freeze([]);
+  } else if (config.referenceMode === 'coinbase-basis') {
+    for (const field of ['basisSource', 'basisRequestedPair', 'basisResolvedPair',
+      'basisBase', 'basisQuote', 'basisSystem']) {
+      if (typeof config[field] !== 'string' || config[field].trim() === '') {
+        throw new Error(`${field} must be a non-empty string`);
+      }
+      config[field] = config[field].trim();
+    }
+    if (config.product !== 'BTC-USD' || config.quoteCurrency !== 'USD' ||
+        config.sourceExchange !== 'coinbase' || config.sourceType !== 'top-of-book') {
+      throw new Error('reference source must be Coinbase BTC-USD top-of-book quoted in USD');
+    }
+    if (config.basisSource !== 'kraken-pretrade' || config.basisResolvedPair !== 'PYUSD/USD' ||
+        config.basisBase !== 'PYUSD' || config.basisQuote !== 'USD' || config.basisSystem !== 'CLOB') {
+      throw new Error('basis identity must be Kraken PreTrade PYUSD/USD CLOB');
+    }
+    if (!Array.isArray(config.basisVenueAllowlist) || config.basisVenueAllowlist.length === 0 ||
+        config.basisVenueAllowlist.some(value => typeof value !== 'string' ||
+          !/^[A-Za-z0-9._:-]{1,32}$/.test(value))) {
+      throw new Error('basisVenueAllowlist must contain at least one valid configured venue');
+    }
+    config.basisVenueAllowlist = Object.freeze([...new Set(config.basisVenueAllowlist)]);
+  } else {
+    throw new Error('referenceMode must be coinbase-basis or cryptocom-direct');
   }
-  if (config.basisSource !== 'kraken-pretrade' || config.basisResolvedPair !== 'PYUSD/USD' ||
-      config.basisBase !== 'PYUSD' || config.basisQuote !== 'USD' || config.basisSystem !== 'CLOB') {
-    throw new Error('basis identity must be Kraken PreTrade PYUSD/USD CLOB');
-  }
-  if (!Array.isArray(config.basisVenueAllowlist) || config.basisVenueAllowlist.length === 0 ||
-      config.basisVenueAllowlist.some(value => typeof value !== 'string' ||
-        !/^[A-Za-z0-9._:-]{1,32}$/.test(value))) {
-    throw new Error('basisVenueAllowlist must contain at least one valid configured venue');
-  }
-  config.basisVenueAllowlist = Object.freeze([...new Set(config.basisVenueAllowlist)]);
   if (!Array.isArray(config.horizonsMs) || config.horizonsMs.length === 0) {
     throw new Error('horizonsMs must be a non-empty array');
   }
@@ -96,7 +132,7 @@ export function validateReferenceMarkoutConfig(input) {
       config.dbStatementTimeoutMs > config.dbQueryTimeoutMs) {
     throw new Error('database timeouts must satisfy lock <= statement <= query');
   }
-  if (config.maxBasisRttMs > config.maxSourceAgeMs) {
+  if (config.referenceMode === 'coinbase-basis' && config.maxBasisRttMs > config.maxSourceAgeMs) {
     throw new Error('maxBasisRttMs must not exceed maxSourceAgeMs');
   }
   if (config.retentionMaxDurationMs >= config.retentionSweepIntervalMs ||
@@ -138,6 +174,7 @@ function finitePositive(value) {
 
 export class ReferenceMarkoutCollector {
   constructor({ writer = null, marketProvider = () => null, basisProvider = () => null,
+    sourceFeed = null,
     config, logger = console, now = () => Date.now(), monotonicNow = () => performance.now(),
     yieldFn = ms => new Promise(resolve => setTimeout(resolve, ms)),
     claimTokenNamespace = randomUUID() } = {}) {
@@ -145,6 +182,7 @@ export class ReferenceMarkoutCollector {
     this.writer = writer;
     this.marketProvider = marketProvider;
     this.basisProvider = basisProvider;
+    this.sourceFeed = sourceFeed;
     this.logger = logger;
     this.now = now;
     this.monotonicNow = monotonicNow;
@@ -190,9 +228,13 @@ export class ReferenceMarkoutCollector {
   getStats() {
     const config = Object.freeze({
       product: this.config.product,
+      referenceMode: this.config.referenceMode,
       quoteCurrency: this.config.quoteCurrency,
       sourceExchange: this.config.sourceExchange,
       sourceType: this.config.sourceType,
+      sourceInstrument: this.config.sourceInstrument || null,
+      sourceChannel: this.config.sourceChannel || null,
+      sourceEndpointAllowlist: Object.freeze([...(this.config.sourceEndpointAllowlist || [])]),
       horizonsMs: Object.freeze([...this.config.horizonsMs]),
       maxSourceAgeMs: this.config.maxSourceAgeMs,
       maxLatenessMs: this.config.maxLatenessMs,
@@ -233,12 +275,16 @@ export class ReferenceMarkoutCollector {
       invalidSampleReasons: Object.freeze({ ...this.stats.invalidSampleReasons }),
       persistence: Object.freeze({ ...(this.writer?.getReferencePersistenceStats?.() || {}) }),
       running: this._timer !== null,
+      source: this.sourceFeed?.getStats?.() || null,
       config,
     };
   }
 
   start() {
     if (this._timer) return;
+    try { this.sourceFeed?.start?.(); } catch (error) {
+      this._warn('reference source start failed', error);
+    }
     this.processDue().catch(error => this._warn('initial due processing failed', error));
     this._timer = setInterval(() => {
       this.processDue().catch(error => this._warn('due processing failed', error));
@@ -254,6 +300,9 @@ export class ReferenceMarkoutCollector {
     this._timer = null;
     if (this._retentionTimer) clearInterval(this._retentionTimer);
     this._retentionTimer = null;
+    try { this.sourceFeed?.stop?.(); } catch (error) {
+      this._warn('reference source stop failed', error);
+    }
   }
 
   _warn(message, error) {
@@ -423,9 +472,9 @@ export class ReferenceMarkoutCollector {
     }
     const afterDeadline = notAfterTimestamp !== null && observationTimestamp > notAfterTimestamp;
     const market = marketInput === undefined ? this.marketProvider?.() : marketInput;
-    const source = market?.sources?.find(item =>
-      item?.exchange === this.config.sourceExchange,
-    );
+    const source = this.config.referenceMode === 'cryptocom-direct'
+      ? market
+      : market?.sources?.find(item => item?.exchange === this.config.sourceExchange);
     if (!source) {
       return this._unavailable(afterDeadline ? 'after-deadline' : 'missing-book',
         observationTimestamp);
@@ -452,6 +501,44 @@ export class ReferenceMarkoutCollector {
       return this._unavailable('stale-source', observationTimestamp);
     }
     if (source.isStale === true) return this._unavailable('stale-source', observationTimestamp);
+    if (this.config.referenceMode === 'cryptocom-direct') {
+      if (source.exchange !== this.config.sourceExchange ||
+          source.sourceType !== this.config.sourceType ||
+          source.instrument !== this.config.sourceInstrument ||
+          source.channel !== this.config.sourceChannel ||
+          !this.config.sourceEndpointAllowlist.includes(source.sourceEndpoint)) {
+        return this._unavailable('source-identity-mismatch', observationTimestamp);
+      }
+      if (!Number.isSafeInteger(source.sequence) || source.sequence < 0 ||
+          !Number.isSafeInteger(source.generation) || source.generation <= 0 ||
+          typeof source.sourceSessionId !== 'string' || source.sourceSessionId.length < 8 ||
+          source.sourceSessionId.length > 64 ||
+          typeof source.sourceBookHash !== 'string' || !/^[a-f0-9]{64}$/.test(source.sourceBookHash) ||
+          source.depth !== 10 || !finitePositive(source.bidQty) || !finitePositive(source.askQty) ||
+          !Number.isSafeInteger(source.bidCount) || source.bidCount <= 0 ||
+          !Number.isSafeInteger(source.askCount) || source.askCount <= 0 ||
+          !finiteTimestamp(source.bookUpdateTimestamp) || source.bookUpdateTimestamp > sourceTimestamp) {
+        return this._unavailable('invalid-source-provenance', observationTimestamp);
+      }
+      const directEvidence = {
+        available: true, unavailableReason: null, observationTimestamp,
+        referenceMode: 'cryptocom-direct',
+        product: this.config.product, quoteCurrency: this.config.quoteCurrency,
+        sourceExchange: this.config.sourceExchange, sourceType: this.config.sourceType,
+        sourceTimestamp, receivedTimestamp, bid, ask, midpoint: (bid + ask) / 2,
+        basisTimestamp: null, basisPrice: null, basisAdjustmentBps: 0,
+        sourceInstrument: source.instrument, sourceChannel: source.channel,
+        sourceSequence: source.sequence, sourceGeneration: source.generation,
+        sourceSessionId: source.sourceSessionId,
+        sourceEndpoint: source.sourceEndpoint, sourceBookHash: source.sourceBookHash,
+        sourceDepth: source.depth, sourceBidQty: source.bidQty, sourceAskQty: source.askQty,
+        sourceBidCount: source.bidCount, sourceAskCount: source.askCount,
+        sourceBookUpdateTimestamp: source.bookUpdateTimestamp, promotionGrade: true,
+      };
+      return afterDeadline
+        ? this._unavailable('after-deadline', observationTimestamp, true, directEvidence)
+        : directEvidence;
+    }
     const basis = this._basisAt(observationTimestamp, basisInput);
     const evidence = {
       available: true, unavailableReason: null, observationTimestamp,
@@ -490,6 +577,11 @@ export class ReferenceMarkoutCollector {
       basisBidSubmissionTimestamp: null, basisBidPublicationTimestamp: null,
       basisAskSubmissionTimestamp: null, basisAskPublicationTimestamp: null,
       promotionGrade: false,
+      referenceMode: this.config.referenceMode,
+      sourceInstrument: null, sourceChannel: null, sourceSequence: null,
+      sourceGeneration: null, sourceSessionId: null, sourceBookUpdateTimestamp: null,
+      sourceEndpoint: null, sourceBookHash: null, sourceDepth: null,
+      sourceBidQty: null, sourceAskQty: null, sourceBidCount: null, sourceAskCount: null,
       ...preserved,
       available: false, unavailableReason, observationTimestamp,
     };
@@ -676,6 +768,10 @@ export class ReferenceMarkoutCollector {
               dueTimestamp: work.dueTimestamp, deadlineTimestamp: work.deadlineTimestamp,
               product: this.config.product, quoteCurrency: this.config.quoteCurrency,
               sourceExchange: this.config.sourceExchange, sourceType: this.config.sourceType,
+              referenceMode: this.config.referenceMode,
+              sourceInstrument: this.config.sourceInstrument,
+              sourceChannel: this.config.sourceChannel,
+              sourceEndpointAllowlist: this.config.sourceEndpointAllowlist,
               maxSourceAgeMs: this.config.maxSourceAgeMs,
               maxAbsBasisAdjustmentBps: this.config.maxAbsBasisAdjustmentBps,
               basisSource: this.config.basisSource,
@@ -703,7 +799,9 @@ export class ReferenceMarkoutCollector {
           continue;
         }
         const adjustedMidpoint = observation.available
-          ? observation.midpoint / observation.basisPrice : null;
+          ? (this.config.referenceMode === 'cryptocom-direct'
+            ? observation.midpoint : observation.midpoint / observation.basisPrice)
+          : null;
         const observedEdgeBps = observation.available && finitePositive(work.price)
           ? (work.side === 'buy' ? adjustedMidpoint - work.price : work.price - adjustedMidpoint) /
             work.price * 10_000

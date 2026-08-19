@@ -17,6 +17,18 @@ const referenceBasisValues = value => [
   value.basisAskSubmissionTimestamp, value.basisAskPublicationTimestamp,
   value.promotionGrade === true,
 ];
+const REFERENCE_DIRECT_COLUMNS = [
+  'reference_mode', 'source_instrument', 'source_channel', 'source_sequence',
+  'source_generation', 'source_session_id', 'source_endpoint', 'source_book_hash',
+  'source_depth', 'source_bid_qty', 'source_ask_qty', 'source_bid_count', 'source_ask_count',
+  'source_book_update_timestamp',
+];
+const referenceDirectValues = value => value.referenceMode === 'cryptocom-direct' ? [
+  'cryptocom-direct', value.sourceInstrument, value.sourceChannel, value.sourceSequence,
+  value.sourceGeneration, value.sourceSessionId, value.sourceEndpoint, value.sourceBookHash,
+  value.sourceDepth, value.sourceBidQty, value.sourceAskQty, value.sourceBidCount,
+  value.sourceAskCount, value.sourceBookUpdateTimestamp,
+] : [value.referenceMode === 'coinbase-basis' ? 'coinbase-basis' : null, ...Array(13).fill(null)];
 
 /**
  * TrueX PostgreSQL Manager - Layer 3: Analytics & Long-term Storage
@@ -262,8 +274,8 @@ export class TrueXPostgreSQLManager {
             bid NUMERIC NOT NULL,
             ask NUMERIC NOT NULL,
             midpoint NUMERIC NOT NULL,
-            basis_timestamp BIGINT NOT NULL,
-            basis_price NUMERIC NOT NULL,
+            basis_timestamp BIGINT,
+            basis_price NUMERIC,
             basis_adjustment_bps NUMERIC NOT NULL,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
           )
@@ -274,6 +286,11 @@ export class TrueXPostgreSQLManager {
         // on databases that already created the original index.
         await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_market_selector_v2 ON reference_market_observations(product, quote_currency, source_exchange, source_type, observation_timestamp, source_timestamp, received_timestamp, basis_timestamp)`);
         await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_market_retention_v3 ON reference_market_observations(received_timestamp, observation_timestamp, observation_id)`);
+        // Direct BTC-PYUSD evidence has no conversion basis. Existing deployments
+        // created these legacy basis columns as NOT NULL, so make the additive
+        // migration explicit before direct observations can be inserted.
+        await this.db.query(`ALTER TABLE reference_market_observations ALTER COLUMN basis_timestamp DROP NOT NULL`);
+        await this.db.query(`ALTER TABLE reference_market_observations ALTER COLUMN basis_price DROP NOT NULL`);
 
         await this.db.query(`
           CREATE TABLE IF NOT EXISTS fill_reference_markout_work (
@@ -341,6 +358,10 @@ export class TrueXPostgreSQLManager {
         await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_evidence_availability ON fill_reference_markout_evidence(available, unavailable_reason)`);
         await this.db.query(`ALTER TABLE fill_reference_markout_evidence ADD COLUMN IF NOT EXISTS observed_edge_bps NUMERIC`);
         await this.db.query(`ALTER TABLE fill_reference_markout_evidence ADD COLUMN IF NOT EXISTS adjusted_midpoint NUMERIC`);
+        // Direct provenance columns and their sole writer ship together in this
+        // never-before-deployed schema version. New writes canonicalize the endpoint
+        // before persistence. Do not rewrite immutable evidence for a hypothetical
+        // pre-canonical writer; none exists on the production baseline.
         const provenanceTypes = {
           basis_request_timestamp: 'BIGINT', basis_received_timestamp: 'BIGINT',
           basis_bid: 'NUMERIC', basis_ask: 'NUMERIC', basis_bid_qty: 'NUMERIC',
@@ -354,11 +375,22 @@ export class TrueXPostgreSQLManager {
           for (const column of REFERENCE_BASIS_COLUMNS) {
             await this.db.query(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${column} ${provenanceTypes[column] || 'TEXT'}`);
           }
+          for (const column of REFERENCE_DIRECT_COLUMNS) {
+            const type = ['source_sequence', 'source_generation', 'source_book_update_timestamp']
+              .includes(column) ? 'BIGINT'
+              : ['source_depth', 'source_bid_count', 'source_ask_count'].includes(column) ? 'INTEGER'
+                : ['source_bid_qty', 'source_ask_qty'].includes(column) ? 'NUMERIC' : 'TEXT';
+            await this.db.query(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${column} ${type}`);
+          }
         }
         await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_market_selector_v3
           ON reference_market_observations(product, quote_currency, source_exchange, source_type,
             basis_source, basis_requested_pair, basis_resolved_pair, basis_base, basis_quote,
             basis_system, basis_venue, observation_timestamp, observation_id)`);
+        await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_market_selector_v4_direct
+          ON reference_market_observations(reference_mode, product, quote_currency,
+            source_exchange, source_type, source_instrument, source_channel,
+            source_endpoint, observation_timestamp, observation_id)`);
 
         // Create index on exec_id for fills deduplication
         await this.db.query(`
@@ -426,13 +458,14 @@ export class TrueXPostgreSQLManager {
       decision.sourceTimestamp, decision.receivedTimestamp, decision.bid, decision.ask,
       decision.midpoint, decision.basisTimestamp, decision.basisPrice,
       decision.basisAdjustmentBps, decision.available, decision.unavailableReason,
-      ...referenceBasisValues(decision),
+      ...referenceBasisValues(decision), ...referenceDirectValues(decision),
     ];
     return this._referenceQuery(`INSERT INTO reference_quote_decisions (
       decision_id, event_id, decision_timestamp, session_id, quote_id, symbol, side, level,
       policy_id, quote_price, quote_size, product, quote_currency, source_exchange, source_type,
       source_timestamp, received_timestamp, bid, ask, midpoint, basis_timestamp, basis_price,
-      basis_adjustment_bps, available, unavailable_reason, ${REFERENCE_BASIS_COLUMNS.join(', ')}
+      basis_adjustment_bps, available, unavailable_reason, ${REFERENCE_BASIS_COLUMNS.join(', ')},
+      ${REFERENCE_DIRECT_COLUMNS.join(', ')}
     ) VALUES (${values.map((_, index) => `$${index + 1}`).join(',')})
     ON CONFLICT (decision_id) DO NOTHING`, values);
   }
@@ -483,7 +516,7 @@ export class TrueXPostgreSQLManager {
       observation.sourceTimestamp,
       observation.receivedTimestamp, observation.bid, observation.ask,
       observation.basisTimestamp, observation.basisPrice,
-      ...referenceBasisValues(observation),
+      ...referenceBasisValues(observation), ...referenceDirectValues(observation),
     ].join(':');
     const values = [
       observationId, observation.observationTimestamp, observation.product,
@@ -491,12 +524,13 @@ export class TrueXPostgreSQLManager {
       observation.sourceTimestamp, observation.receivedTimestamp, observation.bid,
       observation.ask, observation.midpoint, observation.basisTimestamp,
       observation.basisPrice, observation.basisAdjustmentBps,
-      ...referenceBasisValues(observation),
+      ...referenceBasisValues(observation), ...referenceDirectValues(observation),
     ];
     const result = await this._referenceQuery(`INSERT INTO reference_market_observations (
       observation_id, observation_timestamp, product, quote_currency, source_exchange,
       source_type, source_timestamp, received_timestamp, bid, ask, midpoint,
-      basis_timestamp, basis_price, basis_adjustment_bps, ${REFERENCE_BASIS_COLUMNS.join(', ')}
+      basis_timestamp, basis_price, basis_adjustment_bps, ${REFERENCE_BASIS_COLUMNS.join(', ')},
+      ${REFERENCE_DIRECT_COLUMNS.join(', ')}
     ) VALUES (${values.map((_, index) => `$${index + 1}`).join(',')})
     ON CONFLICT (observation_id) DO NOTHING`, values);
     return (result.rowCount ?? 0) > 0;
@@ -505,7 +539,56 @@ export class TrueXPostgreSQLManager {
   async getFirstReferenceMarketObservation({ dueTimestamp, deadlineTimestamp, product,
     quoteCurrency, sourceExchange, sourceType, maxSourceAgeMs, maxAbsBasisAdjustmentBps,
     basisSource, basisRequestedPair, basisResolvedPair, basisBase, basisQuote, basisSystem,
-    basisVenueAllowlist, maxBasisRttMs }) {
+    basisVenueAllowlist, maxBasisRttMs, referenceMode, sourceInstrument, sourceChannel,
+    sourceEndpointAllowlist }) {
+    if (referenceMode === 'cryptocom-direct') {
+      const direct = await this._referenceQuery(`SELECT * FROM reference_market_observations
+        WHERE reference_mode = 'cryptocom-direct'
+          AND product = $1 AND quote_currency = $2 AND source_exchange = $3
+          AND source_type = $4 AND source_instrument = $8 AND source_channel = $9
+          AND source_endpoint = ANY($10::text[])
+          AND observation_timestamp BETWEEN $5 AND $6
+          AND observation_timestamp >= 0 AND source_timestamp >= 0 AND received_timestamp >= 0
+          AND source_sequence >= 0 AND source_generation > 0
+          AND source_session_id IS NOT NULL AND LENGTH(source_session_id) BETWEEN 8 AND 64
+          AND source_book_hash ~ '^[a-f0-9]{64}$' AND source_depth = 10
+          AND source_bid_qty > 0 AND source_ask_qty > 0
+          AND source_bid_count > 0 AND source_ask_count > 0
+          AND source_book_update_timestamp >= 0
+          AND source_book_update_timestamp <= source_timestamp
+          AND source_timestamp <= received_timestamp
+          AND received_timestamp <= observation_timestamp
+          AND received_timestamp - source_timestamp <= $7
+          AND observation_timestamp - received_timestamp <= $7
+          AND observation_timestamp - source_timestamp <= $7
+          AND bid::text NOT IN ('NaN', 'Infinity', '-Infinity')
+          AND ask::text NOT IN ('NaN', 'Infinity', '-Infinity')
+          AND midpoint::text NOT IN ('NaN', 'Infinity', '-Infinity')
+          AND bid > 0 AND ask > 0 AND bid <= ask AND midpoint = ((bid + ask) / 2)
+          AND basis_adjustment_bps = 0 AND promotion_grade IS TRUE
+        ORDER BY observation_timestamp, source_timestamp, received_timestamp, observation_id
+        LIMIT 1`, [product, quoteCurrency, sourceExchange, sourceType, dueTimestamp,
+        deadlineTimestamp, maxSourceAgeMs, sourceInstrument, sourceChannel,
+        sourceEndpointAllowlist]);
+      const row = direct.rows?.[0];
+      if (!row) return null;
+      return { available: true, unavailableReason: null,
+        observationTimestamp: Number(row.observation_timestamp), product: row.product,
+        quoteCurrency: row.quote_currency, sourceExchange: row.source_exchange,
+        sourceType: row.source_type, sourceTimestamp: Number(row.source_timestamp),
+        receivedTimestamp: Number(row.received_timestamp), bid: Number(row.bid),
+        ask: Number(row.ask), midpoint: Number(row.midpoint), basisTimestamp: null,
+        basisPrice: null, basisAdjustmentBps: 0, sourceInstrument: row.source_instrument,
+        sourceChannel: row.source_channel, sourceSequence: Number(row.source_sequence),
+        sourceGeneration: Number(row.source_generation),
+        sourceSessionId: row.source_session_id,
+        sourceEndpoint: row.source_endpoint, sourceBookHash: row.source_book_hash,
+        sourceDepth: Number(row.source_depth), sourceBidQty: Number(row.source_bid_qty),
+        sourceAskQty: Number(row.source_ask_qty), sourceBidCount: Number(row.source_bid_count),
+        sourceAskCount: Number(row.source_ask_count),
+        sourceBookUpdateTimestamp: Number(row.source_book_update_timestamp),
+        referenceMode: row.reference_mode, promotionGrade: row.promotion_grade === true };
+    }
     const result = await this._referenceQuery(`SELECT * FROM reference_market_observations
       WHERE product = $1 AND quote_currency = $2 AND source_exchange = $3 AND source_type = $4
         AND observation_timestamp >= $5 AND observation_timestamp <= $6
@@ -648,9 +731,11 @@ export class TrueXPostgreSQLManager {
       observation.bid, observation.ask, observation.midpoint, observation.basisTimestamp,
       observation.basisPrice, observation.basisAdjustmentBps, observation.adjustedMidpoint,
       observation.observedEdgeBps, observation.available, observation.unavailableReason,
-      ...referenceBasisValues(observation),
+      ...referenceBasisValues(observation), ...referenceDirectValues(observation),
     ];
     const provenancePlaceholders = REFERENCE_BASIS_COLUMNS.map((_, index) => `$${21 + index}`);
+    const directPlaceholders = REFERENCE_DIRECT_COLUMNS.map((_, index) =>
+      `$${21 + REFERENCE_BASIS_COLUMNS.length + index}`);
     const result = await this._referenceQuery(`WITH eligible AS (
       SELECT fill_id, horizon_ms FROM fill_reference_markout_work
       WHERE fill_id = $1 AND horizon_ms = $2 AND state = 'claimed' AND claim_token = $3
@@ -660,9 +745,10 @@ export class TrueXPostgreSQLManager {
         fill_id, horizon_ms, observation_timestamp, product, quote_currency,
         source_exchange, source_type, source_timestamp, received_timestamp, bid, ask,
         midpoint, basis_timestamp, basis_price, basis_adjustment_bps, adjusted_midpoint,
-        observed_edge_bps, available, unavailable_reason, ${REFERENCE_BASIS_COLUMNS.join(', ')}
+        observed_edge_bps, available, unavailable_reason, ${REFERENCE_BASIS_COLUMNS.join(', ')},
+        ${REFERENCE_DIRECT_COLUMNS.join(', ')}
       ) SELECT $1,$2,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-        ${provenancePlaceholders.join(',')}
+        ${provenancePlaceholders.join(',')},${directPlaceholders.join(',')}
         FROM eligible
       ON CONFLICT (fill_id, horizon_ms) DO NOTHING
     )
@@ -742,6 +828,11 @@ export class TrueXPostgreSQLManager {
       SELECT work.side, work.level, work.policy_id, work.horizon_ms,
         CASE
           WHEN evidence.fill_id IS NOT NULL AND evidence.available AND evidence.promotion_grade IS TRUE
+            AND evidence.reference_mode = 'cryptocom-direct'
+            AND evidence.source_exchange = 'cryptocom' AND evidence.source_type = 'public-ws-book'
+            AND evidence.source_instrument = 'BTC_PYUSD'
+            AND evidence.source_channel = 'book.BTC_PYUSD.10'
+            AND evidence.source_endpoint = 'wss://stream.crypto.com/exchange/v1/market'
             THEN 'promotion-grade'
           WHEN evidence.fill_id IS NOT NULL AND evidence.available THEN 'non-promotion-grade'
           WHEN evidence.fill_id IS NOT NULL THEN 'unavailable'
@@ -750,6 +841,11 @@ export class TrueXPostgreSQLManager {
         END AS availability_status,
         CASE
           WHEN evidence.fill_id IS NOT NULL AND evidence.available AND evidence.promotion_grade IS TRUE
+            AND evidence.reference_mode = 'cryptocom-direct'
+            AND evidence.source_exchange = 'cryptocom' AND evidence.source_type = 'public-ws-book'
+            AND evidence.source_instrument = 'BTC_PYUSD'
+            AND evidence.source_channel = 'book.BTC_PYUSD.10'
+            AND evidence.source_endpoint = 'wss://stream.crypto.com/exchange/v1/market'
             THEN 'promotion-grade'
           WHEN evidence.fill_id IS NOT NULL AND evidence.available
             THEN 'legacy-missing-basis-provenance'

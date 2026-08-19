@@ -40,6 +40,7 @@ import { KrakenRestClient } from '../src/connectors/kraken/KrakenRestClient.ts';
 import { CoinbaseWsIngest } from '../src/data-pipeline/coinbase-ws-ingest.js';
 import { CoinbaseMarketDataAdapter } from '../src/data-pipeline/coinbase-market-data-adapter.js';
 import { buildReferenceMarkoutRolloutOptions } from './reference-markout-rollout-config.js';
+import { CryptoComReferenceBookFeed } from '../src/connectors/cryptocom/CryptoComReferenceBookFeed.js';
 import { buildContinuityConfig } from './continuity-config.js';
 import { buildOrderReconciliationScope } from './order-reconciliation-scope-config.js';
 import { startProductionOrchestrator } from './production-orchestrator-startup.js';
@@ -216,7 +217,9 @@ const referenceMarkoutRolloutOptions = buildReferenceMarkoutRolloutOptions(proce
   maxQuoteDecisionsPerSecond: config.maxOrdersPerSecond,
   basisPollTimeoutMs: config.pyusdUsdPollTimeoutMs,
 });
-if (referenceMarkoutRolloutOptions.referenceMarkoutConfig) {
+const referenceBookFeed = referenceMarkoutRolloutOptions.referenceBookFeedConfig
+  ? new CryptoComReferenceBookFeed(referenceMarkoutRolloutOptions.referenceBookFeedConfig) : null;
+if (referenceMarkoutRolloutOptions.referenceMarkoutConfig?.referenceMode === 'coinbase-basis') {
   config.pyusdUsdReferenceSources = [{
     type: 'kraken-rest',
     pair: referenceMarkoutRolloutOptions.referenceMarkoutConfig.basisRequestedPair,
@@ -501,7 +504,8 @@ async function main() {
 
     // Data pipeline
     dataPipeline,
-    ...referenceMarkoutRolloutOptions,
+    referenceMarkoutConfig: referenceMarkoutRolloutOptions.referenceMarkoutConfig,
+    referenceBookFeed,
     continuityConfig: config.continuityConfig,
     ...config.truexMakerSafety,
     ...orderReconciliationScope,

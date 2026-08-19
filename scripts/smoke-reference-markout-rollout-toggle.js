@@ -9,7 +9,9 @@ if ('referenceMarkoutConfig' in disabledOptions || disabled.referenceMarkoutColl
 }
 
 const enabledOptions = buildReferenceMarkoutRolloutOptions({
-  REFERENCE_MARKOUT_ENABLED: 'true', REFERENCE_MARKOUT_BASIS_VENUE_ALLOWLIST: 'PDSL',
+  REFERENCE_MARKOUT_ENABLED: 'true',
+  REFERENCE_MARKOUT_SOURCE_WS_URL: 'wss://stream.crypto.com/exchange/v1/market',
+  REFERENCE_MARKOUT_SOURCE_ENDPOINT_ALLOWLIST: 'wss://stream.crypto.com/exchange/v1/market',
 });
 const enabled = new MarketMakerOrchestrator(enabledOptions);
 if (!enabled.referenceMarkoutCollector ||

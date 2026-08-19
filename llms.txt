@@ -41,7 +41,8 @@ to Kraken. DataPipelineManager: audit JSONL → Redis → PG.
 - `scripts/daily-perf-review.ts` — Read-only daily PnL/adverse-selection review (see `docs/DAILY_PERF_REVIEW.md`)
 - `scripts/daily-perf-review-job.sh` — Scheduled wrapper: archives report, appends daily log, ADMP-alerts on WARN/ERROR, chains the email digest
 - `scripts/daily-perf-email.ts` — Daily email digest: HTML report + 7-day trend published to Cloudflare Pages (truex-mm-reports.pages.dev), summary emailed via CircleInbox from truex-mm@derivative.email to DAILY_REPORT_EMAIL (flags: --date --to --send --skip-deploy --dry-run; archive persists in TRUEX_PERF_DATA_ROOT/logs/reports-site)
-- `src/data-pipeline/reference-markout-collector.js` — Default-off, restart-safe 1/5/60m Coinbase mark-out evidence collector; no order/FIX capability
+- `src/connectors/cryptocom/CryptoComReferenceBookFeed.js` — Isolated Crypto.com BTC_PYUSD full-book reference feed; never supplies pricing or execution
+- `src/data-pipeline/reference-markout-collector.js` — Default-off, restart-safe 1/5/60m direct BTC-PYUSD mark-out evidence collector; no order/FIX capability
 - `scripts/report-reference-markout-coverage.js` — Bounded grouped coverage audit (`--from`, `--to`, `--limit`)
 - `docs/REFERENCE_MARKOUTS.md` — Rollout, evidence semantics, configuration, verification, and rollback
 - `ops/launchd/install-daily-perf-review.sh` — Idempotent LaunchAgent installer (DRY_RUN=1 supported)
@@ -234,10 +235,12 @@ fill-probability, and P&L scoring belong to the offline evaluator.
 Production collection is opt-in: `REFERENCE_MARKOUT_ENABLED=true`. Unset/false means no
 collector, sampling, or mark-out writes, although additive reference tables are still initialized
 with the normal PostgreSQL schema. Enabled collection schedules 60s/300s/3600s work per fill and
-persists the earliest fresh, non-crossed Coinbase BTC-USD observation inside each due/lateness
-window. Source, receipt, observation, and PYUSD/USD basis timestamps are independently validated;
-unavailable evidence is explicit and never converted to zero edge. Claims are lease-owned,
-overlap-safe, and restart-recoverable. The collector is fail-soft and has no quote/FIX/order path.
+persists the earliest fresh, non-crossed Crypto.com BTC_PYUSD full-book observation inside each
+due/lateness window. Exact endpoint/channel/instrument/depth, publication/receipt/observation
+times, canonical book hash, sequence, connection generation, and process-session identity are
+independently validated; unavailable evidence is explicit and never converted to zero edge.
+Legacy Coinbase plus Kraken basis rows are diagnostic-only. Claims are lease-owned, overlap-safe,
+and restart-recoverable. The collector is fail-soft and has no quote/FIX/order path.
 
 Run `bun run test:reference-markouts`, `bun scripts/report-reference-markout-coverage.js`, and see
 `docs/REFERENCE_MARKOUTS.md`. Do not mark PRD tasks 5.1/5.2 complete until production schema,

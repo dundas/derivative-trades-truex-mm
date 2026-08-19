@@ -4,11 +4,21 @@
  */
 
 const HORIZONS = Object.freeze({ '1m': 60_000, '5m': 300_000, '60m': 3_600_000 });
+const CRYPTOCOM_PUBLIC_MARKET_ENDPOINT = 'wss://stream.crypto.com/exchange/v1/market';
 const PROMOTION_GRADE_SOURCE_TYPES = Object.freeze([
   'top-of-book',
   'point-in-time-book',
   'equivalent-point-in-time',
+  'public-ws-book',
 ]);
+const isOfficialCryptoComEndpoint = value => {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'wss:' && url.hostname === 'stream.crypto.com' &&
+      (url.port === '' || url.port === '443') && url.pathname === '/exchange/v1/market' &&
+      !url.username && !url.password && !url.search && !url.hash;
+  } catch { return false; }
+};
 
 export const DEFAULT_REGIME_VALIDATOR_CONFIG = Object.freeze({
   clusterBurstMs: 1_000,
@@ -19,6 +29,7 @@ export const DEFAULT_REGIME_VALIDATOR_CONFIG = Object.freeze({
   primaryHorizon: '5m',
   regime: Object.freeze({ lookbackMs: 60_000, directionalMoveBps: 5, highVolatilityBps: 15, staleReferenceAgeMs: 5_000 }),
   sourceQuality: Object.freeze({
+    referenceMode: 'coinbase-basis',
     promotionGradeSourceTypes: PROMOTION_GRADE_SOURCE_TYPES, referenceProduct: 'BTC-USD',
     quoteCurrency: 'USD', sourceExchange: 'coinbase', maxSourceAgeMs: 5_000,
     maxAbsBasisAdjustmentBps: 25,
@@ -101,6 +112,19 @@ function mergeConfig(config = {}) {
   nonEmptyString(merged.sourceQuality.referenceProduct, 'sourceQuality.referenceProduct');
   nonEmptyString(merged.sourceQuality.quoteCurrency, 'sourceQuality.quoteCurrency');
   nonEmptyString(merged.sourceQuality.sourceExchange, 'sourceQuality.sourceExchange');
+  if (merged.sourceQuality.referenceMode === 'cryptocom-direct') {
+    for (const field of ['sourceInstrument', 'sourceChannel']) {
+      nonEmptyString(merged.sourceQuality[field], `sourceQuality.${field}`);
+    }
+    if (!Array.isArray(merged.sourceQuality.sourceEndpointAllowlist) ||
+        merged.sourceQuality.sourceEndpointAllowlist.length < 1 ||
+        merged.sourceQuality.sourceEndpointAllowlist.some(value => !isOfficialCryptoComEndpoint(value))) {
+      throw new Error('sourceQuality.sourceEndpointAllowlist must contain only the exact official Crypto.com endpoint');
+    }
+    merged.sourceQuality.sourceEndpointAllowlist = [CRYPTOCOM_PUBLIC_MARKET_ENDPOINT];
+  } else if (merged.sourceQuality.referenceMode !== 'coinbase-basis') {
+    throw new Error('sourceQuality.referenceMode is invalid');
+  }
   nonNegativeInteger(merged.sourceQuality.maxSourceAgeMs, 'sourceQuality.maxSourceAgeMs');
   nonNegative(merged.sourceQuality.maxAbsBasisAdjustmentBps, 'sourceQuality.maxAbsBasisAdjustmentBps');
   for (const field of ['basisSource', 'basisRequestedPair', 'basisResolvedPair', 'basisBase',
@@ -281,6 +305,32 @@ function referenceSourceProvenanceReason(reference, config) {
   return null;
 }
 
+function directReferenceProvenanceReason(reference, config) {
+  if (reference.promotionGrade !== true) return 'promotion-attestation-required';
+  if (reference.referenceMode !== 'cryptocom-direct' ||
+      reference.sourceInstrument !== config.sourceInstrument ||
+      reference.sourceChannel !== config.sourceChannel ||
+      !config.sourceEndpointAllowlist.includes(reference.sourceEndpoint)) {
+    return 'direct-reference-identity-mismatch';
+  }
+  if (!Number.isSafeInteger(reference.sourceSequence) || reference.sourceSequence < 0 ||
+      !Number.isSafeInteger(reference.sourceGeneration) || reference.sourceGeneration <= 0 ||
+      typeof reference.sourceSessionId !== 'string' || reference.sourceSessionId.length < 8 ||
+      reference.sourceSessionId.length > 64 ||
+      typeof reference.sourceBookHash !== 'string' || !/^[a-f0-9]{64}$/.test(reference.sourceBookHash) ||
+      reference.sourceDepth !== 10 || !Number.isFinite(reference.sourceBidQty) ||
+      reference.sourceBidQty <= 0 || !Number.isFinite(reference.sourceAskQty) ||
+      reference.sourceAskQty <= 0 || !Number.isSafeInteger(reference.sourceBidCount) ||
+      reference.sourceBidCount <= 0 || !Number.isSafeInteger(reference.sourceAskCount) ||
+      reference.sourceAskCount <= 0 || !Number.isSafeInteger(reference.sourceBookUpdateTimestamp) ||
+      reference.sourceBookUpdateTimestamp < 0 ||
+      reference.sourceBookUpdateTimestamp > reference.sourceTimestamp) {
+    return 'invalid-direct-reference-provenance';
+  }
+  if (reference.basisAdjustmentBps !== 0) return 'direct-reference-must-not-use-basis';
+  return null;
+}
+
 function classifyReferences(references, config) {
   const duplicateCounts = new Map();
   for (const reference of references) duplicateCounts.set(referenceKey(reference), (duplicateCounts.get(referenceKey(reference)) || 0) + 1);
@@ -296,7 +346,10 @@ function classifyReferences(references, config) {
     const sourceProvenanceReason = metadataValid
       ? referenceSourceProvenanceReason(reference, config.sourceQuality) : 'malformed-reference';
     const basisProvenanceReason = metadataValid && sourceProvenanceReason === null
-      ? referenceBasisProvenanceReason(reference, config.sourceQuality) : sourceProvenanceReason;
+      ? (config.sourceQuality.referenceMode === 'cryptocom-direct'
+        ? directReferenceProvenanceReason(reference, config.sourceQuality)
+        : referenceBasisProvenanceReason(reference, config.sourceQuality))
+      : sourceProvenanceReason;
     const promotionGrade = metadataValid && productMatches
       && basisProvenanceReason === null
       && PROMOTION_GRADE_SOURCE_TYPES.includes(reference.sourceType)

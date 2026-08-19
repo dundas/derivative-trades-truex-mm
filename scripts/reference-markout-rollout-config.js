@@ -1,8 +1,15 @@
 import { validateReferenceMarkoutConfig } from '../src/data-pipeline/reference-markout-collector.js';
 
+const CRYPTOCOM_PUBLIC_MARKET_ENDPOINT = 'wss://stream.crypto.com/exchange/v1/market';
+
 const DEFAULTS = Object.freeze({
-  product: 'BTC-USD', quoteCurrency: 'USD', sourceExchange: 'coinbase',
-  sourceType: 'top-of-book', horizonsMs: Object.freeze([60_000, 300_000, 3_600_000]),
+  referenceMode: 'cryptocom-direct', product: 'BTC-PYUSD', quoteCurrency: 'PYUSD',
+  sourceExchange: 'cryptocom', sourceType: 'public-ws-book',
+  sourceInstrument: 'BTC_PYUSD', sourceChannel: 'book.BTC_PYUSD.10',
+  sourceDepth: 10, sourceReconnectDelayMs: 1_000,
+  sourceSubscribeDelayMs: 1_000, sourceHeartbeatTimeoutMs: 15_000,
+  sourceReconnectJitterMs: 250,
+  horizonsMs: Object.freeze([60_000, 300_000, 3_600_000]),
   maxSourceAgeMs: 5_000, maxLatenessMs: 30_000, pollIntervalMs: 1_000,
   batchSize: 100, claimLeaseMs: 5_000, retentionMs: 90 * 86_400_000,
   retentionSweepIntervalMs: 3_600_000, auditMaxGroups: 500,
@@ -32,6 +39,14 @@ function numberFromEnv(env, name, fallback) {
   const raw = env[name];
   return raw === undefined || raw === null || String(raw).trim() === '' ? fallback : Number(raw);
 }
+function officialCryptoComEndpoint(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'wss:' && url.hostname === 'stream.crypto.com' &&
+      (url.port === '' || url.port === '443') && url.pathname === '/exchange/v1/market' &&
+      !url.username && !url.password && !url.search && !url.hash;
+  } catch { return false; }
+}
 
 function horizonsFromEnv(env) {
   const raw = env.REFERENCE_MARKOUT_HORIZONS_MS;
@@ -55,6 +70,23 @@ export function buildReferenceMarkoutRolloutOptions(env = {}, {
   maxQuoteDecisionsPerSecond, basisPollTimeoutMs,
 } = {}) {
   if (!enabledFromEnv(env)) return {};
+  const referenceMode = env.REFERENCE_MARKOUT_REFERENCE_MODE || DEFAULTS.referenceMode;
+  const rawSourceUrl = env.REFERENCE_MARKOUT_SOURCE_WS_URL;
+  const rawSourceEndpointAllowlist = String(env.REFERENCE_MARKOUT_SOURCE_ENDPOINT_ALLOWLIST || '')
+    .split(',').map(value => value.trim()).filter(Boolean);
+  if (referenceMode === 'cryptocom-direct' &&
+      !officialCryptoComEndpoint(rawSourceUrl)) {
+    throw new Error('REFERENCE_MARKOUT_SOURCE_WS_URL must be the exact official Crypto.com public market endpoint');
+  }
+  if (referenceMode === 'cryptocom-direct' &&
+      (rawSourceEndpointAllowlist.some(value => !officialCryptoComEndpoint(value)) ||
+       !rawSourceEndpointAllowlist.some(value => officialCryptoComEndpoint(value)))) {
+    throw new Error('REFERENCE_MARKOUT_SOURCE_WS_URL must exactly match its configured endpoint allowlist');
+  }
+  const sourceUrl = referenceMode === 'cryptocom-direct'
+    ? CRYPTOCOM_PUBLIC_MARKET_ENDPOINT : rawSourceUrl;
+  const sourceEndpointAllowlist = referenceMode === 'cryptocom-direct'
+    ? [CRYPTOCOM_PUBLIC_MARKET_ENDPOINT] : rawSourceEndpointAllowlist;
   const configuredDecisionRate = numberFromEnv(env,
     'REFERENCE_MARKOUT_MAX_QUOTE_DECISIONS_PER_SECOND',
     maxQuoteDecisionsPerSecond ?? DEFAULTS.maxQuoteDecisionsPerSecond);
@@ -63,10 +95,14 @@ export function buildReferenceMarkoutRolloutOptions(env = {}, {
     throw new Error('REFERENCE_MARKOUT_MAX_QUOTE_DECISIONS_PER_SECOND must equal the enforced order rate');
   }
   const referenceMarkoutConfig = validateReferenceMarkoutConfig({
+    referenceMode,
     product: env.REFERENCE_MARKOUT_PRODUCT || DEFAULTS.product,
     quoteCurrency: env.REFERENCE_MARKOUT_QUOTE_CURRENCY || DEFAULTS.quoteCurrency,
     sourceExchange: env.REFERENCE_MARKOUT_SOURCE_EXCHANGE || DEFAULTS.sourceExchange,
     sourceType: env.REFERENCE_MARKOUT_SOURCE_TYPE || DEFAULTS.sourceType,
+    sourceInstrument: env.REFERENCE_MARKOUT_SOURCE_INSTRUMENT || DEFAULTS.sourceInstrument,
+    sourceChannel: env.REFERENCE_MARKOUT_SOURCE_CHANNEL || DEFAULTS.sourceChannel,
+    sourceEndpointAllowlist: referenceMode === 'cryptocom-direct' ? sourceEndpointAllowlist : [],
     horizonsMs: horizonsFromEnv(env),
     maxSourceAgeMs: numberFromEnv(env, 'REFERENCE_MARKOUT_MAX_SOURCE_AGE_MS', DEFAULTS.maxSourceAgeMs),
     maxLatenessMs: numberFromEnv(env, 'REFERENCE_MARKOUT_MAX_LATENESS_MS', DEFAULTS.maxLatenessMs),
@@ -97,11 +133,35 @@ export function buildReferenceMarkoutRolloutOptions(env = {}, {
     basisBase: env.REFERENCE_MARKOUT_BASIS_BASE || DEFAULTS.basisBase,
     basisQuote: env.REFERENCE_MARKOUT_BASIS_QUOTE || DEFAULTS.basisQuote,
     basisSystem: env.REFERENCE_MARKOUT_BASIS_SYSTEM || DEFAULTS.basisSystem,
-    basisVenueAllowlist: venueAllowlistFromEnv(env),
+    basisVenueAllowlist: referenceMode === 'coinbase-basis' ? venueAllowlistFromEnv(env) : [],
     maxBasisRttMs: numberFromEnv(env, 'REFERENCE_MARKOUT_MAX_BASIS_RTT_MS', DEFAULTS.maxBasisRttMs),
   });
-  if (basisPollTimeoutMs !== undefined && referenceMarkoutConfig.maxBasisRttMs > basisPollTimeoutMs) {
+  if (referenceMode === 'coinbase-basis' && basisPollTimeoutMs !== undefined &&
+      referenceMarkoutConfig.maxBasisRttMs > basisPollTimeoutMs) {
     throw new Error('REFERENCE_MARKOUT_MAX_BASIS_RTT_MS must not exceed PYUSD_USD_POLL_TIMEOUT_MS');
   }
-  return { referenceMarkoutConfig };
+  if (referenceMode !== 'cryptocom-direct') return { referenceMarkoutConfig };
+  const url = sourceUrl;
+  const sourceDepth = numberFromEnv(env, 'REFERENCE_MARKOUT_SOURCE_DEPTH', DEFAULTS.sourceDepth);
+  const reconnectDelayMs = numberFromEnv(env, 'REFERENCE_MARKOUT_SOURCE_RECONNECT_DELAY_MS',
+    DEFAULTS.sourceReconnectDelayMs);
+  const subscribeDelayMs = numberFromEnv(env, 'REFERENCE_MARKOUT_SOURCE_SUBSCRIBE_DELAY_MS',
+    DEFAULTS.sourceSubscribeDelayMs);
+  const heartbeatTimeoutMs = numberFromEnv(env, 'REFERENCE_MARKOUT_SOURCE_HEARTBEAT_TIMEOUT_MS',
+    DEFAULTS.sourceHeartbeatTimeoutMs);
+  const reconnectJitterMs = numberFromEnv(env, 'REFERENCE_MARKOUT_SOURCE_RECONNECT_JITTER_MS',
+    DEFAULTS.sourceReconnectJitterMs);
+  if (sourceDepth !== 10 || !Number.isSafeInteger(reconnectDelayMs) || reconnectDelayMs < 100 ||
+      reconnectDelayMs > 60_000 || !Number.isSafeInteger(subscribeDelayMs) ||
+      subscribeDelayMs < 500 || subscribeDelayMs > 5_000 ||
+      !Number.isSafeInteger(heartbeatTimeoutMs) || heartbeatTimeoutMs <= subscribeDelayMs ||
+      heartbeatTimeoutMs > 60_000 || !Number.isSafeInteger(reconnectJitterMs) ||
+      reconnectJitterMs < 0 || reconnectJitterMs > reconnectDelayMs) {
+    throw new Error('Crypto.com source depth/reconnect configuration is invalid');
+  }
+  return { referenceMarkoutConfig, referenceBookFeedConfig: {
+    url, instrument: referenceMarkoutConfig.sourceInstrument, depth: sourceDepth,
+    maxAgeMs: referenceMarkoutConfig.maxSourceAgeMs, reconnectDelayMs, subscribeDelayMs,
+    heartbeatTimeoutMs, reconnectJitterMs,
+  } };
 }

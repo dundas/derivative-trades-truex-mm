@@ -101,6 +101,47 @@ function evidence({ days = 7, clustersPerDay = 20 } = {}) {
 }
 
 describe('regime strategy validator', () => {
+  test('independently promotes only complete direct BTC-PYUSD provenance', () => {
+    const timestamp = Date.UTC(2026, 7, 1, 1);
+    const direct = reference(timestamp - 1_000, 100, {
+      referenceMode: 'cryptocom-direct', product: 'BTC-PYUSD', quoteCurrency: 'PYUSD',
+      sourceType: 'public-ws-book', sourceExchange: 'cryptocom',
+      sourceInstrument: 'BTC_PYUSD', sourceChannel: 'book.BTC_PYUSD.10',
+      sourceEndpoint: 'wss://stream.crypto.com/exchange/v1/market', sourceSequence: 41,
+      sourceGeneration: 2, sourceSessionId: 'session-123', sourceBookHash: 'a'.repeat(64),
+      sourceDepth: 10, sourceBidQty: 2, sourceAskQty: 3, sourceBidCount: 1,
+      sourceAskCount: 1, sourceBookUpdateTimestamp: timestamp - 2_000,
+      basisAdjustmentBps: 0,
+    });
+    const config = { heldOutDays: 1, gates: permissiveGates(), sourceQuality: {
+      referenceMode: 'cryptocom-direct', referenceProduct: 'BTC-PYUSD', quoteCurrency: 'PYUSD',
+      sourceExchange: 'cryptocom', sourceInstrument: 'BTC_PYUSD',
+      sourceChannel: 'book.BTC_PYUSD.10',
+      sourceEndpointAllowlist: ['wss://stream.crypto.com/exchange/v1/market'],
+      promotionGradeSourceTypes: ['public-ws-book'],
+    } };
+    const valid = validateRegimeStrategy({ fills: [fill(timestamp)], references: [direct],
+      candidateId: CANDIDATE_ID, config, shadowEvidence: shadowEvidence() });
+    expect(valid.evidenceQuality.promotionGradeReferences).toBe(1);
+    const canonicalized = validateRegimeStrategy({ fills: [fill(timestamp)], references: [direct],
+      candidateId: CANDIDATE_ID, config: { ...config, sourceQuality: {
+        ...config.sourceQuality,
+        sourceEndpointAllowlist: ['wss://stream.crypto.com:443/exchange/v1/market'],
+      } }, shadowEvidence: shadowEvidence() });
+    expect(canonicalized.evidenceQuality.promotionGradeReferences).toBe(1);
+    expect(() => validateRegimeStrategy({ fills: [fill(timestamp)], references: [direct],
+      candidateId: CANDIDATE_ID, config: { ...config, sourceQuality: {
+        ...config.sourceQuality, sourceEndpointAllowlist: ['wss://operator.example/exchange/v1/market'],
+      } }, shadowEvidence: shadowEvidence() })).toThrow('exact official Crypto.com endpoint');
+    for (const overrides of [{ sourceEndpoint: 'wss://evil.example/ws' },
+      { sourceBookHash: 'forged' }, { sourceBookUpdateTimestamp: timestamp },
+      { sourceSessionId: 'x'.repeat(65) }]) {
+      const invalid = validateRegimeStrategy({ fills: [fill(timestamp)],
+        references: [{ ...direct, ...overrides }], candidateId: CANDIDATE_ID, config,
+        shadowEvidence: shadowEvidence() });
+      expect(invalid.evidenceQuality.promotionGradeReferences).toBe(0);
+    }
+  });
   test('keeps legacy available rows without explicit basis provenance diagnostic-only', () => {
     const timestamp = Date.UTC(2026, 7, 1, 1);
     const report = validateRegimeStrategy({

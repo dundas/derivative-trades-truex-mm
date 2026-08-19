@@ -5,13 +5,25 @@ The reference mark-out path records evidence needed to evaluate market-making pr
 does not change quote prices or sizes, authorize a strategy, send FIX messages, or dispatch an
 order. Failures are logged and counted without interrupting the market maker.
 
+Promotion-grade collection is default-off and uses a dedicated Crypto.com public WebSocket
+`book.BTC_PYUSD.10` full-snapshot feed. This feed is evidence-only: Coinbase remains the
+pricing/quote anchor and the collector has no order or FIX capability. Configure the reviewed
+`wss://` endpoint explicitly with `REFERENCE_MARKOUT_SOURCE_WS_URL`; do not enable collection
+until the separate 30–60 minute source soak passes.
+
+Message publication `t` is the point-in-time source timestamp and local callback receipt is
+recorded separately. `tt` is retained as diagnostic last-book-update provenance and may be older
+than `t`. Sequence, connection generation, and process-session identity are persisted. Missing,
+stale, crossed, malformed, replayed, conflicting same-sequence, or disconnected books are
+unavailable. Legacy Coinbase plus Kraken-basis rows remain diagnostic-only.
+
 ## Data flow
 
 ```mermaid
 flowchart LR
     Q[Quote create/replace] --> D[(reference_quote_decisions)]
     F[Partial/full fill] --> W[(fill_reference_markout_work)]
-    C[Coinbase book + PYUSD/USD basis] --> O[(reference_market_observations)]
+    C[Crypto.com BTC-PYUSD full book] --> O[(reference_market_observations)]
     W --> L[Lease-owned due claim]
     O --> L
     D --> L
@@ -21,9 +33,8 @@ flowchart LR
 
 Each unique fill schedules configured horizons. The collector samples one immutable observation
 per poll, then selects the earliest valid observation whose observation time is within the
-horizon's due/deadline window. A fresh source tick may predate the due time, but it must not be
-future-dated, stale, crossed, non-positive, or paired with future/stale/out-of-bounds basis data.
-Coinbase BTC-USD is converted to BTC-PYUSD by dividing the midpoint by PYUSD/USD.
+horizon's due/deadline window. A fresh source snapshot may predate the due time, but it must not be
+future-dated, stale, crossed, non-positive, replayed, or missing its validated book provenance.
 
 Claims use unique owner tokens and `FOR UPDATE OF work SKIP LOCKED`. An expired claim is recoverable
 after process restart. Evidence is append-only and idempotent; before the deadline, unavailable
@@ -38,10 +49,20 @@ PostgreSQL initializer still creates the additive reference tables and indexes.
 | Variable | Default | Meaning |
 |---|---:|---|
 | `REFERENCE_MARKOUT_ENABLED` | `false` | Enable collector and fill scheduling |
-| `REFERENCE_MARKOUT_PRODUCT` | `BTC-USD` | Reference product; current collector accepts only this value |
-| `REFERENCE_MARKOUT_QUOTE_CURRENCY` | `USD` | Reference quote currency |
-| `REFERENCE_MARKOUT_SOURCE_EXCHANGE` | `coinbase` | Reference exchange |
-| `REFERENCE_MARKOUT_SOURCE_TYPE` | `top-of-book` | Promotion-grade source type |
+| `REFERENCE_MARKOUT_REFERENCE_MODE` | `cryptocom-direct` | Direct BTC-PYUSD promotion path; legacy Coinbase+basis remains diagnostic |
+| `REFERENCE_MARKOUT_PRODUCT` | `BTC-PYUSD` | Exact reference product |
+| `REFERENCE_MARKOUT_QUOTE_CURRENCY` | `PYUSD` | Exact reference quote currency |
+| `REFERENCE_MARKOUT_SOURCE_EXCHANGE` | `cryptocom` | Exact reference exchange identity |
+| `REFERENCE_MARKOUT_SOURCE_TYPE` | `public-ws-book` | Promotion-grade full-book source type |
+| `REFERENCE_MARKOUT_SOURCE_INSTRUMENT` | `BTC_PYUSD` | Exact Crypto.com instrument |
+| `REFERENCE_MARKOUT_SOURCE_CHANNEL` | `book.BTC_PYUSD.10` | Exact snapshot subscription |
+| `REFERENCE_MARKOUT_SOURCE_WS_URL` | none | Required exact official public market endpoint when enabled |
+| `REFERENCE_MARKOUT_SOURCE_ENDPOINT_ALLOWLIST` | none | Required allowlist containing the exact configured official endpoint |
+| `REFERENCE_MARKOUT_SOURCE_DEPTH` | `10` | Exact validated book depth |
+| `REFERENCE_MARKOUT_SOURCE_RECONNECT_DELAY_MS` | `1000` | Bounded reconnect delay |
+| `REFERENCE_MARKOUT_SOURCE_SUBSCRIBE_DELAY_MS` | `1000` | Generation-fenced delay after open before subscribe |
+| `REFERENCE_MARKOUT_SOURCE_HEARTBEAT_TIMEOUT_MS` | `15000` | Half-open watchdog; must exceed subscribe delay and is bounded at startup |
+| `REFERENCE_MARKOUT_SOURCE_RECONNECT_JITTER_MS` | `250` | Bounded reconnect jitter; cannot exceed reconnect delay |
 | `REFERENCE_MARKOUT_HORIZONS_MS` | `60000,300000,3600000` | Unique positive horizons |
 | `REFERENCE_MARKOUT_MAX_SOURCE_AGE_MS` | `5000` | Maximum source and basis age at observation |
 | `REFERENCE_MARKOUT_MAX_LATENESS_MS` | `30000` | Deadline extension after each horizon |
@@ -65,13 +86,13 @@ PostgreSQL initializer still creates the additive reference tables and indexes.
 | `REFERENCE_MARKOUT_MAX_CONSECUTIVE_FILL_STARTS` | `10` | Weighted-fair fill burst before one waiting decision must start; FIFO is preserved within each lane |
 | `REFERENCE_MARKOUT_FILL_HORIZON_SAFETY_MARGIN_MS` | `1000` | Positive margin required after worst-case admitted fill service and before the earliest horizon |
 | `REFERENCE_MARKOUT_AUDIT_MAX_GROUPS` | `500` | Maximum grouped audit rows |
-| `REFERENCE_MARKOUT_MAX_ABS_BASIS_BPS` | `25` | Maximum absolute PYUSD/USD basis adjustment |
+| `REFERENCE_MARKOUT_MAX_ABS_BASIS_BPS` | `25` | Legacy diagnostic basis bound; direct evidence has zero basis adjustment |
 | `REFERENCE_MARKOUT_BASIS_SOURCE` | `kraken-pretrade` | Required promotion-grade basis source identity |
 | `REFERENCE_MARKOUT_BASIS_REQUESTED_PAIR` | `PYUSD/USD` | Configured Kraken PreTrade request candidate |
 | `REFERENCE_MARKOUT_BASIS_RESOLVED_PAIR` | `PYUSD/USD` | Exact resolved symbol accepted for promotion evidence |
 | `REFERENCE_MARKOUT_BASIS_BASE` / `REFERENCE_MARKOUT_BASIS_QUOTE` | `PYUSD` / `USD` | Exact basis asset identity |
 | `REFERENCE_MARKOUT_BASIS_SYSTEM` | `CLOB` | Exact market system identity |
-| `REFERENCE_MARKOUT_BASIS_VENUE_ALLOWLIST` | none | Required comma-separated venue allowlist when enabled. Resolve from live PreTrade metadata; no MIC is hard-coded |
+| `REFERENCE_MARKOUT_BASIS_VENUE_ALLOWLIST` | none | Required only for the legacy Coinbase+basis diagnostic mode |
 | `REFERENCE_MARKOUT_MAX_BASIS_RTT_MS` | `1000` | Maximum request-to-receipt duration; cannot exceed source age or poll timeout |
 
 Invalid enabled configuration fails before production startup. Settings are not parsed while the
@@ -133,22 +154,28 @@ Unknown flags or unsafe numeric bounds exit nonzero before opening a database co
 
 ### Pre-enable evidence gate
 
-Keep `REFERENCE_MARKOUT_ENABLED=false` until the reviewed image proves the bounded retention and
-database isolation checks above and operators configure the observed Kraken PreTrade venue
-explicitly. Promotion-grade basis rows retain requested/resolved pair, base/quote, venue, system,
-request/receipt, and both side submission/publication timestamps. `basis_timestamp` is the older of
-the two venue publication timestamps; receipt time is never relabeled as venue time. Legacy ticker
-rows have nullable provenance and are intentionally excluded by the v3 selector.
-
-Kraken's PreTrade response always needs a valid publication timestamp for every returned level;
-`submission_ts` is treated as optional because official/live payload availability may vary. A
-publication-only book is retained as diagnostic evidence with null submission fields and explicit
-`missing-basis-submission-provenance` classification. Submission time is never inferred from
-publication, request, or receipt, and the v3 selector cannot promote such a row.
+Keep `REFERENCE_MARKOUT_ENABLED=false` until the reviewed image proves the bounded retention,
+database isolation, exact effective Crypto.com endpoint configuration, and maker-isolation checks
+above. Promotion-grade direct rows require the complete v4 Crypto.com provenance contract described
+in this document. Legacy Coinbase observations and Kraken PreTrade basis rows remain readable
+diagnostic evidence and are intentionally excluded by the v4 selector; no legacy timestamp or
+caller-supplied promotion flag can substitute for direct-source attestation.
 
 To stop collection, set `REFERENCE_MARKOUT_ENABLED=false` and recreate the service. If the image or
 schema change affects service health, restore the recorded prior image. Additive evidence tables may
 remain; do not delete them during an incident, because deletion is unnecessary for rollback and can
 destroy recoverable evidence.
 
-PRD tasks 5.1 and 5.2 remain open until this live verification is complete.
+### Direct-source pre-enable soak (2026-08-18)
+
+A 30-minute read-only `book.BTC_PYUSD.10` source soak captured 3,569 complete snapshots. Venue
+publication age was 70ms p50, 155ms p95, and 1,326ms maximum; snapshot cadence was 503ms p50 and
+575ms p95. The run handled 59 heartbeats and one bounded reconnect with zero malformed frames,
+conflicting repeated sequences, sequence/timestamp regressions, or REST BBO mismatches across 30
+comparisons. Repeated `u` occurred 3,484 times and always carried the identical canonical book and
+`tt` with a newer `t`, matching the direct-source acceptance rule. This qualifies the source for a
+separate default-off deployment and enabled observability canary; it is not profitability evidence
+and does not authorize a strategy change.
+
+PRD tasks 5.1 and 5.2 remain open until the separate production canary, eligible-fill coverage, and
+multi-day profitability gates are complete.
