@@ -4,6 +4,7 @@
  */
 
 const HORIZONS = Object.freeze({ '1m': 60_000, '5m': 300_000, '60m': 3_600_000 });
+const CRYPTOCOM_PUBLIC_MARKET_ENDPOINT = 'wss://stream.crypto.com/exchange/v1/market';
 const PROMOTION_GRADE_SOURCE_TYPES = Object.freeze([
   'top-of-book',
   'point-in-time-book',
@@ -120,6 +121,7 @@ function mergeConfig(config = {}) {
         merged.sourceQuality.sourceEndpointAllowlist.some(value => !isOfficialCryptoComEndpoint(value))) {
       throw new Error('sourceQuality.sourceEndpointAllowlist must contain only the exact official Crypto.com endpoint');
     }
+    merged.sourceQuality.sourceEndpointAllowlist = [CRYPTOCOM_PUBLIC_MARKET_ENDPOINT];
   } else if (merged.sourceQuality.referenceMode !== 'coinbase-basis') {
     throw new Error('sourceQuality.referenceMode is invalid');
   }

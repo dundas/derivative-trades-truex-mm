@@ -1,6 +1,8 @@
 import WebSocket from 'ws';
 import { createHash, randomUUID } from 'node:crypto';
 
+const CRYPTOCOM_PUBLIC_MARKET_ENDPOINT = 'wss://stream.crypto.com/exchange/v1/market';
+
 const positive = value => Number.isFinite(Number(value)) && Number(value) > 0;
 const safeTime = value => Number.isSafeInteger(value) && value >= 0;
 const DECIMAL_STRING = /^(?:0|[1-9]\d*)(?:\.\d+)?$/;
@@ -26,6 +28,7 @@ export class CryptoComReferenceBookFeed {
     setTimeoutFn = setTimeout, clearTimeoutFn = clearTimeout, random = Math.random,
     logger = console } = {}) {
     if (!officialEndpoint(url)) throw new Error('Crypto.com reference URL must be the exact official public market endpoint');
+    url = CRYPTOCOM_PUBLIC_MARKET_ENDPOINT;
     if (instrument !== 'BTC_PYUSD') throw new Error('Crypto.com reference instrument must be BTC_PYUSD');
     if (!Number.isSafeInteger(depth) || depth !== 10) throw new Error('Crypto.com reference depth must be 10');
     if (!Number.isSafeInteger(maxAgeMs) || maxAgeMs < 1) throw new Error('maxAgeMs must be positive');

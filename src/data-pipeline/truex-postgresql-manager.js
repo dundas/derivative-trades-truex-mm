@@ -358,6 +358,10 @@ export class TrueXPostgreSQLManager {
         await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_evidence_availability ON fill_reference_markout_evidence(available, unavailable_reason)`);
         await this.db.query(`ALTER TABLE fill_reference_markout_evidence ADD COLUMN IF NOT EXISTS observed_edge_bps NUMERIC`);
         await this.db.query(`ALTER TABLE fill_reference_markout_evidence ADD COLUMN IF NOT EXISTS adjusted_midpoint NUMERIC`);
+        // Direct provenance columns and their sole writer ship together in this
+        // never-before-deployed schema version. New writes canonicalize the endpoint
+        // before persistence. Do not rewrite immutable evidence for a hypothetical
+        // pre-canonical writer; none exists on the production baseline.
         const provenanceTypes = {
           basis_request_timestamp: 'BIGINT', basis_received_timestamp: 'BIGINT',
           basis_bid: 'NUMERIC', basis_ask: 'NUMERIC', basis_bid_qty: 'NUMERIC',

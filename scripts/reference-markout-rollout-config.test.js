@@ -59,6 +59,19 @@ describe('reference mark-out production rollout options', () => {
     }, { maxQuoteDecisionsPerSecond: 6 })).toThrow('must equal the enforced order rate');
   });
 
+  test('canonicalizes explicit default TLS port across source, selector, and persisted identity', () => {
+    const options = buildReferenceMarkoutRolloutOptions({
+      ...ENABLED,
+      REFERENCE_MARKOUT_SOURCE_WS_URL: 'wss://stream.crypto.com:443/exchange/v1/market',
+      REFERENCE_MARKOUT_SOURCE_ENDPOINT_ALLOWLIST:
+        'wss://stream.crypto.com:443/exchange/v1/market,wss://stream.crypto.com/exchange/v1/market',
+    });
+    expect(options.referenceBookFeedConfig.url)
+      .toBe('wss://stream.crypto.com/exchange/v1/market');
+    expect(options.referenceMarkoutConfig.sourceEndpointAllowlist)
+      .toEqual(['wss://stream.crypto.com/exchange/v1/market']);
+  });
+
   test('rejects ambiguous kill-switch and enabled configuration values', () => {
     expect(() => buildReferenceMarkoutRolloutOptions({ REFERENCE_MARKOUT_ENABLED: 'maybe' }))
       .toThrow('REFERENCE_MARKOUT_ENABLED');

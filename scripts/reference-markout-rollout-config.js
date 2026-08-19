@@ -1,5 +1,7 @@
 import { validateReferenceMarkoutConfig } from '../src/data-pipeline/reference-markout-collector.js';
 
+const CRYPTOCOM_PUBLIC_MARKET_ENDPOINT = 'wss://stream.crypto.com/exchange/v1/market';
+
 const DEFAULTS = Object.freeze({
   referenceMode: 'cryptocom-direct', product: 'BTC-PYUSD', quoteCurrency: 'PYUSD',
   sourceExchange: 'cryptocom', sourceType: 'public-ws-book',
@@ -69,16 +71,22 @@ export function buildReferenceMarkoutRolloutOptions(env = {}, {
 } = {}) {
   if (!enabledFromEnv(env)) return {};
   const referenceMode = env.REFERENCE_MARKOUT_REFERENCE_MODE || DEFAULTS.referenceMode;
-  const sourceUrl = env.REFERENCE_MARKOUT_SOURCE_WS_URL;
-  const sourceEndpointAllowlist = String(env.REFERENCE_MARKOUT_SOURCE_ENDPOINT_ALLOWLIST || '')
+  const rawSourceUrl = env.REFERENCE_MARKOUT_SOURCE_WS_URL;
+  const rawSourceEndpointAllowlist = String(env.REFERENCE_MARKOUT_SOURCE_ENDPOINT_ALLOWLIST || '')
     .split(',').map(value => value.trim()).filter(Boolean);
   if (referenceMode === 'cryptocom-direct' &&
-      !officialCryptoComEndpoint(sourceUrl)) {
+      !officialCryptoComEndpoint(rawSourceUrl)) {
     throw new Error('REFERENCE_MARKOUT_SOURCE_WS_URL must be the exact official Crypto.com public market endpoint');
   }
-  if (referenceMode === 'cryptocom-direct' && !sourceEndpointAllowlist.includes(sourceUrl)) {
+  if (referenceMode === 'cryptocom-direct' &&
+      (rawSourceEndpointAllowlist.some(value => !officialCryptoComEndpoint(value)) ||
+       !rawSourceEndpointAllowlist.some(value => officialCryptoComEndpoint(value)))) {
     throw new Error('REFERENCE_MARKOUT_SOURCE_WS_URL must exactly match its configured endpoint allowlist');
   }
+  const sourceUrl = referenceMode === 'cryptocom-direct'
+    ? CRYPTOCOM_PUBLIC_MARKET_ENDPOINT : rawSourceUrl;
+  const sourceEndpointAllowlist = referenceMode === 'cryptocom-direct'
+    ? [CRYPTOCOM_PUBLIC_MARKET_ENDPOINT] : rawSourceEndpointAllowlist;
   const configuredDecisionRate = numberFromEnv(env,
     'REFERENCE_MARKOUT_MAX_QUOTE_DECISIONS_PER_SECOND',
     maxQuoteDecisionsPerSecond ?? DEFAULTS.maxQuoteDecisionsPerSecond);

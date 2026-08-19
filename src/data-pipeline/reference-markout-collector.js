@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
+const CRYPTOCOM_PUBLIC_MARKET_ENDPOINT = 'wss://stream.crypto.com/exchange/v1/market';
+
 const STRING_FIELDS = [
   'product', 'quoteCurrency', 'sourceExchange', 'sourceType',
 ];
@@ -71,7 +73,7 @@ export function validateReferenceMarkoutConfig(input) {
         config.sourceEndpointAllowlist.some(value => !isOfficialCryptoComEndpoint(value))) {
       throw new Error('sourceEndpointAllowlist must contain only the exact official Crypto.com endpoint');
     }
-    config.sourceEndpointAllowlist = Object.freeze([...new Set(config.sourceEndpointAllowlist)]);
+    config.sourceEndpointAllowlist = Object.freeze([CRYPTOCOM_PUBLIC_MARKET_ENDPOINT]);
     config.basisVenueAllowlist = Object.freeze([]);
   } else if (config.referenceMode === 'coinbase-basis') {
     for (const field of ['basisSource', 'basisRequestedPair', 'basisResolvedPair',

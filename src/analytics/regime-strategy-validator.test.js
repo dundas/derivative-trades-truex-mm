@@ -123,6 +123,12 @@ describe('regime strategy validator', () => {
     const valid = validateRegimeStrategy({ fills: [fill(timestamp)], references: [direct],
       candidateId: CANDIDATE_ID, config, shadowEvidence: shadowEvidence() });
     expect(valid.evidenceQuality.promotionGradeReferences).toBe(1);
+    const canonicalized = validateRegimeStrategy({ fills: [fill(timestamp)], references: [direct],
+      candidateId: CANDIDATE_ID, config: { ...config, sourceQuality: {
+        ...config.sourceQuality,
+        sourceEndpointAllowlist: ['wss://stream.crypto.com:443/exchange/v1/market'],
+      } }, shadowEvidence: shadowEvidence() });
+    expect(canonicalized.evidenceQuality.promotionGradeReferences).toBe(1);
     expect(() => validateRegimeStrategy({ fills: [fill(timestamp)], references: [direct],
       candidateId: CANDIDATE_ID, config: { ...config, sourceQuality: {
         ...config.sourceQuality, sourceEndpointAllowlist: ['wss://operator.example/exchange/v1/market'],

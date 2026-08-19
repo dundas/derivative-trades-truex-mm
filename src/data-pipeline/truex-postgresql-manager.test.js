@@ -158,6 +158,7 @@ describe('TrueXPostgreSQLManager', () => {
       expect(sql).toContain('(decision_timestamp, decision_id, session_id, quote_id)');
       expect(sql).toContain('idx_reference_markout_retention_v2');
       expect(sql).toContain('(completed_at, fill_id, horizon_ms)');
+      expect(sql).not.toMatch(/UPDATE\s+(reference_market_observations|fill_reference_markout_evidence)/i);
     });
     
     it('should create TrueX-specific schema', async () => {
@@ -419,6 +420,8 @@ describe('TrueXPostgreSQLManager', () => {
       const audit = await pgManager.getReferenceMarkoutCoverage({ fromTimestamp: 1, toTimestamp: 2, limit: 5000 });
       expect(mockDb.query).toHaveBeenLastCalledWith(expect.stringContaining('availability_reason'), [1, 2, 1001]);
       expect(String(mockDb.query.mock.calls.at(-1)[0])).toContain('legacy-missing-basis-provenance');
+      expect(String(mockDb.query.mock.calls.at(-1)[0]))
+        .toContain("evidence.source_endpoint = 'wss://stream.crypto.com/exchange/v1/market'");
       expect(audit).toEqual({ groups: [], truncated: false, limit: 1000 });
     });
   });

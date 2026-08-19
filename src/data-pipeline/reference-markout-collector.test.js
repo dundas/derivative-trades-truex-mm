@@ -73,6 +73,9 @@ describe('reference mark-out configuration', () => {
     expect(() => validateReferenceMarkoutConfig({ ...DIRECT_CONFIG,
       sourceEndpointAllowlist: ['wss://operator.example/exchange/v1/market'] }))
       .toThrow('exact official Crypto.com endpoint');
+    expect(validateReferenceMarkoutConfig({ ...DIRECT_CONFIG,
+      sourceEndpointAllowlist: ['wss://stream.crypto.com:443/exchange/v1/market'] })
+      .sourceEndpointAllowlist).toEqual(['wss://stream.crypto.com/exchange/v1/market']);
   });
   test('normalizes unique sorted horizons and rejects unsafe values', () => {
     expect(validateReferenceMarkoutConfig({ ...VALID_CONFIG, horizonsMs: [300_000, 60_000] }).horizonsMs)

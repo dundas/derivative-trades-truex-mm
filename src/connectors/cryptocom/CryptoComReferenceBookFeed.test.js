@@ -175,6 +175,13 @@ describe('CryptoComReferenceBookFeed', () => {
       expect(() => new CryptoComReferenceBookFeed({ url, instrument: 'BTC_PYUSD', depth: 10,
         reconnectDelayMs: 100 })).toThrow('exact official public market endpoint');
     }
+    const canonical = new CryptoComReferenceBookFeed({
+      url: 'wss://stream.crypto.com:443/exchange/v1/market', instrument: 'BTC_PYUSD', depth: 10,
+      reconnectDelayMs: 100, subscribeDelayMs: 0, heartbeatTimeoutMs: 0,
+      webSocketFactory: () => new FakeSocket(),
+    });
+    expect(canonical.getStats().config.endpoint)
+      .toBe('wss://stream.crypto.com/exchange/v1/market');
     for (const badAck of [
       { ...ack(2), id: 9 },
       { ...ack(2), code: 1 },
