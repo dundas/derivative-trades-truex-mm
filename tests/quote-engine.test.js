@@ -114,6 +114,95 @@ describe('QuoteEngine', () => {
   });
 
   describe('computeDesiredQuotes', () => {
+    it('returns no desired quotes in unsafe continuity and dispatches only cancels for live orders', () => {
+      const fixConnection = createMockFix();
+      const engine = createEngine({ fixConnection });
+      engine.activeOrders.set('LIVE-BUY-L1', {
+        side: 'buy', level: 1, price: 99990, size: 0.1, status: 'active', placedAt: Date.now(),
+      });
+      engine.setContinuityState({ executionState: 'unsafe', reasons: ['sell-side-gap-exceeded'] });
+
+      const desired = engine.computeDesiredQuotes(100000, { bidSkewTicks: 0, askSkewTicks: 0 });
+      expect(desired).toEqual([]);
+
+      engine.executeActions(engine.reconcileOrders(desired, engine.activeOrders));
+      expect(fixConnection.sendMessage).toHaveBeenCalledTimes(1);
+      expect(fixConnection.sendMessage.mock.calls[0][0]).toMatchObject({
+        '35': 'F',
+        '41': 'LIVE-BUY-L1',
+      });
+    });
+
+    it('bypasses reprice debounce and cancels immediately when continuity becomes unsafe', () => {
+      const fixConnection = createMockFix();
+      const engine = createEngine({
+        fixConnection,
+        minRepriceIntervalMs: 60_000,
+        continuityStateProvider: () => ({
+          executionState: 'unsafe', reasons: ['sell-side-gap-exceeded'],
+        }),
+      });
+      engine.lastRepriceAt = Date.now();
+      engine.actionQueue.push({ type: 'place', quote: { side: 'sell', price: 100100, size: 0.1, level: 1 } });
+      engine.activeOrders.set('LIVE-BUY-L1', {
+        side: 'buy', level: 1, price: 99990, size: 0.1, status: 'active', placedAt: Date.now(),
+      });
+
+      engine.onPriceUpdate(makePrice(100000));
+
+      expect(fixConnection.sendMessage).toHaveBeenCalledTimes(1);
+      expect(fixConnection.sendMessage.mock.calls[0][0]).toMatchObject({
+        '35': 'F', '41': 'LIVE-BUY-L1',
+      });
+      expect(engine.actionQueue).toEqual([]);
+      expect(engine.isQuoting).toBe(false);
+    });
+
+    it('bypasses an exhausted order-rate budget for unsafe cancels', () => {
+      const fixConnection = createMockFix();
+      const engine = createEngine({
+        fixConnection,
+        maxOrdersPerSecond: 1,
+        continuityStateProvider: () => ({
+          executionState: 'unsafe', reasons: ['sell-side-gap-exceeded'],
+        }),
+      });
+      engine.actionsThisSecond = engine.config.maxOrdersPerSecond;
+      engine.lastActionReset = Date.now();
+      engine.activeOrders.set('LIVE-BUY-L1', {
+        side: 'buy', level: 1, price: 99990, size: 0.1, status: 'active', placedAt: Date.now(),
+      });
+
+      engine.onPriceUpdate(makePrice(100000));
+
+      expect(fixConnection.sendMessage).toHaveBeenCalledTimes(1);
+      expect(fixConnection.sendMessage.mock.calls[0][0]).toMatchObject({
+        '35': 'F', '41': 'LIVE-BUY-L1',
+      });
+      expect(engine.activeOrders.get('LIVE-BUY-L1')?.status).toBe('cancelling');
+    });
+
+    it('cancels a pending new order that may already be venue-live', () => {
+      const fixConnection = createMockFix();
+      const engine = createEngine({
+        fixConnection,
+        continuityStateProvider: () => ({
+          executionState: 'unsafe', reasons: ['sell-side-gap-exceeded'],
+        }),
+      });
+      engine.activeOrders.set('PENDING-BUY-L1', {
+        side: 'buy', level: 1, price: 99990, size: 0.1, status: 'pending', placedAt: Date.now(),
+      });
+
+      engine.onPriceUpdate(makePrice(100000));
+
+      expect(fixConnection.sendMessage).toHaveBeenCalledTimes(1);
+      expect(fixConnection.sendMessage.mock.calls[0][0]).toMatchObject({
+        '35': 'F', '41': 'PENDING-BUY-L1',
+      });
+      expect(engine.activeOrders.get('PENDING-BUY-L1')?.status).toBe('cancelling');
+    });
+
     it('should produce N levels on each side', () => {
       const engine = createEngine({ levels: 3 });
       const mid = 100000;

@@ -697,6 +697,7 @@ function wireOrchestratorEvents(orch) {
 async function shutdown(signal, exitCode = 0) {
   if (isShuttingDown) return;
   isShuttingDown = true;
+  const intentionalSignalShutdown = exitCode === 0 && ['SIGINT', 'SIGTERM'].includes(signal);
 
   logger.info(`\n[SHUTDOWN] Received ${signal} — stopping gracefully...`);
 
@@ -705,7 +706,7 @@ async function shutdown(signal, exitCode = 0) {
       await orchestrator.stop();
     } catch (err) {
       logger.error(`[SHUTDOWN] Orchestrator stop error: ${err.message}`);
-      exitCode = Math.max(exitCode, 1);
+      if (!intentionalSignalShutdown) exitCode = Math.max(exitCode, 1);
     }
   }
 
@@ -717,7 +718,7 @@ async function shutdown(signal, exitCode = 0) {
       await dataPipeline.stop();
     } catch (err) {
       logger.error(`[SHUTDOWN] Data pipeline stop error: ${err.message}`);
-      exitCode = Math.max(exitCode, 1);
+      if (!intentionalSignalShutdown) exitCode = Math.max(exitCode, 1);
     }
   }
 

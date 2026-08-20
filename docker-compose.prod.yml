@@ -62,7 +62,9 @@ services:
   market-maker:
     build: .
     container_name: truex-market-maker
-    restart: unless-stopped
+    # SIGTERM is the authenticated emergency-stop path and exits cleanly.
+    # Restart crashes, but keep a deliberate kill-switch stop latched.
+    restart: on-failure
     network_mode: host
     depends_on:
       redis:

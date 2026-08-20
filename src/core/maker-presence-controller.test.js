@@ -53,6 +53,21 @@ describe('MakerPresenceController', () => {
     expect(recovered.twoSidedUptimePct).toBeCloseTo((100 / 1200) * 100, 6);
   });
 
+  test('fails unsafe when an acknowledged side gap reaches the configured maximum', () => {
+    let now = 0;
+    const presence = new MakerPresenceController(CONFIG, { now: () => now });
+    expect(presence.observe({ orders: [live('buy')] }).executionState).toBe('degraded');
+
+    now = CONFIG.maxSideGapMs;
+    expect(presence.observe({ orders: [live('buy')] })).toMatchObject({
+      executionState: 'unsafe',
+      reasons: expect.arrayContaining([
+        'missing-acknowledged-sell',
+        'sell-side-gap-exceeded',
+      ]),
+    });
+  });
+
   test('classifies healthy missing presence as degraded and safety failures as unsafe', () => {
     const presence = new MakerPresenceController(CONFIG, { now: () => 1000 });
     expect(presence.observe({ orders: [] })).toMatchObject({

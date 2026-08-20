@@ -138,6 +138,7 @@ describe('MarketMakerOrchestrator continuity binding', () => {
 
   test('does not route missing-side degradation into the generic cancel-all watchdog', () => {
     const cancelAll = mock(async () => {});
+    const enforceUnsafeContinuity = mock(() => false);
     const orchestrator = Object.assign(Object.create(MarketMakerOrchestrator.prototype), {
       isRunning: true,
       _intentionalStop: false,
@@ -149,6 +150,7 @@ describe('MarketMakerOrchestrator continuity binding', () => {
       _quotingIdleThresholdMs: 30000,
       _activeWatchdogIssues: new Set(),
       inventoryManager: { getPositionSummary: () => ({}) },
+      quoteEngine: { enforceUnsafeContinuity },
       alertManager: { sendRecovery: async () => {}, sendAlert: async () => {} },
       restClient: { cancelAllOrders: cancelAll },
       logger: { debug() {}, error() {}, info() {} },
@@ -157,6 +159,75 @@ describe('MarketMakerOrchestrator continuity binding', () => {
 
     orchestrator._runWatchdog();
     expect(cancelAll).not.toHaveBeenCalled();
+    expect(enforceUnsafeContinuity).toHaveBeenCalledWith({
+      executionState: 'degraded', reasons: ['missing-acknowledged-sell'],
+    });
+  });
+
+  test('enforces unsafe continuity from the watchdog without waiting for a price tick', () => {
+    const status = { executionState: 'unsafe', reasons: ['sell-side-gap-exceeded'] };
+    const enforceUnsafeContinuity = mock(() => true);
+    const orchestrator = Object.assign(Object.create(MarketMakerOrchestrator.prototype), {
+      isRunning: true,
+      _intentionalStop: false,
+      _getContinuityStatus: mock(() => status),
+      fixOE: { isLoggedOn: true },
+      marketDataFeed: null,
+      _checkMdStaleness: () => false,
+      _lastRepriceTime: Date.now(),
+      _quotingIdleThresholdMs: 30000,
+      _activeWatchdogIssues: new Set(),
+      inventoryManager: { getPositionSummary: () => ({}) },
+      quoteEngine: { enforceUnsafeContinuity },
+      alertManager: { sendRecovery: async () => {}, sendAlert: async () => {} },
+      logger: { debug() {}, error() {}, info() {} },
+      emit() {},
+    });
+
+    orchestrator._runWatchdog();
+    expect(enforceUnsafeContinuity).toHaveBeenCalledWith(status);
+  });
+
+  test('arms the exact active side-gap deadline independently of watchdog cadence', async () => {
+    const enforceUnsafeContinuity = mock(() => true);
+    const unsafe = { executionState: 'unsafe', reasons: ['sell-side-gap-exceeded'], gaps: {} };
+    const orchestrator = Object.assign(Object.create(MarketMakerOrchestrator.prototype), {
+      isRunning: true,
+      _intentionalStop: false,
+      _continuityDeadlineTimer: null,
+      presenceController: { config: { maxSideGapMs: 1 } },
+      quoteEngine: { enforceUnsafeContinuity },
+      _getContinuityStatus: mock(() => unsafe),
+    });
+    orchestrator._scheduleContinuityDeadline({
+      executionState: 'degraded',
+      observedAt: 100,
+      gaps: {
+        buy: { active: false, startedAt: null },
+        sell: { active: true, startedAt: 100 },
+      },
+    });
+
+    expect(orchestrator._continuityDeadlineTimer).not.toBeNull();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(enforceUnsafeContinuity).toHaveBeenCalledWith(unsafe);
+    expect(orchestrator._continuityDeadlineTimer).toBeNull();
+  });
+
+  test('rechecks continuity immediately after an execution report changes order state', () => {
+    const status = {
+      executionState: 'degraded', reasons: ['missing-acknowledged-sell'],
+      observedAt: 100, gaps: { buy: { active: false }, sell: { active: true, startedAt: 100 } },
+    };
+    const enforceUnsafeContinuity = mock(() => false);
+    const orchestrator = Object.assign(Object.create(MarketMakerOrchestrator.prototype), {
+      _getContinuityStatus: mock(() => status),
+      quoteEngine: { enforceUnsafeContinuity },
+    });
+
+    expect(orchestrator._recheckContinuityAfterOrderStateChange()).toBe(status);
+    expect(orchestrator._getContinuityStatus).toHaveBeenCalledTimes(1);
+    expect(enforceUnsafeContinuity).toHaveBeenCalledWith(status);
   });
 });
 

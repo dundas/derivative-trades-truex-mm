@@ -327,6 +327,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this._lastMdUpdateTime = 0;
     this._lastRepriceTime = 0;
     this._watchdogTimer = null;
+    this._continuityDeadlineTimer = null;
     this._recordedPipelineFillIds = new Set();
 
     // Balance snapshot state
@@ -458,7 +459,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
     rememberTimers(this, [
       'drainQueueTimer', '_reconcileTimer', '_balanceRefreshTimer', '_watchdogTimer', '_snapshotTimer',
     ], clearInterval, 'orchestrator');
-    rememberTimers(this, ['_truexEbboPollTimer', '_pyusdUsdPollTimer'], clearTimeout, 'orchestrator');
+    rememberTimers(this, [
+      '_truexEbboPollTimer', '_pyusdUsdPollTimer', '_continuityDeadlineTimer',
+    ], clearTimeout, 'orchestrator');
     rememberTimers(this.pnlTracker, ['_logTimer'], clearInterval, 'pnl');
     rememberTimers(this.dataPipeline, [
       '_flushTimer', '_pgFlushTimer', '_migrationTimer', '_cleanupTimer',
@@ -923,6 +926,10 @@ export class MarketMakerOrchestrator extends EventEmitter {
       clearInterval(this._watchdogTimer);
       this._watchdogTimer = null;
     }
+    if (this._continuityDeadlineTimer) {
+      clearTimeout(this._continuityDeadlineTimer);
+      this._continuityDeadlineTimer = null;
+    }
     if (this._snapshotTimer) {
       clearInterval(this._snapshotTimer);
       this._snapshotTimer = null;
@@ -1338,7 +1345,31 @@ export class MarketMakerOrchestrator extends EventEmitter {
         details: alert,
       }).catch((error) => this.logger.error(`[Orchestrator] Side-gap alert failed: ${error.message}`));
     }
+    this._scheduleContinuityDeadline(status);
     return status;
+  }
+
+  _scheduleContinuityDeadline(status) {
+    if (this._continuityDeadlineTimer) {
+      clearTimeout(this._continuityDeadlineTimer);
+      this._continuityDeadlineTimer = null;
+    }
+    if (!this.isRunning || this._intentionalStop || status?.executionState === 'unsafe') return;
+
+    const maxGapMs = this.presenceController?.config?.maxSideGapMs;
+    if (!Number.isFinite(maxGapMs) || maxGapMs <= 0) return;
+    const remaining = ['buy', 'sell']
+      .map((side) => status?.gaps?.[side])
+      .filter((gap) => gap?.active && Number.isFinite(gap.startedAt))
+      .map((gap) => Math.max(0, maxGapMs - (status.observedAt - gap.startedAt)));
+    if (remaining.length === 0) return;
+
+    this._continuityDeadlineTimer = setTimeout(() => {
+      this._continuityDeadlineTimer = null;
+      if (!this.isRunning || this._intentionalStop) return;
+      const deadlineStatus = this._getContinuityStatus();
+      this.quoteEngine.enforceUnsafeContinuity?.(deadlineStatus);
+    }, Math.min(...remaining));
   }
 
   _onFIXMessage(message) {
@@ -1358,6 +1389,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     // Route OrderCancelReject (35=9) to QuoteEngine
     if (msgType === '9') {
       this.quoteEngine.onOrderCancelReject(message.fields);
+      this._recheckContinuityAfterOrderStateChange();
       return;
     }
 
@@ -1366,6 +1398,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
 
     // Route to QuoteEngine for order state management
     this.quoteEngine.onExecutionReport(message.fields);
+    this._recheckContinuityAfterOrderStateChange();
 
     // Track order state and fills in data pipeline
     const pipeline = this.dataPipeline || this.dataManager;
@@ -1412,6 +1445,12 @@ export class MarketMakerOrchestrator extends EventEmitter {
         this._addPipelineFillOnce(pipeline, fill);
       }
     }
+  }
+
+  _recheckContinuityAfterOrderStateChange() {
+    const continuity = this._getContinuityStatus();
+    if (continuity) this.quoteEngine.enforceUnsafeContinuity?.(continuity);
+    return continuity;
   }
 
   _onQuoteFill({
@@ -2565,9 +2604,11 @@ export class MarketMakerOrchestrator extends EventEmitter {
     if (!this.isRunning || this._intentionalStop) return;
     const now = Date.now();
     const issues = [];
-    // Presence alerts are independently rate-limited and never feed the generic
-    // watchdog cancel-all path: a missing side must preserve the funded live side.
-    this._getContinuityStatus();
+    // Transient missing-side degradation preserves the funded live side. Once
+    // the configured maximum gap is exceeded, enforce the unsafe transition
+    // here too so cancellation does not depend on the next market-data tick.
+    const continuity = this._getContinuityStatus();
+    this.quoteEngine.enforceUnsafeContinuity?.(continuity);
 
     // Check OE FIX
     if (!this._isFixExecutionHealthy()) {

@@ -328,8 +328,11 @@ export class QuoteEngine extends EventEmitter {
    */
   onPriceUpdate(aggregatedPrice) {
     if (!aggregatedPrice) return;
-    this._refreshContinuityState();
+    const continuity = this._refreshContinuityState();
     this._expirePendingReplacements();
+    // Safety transitions must not wait for price validity, rejection backoff,
+    // or the normal reprice debounce. Withdraw venue-live quotes immediately.
+    if (this.enforceUnsafeContinuity(continuity)) return;
 
     // Gate on confidence
     if (aggregatedPrice.confidence < this.config.confidenceThreshold) {
@@ -436,6 +439,11 @@ export class QuoteEngine extends EventEmitter {
    * Compute desired bid/ask quotes based on mid price and inventory skew.
    */
   computeDesiredQuotes(mid, skew, anchorBook = null) {
+    // Unsafe continuity is a terminal quoting state: returning an empty
+    // desired set makes reconciliation cancel every venue-live quote. The
+    // execution gate still permits cancels while blocking all placements.
+    if (this.continuityState.executionState === 'unsafe') return [];
+
     const {
       levels,
       baseSpreadBps,
@@ -1270,6 +1278,34 @@ export class QuoteEngine extends EventEmitter {
 
   setContinuityStateProvider(provider) {
     this.continuityStateProvider = typeof provider === 'function' ? provider : null;
+  }
+
+  enforceUnsafeContinuity(status = null) {
+    if (status) this.setContinuityState(status);
+    else this._refreshContinuityState();
+    if (this.continuityState.executionState !== 'unsafe') return false;
+
+    // Queued placements were derived under an older safety state and must not
+    // survive recovery. When a prior FIX delivery outcome is unknown, do not
+    // compound the evidence gap with another unauthoritative cancel attempt.
+    this.invalidateQueuedWork(false);
+    if (this.executionEvidenceGap) {
+      this.isQuoting = false;
+      return true;
+    }
+
+    // A pending new order may already be venue-live while its acknowledgement
+    // is delayed, so unsafe withdrawal covers every tracked non-cancelling
+    // order. It is outside the ordinary order-rate budget: safety cancels
+    // cannot queue behind placements or replacements.
+    for (const [clOrdID, order] of this.activeOrders) {
+      if (order.status === 'cancelling') continue;
+      this._dispatchAction({
+        type: 'cancel', clOrdID, order,
+      });
+    }
+    this.isQuoting = false;
+    return true;
   }
 
   _refreshContinuityState() {

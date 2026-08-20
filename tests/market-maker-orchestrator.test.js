@@ -1109,6 +1109,7 @@ describe('MarketMakerOrchestrator', () => {
     test('routes execution reports to QuoteEngine', async () => {
       const { orchestrator, mocks } = createOrchestrator();
       await orchestrator.start();
+      const continuitySpy = jest.spyOn(orchestrator, '_recheckContinuityAfterOrderStateChange');
 
       const message = {
         fields: {
@@ -1121,6 +1122,7 @@ describe('MarketMakerOrchestrator', () => {
       mocks.fixConnection.emit('message', message);
 
       expect(mocks.quoteEngine.onExecutionReport).toHaveBeenCalledWith(message.fields);
+      expect(continuitySpy).toHaveBeenCalledTimes(1);
       await orchestrator.stop();
     });
 
@@ -1153,6 +1155,7 @@ describe('MarketMakerOrchestrator', () => {
     test('routes OrderCancelReject (35=9) to QuoteEngine', async () => {
       const { orchestrator, mocks } = createOrchestrator();
       await orchestrator.start();
+      const continuitySpy = jest.spyOn(orchestrator, '_recheckContinuityAfterOrderStateChange');
 
       const message = {
         fields: {
@@ -1166,6 +1169,7 @@ describe('MarketMakerOrchestrator', () => {
       mocks.fixConnection.emit('message', message);
 
       expect(mocks.quoteEngine.onOrderCancelReject).toHaveBeenCalledWith(message.fields);
+      expect(continuitySpy).toHaveBeenCalledTimes(1);
       // Should NOT also route to onExecutionReport
       expect(mocks.quoteEngine.onExecutionReport).not.toHaveBeenCalled();
       await orchestrator.stop();

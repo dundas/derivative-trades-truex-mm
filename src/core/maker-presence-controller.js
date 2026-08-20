@@ -82,6 +82,7 @@ export class MakerPresenceController {
 
     const reasons = [];
     const alerts = [];
+    const exceededSideGaps = [];
     for (const side of ['buy', 'sell']) {
       const gap = this.gaps[side];
       if (!present[side]) {
@@ -92,7 +93,11 @@ export class MakerPresenceController {
           gap.startedAt = now;
         }
         const duration = now - gap.startedAt;
-        if (duration >= this.config.maxSideGapMs) reasons.push(`${side}-side-gap-exceeded`);
+        if (duration >= this.config.maxSideGapMs) {
+          const exceededReason = `${side}-side-gap-exceeded`;
+          reasons.push(exceededReason);
+          exceededSideGaps.push(exceededReason);
+        }
         const alertDue = duration >= this.config.alertThresholdMs &&
           (gap.lastAlertAt === null || now - gap.lastAlertAt >= this.config.alertRateLimitMs);
         if (alertDue) {
@@ -108,6 +113,7 @@ export class MakerPresenceController {
     }
 
     const unsafeReasons = [];
+    unsafeReasons.push(...exceededSideGaps);
     if (emergency) unsafeReasons.push('emergency-kill-switch');
     if (!oeHealthy) unsafeReasons.push('order-entry-unhealthy');
     if (!referenceHealthy) unsafeReasons.push('reference-unhealthy');
