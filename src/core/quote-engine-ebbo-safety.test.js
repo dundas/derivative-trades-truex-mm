@@ -53,6 +53,18 @@ describe('strict TrueX EBBO maker safety', () => {
     expect(engine.getQuoteStatus().suppressed.at(-1).reason).toBe('quote-dispatch-observe-mode');
   });
 
+  test('observe dispatch suppression does not schedule a busy-loop reprice', () => {
+    const { engine } = makeEngine({ quoteDispatchMode: 'observe' });
+    engine.updateTruexEbbo(freshEbbo(99, 101));
+    engine.deferredRepriceNeeded = false;
+
+    expect(engine._dispatchAction({ type: 'place', quote: quote('buy', 100) })).toBe(false);
+    expect(engine.deferredRepriceNeeded).toBe(false);
+
+    expect(engine._sendNewOrder(quote('sell', 100))).toBeNull();
+    expect(engine.deferredRepriceNeeded).toBe(false);
+  });
+
   test('missing, stale, and invalid EBBO suppress new D sends while pure cancels remain allowed', () => {
     let now = 10_000;
     const { engine, fixConnection } = makeEngine({ now: () => now });
