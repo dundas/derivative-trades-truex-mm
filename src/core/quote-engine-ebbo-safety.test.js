@@ -65,6 +65,26 @@ describe('strict TrueX EBBO maker safety', () => {
     expect(engine.deferredRepriceNeeded).toBe(false);
   });
 
+  test('observe mode stamps the normal reprice debounce when all placements are suppressed', () => {
+    const originalNow = Date.now;
+    let now = 1_000;
+    Date.now = () => now;
+    try {
+      const { engine } = makeEngine({ quoteDispatchMode: 'observe', minRepriceIntervalMs: 60_000 });
+      engine.updateTruexEbbo(freshEbbo(99, 101));
+      const price = { confidence: 1, weightedMidpoint: 100, sources: [] };
+
+      engine.onPriceUpdate(price);
+      expect(engine.lastRepriceAt).toBe(1_000);
+
+      now = 1_001;
+      engine.onPriceUpdate({ ...price, weightedMidpoint: 101 });
+      expect(engine.lastRepriceAt).toBe(1_000);
+    } finally {
+      Date.now = originalNow;
+    }
+  });
+
   test('missing, stale, and invalid EBBO suppress new D sends while pure cancels remain allowed', () => {
     let now = 10_000;
     const { engine, fixConnection } = makeEngine({ now: () => now });
