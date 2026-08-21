@@ -1,5 +1,5 @@
 # TrueX Market Maker (true_markets_mm)
-# Generated: 2026-06-18 (rev3)
+# Generated: 2026-08-21 (rev4)
 # Audience: AI agents operating or debugging this system
 
 > Automated BTC-PYUSD market maker on TrueX exchange using FIX protocol,
@@ -58,6 +58,20 @@ Fields: 553=apiKey (Username), 554=signature (Password), 141=Y (ResetSeqNumFlag)
 Tags: 11=clOrdID, 55=BTC-PYUSD, 54=1(buy)|2(sell), 38=qty, 44=price,
 40=2(Limit), 59=1(GTC)|3(IOC), 18=6(ALO/maker-only).
 Party block required: 453=1, 448=clientId, 452=3.
+
+### Quote Dispatch Mode
+
+`MM_QUOTE_DISPATCH_MODE` is a deployment-time circuit breaker with values
+`live` (default) and `observe`. In `observe`, the engine still collects feed,
+health, inventory, and shadow evidence and may send protective pure cancels
+(`35=F`), but it rejects every new-order/replacement placement before state
+reservation or FIX dispatch. This is enforced both when actions are selected
+and at the `_sendNewOrder()` boundary, so direct callers cannot bypass it.
+
+Use `observe` for a fresh safety canary. Do not change a live session to
+`observe` expecting reprice-driven replacement cancels to flatten existing
+orders: replacement-cancel actions are suppressed because they would otherwise
+lead to a new `35=D`; use an explicit safe cancellation procedure instead.
 
 ### Order Cancel (35=F) — NOT 35=G
 Tags: 11=newClOrdID, 41=origClOrdID. Party block required. NO tag 54 (Side).
@@ -133,6 +147,11 @@ maxOrdersPerSecond=6,
 repriceThresholdTicks=1, tickSize=0.50, priceBandPct=2.5, heartbeatInterval=30s.
 reconcileIntervalMs=300000 (5min), balanceRefreshIntervalMs=60000 (1min).
 PYUSD/USD poll: 5000ms interval, 1000ms timeout, 15000ms stale threshold.
+Feed controls are validated before polling starts: the PYUSD interval may be
+zero to disable that optional shadow input; both timeouts/stale thresholds and
+the TrueX EBBO interval must be positive integers. Invalid values fail startup.
+`/api/v1/health` exposes `quoteDispatchMode` and `feedHealth` (freshness, age,
+errors, current backoff, and in-flight state for the additive feeds).
 Shadow observe-only mode defaults ON in `run-prod.js` with:
   minTakeEdgeBps=15, maxEdgeCeilingBps=250, pyusdDepegThresholdBps=100,
   maxTakeNotionalPerOrder=250, minTakeSizeBTC=0.0001,
