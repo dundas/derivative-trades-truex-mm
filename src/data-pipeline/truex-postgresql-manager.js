@@ -325,7 +325,8 @@ export class TrueXPostgreSQLManager {
         await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_markout_due ON fill_reference_markout_work(state, due_timestamp, claim_expires_at)`);
         await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_markout_grouping ON fill_reference_markout_work(side, level, policy_id, horizon_ms)`);
         await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_markout_retention_v2 ON fill_reference_markout_work(completed_at, fill_id, horizon_ms) WHERE state = 'completed'`);
-        await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_markout_pending_attribution_v2 ON fill_reference_markout_work(session_id, quote_id) WHERE state <> 'completed'`);
+        await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_markout_attribution_v3 ON fill_reference_markout_work(session_id, quote_id)`);
+        await this.db.query(`DROP INDEX IF EXISTS idx_reference_markout_pending_attribution_v2`);
         await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_markout_unfinished_window_v2 ON fill_reference_markout_work(due_timestamp, deadline_timestamp) WHERE state <> 'completed'`);
 
         await this.db.query(`
@@ -793,7 +794,7 @@ export class TrueXPostgreSQLManager {
       WHERE decision.decision_timestamp < $1
         AND NOT EXISTS (
           SELECT 1 FROM fill_reference_markout_work work
-          WHERE work.state <> 'completed' AND work.session_id = decision.session_id
+          WHERE work.session_id = decision.session_id
             AND work.quote_id = decision.quote_id
         )
       ORDER BY decision.decision_timestamp, decision.decision_id
@@ -824,41 +825,60 @@ export class TrueXPostgreSQLManager {
 
   async getReferenceMarkoutCoverage({ fromTimestamp, toTimestamp, limit = 100 } = {}) {
     const boundedLimit = Math.max(1, Math.min(Number(limit) || 100, 1000));
-    const result = await this._referenceQuery(`WITH classified AS (
-      SELECT work.side, work.level, work.policy_id, work.horizon_ms,
-        CASE
-          WHEN evidence.fill_id IS NOT NULL AND evidence.available AND evidence.promotion_grade IS TRUE
-            AND evidence.reference_mode = 'cryptocom-direct'
-            AND evidence.source_exchange = 'cryptocom' AND evidence.source_type = 'public-ws-book'
-            AND evidence.source_instrument = 'BTC_PYUSD'
-            AND evidence.source_channel = 'book.BTC_PYUSD.10'
-            AND evidence.source_endpoint = 'wss://stream.crypto.com/exchange/v1/market'
-            THEN 'promotion-grade'
-          WHEN evidence.fill_id IS NOT NULL AND evidence.available THEN 'non-promotion-grade'
-          WHEN evidence.fill_id IS NOT NULL THEN 'unavailable'
-          WHEN work.state = 'claimed' THEN 'claimed'
-          ELSE 'pending'
-        END AS availability_status,
-        CASE
-          WHEN evidence.fill_id IS NOT NULL AND evidence.available AND evidence.promotion_grade IS TRUE
-            AND evidence.reference_mode = 'cryptocom-direct'
-            AND evidence.source_exchange = 'cryptocom' AND evidence.source_type = 'public-ws-book'
-            AND evidence.source_instrument = 'BTC_PYUSD'
-            AND evidence.source_channel = 'book.BTC_PYUSD.10'
-            AND evidence.source_endpoint = 'wss://stream.crypto.com/exchange/v1/market'
-            THEN 'promotion-grade'
-          WHEN evidence.fill_id IS NOT NULL AND evidence.available
-            THEN 'legacy-missing-basis-provenance'
-          WHEN evidence.fill_id IS NOT NULL THEN COALESCE(evidence.unavailable_reason, 'unavailable-unspecified')
-          WHEN work.last_unavailable_reason IS NOT NULL THEN work.last_unavailable_reason
-          WHEN work.state = 'claimed' THEN 'claim-in-progress'
-          ELSE 'awaiting-horizon'
-        END AS availability_reason
+    const result = await this._referenceQuery(`WITH attributed AS (
+      SELECT work.*, evidence.fill_id AS evidence_fill_id, evidence.available AS evidence_available,
+        evidence.promotion_grade AS evidence_promotion_grade,
+        evidence.reference_mode AS evidence_reference_mode,
+        evidence.source_exchange AS evidence_source_exchange,
+        evidence.source_type AS evidence_source_type,
+        evidence.source_instrument AS evidence_source_instrument,
+        evidence.source_channel AS evidence_source_channel,
+        evidence.source_endpoint AS evidence_source_endpoint,
+        evidence.unavailable_reason AS evidence_unavailable_reason,
+        work.quote_id IS NOT NULL AND work.session_id IS NOT NULL AND EXISTS (
+          SELECT 1 FROM reference_quote_decisions decision
+          WHERE decision.quote_id = work.quote_id
+            AND decision.session_id = work.session_id
+            AND decision.decision_timestamp <= work.fill_timestamp
+        ) AS has_quote_attribution
       FROM fill_reference_markout_work work
       LEFT JOIN fill_reference_markout_evidence evidence
         ON evidence.fill_id = work.fill_id AND evidence.horizon_ms = work.horizon_ms
       WHERE ($1::bigint IS NULL OR work.fill_timestamp >= $1)
         AND ($2::bigint IS NULL OR work.fill_timestamp <= $2)
+    ), classified AS (
+      SELECT side, level, policy_id, horizon_ms,
+        CASE
+          WHEN NOT has_quote_attribution THEN 'unavailable'
+          WHEN evidence_fill_id IS NOT NULL AND evidence_available AND evidence_promotion_grade IS TRUE
+            AND evidence_reference_mode = 'cryptocom-direct'
+            AND evidence_source_exchange = 'cryptocom' AND evidence_source_type = 'public-ws-book'
+            AND evidence_source_instrument = 'BTC_PYUSD'
+            AND evidence_source_channel = 'book.BTC_PYUSD.10'
+            AND evidence_source_endpoint = 'wss://stream.crypto.com/exchange/v1/market'
+            THEN 'promotion-grade'
+          WHEN evidence_fill_id IS NOT NULL AND evidence_available THEN 'non-promotion-grade'
+          WHEN evidence_fill_id IS NOT NULL THEN 'unavailable'
+          WHEN state = 'claimed' THEN 'claimed'
+          ELSE 'pending'
+        END AS availability_status,
+        CASE
+          WHEN NOT has_quote_attribution THEN 'missing-quote-attribution'
+          WHEN evidence_fill_id IS NOT NULL AND evidence_available AND evidence_promotion_grade IS TRUE
+            AND evidence_reference_mode = 'cryptocom-direct'
+            AND evidence_source_exchange = 'cryptocom' AND evidence_source_type = 'public-ws-book'
+            AND evidence_source_instrument = 'BTC_PYUSD'
+            AND evidence_source_channel = 'book.BTC_PYUSD.10'
+            AND evidence_source_endpoint = 'wss://stream.crypto.com/exchange/v1/market'
+            THEN 'promotion-grade'
+          WHEN evidence_fill_id IS NOT NULL AND evidence_available
+            THEN 'legacy-missing-basis-provenance'
+          WHEN evidence_fill_id IS NOT NULL THEN COALESCE(evidence_unavailable_reason, 'unavailable-unspecified')
+          WHEN last_unavailable_reason IS NOT NULL THEN last_unavailable_reason
+          WHEN state = 'claimed' THEN 'claim-in-progress'
+          ELSE 'awaiting-horizon'
+        END AS availability_reason
+      FROM attributed
     ) SELECT side, level, policy_id, horizon_ms, availability_status,
       availability_reason, COUNT(*)::bigint AS observation_count
       FROM classified

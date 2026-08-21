@@ -158,6 +158,9 @@ describe('TrueXPostgreSQLManager', () => {
       expect(sql).toContain('(decision_timestamp, decision_id, session_id, quote_id)');
       expect(sql).toContain('idx_reference_markout_retention_v2');
       expect(sql).toContain('(completed_at, fill_id, horizon_ms)');
+      expect(sql).toContain('idx_reference_markout_attribution_v3');
+      expect(sql).toContain('ON fill_reference_markout_work(session_id, quote_id)');
+      expect(sql).toContain('DROP INDEX IF EXISTS idx_reference_markout_pending_attribution_v2');
       expect(sql).not.toMatch(/UPDATE\s+(reference_market_observations|fill_reference_markout_evidence)/i);
     });
     
@@ -402,15 +405,18 @@ describe('TrueXPostgreSQLManager', () => {
       expect(sql).toContain("SET state = 'completed'");
     });
 
-    it('prunes only terminal evidence and returns a bounded grouped coverage audit', async () => {
+    it('retains quote decisions while completed evidence remains and returns a bounded grouped coverage audit', async () => {
       await pgManager.pruneReferenceMarkoutEvidence(1000, 250);
       const pruneSql = String(mockDb.query.mock.calls.at(-1)[0]);
       expect(pruneSql).toContain("work.state = 'completed'");
       expect(pruneSql).toContain('LIMIT $2');
       expect(mockDb.query).toHaveBeenLastCalledWith(expect.any(String), [1000, 250]);
       await pgManager.pruneReferenceQuoteDecisions(1000, 250);
-      expect(mockDb.query).toHaveBeenLastCalledWith(expect.stringContaining("work.state <> 'completed'"), [1000, 250]);
-      expect(String(mockDb.query.mock.calls.at(-1)[0])).toContain('LIMIT $2');
+      const decisionPruneSql = String(mockDb.query.mock.calls.at(-1)[0]);
+      expect(decisionPruneSql).toContain('WHERE work.session_id = decision.session_id');
+      expect(decisionPruneSql).toContain('AND work.quote_id = decision.quote_id');
+      expect(decisionPruneSql).not.toContain("work.state <> 'completed'");
+      expect(decisionPruneSql).toContain('LIMIT $2');
       await pgManager.pruneReferenceMarketObservations(1000, 250);
       expect(mockDb.query).toHaveBeenLastCalledWith(
         expect.stringMatching(/work\.state <> 'completed'[\s\S]*observation\.observation_timestamp BETWEEN work\.due_timestamp AND work\.deadline_timestamp[\s\S]*LIMIT \$2/),
@@ -421,8 +427,31 @@ describe('TrueXPostgreSQLManager', () => {
       expect(mockDb.query).toHaveBeenLastCalledWith(expect.stringContaining('availability_reason'), [1, 2, 1001]);
       expect(String(mockDb.query.mock.calls.at(-1)[0])).toContain('legacy-missing-basis-provenance');
       expect(String(mockDb.query.mock.calls.at(-1)[0]))
-        .toContain("evidence.source_endpoint = 'wss://stream.crypto.com/exchange/v1/market'");
+        .toContain("evidence_source_endpoint = 'wss://stream.crypto.com/exchange/v1/market'");
       expect(audit).toEqual({ groups: [], truncated: false, limit: 1000 });
+    });
+
+    it('classifies missing quote attribution explicitly without expanding the audit bound', async () => {
+      mockDb.query.mockResolvedValueOnce({ rows: [{
+        side: 'buy', level: 1, policy_id: 'maker-v1', horizon_ms: '60000',
+        availability_status: 'unavailable', availability_reason: 'missing-quote-attribution',
+        observation_count: '2',
+      }] });
+
+      const audit = await pgManager.getReferenceMarkoutCoverage({ limit: 1 });
+      const [sql, params] = mockDb.query.mock.calls.at(-1);
+      expect(sql).toContain("THEN 'missing-quote-attribution'");
+      expect(sql).toContain('AS has_quote_attribution');
+      expect(sql.match(/AS has_quote_attribution/g)).toHaveLength(1);
+      expect(sql).toContain('FROM reference_quote_decisions decision');
+      expect(sql).toContain('GROUP BY side, level, policy_id, horizon_ms, availability_status, availability_reason');
+      expect(sql).toContain('LIMIT $3');
+      expect(params).toEqual([null, null, 2]);
+      expect(audit).toEqual({
+        groups: [expect.objectContaining({ availability_reason: 'missing-quote-attribution' })],
+        truncated: false,
+        limit: 1,
+      });
     });
   });
   

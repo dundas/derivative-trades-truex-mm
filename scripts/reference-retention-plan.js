@@ -27,7 +27,7 @@ export function buildReferenceRetentionPlanQueries({ cutoffTimestamp, batchSize,
       sql: `${prefix}SELECT decision_id FROM reference_quote_decisions decision
         WHERE decision_timestamp < $1 AND NOT EXISTS (
           SELECT 1 FROM fill_reference_markout_work work
-          WHERE work.state <> 'completed' AND work.session_id = decision.session_id
+          WHERE work.session_id = decision.session_id
             AND work.quote_id = decision.quote_id)
         ORDER BY decision_timestamp, decision_id LIMIT $2`,
     },
@@ -108,18 +108,21 @@ export async function runRepresentativeRetentionBenchmark(client, {
       SELECT 'o-' || n, n, n FROM generate_series(1, $1) n`, [observationRows]);
     await client.query(`INSERT INTO fill_reference_markout_work
       SELECT 'f-' || n, ((n % 3) + 1) * 60000, 'completed', n,
-        's-' || (n % 100), 'q-' || n, n, n + 30000 FROM generate_series(1, $1) n`, [workRows]);
-    // Representative unfinished windows exercise both anti-join protection paths.
+        's-' || (n % 100), 'work-q-' || n, n, n + 30000 FROM generate_series(1, $1) n`, [workRows]);
+    // Both terminal and unfinished work protect their matching decisions. The
+    // remaining decisions are intentionally orphaned so the bounded plan has
+    // eligible rows to benchmark.
     await client.query(`INSERT INTO fill_reference_markout_work VALUES
-      ('unfinished', 60000, 'pending', NULL, 's-1', 'q-1', $1 - 100, $1)`, [observationRows]);
+      ('attributed-completed', 60000, 'completed', $1 - 1, 's-1', 'q-1', $1 - 100, $1),
+      ('unfinished', 60000, 'pending', NULL, 's-2', 'q-2', $1 - 100, $1)`, [observationRows]);
     await client.query(`CREATE INDEX bench_decision_retention ON reference_quote_decisions
       (decision_timestamp, decision_id, session_id, quote_id)`);
     await client.query(`CREATE INDEX bench_market_retention ON reference_market_observations
       (received_timestamp, observation_timestamp, observation_id)`);
     await client.query(`CREATE INDEX bench_work_retention ON fill_reference_markout_work
       (completed_at, fill_id, horizon_ms) WHERE state = 'completed'`);
-    await client.query(`CREATE INDEX bench_pending_attribution ON fill_reference_markout_work
-      (session_id, quote_id) WHERE state <> 'completed'`);
+    await client.query(`CREATE INDEX bench_work_attribution ON fill_reference_markout_work
+      (session_id, quote_id)`);
     await client.query(`CREATE INDEX bench_unfinished_window ON fill_reference_markout_work
       (due_timestamp, deadline_timestamp) WHERE state <> 'completed'`);
     await client.query('ANALYZE reference_quote_decisions');
