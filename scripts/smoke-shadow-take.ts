@@ -156,6 +156,9 @@ function nowNanos() {
 }
 
 orchestrator.restClient = {
+  async getActiveOrders() {
+    return [];
+  },
   async getAccountSummary() {
     return {
       balances: [

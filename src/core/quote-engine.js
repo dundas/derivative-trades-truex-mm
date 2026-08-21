@@ -983,6 +983,14 @@ export class QuoteEngine extends EventEmitter {
       this._recordSuppression(quote, 'quote-dispatch-observe-mode');
       return null;
     }
+    // Shadow evaluation is deliberately non-executable. Keep this protection at
+    // the transport-adjacent boundary as well as in _prepareTakerQuote so a
+    // direct or future internal caller cannot reserve capital, mutate local
+    // order state, or emit a taker NewOrderSingle during a shadow canary.
+    if (this.config.shadowTakeMode && quote?.postOnly === false) {
+      this._recordSuppression(quote, 'shadow-mode-observe-only');
+      return null;
+    }
     if (this.continuityState.executionState === 'unsafe') {
       this._recordSuppression(quote, 'unsafe-execution-gate');
       return null;
