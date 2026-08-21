@@ -52,8 +52,8 @@ measurement/promotion path after production telemetry is available.
   - [ ] 4.2 Add a bounded volatility/feed-age/adverse-selection spread floor.
   - [ ] 4.3 Add target-relative inventory bands, bps skew, and side-size asymmetry.
   - [ ] 4.4 Add directional repricing, safe-side hysteresis, and action-budget metrics.
-  - [ ] 4.5 Wire fresh TrueX EBBO into maker crossing safety and presence verification.
-  - [ ] 4.6 Add shadow and canary coverage proving zero taker dispatch.
+  - [x] 4.5 Wire fresh TrueX EBBO into maker crossing safety and presence verification.
+  - [x] 4.6 Add shadow and canary coverage proving zero taker dispatch.
 
 - [ ] 5.0 Close the profitability iteration loop
   - [ ] 5.1 Deploy/verify quote lifecycle telemetry and a bounded coverage audit grouped by side,
