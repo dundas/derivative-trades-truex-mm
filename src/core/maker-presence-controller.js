@@ -47,6 +47,7 @@ export class MakerPresenceController {
     orders = [],
     oeHealthy = true,
     referenceHealthy = true,
+    venueHealthy = true,
     reconciliationState = 'normal',
     fundedSizeBySide = { buy: Infinity, sell: Infinity },
     blockedSides = [],
@@ -111,6 +112,7 @@ export class MakerPresenceController {
     if (emergency) unsafeReasons.push('emergency-kill-switch');
     if (!oeHealthy) unsafeReasons.push('order-entry-unhealthy');
     if (!referenceHealthy) unsafeReasons.push('reference-unhealthy');
+    if (!venueHealthy) unsafeReasons.push('truex-ebbo-unhealthy');
     const blocked = new Set(blockedSides);
     const reconciliationFailed = reconciliationState === 'failed';
     const capitalDegraded = reconciliationState === 'degraded' || reconciliationFailed || blocked.size > 0;

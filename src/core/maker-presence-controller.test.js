@@ -61,6 +61,7 @@ describe('MakerPresenceController', () => {
     });
     expect(presence.observe({ orders: [], oeHealthy: false }).reasons).toContain('order-entry-unhealthy');
     expect(presence.observe({ orders: [], referenceHealthy: false }).reasons).toContain('reference-unhealthy');
+    expect(presence.observe({ orders: [], venueHealthy: false }).reasons).toContain('truex-ebbo-unhealthy');
     expect(presence.observe({ orders: [], reconciliationState: 'failed', fundedSizeBySide: { buy: 0, sell: 0 } }).reasons).toContain('reconciliation-failed-no-safe-l1');
     expect(presence.observe({ orders: [], emergency: true }).reasons).toContain('emergency-kill-switch');
   });
