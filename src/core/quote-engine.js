@@ -899,7 +899,6 @@ export class QuoteEngine extends EventEmitter {
     this._refreshContinuityState();
     if (this.config.quoteDispatchMode === 'observe' && action.type !== 'cancel') {
       this._recordSuppression(action.quote || action.order, 'quote-dispatch-observe-mode');
-      this.deferredRepriceNeeded = true;
       return false;
     }
     if (action.type === 'replacement-cancel' &&
@@ -982,7 +981,6 @@ export class QuoteEngine extends EventEmitter {
     // but this protects direct and future internal callers of this method.
     if (this.config.quoteDispatchMode === 'observe') {
       this._recordSuppression(quote, 'quote-dispatch-observe-mode');
-      this.deferredRepriceNeeded = true;
       return null;
     }
     if (this.continuityState.executionState === 'unsafe') {
