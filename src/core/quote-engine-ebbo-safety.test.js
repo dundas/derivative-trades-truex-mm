@@ -65,6 +65,61 @@ describe('strict TrueX EBBO maker safety', () => {
     expect(engine.deferredRepriceNeeded).toBe(false);
   });
 
+  test('shadow canary blocks a direct taker call before reservation or local order mutation', () => {
+    const capitalReservationManager = { reserve: mock(() => ({ accepted: true })) };
+    const { engine, fixConnection } = makeEngine({
+      shadowTakeMode: true,
+      allowTakerOrders: true,
+      minTakeEdgeBps: 1,
+      capitalReservationManager,
+    });
+    engine.updateTruexEbbo(freshEbbo(99, 101));
+
+    const result = engine._sendNewOrder({
+      side: 'buy',
+      price: 99,
+      executionPrice: 99,
+      fairValue: 100,
+      size: 0.01,
+      level: 1,
+      postOnly: false,
+    });
+
+    expect(result).toBeNull();
+    expect(capitalReservationManager.reserve).not.toHaveBeenCalled();
+    expect(engine.activeOrders.size).toBe(0);
+    expect(fixConnection.sendMessage).not.toHaveBeenCalled();
+    expect(engine.getQuoteStatus().suppressed.at(-1).reason).toBe('shadow-mode-observe-only');
+  });
+
+  test('shadow observe canary blocks a direct taker call before reservation or local order mutation', () => {
+    const capitalReservationManager = { reserve: mock(() => ({ accepted: true })) };
+    const { engine, fixConnection } = makeEngine({
+      shadowTakeMode: true,
+      allowTakerOrders: true,
+      quoteDispatchMode: 'observe',
+      minTakeEdgeBps: 1,
+      capitalReservationManager,
+    });
+    engine.updateTruexEbbo(freshEbbo(99, 101));
+
+    const result = engine._sendNewOrder({
+      side: 'buy',
+      price: 99,
+      executionPrice: 99,
+      fairValue: 100,
+      size: 0.01,
+      level: 1,
+      postOnly: false,
+    });
+
+    expect(result).toBeNull();
+    expect(capitalReservationManager.reserve).not.toHaveBeenCalled();
+    expect(engine.activeOrders.size).toBe(0);
+    expect(fixConnection.sendMessage).not.toHaveBeenCalled();
+    expect(engine.getQuoteStatus().suppressed.at(-1).reason).toBe('quote-dispatch-observe-mode');
+  });
+
   test('observe mode stamps the normal reprice debounce when all placements are suppressed', () => {
     const originalNow = Date.now;
     let now = 1_000;
