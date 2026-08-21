@@ -167,6 +167,28 @@ describe('MarketMakerOrchestrator — Redis wiring (Task 1.4)', () => {
   });
 });
 
+describe('strict EBBO presence verification', () => {
+  it('uses the strict dispatch predicate, not legacy EBBO freshness', () => {
+    const presenceController = { observe: jest.fn().mockReturnValue({ alerts: [] }) };
+    const capitalReservationManager = {
+      getReservations: jest.fn().mockReturnValue([]),
+      getStatus: jest.fn().mockReturnValue({ state: 'normal', blockedSides: [] }),
+      getQuoteCapacity: jest.fn().mockReturnValue(1),
+    };
+    const orch = makeOrch({ presenceController, capitalReservationManager });
+    orch.quoteEngine.config = { strictTruexMakerSafety: true };
+    orch.quoteEngine._strictEbboState = jest.fn().mockReturnValue({ usable: false });
+    orch.quoteEngine._isTruexEbboFresh = jest.fn().mockReturnValue(true);
+    orch._lastMdUpdateTime = Date.now();
+    orch._lastMidPrice = 100;
+
+    orch._getContinuityStatus();
+
+    expect(presenceController.observe).toHaveBeenCalledWith(expect.objectContaining({ venueHealthy: false }));
+    expect(orch.quoteEngine._strictEbboState).toHaveBeenCalled();
+  });
+});
+
 // -----------------------------------------------------------------------
 // coinbase-mirror anchor config threads through to the QuoteEngine
 // -----------------------------------------------------------------------
