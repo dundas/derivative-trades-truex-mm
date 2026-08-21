@@ -169,6 +169,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       selfMatchPreventionInstruction: options.selfMatchPreventionInstruction ?? process.env.TRUEX_SELF_MATCH_PREVENTION_INSTRUCTION,
       truexBookStaleThresholdMs: options.truexBookStaleThresholdMs || 10000,
       strictTruexMakerSafety: options.strictTruexMakerSafety ?? false,
+      quoteDispatchMode: options.quoteDispatchMode,
       truexMakerEbboMaxAgeMs: options.truexMakerEbboMaxAgeMs ?? 10000,
       truexAloRetryCooldownMs: options.truexAloRetryCooldownMs ?? 5000,
       truexAloRetryMaxEntries: options.truexAloRetryMaxEntries ?? 256,
@@ -2728,6 +2729,8 @@ export class MarketMakerOrchestrator extends EventEmitter {
     const oeConnected = this._isFixExecutionHealthy();
     const mdConnected = this.marketDataFeed ? (this.marketDataFeed.isLoggedOn === true) : null;
     const uptime = this.startedAt ? now - this.startedAt : 0;
+    const feedHealth = this._getFeedHealth(now);
+    const quoteDispatchMode = this.quoteEngine.config?.quoteDispatchMode ?? 'live';
 
     const continuity = this._getContinuityStatus();
 
@@ -2737,7 +2740,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
     const twoSidedPresent = continuity ? continuity.present.twoSided : null;
     const quoteLoopActive = this.isRunning && !quotingIdle;
     const quoting = quoteLoopActive && (twoSidedPresent ?? true);
-    const isHealthy = quoting && bothConnected;
+    const hasStaleRequiredFeed = Object.values(feedHealth)
+      .some((feed) => feed.requiredForOrderDispatch && !feed.fresh);
+    const isHealthy = quoting && bothConnected && quoteDispatchMode === 'live' && !hasStaleRequiredFeed;
     const isUnhealthy = quotingIdle || !oeConnected || mdConnected === false;
 
     let status;
@@ -2758,10 +2763,12 @@ export class MarketMakerOrchestrator extends EventEmitter {
       status,
       quoting,
       quoteLoopActive,
+      quoteDispatchMode,
       lastRepriceAge,
       oeConnected,
       mdConnected,
       lastMdAge,
+      feedHealth,
       activeOrders: this.quoteEngine.activeOrders?.size ?? 0,
       makerActiveOrders: this.capitalReservationManager?.getReservations?.()
         ?.filter((order) => order.acknowledgedLive === true).length ?? null,
@@ -2788,6 +2795,51 @@ export class MarketMakerOrchestrator extends EventEmitter {
       // Additive observability only. Persistence failures remain visible in
       // this payload but are deliberately excluded from health classification.
       referenceMarkouts: this.referenceMarkoutCollector?.getStats?.() || null,
+    };
+  }
+
+  _getFeedHealth(now = Date.now()) {
+    const describe = ({
+      enabled, requiredForOrderDispatch, requiredForShadowEvaluation,
+      lastSuccessAt, maxAgeMs, consecutiveErrors, currentBackoffMs, inFlight,
+    }) => {
+      const lastSuccessAgeMs = lastSuccessAt > 0 ? now - lastSuccessAt : null;
+      return {
+        enabled,
+        requiredForOrderDispatch,
+        requiredForShadowEvaluation,
+        fresh: enabled ? lastSuccessAgeMs !== null && lastSuccessAgeMs <= maxAgeMs : null,
+        lastSuccessAt: lastSuccessAt || null,
+        lastSuccessAgeMs,
+        maxAgeMs,
+        consecutiveErrors,
+        currentBackoffMs,
+        inFlight,
+      };
+    };
+    return {
+      truexEbbo: describe({
+        enabled: this.truexEbboPollIntervalMs > 0,
+        requiredForOrderDispatch: this.quoteEngine.config?.strictTruexMakerSafety === true,
+        requiredForShadowEvaluation: this.quoteEngine.config?.shadowTakeMode === true,
+        lastSuccessAt: this._truexEbboLastSuccessAt,
+        maxAgeMs: this.quoteEngine.config?.truexMakerEbboMaxAgeMs ?? 0,
+        consecutiveErrors: this._truexEbboConsecutiveErrors,
+        currentBackoffMs: this._truexEbboCurrentBackoffMs,
+        inFlight: this._truexEbboPollInFlight,
+      }),
+      pyusdUsd: describe({
+        enabled: this.pyusdUsdPollIntervalMs > 0,
+        // PYUSD/USD only affects the non-dispatching shadow-take evaluator in
+        // the current policy; it is intentionally not a maker-order gate.
+        requiredForOrderDispatch: false,
+        requiredForShadowEvaluation: this.quoteEngine.config?.shadowTakeMode === true,
+        lastSuccessAt: this._pyusdUsdLastSuccessAt,
+        maxAgeMs: this.pyusdUsdStaleThresholdMs,
+        consecutiveErrors: this._pyusdUsdConsecutiveErrors,
+        currentBackoffMs: this._pyusdUsdCurrentBackoffMs,
+        inFlight: this._pyusdUsdPollInFlight,
+      }),
     };
   }
 

@@ -32,6 +32,27 @@ function freshEbbo(bestBid = 99, bestAsk = 101) {
 }
 
 describe('strict TrueX EBBO maker safety', () => {
+  test('observe dispatch mode permits protective cancels but suppresses all placement paths', () => {
+    const { engine, fixConnection } = makeEngine({ quoteDispatchMode: 'observe' });
+    engine.updateTruexEbbo(freshEbbo(99, 101));
+    engine.activeOrders.set('existing', { ...quote('buy', 98), status: 'active' });
+
+    expect(engine._sendNewOrder(quote('buy', 100))).toBeNull();
+    expect(engine.activeOrders.size).toBe(1);
+    expect(engine._dispatchAction({ type: 'place', quote: quote('buy', 100) })).toBe(false);
+    expect(engine._dispatchAction({
+      type: 'replacement-cancel', clOrdID: 'existing',
+      order: engine.activeOrders.get('existing'), quote: quote('buy', 100),
+    })).toBe(false);
+    expect(engine._dispatchAction({
+      type: 'cancel', clOrdID: 'existing', order: engine.activeOrders.get('existing'),
+    })).toBe(true);
+
+    const messageTypes = fixConnection.sendMessage.mock.calls.map(([fields]) => fields['35']);
+    expect(messageTypes).toEqual(['F']);
+    expect(engine.getQuoteStatus().suppressed.at(-1).reason).toBe('quote-dispatch-observe-mode');
+  });
+
   test('missing, stale, and invalid EBBO suppress new D sends while pure cancels remain allowed', () => {
     let now = 10_000;
     const { engine, fixConnection } = makeEngine({ now: () => now });

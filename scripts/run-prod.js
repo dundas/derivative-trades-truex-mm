@@ -45,6 +45,7 @@ import { buildContinuityConfig } from './continuity-config.js';
 import { buildOrderReconciliationScope } from './order-reconciliation-scope-config.js';
 import { startProductionOrchestrator } from './production-orchestrator-startup.js';
 import { buildTruexMakerSafetyConfig } from './truex-maker-safety-config.js';
+import { buildQuoteDispatchMode } from './quote-dispatch-mode-config.js';
 import { buildFixLivenessConfig } from './fix-liveness-config.js';
 import {
   buildInventoryRebalanceShadowConfig,
@@ -101,6 +102,7 @@ const shadowPhase2Criteria = {
   maxP95AbsPyusdBasisBps: parseNumber('SHADOW_ABORT_MAX_P95_ABS_PYUSD_BASIS_BPS', 80),
 };
 const orderReconciliationScope = buildOrderReconciliationScope(process.env);
+const quoteDispatchMode = buildQuoteDispatchMode(process.env);
 const fixLivenessConfig = buildFixLivenessConfig(process.env);
 const presenceRecoveryConfig = buildMakerPresenceRecoveryConfig(process.env);
 const inventoryRebalanceShadowConfig = buildInventoryRebalanceShadowConfig(process.env);
@@ -516,6 +518,7 @@ async function main() {
     presenceRecoveryConfig,
     inventoryRebalanceShadowConfig,
     ...config.truexMakerSafety,
+    quoteDispatchMode,
     ...orderReconciliationScope,
 
     // REST reconciliation + balance refresh

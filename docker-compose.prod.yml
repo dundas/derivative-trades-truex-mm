@@ -122,6 +122,15 @@ services:
       - TRUEX_MAKER_EBBO_MAX_AGE_MS=${TRUEX_MAKER_EBBO_MAX_AGE_MS:?required}
       - TRUEX_ALO_RETRY_COOLDOWN_MS=${TRUEX_ALO_RETRY_COOLDOWN_MS:?required}
       - TRUEX_ALO_RETRY_MAX_ENTRIES=${TRUEX_ALO_RETRY_MAX_ENTRIES:?required}
+      # `observe` permits data collection and protective cancels but never a new FIX D.
+      - MM_QUOTE_DISPATCH_MODE=${MM_QUOTE_DISPATCH_MODE:-live}
+      # Feed controls remain operator-configurable; stale data continues to fail closed.
+      - PYUSD_USD_POLL_INTERVAL_MS=${PYUSD_USD_POLL_INTERVAL_MS:-5000}
+      - PYUSD_USD_POLL_TIMEOUT_MS=${PYUSD_USD_POLL_TIMEOUT_MS:-1000}
+      - PYUSD_USD_STALE_THRESHOLD_MS=${PYUSD_USD_STALE_THRESHOLD_MS:-15000}
+      - PYUSD_USD_PRIMARY_PAIR=${PYUSD_USD_PRIMARY_PAIR:-PYUSD/USD}
+      - PYUSD_USD_FALLBACK_PAIR=${PYUSD_USD_FALLBACK_PAIR:-PYUSDUSD}
+      - TRUEX_EBBO_POLL_INTERVAL_MS=${TRUEX_EBBO_POLL_INTERVAL_MS:-1000}
       # Reference mark-outs remain inert by default. Direct mode requires the
       # reviewed Crypto.com endpoint identity; legacy basis mode requires its Kraken venue allowlist.
       - REFERENCE_MARKOUT_ENABLED=${REFERENCE_MARKOUT_ENABLED:-false}

@@ -88,6 +88,10 @@ export class QuoteEngine extends EventEmitter {
       selfMatchPreventionInstruction: normalizeSelfMatchPreventionInstruction(options.selfMatchPreventionInstruction),
       truexBookStaleThresholdMs: options.truexBookStaleThresholdMs || 10000,
       strictTruexMakerSafety: options.strictTruexMakerSafety ?? false,
+      // `observe` keeps market-data, reconciliation, and cancellation paths live
+      // while making a new-order FIX D impossible from this engine instance.
+      // It is intentionally a deployment-time control, not a strategy toggle.
+      quoteDispatchMode: options.quoteDispatchMode ?? 'live',
       truexMakerEbboMaxAgeMs: options.truexMakerEbboMaxAgeMs ?? 10000,
       truexAloRetryCooldownMs: options.truexAloRetryCooldownMs ?? 5000,
       truexAloRetryMaxEntries: options.truexAloRetryMaxEntries ?? 256,
@@ -141,6 +145,9 @@ export class QuoteEngine extends EventEmitter {
     }
     if (typeof this.config.strictTruexMakerSafety !== 'boolean') {
       throw new Error('strictTruexMakerSafety must be boolean');
+    }
+    if (!['live', 'observe'].includes(this.config.quoteDispatchMode)) {
+      throw new Error('quoteDispatchMode must be live or observe');
     }
     if (this.config.strictTruexMakerSafety) {
       if (!['skip', 'slide'].includes(this.config.marketablePostOnlyAction)) {
@@ -890,6 +897,11 @@ export class QuoteEngine extends EventEmitter {
    */
   _dispatchAction(action) {
     this._refreshContinuityState();
+    if (this.config.quoteDispatchMode === 'observe' && action.type !== 'cancel') {
+      this._recordSuppression(action.quote || action.order, 'quote-dispatch-observe-mode');
+      this.deferredRepriceNeeded = true;
+      return false;
+    }
     if (action.type === 'replacement-cancel' &&
         this.activeOrders.get(action.clOrdID)?.dispatchOutcomeUnknown) return false;
     if (this.continuityState.executionState === 'unsafe' && action.type !== 'cancel') {
@@ -965,6 +977,14 @@ export class QuoteEngine extends EventEmitter {
    */
   _sendNewOrder(quote) {
     this._refreshContinuityState();
+    // Keep the deployment control at the transport-adjacent D boundary as
+    // defense in depth. `_dispatchAction` also gates normal reconciliation,
+    // but this protects direct and future internal callers of this method.
+    if (this.config.quoteDispatchMode === 'observe') {
+      this._recordSuppression(quote, 'quote-dispatch-observe-mode');
+      this.deferredRepriceNeeded = true;
+      return null;
+    }
     if (this.continuityState.executionState === 'unsafe') {
       this._recordSuppression(quote, 'unsafe-execution-gate');
       return null;
