@@ -46,6 +46,10 @@ import { buildOrderReconciliationScope } from './order-reconciliation-scope-conf
 import { startProductionOrchestrator } from './production-orchestrator-startup.js';
 import { buildTruexMakerSafetyConfig } from './truex-maker-safety-config.js';
 import { buildFixLivenessConfig } from './fix-liveness-config.js';
+import {
+  buildInventoryRebalanceShadowConfig,
+  buildMakerPresenceRecoveryConfig,
+} from './strategy-control-config.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -98,6 +102,8 @@ const shadowPhase2Criteria = {
 };
 const orderReconciliationScope = buildOrderReconciliationScope(process.env);
 const fixLivenessConfig = buildFixLivenessConfig(process.env);
+const presenceRecoveryConfig = buildMakerPresenceRecoveryConfig(process.env);
+const inventoryRebalanceShadowConfig = buildInventoryRebalanceShadowConfig(process.env);
 
 // ---------------------------------------------------------------------------
 // Configuration — PRODUCTION
@@ -507,6 +513,8 @@ async function main() {
     referenceMarkoutConfig: referenceMarkoutRolloutOptions.referenceMarkoutConfig,
     referenceBookFeed,
     continuityConfig: config.continuityConfig,
+    presenceRecoveryConfig,
+    inventoryRebalanceShadowConfig,
     ...config.truexMakerSafety,
     ...orderReconciliationScope,
 

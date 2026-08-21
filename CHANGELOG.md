@@ -8,6 +8,8 @@ with enhanced attribution to track which AI model/CLI made each change.
 ## [Unreleased]
 
 ### Added
+- Added observe-only Gaussian inventory-control telemetry and bounded, opt-in maker-presence recovery (Codex GPT-5, 2026-08-21)
+  - **Context:** [PRD 0014](tasks/0014-prd-continuous-market-maker-control.md) | Task 4.3
 - Added authoritative exchange-capital reservations, acknowledged two-sided presence, fail-soft
   execution states, and configurable degraded-mode continuity controls (Codex, 2026-08-18)
   - **Context:** [PRD 0014](tasks/0014-prd-continuous-market-maker-control.md) | Tasks 2.0 and 3.1-3.4
@@ -17,6 +19,8 @@ with enhanced attribution to track which AI model/CLI made each change.
   - **Context:** PR #72; PRD 0014 tasks 5.3-5.6
 
 ### Fixed
+- Made health report acknowledged two-sided maker presence separately from pricing-loop activity and prevented degraded-state restart loops (Codex GPT-5, 2026-08-21)
+  - **Context:** [PRD 0014](tasks/0014-prd-continuous-market-maker-control.md) | Task 4.3
 - Added TrueX FIX self-match prevention and local self-cross quote safeguards (Codex, 2026-06-23)
   - **Context:** PR #48
 
