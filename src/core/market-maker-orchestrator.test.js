@@ -202,6 +202,12 @@ describe('MarketMakerOrchestrator — anchor config wiring', () => {
     expect(orch.quoteEngine.config.cancellingSelfCrossGuardMs).toBe(2345);
   });
 
+  it('forwards observe dispatch mode to the engine', () => {
+    const orch = makeRealEngineOrch({ quoteDispatchMode: 'observe' });
+
+    expect(orch.quoteEngine.config.quoteDispatchMode).toBe('observe');
+  });
+
   it('forwards self-match prevention instruction from env when option is unset', () => {
     const previousValue = process.env.TRUEX_SELF_MATCH_PREVENTION_INSTRUCTION;
     process.env.TRUEX_SELF_MATCH_PREVENTION_INSTRUCTION = '1';
@@ -573,6 +579,37 @@ describe('getHealthStatus', () => {
     expect(status.status).toBe('healthy');
     expect(status.quoting).toBe(true);
     expect(status.oeConnected).toBe(true);
+  });
+
+  it('surfaces stale execution-critical feeds as degraded without treating observer mode as a live quote path', () => {
+    const orch = makeOrch({ truexEbboPollIntervalMs: 1000, pyusdUsdPollIntervalMs: 1000 });
+    orch.isRunning = true;
+    orch.startedAt = Date.now() - 5000;
+    orch.fixOE.isLoggedOn = true;
+    orch._lastRepriceTime = Date.now() - 1000;
+    orch.quoteEngine.config = {
+      strictTruexMakerSafety: true,
+      quoteDispatchMode: 'observe',
+      truexMakerEbboMaxAgeMs: 10000,
+    };
+    orch._truexEbboLastSuccessAt = Date.now() - 20000;
+    orch._truexEbboCurrentBackoffMs = 1500;
+    orch._truexEbboPollInFlight = true;
+    orch._pyusdUsdLastSuccessAt = Date.now() - 20000;
+    orch._pyusdUsdCurrentBackoffMs = 7500;
+
+    const status = orch.getHealthStatus();
+
+    expect(status.status).toBe('degraded');
+    expect(status.quoteDispatchMode).toBe('observe');
+    expect(status.feedHealth.truexEbbo).toMatchObject({
+      enabled: true, fresh: false, requiredForOrderDispatch: true,
+      currentBackoffMs: 1500, inFlight: true,
+    });
+    expect(status.feedHealth.pyusdUsd).toMatchObject({
+      enabled: true, fresh: false, requiredForOrderDispatch: false,
+      currentBackoffMs: 7500, inFlight: false,
+    });
   });
 
   it('returns unhealthy when quoting has been idle too long', () => {

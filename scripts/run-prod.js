@@ -45,6 +45,8 @@ import { buildContinuityConfig } from './continuity-config.js';
 import { buildOrderReconciliationScope } from './order-reconciliation-scope-config.js';
 import { startProductionOrchestrator } from './production-orchestrator-startup.js';
 import { buildTruexMakerSafetyConfig } from './truex-maker-safety-config.js';
+import { buildQuoteDispatchMode } from './quote-dispatch-mode-config.js';
+import { buildFeedPollConfig } from './feed-poll-config.js';
 import { buildFixLivenessConfig } from './fix-liveness-config.js';
 import {
   buildInventoryRebalanceShadowConfig,
@@ -101,6 +103,8 @@ const shadowPhase2Criteria = {
   maxP95AbsPyusdBasisBps: parseNumber('SHADOW_ABORT_MAX_P95_ABS_PYUSD_BASIS_BPS', 80),
 };
 const orderReconciliationScope = buildOrderReconciliationScope(process.env);
+const quoteDispatchMode = buildQuoteDispatchMode(process.env);
+const feedPollConfig = buildFeedPollConfig(process.env);
 const fixLivenessConfig = buildFixLivenessConfig(process.env);
 const presenceRecoveryConfig = buildMakerPresenceRecoveryConfig(process.env);
 const inventoryRebalanceShadowConfig = buildInventoryRebalanceShadowConfig(process.env);
@@ -182,9 +186,9 @@ const config = {
   restUrl: process.env.TRUEX_REST_URL || 'http://178.156.230.110:3006',
   startupCancelVerifyTimeoutMs: parsePositiveInteger('TRUEX_STARTUP_CANCEL_VERIFY_TIMEOUT_MS', 30000),
   startupCancelVerifyIntervalMs: parsePositiveInteger('TRUEX_STARTUP_CANCEL_VERIFY_INTERVAL_MS', 500),
-  pyusdUsdPollIntervalMs: parseInt(process.env.PYUSD_USD_POLL_INTERVAL_MS || '5000', 10),
-  pyusdUsdPollTimeoutMs: parseInt(process.env.PYUSD_USD_POLL_TIMEOUT_MS || '1000', 10),
-  pyusdUsdStaleThresholdMs: parseInt(process.env.PYUSD_USD_STALE_THRESHOLD_MS || '15000', 10),
+  pyusdUsdPollIntervalMs: feedPollConfig.pyusdUsdPollIntervalMs,
+  pyusdUsdPollTimeoutMs: feedPollConfig.pyusdUsdPollTimeoutMs,
+  pyusdUsdStaleThresholdMs: feedPollConfig.pyusdUsdStaleThresholdMs,
   pyusdUsdReferenceSources: [
     { type: 'kraken-rest', pair: process.env.PYUSD_USD_PRIMARY_PAIR || 'PYUSD/USD' },
     { type: 'kraken-rest', pair: process.env.PYUSD_USD_FALLBACK_PAIR || 'PYUSDUSD' },
@@ -199,7 +203,7 @@ const config = {
   maxTakeNotionalPerOrder: parseNumber('SHADOW_MAX_TAKE_NOTIONAL_PER_ORDER', 250),
   minTakeSizeBTC: parseNumber('SHADOW_MIN_TAKE_SIZE_BTC', 0.0001),
   shadowPersistenceRequiredPolls: parseInt(process.env.SHADOW_PERSISTENCE_POLLS || '3', 10),
-  truexEbboPollIntervalMs: parseInt(process.env.TRUEX_EBBO_POLL_INTERVAL_MS || '1000', 10),
+  truexEbboPollIntervalMs: feedPollConfig.truexEbboPollIntervalMs,
   shadowZeroDetectionAlertThresholdMs: parseInt(process.env.SHADOW_ZERO_DETECTION_ALERT_THRESHOLD_MS || '300000', 10),
   shadowSuppressionAlertThreshold: parseInt(process.env.SHADOW_SUPPRESSION_ALERT_THRESHOLD || '5', 10),
   shadowEdgeCeilingAlertThreshold: parseInt(process.env.SHADOW_EDGE_CEILING_ALERT_THRESHOLD || '3', 10),
@@ -516,6 +520,7 @@ async function main() {
     presenceRecoveryConfig,
     inventoryRebalanceShadowConfig,
     ...config.truexMakerSafety,
+    quoteDispatchMode,
     ...orderReconciliationScope,
 
     // REST reconciliation + balance refresh
