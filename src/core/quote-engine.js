@@ -423,7 +423,7 @@ export class QuoteEngine extends EventEmitter {
     // implicitly disables this debounce for every tick until a hold clears.
     // The completion-retry exemption lives solely in _runDeferredReprice's
     // heldPlacementsPending check.
-    if (dispatched) {
+    if (dispatched || this.config.quoteDispatchMode === 'observe') {
       this.lastRepriceAt = Date.now();
       this.lastRepricedMid = mid;
       if (momentumBypass) {
