@@ -158,6 +158,72 @@ describe('MarketMakerOrchestrator continuity binding', () => {
     orchestrator._runWatchdog();
     expect(cancelAll).not.toHaveBeenCalled();
   });
+
+  test('reconciles authoritative capital and rearms without cancelling the surviving side', async () => {
+    const recovery = {
+      observe: mock(() => ({ shouldRecover: true })),
+      reconciled: mock(() => {}), failed: mock(() => {}), snapshot: () => ({ state: 'rearming' }),
+    };
+    const orchestrator = Object.assign(Object.create(MarketMakerOrchestrator.prototype), {
+      presenceRecoveryController: recovery,
+      restClient: {},
+      capitalReservationManager: { getStatus: () => ({ state: 'normal', blockedSides: [] }) },
+      _onCapitalResyncRequired: mock(async () => {}),
+      quoteEngine: { deferredRepriceNeeded: false, drainQueue: mock(() => {}), cancelAllQuotes: mock(() => {}) },
+      logger: { error() {} }, emit() {},
+    });
+    orchestrator._maybeRecoverMakerPresence({ executionState: 'degraded' });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(orchestrator._onCapitalResyncRequired).toHaveBeenCalledWith({
+      side: 'multiple', reason: 'maker-presence-gap', strict: true,
+    });
+    expect(orchestrator.quoteEngine.cancelAllQuotes).not.toHaveBeenCalled();
+    expect(recovery.reconciled).toHaveBeenCalledTimes(1);
+  });
+
+  test('reports the quote loop separately from actual two-sided maker presence', () => {
+    const orchestrator = Object.assign(Object.create(MarketMakerOrchestrator.prototype), {
+      isRunning: true, startedAt: Date.now() - 1000, sessionId: 'health-test',
+      _lastRepriceTime: Date.now(), _lastMdUpdateTime: Date.now(), _quotingIdleThresholdMs: 1000,
+      fixOE: { isLoggedOn: true }, marketDataFeed: null,
+      _getContinuityStatus: () => ({
+        executionState: 'degraded', reasons: ['missing-acknowledged-sell'],
+        present: { buy: true, sell: false, twoSided: false },
+        activeLevels: { buy: 1, sell: 0 }, gaps: { buy: {}, sell: {} },
+      }),
+      inventoryManager: { getPositionSummary: () => ({ balancesInitialized: false }) },
+      quoteEngine: { activeOrders: new Map([['stale', {}]]) },
+      capitalReservationManager: { getReservations: () => [], getStatus: () => ({ state: 'normal' }) },
+      pnlTracker: { getSummary: () => ({}), getLastFill: () => null },
+      presenceRecoveryController: null, inventoryRebalanceShadow: null,
+    });
+    expect(orchestrator.getHealthStatus()).toMatchObject({
+      status: 'degraded', quoting: false, quoteLoopActive: true, activeOrders: 1,
+      makerActiveOrders: 0, makerPresence: { twoSided: false },
+    });
+  });
+
+  test('publishes bell-curve inventory guidance as an unreachable observe-only order path', () => {
+    const events = [];
+    const orchestrator = Object.assign(Object.create(MarketMakerOrchestrator.prototype), {
+      inventoryRebalanceShadowConfig: {
+        enabled: true, sampleIntervalMs: 5000, targetInventoryBTC: 0.014, inventorySigmaBTC: 0.004,
+        centerBandSigma: 0.5, softHedgeBandSigma: 2, hardHedgeBandSigma: 3,
+        minimumMakerParticipation: 0.25, maxSizeAsymmetry: 0.75, maxQuoteSkewBps: 10,
+      },
+      inventoryManager: { getPositionSummary: () => ({ baseBalance: { total: 0.002 }, netPosition: 99 }) },
+      _inventoryRebalanceShadowLastAt: 0,
+      emit: (name, payload) => events.push({ name, payload }),
+    });
+    const shadow = orchestrator._updateInventoryRebalanceShadow();
+    expect(shadow).toMatchObject({
+      mode: 'observe-only', orderPathEnabled: false, inventoryBTC: 0.002,
+      regime: { status: 'unavailable', adjustmentApplied: false },
+      hedge: { side: 'buy' },
+    });
+    expect(events[0].name).toBe('inventory-rebalance-shadow');
+  });
 });
 
 describe('MarketMakerOrchestrator strict startup reconciliation', () => {

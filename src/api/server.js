@@ -141,10 +141,14 @@ async function handleHealth() {
       status,
       // Orchestrator health fields at top level (per FR-2.4)
       quoting: orchHealth?.quoting ?? null,
+      quoteLoopActive: orchHealth?.quoteLoopActive ?? null,
       lastRepriceAge: orchHealth?.lastRepriceAge ?? null,
       oeConnected: orchHealth?.oeConnected ?? null,
       mdConnected: orchHealth?.mdConnected ?? null,
       lastMdAge: orchHealth?.lastMdAge ?? null,
+      makerPresence: orchHealth?.makerPresence ?? null,
+      makerPresenceRecovery: orchHealth?.makerPresenceRecovery ?? null,
+      inventoryRebalanceShadow: orchHealth?.inventoryRebalanceShadow ?? null,
       // Other fields
       database: dbInfo,
       uptime: process.uptime(),

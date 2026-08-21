@@ -13,6 +13,8 @@ import { QuoteLifecycleTelemetry } from '../data-pipeline/quote-lifecycle-teleme
 import { ReferenceMarkoutCollector } from '../data-pipeline/reference-markout-collector.js';
 import { CapitalReservationManager } from './capital-reservation-manager.js';
 import { MakerPresenceController } from './maker-presence-controller.js';
+import { MakerPresenceRecoveryController } from './maker-presence-recovery.js';
+import { evaluateInventoryRebalance } from '../analytics/inventory-rebalance-model.js';
 
 function strictPositiveRestNumber(value) {
   if ((typeof value !== 'string' && typeof value !== 'number') ||
@@ -121,6 +123,13 @@ export class MarketMakerOrchestrator extends EventEmitter {
       (options.continuityConfig ? new CapitalReservationManager(options.continuityConfig) : null);
     this.presenceController = options.presenceController ||
       (options.continuityConfig ? new MakerPresenceController(options.continuityConfig, { now: options.now || Date.now }) : null);
+    this.presenceRecoveryController = options.presenceRecoveryController ||
+      (options.presenceRecoveryConfig
+        ? new MakerPresenceRecoveryController(options.presenceRecoveryConfig, { now: options.now || Date.now })
+        : null);
+    this.inventoryRebalanceShadowConfig = options.inventoryRebalanceShadowConfig || null;
+    this.inventoryRebalanceShadow = null;
+    this._inventoryRebalanceShadowLastAt = 0;
 
     this.pnlTracker = options.pnlTracker || new PnLTracker({
       truexMakerFeeBps: options.truexMakerFeeBps ?? 0,
@@ -1237,6 +1246,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
     if (continuity) this.quoteEngine.setContinuityState(continuity);
     this.quoteEngine.onPriceUpdate(aggregatedPrice);
     this._lastRepriceTime = Date.now();
+    const postRepriceContinuity = this._getContinuityStatus();
+    this._maybeRecoverMakerPresence(postRepriceContinuity);
+    this._updateInventoryRebalanceShadow();
 
     if (this._shouldTriggerShadowReevaluation(aggregatedPrice)) {
       this._processShadowEvaluation('coinbase-update', { refreshTape: false }).catch((err) => {
@@ -1339,6 +1351,63 @@ export class MarketMakerOrchestrator extends EventEmitter {
       }).catch((error) => this.logger.error(`[Orchestrator] Side-gap alert failed: ${error.message}`));
     }
     return status;
+  }
+
+  _maybeRecoverMakerPresence(status) {
+    if (!this.presenceRecoveryController || !status) return null;
+    const decision = this.presenceRecoveryController.observe(status, {
+      authoritativeRecoveryAvailable: Boolean(this.restClient),
+    });
+    if (!decision.shouldRecover) return decision;
+
+    const operation = this._onCapitalResyncRequired({
+      side: 'multiple', reason: 'maker-presence-gap', strict: true,
+    }).then(() => {
+      const capital = this.capitalReservationManager?.getStatus?.();
+      if (capital && (capital.state !== 'normal' || capital.blockedSides?.length > 0)) {
+        throw new Error('authoritative capital reconciliation did not return to normal');
+      }
+      this.presenceRecoveryController.reconciled();
+      this.emit('maker-presence-recovery', {
+        outcome: 'rearming', recovery: this.presenceRecoveryController.snapshot(),
+      });
+    }).catch((error) => {
+      this.presenceRecoveryController.failed(error);
+      this.logger.error(`[Orchestrator] Maker-presence recovery failed: ${error.message}`);
+      this.emit('maker-presence-recovery', {
+        outcome: 'failed', error: error.message, recovery: this.presenceRecoveryController.snapshot(),
+      });
+    });
+    operation.catch(() => {});
+    return decision;
+  }
+
+  _updateInventoryRebalanceShadow() {
+    const config = this.inventoryRebalanceShadowConfig;
+    if (!config?.enabled) return null;
+    const now = Date.now();
+    if (this._inventoryRebalanceShadowLastAt > 0 &&
+        now - this._inventoryRebalanceShadowLastAt < config.sampleIntervalMs) {
+      return this.inventoryRebalanceShadow;
+    }
+    const position = this.inventoryManager.getPositionSummary();
+    const inventoryBTC = Number(position.baseBalance?.total ?? position.netPosition);
+    if (!Number.isFinite(inventoryBTC)) return null;
+    const evaluation = evaluateInventoryRebalance(inventoryBTC, config);
+    this.inventoryRebalanceShadow = {
+      mode: 'observe-only',
+      orderPathEnabled: false,
+      observedAt: now,
+      regime: {
+        status: 'unavailable',
+        adjustmentApplied: false,
+        adjustedTargetInventoryBTC: evaluation.targetInventoryBTC,
+      },
+      ...evaluation,
+    };
+    this._inventoryRebalanceShadowLastAt = now;
+    this.emit('inventory-rebalance-shadow', this.inventoryRebalanceShadow);
+    return this.inventoryRebalanceShadow;
   }
 
   _onFIXMessage(message) {
@@ -2567,7 +2636,8 @@ export class MarketMakerOrchestrator extends EventEmitter {
     const issues = [];
     // Presence alerts are independently rate-limited and never feed the generic
     // watchdog cancel-all path: a missing side must preserve the funded live side.
-    this._getContinuityStatus();
+    const continuity = this._getContinuityStatus();
+    this._maybeRecoverMakerPresence(continuity);
 
     // Check OE FIX
     if (!this._isFixExecutionHealthy()) {
@@ -2664,7 +2734,10 @@ export class MarketMakerOrchestrator extends EventEmitter {
     // Status logic
     const quotingIdle = lastRepriceAge !== null && lastRepriceAge > this._quotingIdleThresholdMs;
     const bothConnected = oeConnected && (mdConnected === null || mdConnected === true);
-    const isHealthy = !quotingIdle && bothConnected && this.isRunning;
+    const twoSidedPresent = continuity ? continuity.present.twoSided : null;
+    const quoteLoopActive = this.isRunning && !quotingIdle;
+    const quoting = quoteLoopActive && (twoSidedPresent ?? true);
+    const isHealthy = quoting && bothConnected;
     const isUnhealthy = quotingIdle || !oeConnected || mdConnected === false;
 
     let status;
@@ -2683,12 +2756,15 @@ export class MarketMakerOrchestrator extends EventEmitter {
     const position = this.inventoryManager.getPositionSummary();
     return {
       status,
-      quoting: this.isRunning && !quotingIdle,
+      quoting,
+      quoteLoopActive,
       lastRepriceAge,
       oeConnected,
       mdConnected,
       lastMdAge,
       activeOrders: this.quoteEngine.activeOrders?.size ?? 0,
+      makerActiveOrders: this.capitalReservationManager?.getReservations?.()
+        ?.filter((order) => order.acknowledgedLive === true).length ?? null,
       position,
       balances: position.balancesInitialized
         ? { base: position.baseBalance, quote: position.quoteBalance }
@@ -2700,6 +2776,14 @@ export class MarketMakerOrchestrator extends EventEmitter {
       uptime,
       sessionId: this.sessionId,
       continuity,
+      makerPresence: continuity ? {
+        twoSided: continuity.present.twoSided,
+        sides: continuity.present,
+        activeLevels: continuity.activeLevels,
+        gaps: continuity.gaps,
+      } : null,
+      makerPresenceRecovery: this.presenceRecoveryController?.snapshot() || null,
+      inventoryRebalanceShadow: this.inventoryRebalanceShadow,
       capital: this.capitalReservationManager?.getStatus() || null,
       // Additive observability only. Persistence failures remain visible in
       // this payload but are deliberately excluded from health classification.

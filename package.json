@@ -10,7 +10,8 @@
     "start:coinbase": "node src/core/truex-coinbase-market-maker.js",
     "start:uat": "bun scripts/run-uat-paper-trading.js",
     "start:api": "bun src/api/server.js",
-    "test": "bun run test:regime && bun run test:reference-markouts && bun run test:continuity && bun run test:truex-maker-safety && bun run test:production-image && node --test tests/**/*.test.js",
+    "test": "bun run test:inventory-rebalance && bun run test:regime && bun run test:reference-markouts && bun run test:continuity && bun run test:truex-maker-safety && bun run test:production-image && node --test tests/**/*.test.js",
+    "test:inventory-rebalance": "bun test scripts/strategy-control-config.test.js src/analytics/inventory-rebalance-model.test.js src/analytics/inventory-rebalance-backtest.test.js src/core/maker-presence-recovery.test.js",
     "test:regime": "bun test src/analytics/regime-strategy-validator.test.js",
     "test:reference-markouts": "bun test lib/postgresql-api/index.test.js scripts/reference-markout-rollout-config.test.js scripts/reference-retention-plan.test.js scripts/report-reference-markout-coverage.test.js src/api/status-snapshot.test.js src/analytics/regime-strategy-validator.test.js src/connectors/aggregator/PriceAggregator.test.ts src/connectors/cryptocom/CryptoComReferenceBookFeed.test.js src/connectors/kraken/KrakenRestClient.test.ts src/data-pipeline/coinbase-ws-ingest.test.js src/data-pipeline/quote-lifecycle-telemetry.test.js src/data-pipeline/reference-markout-collector.test.js src/data-pipeline/truex-postgresql-manager.test.js tests/market-maker-orchestrator.test.js && bun scripts/smoke-reference-markout-rollout-toggle.js && bun scripts/smoke-reference-markouts.js && bun scripts/smoke-cryptocom-reference.js",
     "test:continuity": "bun test scripts/continuity-config.test.js scripts/order-reconciliation-scope-config.test.js scripts/production-orchestrator-startup.test.js src/core/capital-reservation-manager.test.js src/core/capital-reservation-remediation.test.js src/core/maker-presence-controller.test.js src/core/market-maker-continuity.test.js src/core/quote-engine-capital-reservation.test.js && bun scripts/smoke-capital-presence.js",
@@ -23,6 +24,8 @@
     "simulate:maker": "node src/simulation/market-maker-ladder.js",
     "simulate:taker": "node src/simulation/market-taker-simple.js",
     "simulate:full": "node src/simulation/run-two-sided-market-test.js",
+    "model:inventory-rebalance": "bun scripts/model-inventory-rebalancing.js",
+    "backtest:inventory-rebalance": "bun scripts/backtest-inventory-rebalancing.js",
     "brain": "claude --project . /autonomous-bootup",
     "brain:sync": "memory-sync",
     "brain:daemon": "memory-sync-daemon --interval 30m"

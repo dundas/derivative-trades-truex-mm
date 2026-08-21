@@ -534,6 +534,21 @@ PostgreSQL-backed analytics server using `Bun.serve()` on port 3100.
 | `MM_DEGRADED_MAX_LEVELS` | Yes | -- | Maximum levels per side in degraded mode; must be below normal depth and at least the presence obligation |
 | `MM_DEGRADED_SIZE_FACTOR` | Yes | -- | Degraded-mode size multiplier in `(0,1)`; scaled L1 must remain at least the funded minimum |
 | `MM_DEFENSIVE_SPREAD_FLOOR_BPS` | Yes | -- | Minimum degraded-mode spread; must be wider than the normal base spread |
+| `MM_PRESENCE_RECOVERY_ENABLED` | No | `false` | Opt in to bounded coherent REST reconciliation after a prolonged one-sided maker gap |
+| `MM_PRESENCE_RECOVERY_COOLDOWN_MS` | No | `60000` | Minimum delay between recovery attempts |
+| `MM_PRESENCE_RECOVERY_ATTEMPT_WINDOW_MS` | No | `3600000` | Rolling attempt-budget window |
+| `MM_PRESENCE_RECOVERY_MAX_ATTEMPTS` | No | `3` | Maximum recovery attempts in the rolling window |
+| `MM_PRESENCE_RECOVERY_REARM_TIMEOUT_MS` | No | `30000` | Time allowed for acknowledged two-sided presence to return after reconciliation |
+| `INVENTORY_REBALANCE_SHADOW_ENABLED` | No | `true` | Emit observe-only bell-curve inventory guidance; never changes or sends orders |
+| `INVENTORY_REBALANCE_SHADOW_INTERVAL_MS` | No | `5000` | Minimum interval between shadow policy samples |
+| `INVENTORY_REBALANCE_TARGET_BTC` | No | `0.014` | Shadow policy inventory center |
+| `INVENTORY_REBALANCE_SIGMA_BTC` | No | target / 3 | Shadow policy inventory standard deviation |
+| `INVENTORY_REBALANCE_CENTER_BAND_SIGMA` | No | `0.5` | Boundary of the normal spread-capture zone |
+| `INVENTORY_REBALANCE_SOFT_BAND_SIGMA` | No | `2` | Start of shadow external-rebalance intent |
+| `INVENTORY_REBALANCE_HARD_BAND_SIGMA` | No | `3` | Full shadow external-rebalance intensity |
+| `INVENTORY_REBALANCE_MAKER_FLOOR` | No | `0.25` | Minimum shadow maker-participation recommendation |
+| `INVENTORY_REBALANCE_MAX_SIZE_ASYMMETRY` | No | `0.75` | Maximum shadow bid/ask size asymmetry |
+| `INVENTORY_REBALANCE_MAX_QUOTE_SKEW_BPS` | No | `10` | Maximum shadow quote-skew recommendation |
 | `TRUEX_MAKER_FEE_BPS` | No | `0` | TrueX maker fee in basis points |
 | `TRUEX_TAKER_FEE_BPS` | No | `0` | TrueX taker fee in basis points |
 | `HEDGE_MAKER_FEE_BPS` | No | `0` | Hedge venue maker fee in basis points |
