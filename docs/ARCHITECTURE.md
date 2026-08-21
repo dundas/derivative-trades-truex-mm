@@ -1,10 +1,10 @@
 # TrueX Market Maker - Architecture
 
-> Generated from source code on 2026-06-18 (rev3). Source is the single source of truth.
+> Generated from source code on 2026-08-21 (rev4). Source is the single source of truth.
 
 ## Overview
 
-Automated BTC-PYUSD market maker on TrueX exchange using FIX protocol, with Coinbase price feed, additive TrueX EBBO and PYUSD/USD reference polling for shadow-take observation, balance-aware quoting, and a PostgreSQL data pipeline. Production runs on Hetzner-hosted Docker services and connects to TrueX over WireGuard-backed proxies.
+Automated BTC-PYUSD market maker on TrueX exchange using FIX protocol, with Coinbase price feed, additive TrueX EBBO and PYUSD/USD reference polling for shadow-take observation, balance-aware quoting, and a PostgreSQL data pipeline. Production runs on Hetzner-hosted Docker services and connects to TrueX over WireGuard-backed proxies. A deployment-time dispatch mode supports an observe-only safety canary: it keeps feed and health collection active, allows protective cancels, and blocks all new FIX orders.
 
 ---
 
@@ -44,6 +44,8 @@ Automated BTC-PYUSD market maker on TrueX exchange using FIX protocol, with Coin
 |gine   | |er      | |ection  | |Manager     |
 +---+---+ +--------+ +---+----+ +---+--------+
     |                     |          |
+    |  dispatch gate:     |          |
+    |  observe = 35=F only|          |
     |   FIX 35=D/35=F     |          |
     +---->  via rate   ----+          |
           limiter                     |
@@ -207,6 +209,16 @@ Computes bid/ask ladder quotes with inventory skew, manages order lifecycle thro
 - Default replacement mode is `passive-safe`: cancel the old quote first, hold the replacement as pending, then release it only after the cancel ack. `replaceMode='place-before-cancel'` is available only as an explicit legacy override.
 - Pending replacements expire after `pendingReplacementTimeoutMs` and are reported in quote status as suppressed levels.
 - Rate limited: `maxOrdersPerSecond` (prod 6), overflow queued. Queued placements and pending replacement releases are rechecked immediately before FIX send.
+
+**Dispatch safety mode:**
+- `MM_QUOTE_DISPATCH_MODE=live` is the default. `observe` continues quote calculation, feed polling, health reporting, and shadow evaluation but fail-closes placement: no new or replacement `35=D` can be sent.
+- Protective pure cancellations (`35=F`) remain allowed in `observe`; replacement-cancel actions are suppressed because they are coupled to a subsequent new order. A fresh observer deployment should start with no live resting orders; use an explicit safe cancellation procedure for an existing live session.
+- The placement check is duplicated at action dispatch and immediately before `_sendNewOrder()` reserves state or calls the FIX connection. This protects against direct internal callers as well as ordinary reconciliation.
+- `/api/v1/health` exposes `quoteDispatchMode` and per-feed `feedHealth`. Feed records report whether a feed is enabled and required for order dispatch or shadow evaluation, plus freshness, last-success age, error count, current backoff, and in-flight status.
+
+**Polling configuration:**
+- `PYUSD_USD_POLL_INTERVAL_MS` defaults to 5000 and may be `0` to disable the optional PYUSD/USD shadow input. `PYUSD_USD_POLL_TIMEOUT_MS` (1000), `PYUSD_USD_STALE_THRESHOLD_MS` (15000), and `TRUEX_EBBO_POLL_INTERVAL_MS` (1000) must be positive integers.
+- Configuration is validated before timers or exchange requests are created; invalid values fail startup instead of creating an uncontrolled polling loop.
 
 **TrueX book and ALO safety:**
 - Production maker sends use the REST-polled `truexEbbo` as their sole venue marketability
