@@ -426,7 +426,7 @@ export class QuoteEngine extends EventEmitter {
     if (dispatched || this.config.quoteDispatchMode === 'observe') {
       this.lastRepriceAt = Date.now();
       this.lastRepricedMid = mid;
-      if (momentumBypass) {
+      if (dispatched && momentumBypass) {
         this.momentumReprices++;
         this.logger.info(
           `[QuoteEngine] Momentum reprice: move ${momentumMoveBps.toFixed(1)}bps >= ${this.config.momentumRepriceBps}bps since last reprice (lifetime=${this.momentumReprices})`
