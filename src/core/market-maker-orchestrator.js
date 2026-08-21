@@ -1339,7 +1339,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       // In strict-maker mode, venue EBBO is required both to prove a quote is
       // passive and to call its acknowledged presence safe.
       venueHealthy: !this.quoteEngine.config?.strictTruexMakerSafety ||
-        this.quoteEngine._isTruexEbboFresh?.() === true,
+        this.quoteEngine._strictEbboState?.().usable === true,
       reconciliationState: capital.state === 'uninitialized' ? 'failed' : capital.state,
       fundedSizeBySide: {
         buy: mid > 0 ? this.capitalReservationManager.getQuoteCapacity('buy') / mid : 0,
