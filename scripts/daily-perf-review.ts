@@ -211,9 +211,10 @@ export async function fetchReportData(
   symbol: string,
   tradingMode?: string,
   markoutHorizonMs = 0,
-  sinceMs?: number
+  sinceMs?: number,
+  poolFactory: () => { query: (text: string, params?: unknown[]) => Promise<{ rows: unknown[] }>; end: () => Promise<void> } = () => new pg.Pool({ connectionString: dbUrl, connectionTimeoutMillis: 10000, statement_timeout: 60000 })
 ) {
-  const pool = new pg.Pool({ connectionString: dbUrl, connectionTimeoutMillis: 10000, statement_timeout: 60000 });
+  const pool = poolFactory();
   try {
     const q = async (text: string, params: unknown[] = []) => (await pool.query(text, params)).rows;
 
@@ -271,7 +272,23 @@ export async function fetchReportData(
       [dayEnd + markoutHorizonMs, symbol, tradingMode ?? null, sinceMs ?? 0]
     );
 
-    return { sessions, orderRows, orderCountByStatus, fillRows };
+    // Lifecycle telemetry is the only report source for attempts/rejections.
+    // If the additive table has not been deployed yet, preserve the daily
+    // report and label that evidence unavailable instead of assuming zero.
+    const lifecycleTable = await q(`select to_regclass('quote_lifecycle_events') as relation`);
+    const quoteLifecycleAvailable = Boolean(lifecycleTable[0]?.relation);
+    const quoteLifecycleEvents = quoteLifecycleAvailable ? await q(
+      `select event_id as "eventId", event_type as "eventType", event_timestamp as timestamp,
+              quote_id as "quoteId", side, reason
+       from quote_lifecycle_events
+       where event_timestamp >= $1 and event_timestamp < $2 and symbol = $3
+         and ($4::text is null or session_id in
+              (select sessionid from sessions where tradingmode = $4 and symbol = $3))
+       order by event_timestamp`,
+      [dayStart, dayEnd, symbol, tradingMode ?? null]
+    ) : [];
+
+    return { sessions, orderRows, orderCountByStatus, fillRows, quoteLifecycleEvents, quoteLifecycleAvailable };
   } finally {
     await pool.end();
   }
@@ -287,10 +304,98 @@ export interface ReportInput {
   orderTimestamps: number[];
   orderCountByStatus: { status: string; n: number }[];
   fillRows: { timestamp: string; side: string; qty: string; price: string; fee: string | null }[];
+  /** Immutable quote-lifecycle events observed during the reviewed UTC day. */
+  quoteLifecycleEvents?: { eventId?: string | null; eventType: string; timestamp: string; quoteId?: string | null; side?: string | null; reason?: string | null }[];
+  /** Whether the immutable lifecycle source exists for this report. */
+  quoteLifecycleAvailable?: boolean;
   seed?: { qty: number; price: number };
   markoutWindowMin: number;
   maxDailyLoss: number;
   maxAdverseBps: number;
+}
+
+type Evidence<T> = ({ evidence: 'observed' } & T) | { evidence: 'unavailable'; reason: string };
+
+/**
+ * Builds report-only metrics from immutable lifecycle and fill evidence.
+ * It deliberately does not reconstruct acknowledgement uptime or hypothetical
+ * outcomes: neither is present in the input evidence.
+ */
+function buildPerformanceDecomposition({
+  dayFills, positionBeforeDay, fifo, matchedQty, buyVwap, sellVwap, fees, dayPnl, quoteLifecycleEvents, quoteLifecycleAvailable,
+}: {
+  dayFills: Fill[]; positionBeforeDay: number; fifo: FifoResult; matchedQty: number;
+  buyVwap: number; sellVwap: number; fees: number; dayPnl: number;
+  quoteLifecycleEvents: ReportInput['quoteLifecycleEvents'];
+  quoteLifecycleAvailable: boolean;
+}) {
+  const attemptEvents = (quoteLifecycleEvents ?? []).filter(event => event.eventType === 'create' || event.eventType === 'replace');
+  const rejected = (quoteLifecycleEvents ?? []).filter(event => event.eventType === 'reject');
+  // A lifecycle event is an observation, not necessarily a distinct order
+  // attempt. Quote IDs are the durable identity from QuoteEngine. Count an
+  // attempt once per in-day quote ID, then pair each reject with an unused
+  // matching ID. This prevents a delayed reject, or a duplicate reject event,
+  // from inflating a rate denominator/numerator. A replacement gets its own
+  // new quote ID and is therefore a separate attempt.
+  const attemptsByQuoteId = new Map<string, typeof attemptEvents[number]>();
+  for (const event of attemptEvents) {
+    const quoteId = event.quoteId?.trim();
+    if (quoteId && !attemptsByQuoteId.has(quoteId)) attemptsByQuoteId.set(quoteId, event);
+  }
+  const matchedRejectQuoteIds = new Set<string>();
+  const unmatchedRejects = rejected.filter(event => {
+    const quoteId = event.quoteId?.trim();
+    if (!quoteId || !attemptsByQuoteId.has(quoteId) || matchedRejectQuoteIds.has(quoteId)) return true;
+    matchedRejectQuoteIds.add(quoteId);
+    return false;
+  });
+  // Same-day opposing fills are useful execution context, but do not identify
+  // the lots closed by FIFO. In particular, a sale can realize a prior-day
+  // inventory lot without an in-day buy. Never call this proxy realized spread.
+  const sameDayOpposingFillProxy: Evidence<{ matchedQty: number; pnl: number; perBtc: number }> = matchedQty > 0
+    ? { evidence: 'observed', matchedQty, pnl: matchedQty * (sellVwap - buyVwap), perBtc: sellVwap - buyVwap }
+    : { evidence: 'unavailable', reason: 'no matched opposing fill volume' };
+  const rejectReasons = rejected.reduce<Record<string, number>>((counts, event) => {
+    const reason = event.reason?.trim() || 'unspecified';
+    counts[reason] = (counts[reason] ?? 0) + 1;
+    return counts;
+  }, {});
+  const rateUnavailableReason = unmatchedRejects.length > 0
+    ? 'one or more observed rejects lack a distinct matching in-day create/replace attempt'
+    : null;
+  const rejects: Evidence<{ attempts: number | null; rejects: number; rate: number | null; byReason: Record<string, number>; rateUnavailableReason?: string }> = attemptsByQuoteId.size > 0 && !rateUnavailableReason
+    ? {
+        evidence: 'observed', attempts: attemptsByQuoteId.size, rejects: rejected.length, rate: rejected.length / attemptsByQuoteId.size,
+        byReason: rejectReasons,
+      }
+    : rejected.length > 0
+      ? { evidence: 'observed', attempts: attemptsByQuoteId.size || null, rejects: rejected.length, rate: null, byReason: rejectReasons, ...(rateUnavailableReason ? { rateUnavailableReason } : {}) }
+    : { evidence: 'unavailable', reason: quoteLifecycleAvailable ? 'no quote lifecycle attempt observations' : 'quote lifecycle source unavailable' };
+  const positions = dayFills.reduce<number[]>((values, fill) => {
+    values.push(values[values.length - 1] + (fill.side === 'buy' ? fill.qty : -fill.qty));
+    return values;
+  }, [positionBeforeDay]);
+  const inventory: Evidence<{ start: number; end: number; min: number; max: number; mean: number; samples: number }> = dayFills.length > 0
+    ? {
+        evidence: 'observed', start: positionBeforeDay, end: fifo.position,
+        min: Math.min(...positions), max: Math.max(...positions),
+        mean: positions.reduce((sum, position) => sum + position, 0) / positions.length,
+        samples: dayFills.length,
+      }
+    : { evidence: 'unavailable', reason: 'no in-day fills for inventory distribution' };
+  return {
+    realizedSpread: { evidence: 'unavailable' as const, reason: 'no quote-linked FIFO lot attribution' },
+    sameDayOpposingFillProxy,
+    uptime: { evidence: 'unavailable' as const, reason: 'no acknowledged two-sided presence observations' },
+    rejects,
+    inventory,
+    pnl: {
+      evidence: 'observed' as const, realizedGross: dayPnl, fees, netRealizedAfterFees: dayPnl - fees,
+      hedgeSlippage: { evidence: 'unavailable' as const, reason: 'no linked hedge executions' },
+      inventoryMarkToMarket: { evidence: 'unavailable' as const, reason: 'no end-of-day reference price' },
+    },
+    counterfactual: { evidence: 'unavailable' as const, reason: 'no counterfactual performance is inferred from observed fills' },
+  };
 }
 
 export function buildReport(input: ReportInput) {
@@ -334,6 +439,7 @@ export function buildReport(input: ReportInput) {
     if (fillsToDayEnd[i].timestamp >= dayStart) dayIdx.push(i);
   }
   const dayFills = dayIdx.map((i) => fillsToDayEnd[i]);
+  const positionBeforeDay = dayIdx.length ? computeFifo(fillsToDayEnd.slice(0, dayIdx[0]), input.seed).position : fifo.position;
   const buys = dayFills.filter((f) => f.side === 'buy');
   const sells = dayFills.filter((f) => f.side === 'sell');
   const sum = (a: Fill[], fn: (f: Fill) => number) => a.reduce((s, f) => s + fn(f), 0);
@@ -352,6 +458,11 @@ export function buildReport(input: ReportInput) {
   const gapHours = [...hist.entries()].filter(([, n]) => n === 0).map(([h]) => h);
 
   const verdict = evaluateVerdict(dayPnl, avgAdverseBps, input.maxDailyLoss, input.maxAdverseBps);
+  const performance = buildPerformanceDecomposition({
+    dayFills, positionBeforeDay, fifo, matchedQty: matched, buyVwap: vwap(buys), sellVwap: vwap(sells), fees,
+    dayPnl, quoteLifecycleEvents: input.quoteLifecycleEvents,
+    quoteLifecycleAvailable: input.quoteLifecycleAvailable ?? input.quoteLifecycleEvents !== undefined,
+  });
 
   return {
     date: input.date,
@@ -391,6 +502,7 @@ export function buildReport(input: ReportInput) {
       pairs: dayMarks.length,
       avgAdverseBps,
     },
+    performance,
     verdict,
   };
 }
@@ -427,6 +539,25 @@ export function renderText(r: ReturnType<typeof buildReport>): string {
   L.push(`Realized PnL (FIFO${r.pnl.seeded ? ', seeded' : ', unseeded'}):`);
   L.push(`  day: ${money(r.pnl.dayRealized)}   lifetime: ${money(r.pnl.lifetimeRealized)}`);
   L.push(`  open position: ${r.pnl.position.toFixed(6)} @ ${money(r.pnl.positionAvgCost)}`);
+  L.push('');
+  L.push('Performance evidence:');
+  L.push(`  realized spread: unavailable (${r.performance.realizedSpread.reason})`);
+  if (r.performance.sameDayOpposingFillProxy.evidence === 'observed') {
+    L.push(`  same-day opposing-fill proxy (not realized spread): ${money(r.performance.sameDayOpposingFillProxy.pnl)} on ${r.performance.sameDayOpposingFillProxy.matchedQty.toFixed(6)} BTC`);
+  } else L.push(`  same-day opposing-fill proxy: unavailable (${r.performance.sameDayOpposingFillProxy.reason})`);
+  if (r.performance.rejects.evidence === 'observed') {
+    const rate = r.performance.rejects.rate === null
+      ? `rate unavailable (${r.performance.rejects.rateUnavailableReason ?? 'no in-day attempts'})`
+      : `${(r.performance.rejects.rate * 100).toFixed(2)}%`;
+    L.push(`  rejects (observed lifecycle): ${r.performance.rejects.rejects}/${r.performance.rejects.attempts ?? 'unavailable'} (${rate})`);
+  } else L.push(`  rejects: unavailable (${r.performance.rejects.reason})`);
+  if (r.performance.inventory.evidence === 'observed') {
+    L.push(`  inventory (fill-derived): start ${r.performance.inventory.start.toFixed(6)}, range ${r.performance.inventory.min.toFixed(6)} to ${r.performance.inventory.max.toFixed(6)}, end ${r.performance.inventory.end.toFixed(6)}`);
+  } else L.push(`  inventory distribution: unavailable (${r.performance.inventory.reason})`);
+  L.push(`  two-sided uptime: unavailable (${r.performance.uptime.reason})`);
+  L.push(`  PnL decomposition (observed): gross ${money(r.performance.pnl.realizedGross)}, fees ${money(r.performance.pnl.fees)}, net ${money(r.performance.pnl.netRealizedAfterFees)}`);
+  L.push(`  PnL components unavailable: hedge/slippage (${r.performance.pnl.hedgeSlippage.reason}); inventory mark-to-market (${r.performance.pnl.inventoryMarkToMarket.reason})`);
+  L.push(`  counterfactual: unavailable (${r.performance.counterfactual.reason})`);
   L.push('');
   if (r.markout.avgAdverseBps === null) {
     L.push(`Mark-out (${r.markout.windowMin}m window): no opposite-side pairs`);
@@ -575,6 +706,8 @@ export async function main(argv: string[]): Promise<number> {
       orderTimestamps: data.orderRows.map((r) => Number(r.timestamp)),
       orderCountByStatus: data.orderCountByStatus,
       fillRows: data.fillRows,
+      quoteLifecycleEvents: data.quoteLifecycleEvents,
+      quoteLifecycleAvailable: data.quoteLifecycleAvailable,
       seed: seedFlags.seed,
       markoutWindowMin,
       maxDailyLoss,

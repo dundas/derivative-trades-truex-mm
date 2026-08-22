@@ -62,6 +62,8 @@ export async function buildDayReport(dbUrl: string, date: string): Promise<DayRe
     orderTimestamps: data.orderRows.map((r: { timestamp: string }) => Number(r.timestamp)),
     orderCountByStatus: data.orderCountByStatus,
     fillRows: data.fillRows,
+    quoteLifecycleEvents: data.quoteLifecycleEvents,
+    quoteLifecycleAvailable: data.quoteLifecycleAvailable,
     seed: SEED,
     markoutWindowMin: MARKOUT_WINDOW_MIN,
     maxDailyLoss: MAX_DAILY_LOSS,
@@ -114,6 +116,25 @@ function metricCard(label: string, value: string, sub = ''): string {
   </div>`;
 }
 
+function performanceEvidence(day: DayReport): string {
+  const performance = day.performance;
+  if (!performance) return 'Performance decomposition unavailable: report was generated before lifecycle evidence was added.';
+  const proxy = performance.sameDayOpposingFillProxy;
+  const proxyText = proxy.evidence === 'observed'
+    ? `${money(proxy.pnl)} on ${proxy.matchedQty.toFixed(6)} BTC`
+    : `unavailable (${proxy.reason})`;
+  const rejects = performance.rejects;
+  const rejectText = rejects.evidence === 'observed'
+    ? rejects.rate === null
+      ? `${rejects.rejects} observed; rate unavailable (${rejects.rateUnavailableReason ?? 'no in-day attempts'}); reasons: ${Object.entries(rejects.byReason).map(([reason, n]) => `${reason} (${n})`).join(', ') || 'none'}`
+      : `${rejects.rejects}/${rejects.attempts} (${(rejects.rate * 100).toFixed(2)}%); reasons: ${Object.entries(rejects.byReason).map(([reason, n]) => `${reason} (${n})`).join(', ') || 'none'}`
+    : `unavailable (${rejects.reason})`;
+  const inventory = performance.inventory.evidence === 'observed'
+    ? `start ${performance.inventory.start.toFixed(6)}, range ${performance.inventory.min.toFixed(6)} to ${performance.inventory.max.toFixed(6)}, end ${performance.inventory.end.toFixed(6)}`
+    : `unavailable (${performance.inventory.reason})`;
+  return `FIFO realized PnL (observed): ${money(performance.pnl.netRealizedAfterFees)} after fees. Realized spread: unavailable (${performance.realizedSpread.reason}). Same-day opposing-fill proxy (not realized spread): ${proxyText}. Rejects: ${rejectText}. Inventory: ${inventory}. Two-sided uptime: unavailable (${performance.uptime.reason}).`;
+}
+
 export function renderHtml(day: DayReport, trend: DayReport[]): string {
   const bps = day.markout.avgAdverseBps;
   const trendRows = trend.map((t) => {
@@ -153,6 +174,8 @@ export function renderHtml(day: DayReport, trend: DayReport[]): string {
     ${metricCard('Orders', String(day.orders.total), day.orders.gapHours.length ? `gaps: ${day.orders.gapHours.length}h` : 'no zero-order hours')}
     ${metricCard('Open position', day.pnl.position.toFixed(6), `@ ${money(day.pnl.positionAvgCost)} avg`)}
   </div>
+  <h2 style="font-size:16px;color:#111827;margin:28px 0 8px">Performance decomposition &amp; evidence</h2>
+  <div style="background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:12px 16px;font-size:13px;color:#374151;line-height:1.5">${esc(performanceEvidence(day))}</div>
   <h2 style="font-size:16px;color:#111827;margin:28px 0 8px">7-day trend</h2>
   <table style="border-collapse:collapse;background:#fff;border:1px solid #e5e7eb;border-radius:8px;font-size:13px;width:100%">
     <thead><tr style="background:#f9fafb;text-align:left">
@@ -204,6 +227,7 @@ export function emailText(day: DayReport, url: string): string {
     `Mark-out adverse: ${bps !== null ? bps.toFixed(1) + 'bps' : 'n/a'} (${day.markout.pairs} pairs)`,
     `Round-trip wrong-way: ${wrongWay(day) ?? 'n/a'} (${day.fills.matchedQty.toFixed(6)} BTC matched)`,
     `Fills: ${day.fills.total} (${day.fills.buys.n} buys / ${day.fills.sells.n} sells) · Orders: ${day.orders.total}`,
+    `Performance decomposition: ${performanceEvidence(day)}`,
     ...(day.verdict.reasons.length ? [`WARN reasons: ${day.verdict.reasons.join('; ')}`] : []),
     '',
     `Full report: ${url}`,

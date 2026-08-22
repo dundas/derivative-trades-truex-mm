@@ -8,6 +8,7 @@ import {
   evaluateVerdict,
   hourlyHistogram,
   buildReport,
+  fetchReportData,
   parseNumericFlag,
   parseSeedFlags,
   type Fill,
@@ -252,6 +253,136 @@ describe('buildReport end-to-end on fixture data (AC5 shape)', () => {
     const round = JSON.parse(JSON.stringify(r));
     expect(round.pnl.dayRealized).toBeCloseTo(10, 9);
     expect(round.sessions[0].id).toBe('prod-1');
+  });
+
+  test('reports observed performance decomposition without treating absent evidence as zero', () => {
+    const r = buildReport({
+      ...input,
+      quoteLifecycleEvents: [
+        { eventType: 'create', timestamp: String(dayStart + 100), quoteId: 'buy-1', side: 'buy' },
+        { eventType: 'replace', timestamp: String(dayStart + 200), quoteId: 'sell-1', side: 'sell' },
+        { eventType: 'reject', timestamp: String(dayStart + 300), quoteId: 'sell-1', side: 'sell', reason: 'insufficient funds' },
+      ],
+    });
+    expect(r.performance.realizedSpread).toEqual({ evidence: 'unavailable', reason: 'no quote-linked FIFO lot attribution' });
+    expect(r.performance.sameDayOpposingFillProxy).toMatchObject({ evidence: 'observed', matchedQty: 1, pnl: 2 });
+    expect(r.performance.rejects).toMatchObject({ evidence: 'observed', attempts: 2, rejects: 1, rate: 0.5 });
+    expect(r.performance.uptime).toEqual({ evidence: 'unavailable', reason: 'no acknowledged two-sided presence observations' });
+    expect(r.performance.inventory).toMatchObject({ evidence: 'observed', start: 1, end: 1, min: 0, max: 1, samples: 2 });
+    expect(r.performance.pnl).toMatchObject({ evidence: 'observed', realizedGross: 10, fees: 0.5, netRealizedAfterFees: 9.5 });
+    expect(r.performance.pnl.hedgeSlippage).toEqual({ evidence: 'unavailable', reason: 'no linked hedge executions' });
+    expect(r.performance.counterfactual).toEqual({ evidence: 'unavailable', reason: 'no counterfactual performance is inferred from observed fills' });
+  });
+
+  test('does not imply zero realized spread or reject rate when their source observations are absent', () => {
+    const r = buildReport({ ...input, fillRows: [], quoteLifecycleEvents: [] });
+    expect(r.performance.realizedSpread).toEqual({ evidence: 'unavailable', reason: 'no quote-linked FIFO lot attribution' });
+    expect(r.performance.sameDayOpposingFillProxy).toEqual({ evidence: 'unavailable', reason: 'no matched opposing fill volume' });
+    expect(r.performance.rejects).toEqual({ evidence: 'unavailable', reason: 'no quote lifecycle attempt observations' });
+    expect(r.performance.inventory).toEqual({ evidence: 'unavailable', reason: 'no in-day fills for inventory distribution' });
+  });
+});
+
+describe('performance evidence attribution', () => {
+  const date = '2026-08-05';
+  const dayStart = Date.parse(`${date}T00:00:00Z`);
+  test('does not call a prior-day inventory close realized spread or a same-day proxy', () => {
+    const r = buildReport({
+      date, sessions: [], orderTimestamps: [], orderCountByStatus: [],
+      fillRows: [
+        { timestamp: String(dayStart - 1), side: 'buy', qty: '1', price: '100', fee: '0' },
+        { timestamp: String(dayStart + 1000), side: 'sell', qty: '1', price: '110', fee: '0' },
+      ], markoutWindowMin: 5, maxDailyLoss: 50, maxAdverseBps: 10,
+    });
+    expect(r.pnl.dayRealized).toBeCloseTo(10, 9);
+    expect(r.performance.realizedSpread).toEqual({ evidence: 'unavailable', reason: 'no quote-linked FIFO lot attribution' });
+    expect(r.performance.sameDayOpposingFillProxy).toEqual({ evidence: 'unavailable', reason: 'no matched opposing fill volume' });
+  });
+
+  test('keeps observed reject count and reasons when attempts are outside the day', () => {
+    const r = buildReport({
+      date, sessions: [], orderTimestamps: [], orderCountByStatus: [], fillRows: [],
+      quoteLifecycleAvailable: true,
+      quoteLifecycleEvents: [{ eventType: 'reject', timestamp: String(dayStart + 1), quoteId: 'previous-day-quote', reason: 'late venue reject' }],
+      markoutWindowMin: 5, maxDailyLoss: 50, maxAdverseBps: 10,
+    });
+    expect(r.performance.rejects).toEqual({ evidence: 'observed', attempts: null, rejects: 1, rate: null, byReason: { 'late venue reject': 1 }, rateUnavailableReason: 'one or more observed rejects lack a distinct matching in-day create/replace attempt' });
+  });
+
+  test('only reports a rate when every reject maps one-to-one to an in-day quote attempt', () => {
+    const r = buildReport({
+      date, sessions: [], orderTimestamps: [], orderCountByStatus: [], fillRows: [], quoteLifecycleAvailable: true,
+      quoteLifecycleEvents: [
+        { eventType: 'create', timestamp: String(dayStart + 10), quoteId: 'current-create', reason: null },
+        // A duplicate lifecycle create represents the same quote attempt, not a second denominator unit.
+        { eventType: 'create', timestamp: String(dayStart + 11), quoteId: 'current-create', reason: null },
+        // The replacement's new quote identity is a separate in-day attempt.
+        { eventType: 'replace', timestamp: String(dayStart + 12), quoteId: 'current-replacement', reason: null },
+        { eventType: 'reject', timestamp: String(dayStart + 13), quoteId: 'current-replacement', reason: 'post-only' },
+        // This observed reject is for a prior-day quote, so its rate attribution is unsafe.
+        { eventType: 'reject', timestamp: String(dayStart + 14), quoteId: 'previous-day-quote', reason: 'late venue reject' },
+      ],
+      markoutWindowMin: 5, maxDailyLoss: 50, maxAdverseBps: 10,
+    });
+    expect(r.performance.rejects).toEqual({
+      evidence: 'observed', attempts: 2, rejects: 2, rate: null,
+      byReason: { 'post-only': 1, 'late venue reject': 1 },
+      rateUnavailableReason: 'one or more observed rejects lack a distinct matching in-day create/replace attempt',
+    });
+  });
+
+  test('does not treat duplicate rejects for one quote as distinct attributed attempts', () => {
+    const r = buildReport({
+      date, sessions: [], orderTimestamps: [], orderCountByStatus: [], fillRows: [], quoteLifecycleAvailable: true,
+      quoteLifecycleEvents: [
+        { eventType: 'create', timestamp: String(dayStart + 10), quoteId: 'one' },
+        { eventType: 'reject', timestamp: String(dayStart + 11), quoteId: 'one', reason: 'venue' },
+        { eventType: 'reject', timestamp: String(dayStart + 12), quoteId: 'one', reason: 'duplicate venue report' },
+      ],
+      markoutWindowMin: 5, maxDailyLoss: 50, maxAdverseBps: 10,
+    });
+    expect(r.performance.rejects).toMatchObject({ evidence: 'observed', attempts: 1, rejects: 2, rate: null });
+  });
+});
+
+describe('fetchReportData query boundaries', () => {
+  const dayStart = Date.parse('2026-08-05T00:00:00Z');
+  const dayEnd = dayStart + 86400000;
+
+  test('uses SELECT-only, symbol/mode-scoped sources and labels absent lifecycle telemetry unavailable', async () => {
+    const calls: Array<{ text: string; params: unknown[] }> = [];
+    let ended = false;
+    const rows = [[], [], [], [], [{ relation: null }]];
+    const data = await fetchReportData('postgres://ignored', dayStart, dayEnd, 'BTC-PYUSD', 'live', 60000, 123,
+      () => ({
+        query: async (text, params = []) => { calls.push({ text, params }); return { rows: rows.shift() ?? [] }; },
+        end: async () => { ended = true; },
+      })
+    );
+    expect(data.quoteLifecycleAvailable).toBe(false);
+    expect(data.quoteLifecycleEvents).toEqual([]);
+    expect(ended).toBe(true);
+    expect(calls).toHaveLength(5);
+    expect(calls.every(({ text }) => /^\s*select\b/i.test(text))).toBe(true);
+    expect(calls[0].text).toContain('and symbol = $3');
+    expect(calls[0].text).toContain('tradingmode = $4');
+    expect(calls[3].text).toContain('sessionid in');
+    expect(calls[3].params).toEqual([dayEnd + 60000, 'BTC-PYUSD', 'live', 123]);
+  });
+
+  test('queries lifecycle telemetry only when its source is available and scopes it by symbol/mode', async () => {
+    const calls: Array<{ text: string; params: unknown[] }> = [];
+    const rows = [[], [], [], [], [{ relation: 'quote_lifecycle_events' }], [{ eventType: 'reject', timestamp: String(dayStart + 1), side: 'sell', reason: 'venue' }]];
+    const data = await fetchReportData('postgres://ignored', dayStart, dayEnd, 'BTC-PYUSD', 'observe', 0, 0,
+      () => ({ query: async (text, params = []) => { calls.push({ text, params }); return { rows: rows.shift() ?? [] }; }, end: async () => {} })
+    );
+    expect(data.quoteLifecycleAvailable).toBe(true);
+    expect(data.quoteLifecycleEvents).toHaveLength(1);
+    const lifecycle = calls.at(-1)!;
+    expect(lifecycle.text).toContain('from quote_lifecycle_events');
+    expect(lifecycle.text).toContain('symbol = $3');
+    expect(lifecycle.text).toContain('tradingmode = $4');
+    expect(lifecycle.params).toEqual([dayStart, dayEnd, 'BTC-PYUSD', 'observe']);
   });
 });
 

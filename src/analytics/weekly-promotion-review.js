@@ -1,4 +1,36 @@
 /** Read-only weekly synthesis. It cannot modify runtime configuration or deploy. */
+function sumObserved(dailyReports, selector, initial, add) {
+  return dailyReports.reduce((total, report) => {
+    const value = selector(report);
+    return value?.evidence === 'observed' ? add(total, value) : total;
+  }, initial);
+}
+
+function unavailableEvidence(dailyReports, selector) {
+  const unavailable = dailyReports.map(selector).filter(value => value?.evidence === 'unavailable');
+  return { days: unavailable.length, reasons: [...new Set(unavailable.map(value => value.reason))] };
+}
+
+function buildWeeklyPerformanceSummary(dailyReports) {
+  const performance = report => report.performance;
+  const sameDayOpposingFillProxy = sumObserved(dailyReports, report => performance(report)?.sameDayOpposingFillProxy, { days: 0, pnl: 0, matchedQty: 0 }, (total, value) => ({ days: total.days + 1, pnl: total.pnl + value.pnl, matchedQty: total.matchedQty + value.matchedQty }));
+  const rejects = sumObserved(dailyReports, report => performance(report)?.rejects, { attempts: 0, rejects: 0, rate: null, rateAvailable: true }, (total, value) => ({ attempts: total.attempts + (value.attempts ?? 0), rejects: total.rejects + value.rejects, rate: null, rateAvailable: total.rateAvailable && value.rate !== null }));
+  rejects.rate = rejects.attempts ? rejects.rejects / rejects.attempts : null;
+  const pnl = sumObserved(dailyReports, report => performance(report)?.pnl, { realizedGross: 0, fees: 0, netRealizedAfterFees: 0 }, (total, value) => ({ realizedGross: total.realizedGross + value.realizedGross, fees: total.fees + value.fees, netRealizedAfterFees: total.netRealizedAfterFees + value.netRealizedAfterFees }));
+  return {
+    observed: { sameDayOpposingFillProxy, rejects, pnl },
+    unavailable: {
+      realizedSpread: unavailableEvidence(dailyReports, report => performance(report)?.realizedSpread),
+      sameDayOpposingFillProxy: unavailableEvidence(dailyReports, report => performance(report)?.sameDayOpposingFillProxy),
+      uptime: unavailableEvidence(dailyReports, report => performance(report)?.uptime),
+      rejects: unavailableEvidence(dailyReports, report => performance(report)?.rejects),
+      inventory: unavailableEvidence(dailyReports, report => performance(report)?.inventory),
+    },
+    // Weekly aggregation must never turn missing daily counterfactuals into an estimate.
+    counterfactual: { evidence: 'unavailable', reason: 'no counterfactual performance is inferred from observed fills' },
+  };
+}
+
 export function buildWeeklyPromotionReview({ dailyReports = [], shadowReport = null, requiredDays = 7 } = {}) {
   const blockers = [];
   const dates = dailyReports.map(report => report.date).filter(date => typeof date === 'string' && date.length > 0);
@@ -12,6 +44,7 @@ export function buildWeeklyPromotionReview({ dailyReports = [], shadowReport = n
   if (!selectedCandidateId) blockers.push('shadow-report-missing-selected-candidate');
   return {
     cadence: 'weekly-read-only', dailyReportsReviewed: dailyReports.length, distinctDaysReviewed: distinctDays, selectedCandidateId, blockers,
+    performance: buildWeeklyPerformanceSummary(dailyReports),
     decision: blockers.length ? 'HOLD' : 'CANDIDATE_REQUIRES_OPERATOR_APPROVAL',
     productionChangeAuthorized: false,
     requiredBeforeCanary: ['separate canary PRD', 'explicit operator approval', 'pre-deploy effective-state check', 'post-deploy effective-state verification', 'rollback plan'],
@@ -19,5 +52,6 @@ export function buildWeeklyPromotionReview({ dailyReports = [], shadowReport = n
 }
 
 export function formatWeeklyPromotionReview(review) {
-  return `Weekly promotion review: ${review.decision}\nDaily reports: ${review.dailyReportsReviewed}\nCandidate: ${review.selectedCandidateId || 'none'}\nBlockers: ${review.blockers.join('|') || 'none'}\nProduction change: NOT AUTHORIZED. Required before canary: ${review.requiredBeforeCanary.join('; ')}`;
+  const p = review.performance;
+  return `Weekly promotion review: ${review.decision}\nDaily reports: ${review.dailyReportsReviewed}\nCandidate: ${review.selectedCandidateId || 'none'}\nBlockers: ${review.blockers.join('|') || 'none'}\nObserved performance: same-day opposing-fill proxy (not realized spread) ${p.observed.sameDayOpposingFillProxy.pnl} on ${p.observed.sameDayOpposingFillProxy.matchedQty}; rejects ${p.observed.rejects.rejects}/${p.observed.rejects.attempts}${p.observed.rejects.rateAvailable ? '' : ' (rate unavailable)'}; PnL net ${p.observed.pnl.netRealizedAfterFees}\nUnavailable performance evidence: realized spread ${p.unavailable.realizedSpread.days} day(s); same-day opposing-fill proxy ${p.unavailable.sameDayOpposingFillProxy.days} day(s); uptime ${p.unavailable.uptime.days} day(s); rejects ${p.unavailable.rejects.days} day(s); inventory ${p.unavailable.inventory.days} day(s)\nCounterfactual: unavailable (${p.counterfactual.reason})\nProduction change: NOT AUTHORIZED. Required before canary: ${review.requiredBeforeCanary.join('; ')}`;
 }

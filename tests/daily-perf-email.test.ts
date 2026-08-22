@@ -128,6 +128,29 @@ describe('roborev round 1 fixes', () => {
   });
 });
 
+describe('performance decomposition rendering', () => {
+  it('labels the opposing-fill measure as a proxy and renders evidence availability', () => {
+    const day = fixtureDay({
+      performance: {
+        realizedSpread: { evidence: 'unavailable', reason: 'no quote-linked FIFO lot attribution' },
+        sameDayOpposingFillProxy: { evidence: 'observed', pnl: 1.25, matchedQty: 0.01, perBtc: 125 },
+        rejects: { evidence: 'observed', attempts: null, rejects: 1, rate: null, byReason: { 'cross-day attempt': 1 } },
+        inventory: { evidence: 'unavailable', reason: 'no in-day fills for inventory distribution' },
+        uptime: { evidence: 'unavailable', reason: 'no acknowledged two-sided presence observations' },
+        pnl: { evidence: 'observed', realizedGross: 2, fees: 0.25, netRealizedAfterFees: 1.75 },
+      },
+    });
+    const html = renderHtml(day, [day]);
+    const text = emailText(day, 'https://x/1.html');
+    for (const rendered of [html, text]) {
+      expect(rendered).toContain('Same-day opposing-fill proxy (not realized spread)');
+      expect(rendered).toContain('Realized spread: unavailable');
+      expect(rendered).toContain('rate unavailable (no in-day attempts)');
+      expect(rendered).toContain('cross-day attempt (1)');
+    }
+  });
+});
+
 describe('wrapper env propagation (roborev round 2)', () => {
   it('wrapper exports TRUEX_PERF_DATA_ROOT for the email child process', async () => {
     const { readFileSync } = await import('node:fs');
