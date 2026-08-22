@@ -39,7 +39,10 @@ describe('weekly promotion review', () => {
     expect(review.performance.observed.sameDayOpposingFillProxy.pnl).toBe(12);
     expect(review.performance.observed.sameDayOpposingFillProxy.matchedQty).toBeCloseTo(0.06, 12);
     expect(review.performance.observed.rejects).toEqual({ attempts: 70, rejects: 7, rate: 0.1, rateAvailable: true });
-    expect(review.performance.observed.pnl).toEqual({ realizedGross: 21, fees: 3.5, netRealizedAfterFees: 17.5 });
+    expect(review.performance.observed.pnl).toEqual({
+      realizedGross: 21, fees: 3.5, netRealizedAfterFees: 17.5,
+      availability: { evidence: 'observed', coverage: { reviewedDays: 7, observedDays: 7, unavailableDays: 0 } },
+    });
     expect(review.performance.unavailable.realizedSpread).toMatchObject({ days: 7, reasons: ['no quote-linked FIFO lot attribution'], coverage: { reviewedDays: 7, observedDays: 0, unavailableDays: 7 } });
     expect(review.performance.unavailable.sameDayOpposingFillProxy).toMatchObject({ days: 1, reasons: ['no matched opposing fill volume'], coverage: { reviewedDays: 7, observedDays: 6, unavailableDays: 1 } });
     expect(review.performance.unavailable.uptime).toMatchObject({ days: 7, reasons: ['no acknowledged two-sided presence observations'], coverage: { reviewedDays: 7, observedDays: 0, unavailableDays: 7 } });
@@ -60,7 +63,7 @@ describe('weekly promotion review', () => {
     const partial = { date: '2026-08-03', verdict: { status: 'OK' }, performance: { rejects: { evidence: 'observed', attempts: 5, rejects: 1, rate: 0.2 } } };
     const review = buildWeeklyPromotionReview({ dailyReports: [current, legacy, partial] });
     expect(review.performance.observed.sameDayOpposingFillProxy).toEqual({ days: 1, pnl: 2, matchedQty: 0.01 });
-    expect(review.performance.observed.pnl).toEqual({ realizedGross: 2, fees: 0, netRealizedAfterFees: 2 });
+    expect(review.performance.observed.pnl).toMatchObject({ realizedGross: 2, fees: 0, netRealizedAfterFees: 2 });
     expect(review.performance.unavailable.sameDayOpposingFillProxy).toMatchObject({
       days: 2, reasons: ['daily-performance-missing', 'daily-performance-component-missing:sameDayOpposingFillProxy'],
       coverage: { reviewedDays: 3, observedDays: 1, unavailableDays: 2 },
@@ -69,6 +72,11 @@ describe('weekly promotion review', () => {
       days: 3, reasons: ['daily-performance-component-missing:inventory', 'daily-performance-missing'],
       coverage: { reviewedDays: 3, observedDays: 0, unavailableDays: 3 },
     });
+    expect(review.performance.observed.pnl.availability).toEqual({
+      evidence: 'unavailable', reason: 'one-or-more-daily-pnl-components-unavailable',
+      coverage: { reviewedDays: 3, observedDays: 1, unavailableDays: 2 },
+    });
+    expect(formatWeeklyPromotionReview(review)).toContain('PnL net 2 (incomplete: 1/3 observed; one-or-more-daily-pnl-components-unavailable)');
   });
 
   test('never calculates an aggregate rejection rate when any daily rate is unavailable', () => {

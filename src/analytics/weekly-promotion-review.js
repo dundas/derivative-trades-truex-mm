@@ -33,7 +33,18 @@ function buildWeeklyPerformanceSummary(dailyReports) {
   const attributableRejectRates = rejectEvidence.every(value => value.evidence === 'observed' && Number.isFinite(value.rate));
   const rejects = sumObserved(dailyReports, report => performanceEvidence(report, 'rejects'), { attempts: 0, rejects: 0, rate: null, rateAvailable: attributableRejectRates }, (total, value) => ({ attempts: total.attempts + (value.attempts ?? 0), rejects: total.rejects + value.rejects, rate: null, rateAvailable: total.rateAvailable }));
   rejects.rate = rejects.rateAvailable && rejects.attempts > 0 ? rejects.rejects / rejects.attempts : null;
+  const pnlEvidence = dailyReports.map(report => performanceEvidence(report, 'pnl'));
+  const unavailablePnl = pnlEvidence.filter(value => value.evidence !== 'observed');
   const pnl = sumObserved(dailyReports, report => performanceEvidence(report, 'pnl'), { realizedGross: 0, fees: 0, netRealizedAfterFees: 0 }, (total, value) => ({ realizedGross: total.realizedGross + value.realizedGross, fees: total.fees + value.fees, netRealizedAfterFees: total.netRealizedAfterFees + value.netRealizedAfterFees }));
+  pnl.availability = {
+    evidence: unavailablePnl.length === 0 ? 'observed' : 'unavailable',
+    ...(unavailablePnl.length > 0 ? { reason: 'one-or-more-daily-pnl-components-unavailable' } : {}),
+    coverage: {
+      reviewedDays: dailyReports.length,
+      observedDays: pnlEvidence.length - unavailablePnl.length,
+      unavailableDays: unavailablePnl.length,
+    },
+  };
   return {
     observed: { sameDayOpposingFillProxy, rejects, pnl },
     unavailable: {
@@ -70,5 +81,9 @@ export function buildWeeklyPromotionReview({ dailyReports = [], shadowReport = n
 
 export function formatWeeklyPromotionReview(review) {
   const p = review.performance;
-  return `Weekly promotion review: ${review.decision}\nDaily reports: ${review.dailyReportsReviewed}\nCandidate: ${review.selectedCandidateId || 'none'}\nBlockers: ${review.blockers.join('|') || 'none'}\nObserved performance: same-day opposing-fill proxy (not realized spread) ${p.observed.sameDayOpposingFillProxy.pnl} on ${p.observed.sameDayOpposingFillProxy.matchedQty}; rejects ${p.observed.rejects.rejects}/${p.observed.rejects.attempts}${p.observed.rejects.rateAvailable ? '' : ' (rate unavailable)'}; PnL net ${p.observed.pnl.netRealizedAfterFees}\nUnavailable performance evidence: realized spread ${p.unavailable.realizedSpread.days} day(s); same-day opposing-fill proxy ${p.unavailable.sameDayOpposingFillProxy.days} day(s); uptime ${p.unavailable.uptime.days} day(s); rejects ${p.unavailable.rejects.days} day(s); inventory ${p.unavailable.inventory.days} day(s)\nCounterfactual: unavailable (${p.counterfactual.reason})\nProduction change: NOT AUTHORIZED. Required before canary: ${review.requiredBeforeCanary.join('; ')}`;
+  const pnlAvailability = p.observed.pnl.availability;
+  const pnlText = pnlAvailability.evidence === 'observed'
+    ? `PnL net ${p.observed.pnl.netRealizedAfterFees}`
+    : `PnL net ${p.observed.pnl.netRealizedAfterFees} (incomplete: ${pnlAvailability.coverage.observedDays}/${pnlAvailability.coverage.reviewedDays} observed; ${pnlAvailability.reason})`;
+  return `Weekly promotion review: ${review.decision}\nDaily reports: ${review.dailyReportsReviewed}\nCandidate: ${review.selectedCandidateId || 'none'}\nBlockers: ${review.blockers.join('|') || 'none'}\nObserved performance: same-day opposing-fill proxy (not realized spread) ${p.observed.sameDayOpposingFillProxy.pnl} on ${p.observed.sameDayOpposingFillProxy.matchedQty}; rejects ${p.observed.rejects.rejects}/${p.observed.rejects.attempts}${p.observed.rejects.rateAvailable ? '' : ' (rate unavailable)'}; ${pnlText}\nUnavailable performance evidence: realized spread ${p.unavailable.realizedSpread.days} day(s); same-day opposing-fill proxy ${p.unavailable.sameDayOpposingFillProxy.days} day(s); uptime ${p.unavailable.uptime.days} day(s); rejects ${p.unavailable.rejects.days} day(s); inventory ${p.unavailable.inventory.days} day(s)\nCounterfactual: unavailable (${p.counterfactual.reason})\nProduction change: NOT AUTHORIZED. Required before canary: ${review.requiredBeforeCanary.join('; ')}`;
 }
