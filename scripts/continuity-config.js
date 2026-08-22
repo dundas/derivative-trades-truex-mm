@@ -19,6 +19,7 @@ const POLICY_ENV_FIELDS = {
   fallbackBaseSpreadBps: 'MM_FALLBACK_BASE_SPREAD_BPS',
   contractMaxQuoteSpreadBps: 'MM_CONTRACT_MAX_QUOTE_SPREAD_BPS',
   contractRequiredLevelsPerSide: 'MM_CONTRACT_REQUIRED_LEVELS_PER_SIDE',
+  contractOrderStateMaxAgeMs: 'MM_CONTRACT_ORDER_STATE_MAX_AGE_MS',
 };
 
 function requiredFiniteEnv(env, envName) {
@@ -51,7 +52,7 @@ export function buildMakerQuotePolicyConfig(env) {
   if (config.contractRequiredLevelsPerSide > config.normalQuoteLevels) {
     throw new Error('MM_CONTRACT_REQUIRED_LEVELS_PER_SIDE cannot exceed MM_NORMAL_QUOTE_LEVELS');
   }
-  for (const field of ['baseQuoteSizeBTC', 'fallbackBaseSpreadBps', 'contractMaxQuoteSpreadBps']) {
+  for (const field of ['baseQuoteSizeBTC', 'fallbackBaseSpreadBps', 'contractMaxQuoteSpreadBps', 'contractOrderStateMaxAgeMs']) {
     if (config[field] <= 0) throw new Error(`${POLICY_ENV_FIELDS[field]} must be positive`);
   }
   if (config.fallbackBaseSpreadBps > config.contractMaxQuoteSpreadBps) {
@@ -66,6 +67,7 @@ export function buildContinuityConfig(env, {
   fallbackBaseSpreadBps: baseSpreadBps,
   contractMaxQuoteSpreadBps,
   contractRequiredLevelsPerSide,
+  contractOrderStateMaxAgeMs,
 } = {}) {
   const config = {};
   for (const [field, envName] of Object.entries(ENV_FIELDS)) {
@@ -114,6 +116,9 @@ export function buildContinuityConfig(env, {
       validated.defensiveSpreadFloorBps > contractMaxQuoteSpreadBps) {
     throw new Error('normal and defensive maker spreads cannot exceed MM_CONTRACT_MAX_QUOTE_SPREAD_BPS');
   }
+  if (!Number.isFinite(contractOrderStateMaxAgeMs) || contractOrderStateMaxAgeMs <= 0) {
+    throw new Error('MM_CONTRACT_ORDER_STATE_MAX_AGE_MS must be positive');
+  }
   if (validated.alertThresholdMs > validated.maxSideGapMs) {
     throw new Error('MM_SIDE_GAP_ALERT_THRESHOLD_MS cannot exceed MM_MAX_SIDE_GAP_MS');
   }
@@ -121,5 +126,6 @@ export function buildContinuityConfig(env, {
     ...validated,
     contractMaxQuoteSpreadBps,
     contractRequiredLevelsPerSide,
+    contractOrderStateMaxAgeMs,
   });
 }

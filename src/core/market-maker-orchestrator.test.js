@@ -238,10 +238,12 @@ describe('MarketMakerOrchestrator — anchor config wiring', () => {
         alertThresholdMs: 3000, alertRateLimitMs: 60000, degradedMaxLevels: 1,
         degradedSizeFactor: 0.5, defensiveSpreadFloorBps: 80,
         contractMaxQuoteSpreadBps: 100, contractRequiredLevelsPerSide: 1,
+        contractOrderStateMaxAgeMs: 5000,
       },
     });
 
     expect(orch.quoteEngine.config.contractMaxQuoteSpreadBps).toBe(100);
+    expect(orch.quoteEngine.config.contractOrderStateMaxAgeMs).toBe(5000);
   });
 
   it('forwards self-match prevention instruction from env when option is unset', () => {

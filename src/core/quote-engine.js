@@ -34,6 +34,10 @@ export class QuoteEngine extends EventEmitter {
     this.fixConnection = options.fixConnection;
     this.capitalReservationManager = options.capitalReservationManager || null;
     this.continuityStateProvider = options.continuityStateProvider || null;
+    // Finite contractual spread enforcement must not make a displayed-book
+    // claim from process-local lifecycle state after a reconnect or an
+    // out-of-order report. The orchestrator supplies this after REST sync.
+    this.authoritativeOrderStateProvider = options.authoritativeOrderStateProvider || null;
     this.maxExecutionDedupeOrders = options.maxExecutionDedupeOrders ?? 10000;
     if (!Number.isInteger(this.maxExecutionDedupeOrders) || this.maxExecutionDedupeOrders < 1) {
       throw new Error('maxExecutionDedupeOrders must be a positive integer');
@@ -107,6 +111,7 @@ export class QuoteEngine extends EventEmitter {
       // Infinity keeps the reusable engine backwards compatible outside the
       // production policy path; production startup requires a finite value.
       contractMaxQuoteSpreadBps: options.contractMaxQuoteSpreadBps ?? Number.POSITIVE_INFINITY,
+      contractOrderStateMaxAgeMs: options.contractOrderStateMaxAgeMs ?? 0,
       maxReplacementsPerSidePerCycle: options.maxReplacementsPerSidePerCycle ?? Number.POSITIVE_INFINITY,
       pendingReplacementTimeoutMs: options.pendingReplacementTimeoutMs || 5000,
       pendingSelfCrossGuardMs: options.pendingSelfCrossGuardMs ?? 5000,
@@ -151,6 +156,11 @@ export class QuoteEngine extends EventEmitter {
           this.config.contractMaxQuoteSpreadBps !== Number.POSITIVE_INFINITY) ||
         this.config.contractMaxQuoteSpreadBps <= 0) {
       throw new Error('contractMaxQuoteSpreadBps must be a positive finite number or Infinity');
+    }
+    if (Number.isFinite(this.config.contractMaxQuoteSpreadBps) &&
+        (!Number.isFinite(this.config.contractOrderStateMaxAgeMs) ||
+          this.config.contractOrderStateMaxAgeMs <= 0)) {
+      throw new Error('contractOrderStateMaxAgeMs must be a positive finite number with a finite contract cap');
     }
     if (typeof this.config.strictTruexMakerSafety !== 'boolean') {
       throw new Error('strictTruexMakerSafety must be boolean');
@@ -2793,6 +2803,45 @@ export class QuoteEngine extends EventEmitter {
     return true;
   }
 
+  _contractOrderStateUsable() {
+    if (!Number.isFinite(this.config.contractMaxQuoteSpreadBps)) return true;
+    let state;
+    try { state = this.authoritativeOrderStateProvider?.(); } catch (_) { state = null; }
+    const timestamp = Number(state?.timestamp);
+    const ageMs = this.now() - timestamp;
+    return state?.available === true && Array.isArray(state?.orders) &&
+      Number.isFinite(timestamp) && timestamp > 0 &&
+      ageMs >= 0 && ageMs <= this.config.contractOrderStateMaxAgeMs;
+  }
+
+  _contractOrderStateReason() {
+    let state;
+    try { state = this.authoritativeOrderStateProvider?.(); } catch (_) { state = null; }
+    const timestamp = Number(state?.timestamp);
+    if (state?.available !== true || !Array.isArray(state?.orders) ||
+        !Number.isFinite(timestamp) || timestamp <= 0) {
+      return 'contract-order-state-unavailable';
+    }
+    return 'contract-order-state-stale';
+  }
+
+  _reportContractPolicyBreach(quote, reason, actualOpposite = null) {
+    const event = Object.freeze({
+      side: quote?.side || null,
+      level: quote?.level || null,
+      reason,
+      orderId: quote?.replacesQuoteId || null,
+      actualOppositeOrderId: actualOpposite?.clOrdID || null,
+      action: 'authoritative-resync-required',
+    });
+    this._recordSuppression({ ...quote, transition: 'contract-policy-breach' }, reason);
+    this.emit('contract-policy-breach', event);
+    this._emitCapitalResyncRequired({
+      side: quote?.side || 'multiple', reason, orderId: quote?.replacesQuoteId || null, strict: true,
+    });
+    this.deferredRepriceNeeded = true;
+  }
+
   _isSlidQuoteWithinContract(quote) {
     if (!this._isWithinContractQuoteEnvelope(quote)) return false;
     return this._isContractDisplayedPairWithinCap(quote, {
@@ -2816,7 +2865,7 @@ export class QuoteEngine extends EventEmitter {
     const status = String(order.status ?? '').trim().toLowerCase();
     return new Set([
       'active', 'pending', 'pending_new', 'new', 'partial_fill', 'partially_filled',
-      'cancelling', '0', 'a', '1', '6', 'e',
+      'cancelling', 'cancel_pending', '0', 'a', '1', '6', 'e',
     ]).has(status);
   }
 
@@ -2824,11 +2873,16 @@ export class QuoteEngine extends EventEmitter {
     const quoteSide = this._normalizeContractOrderSide(quote?.side);
     if (!quoteSide) return null;
     const oppositeSide = quoteSide === 'buy' ? 'sell' : 'buy';
+    // The finite-cap claim is about exchange-displayed orders.  Do not turn
+    // local lifecycle cache into authority after reconnect/out-of-order FIX;
+    // the provider is a scoped REST snapshot set only by reconciliation.
+    let snapshot;
+    try { snapshot = this.authoritativeOrderStateProvider?.(); } catch (_) { snapshot = null; }
     const candidates = [];
-    for (const order of this.activeOrders.values()) {
+    for (const order of snapshot?.orders || []) {
       if (this._normalizeContractOrderSide(order?.side) !== oppositeSide ||
           !this._isContractLiveOppositeOrder(order)) continue;
-      candidates.push(order);
+      candidates.push({ ...order, clOrdID: order?.clOrdID ?? order?.orderId ?? null });
     }
     if (candidates.length === 0) return null;
 
@@ -2859,6 +2913,10 @@ export class QuoteEngine extends EventEmitter {
     violationReason = 'contract-spread-actual-pair-violates-cap',
   } = {}) {
     if (!Number.isFinite(this.config.contractMaxQuoteSpreadBps)) return true;
+    if (!this._contractOrderStateUsable()) {
+      this._recordSuppression(quote, this._contractOrderStateReason());
+      return false;
+    }
     const referenceMid = Number(quote?.contractReferenceMid);
     const price = Number(quote?.price);
     if (!Number.isFinite(referenceMid) || referenceMid <= 0 || !Number.isFinite(price) || price <= 0) {
@@ -2879,7 +2937,7 @@ export class QuoteEngine extends EventEmitter {
     const maxWidth = referenceMid * this.config.contractMaxQuoteSpreadBps / 10_000;
     const epsilon = Math.max(Number.EPSILON * Math.max(referenceMid, oppositePrice, price) * 8, 1e-12);
     if (!side || !Number.isFinite(displayedWidth) || displayedWidth <= 0 || displayedWidth > maxWidth + epsilon) {
-      this._recordSuppression(quote, violationReason);
+      this._reportContractPolicyBreach(quote, violationReason, actualOpposite);
       return false;
     }
     return true;

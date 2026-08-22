@@ -130,6 +130,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this.inventoryRebalanceShadowConfig = options.inventoryRebalanceShadowConfig || null;
     this.inventoryRebalanceShadow = null;
     this._inventoryRebalanceShadowLastAt = 0;
+    this._authoritativeOrderState = { available: false, timestamp: 0, orders: [] };
 
     this.pnlTracker = options.pnlTracker || new PnLTracker({
       truexMakerFeeBps: options.truexMakerFeeBps ?? 0,
@@ -182,6 +183,8 @@ export class MarketMakerOrchestrator extends EventEmitter {
       degradedSizeFactor: options.continuityConfig?.degradedSizeFactor ?? 1,
       defensiveSpreadFloorBps: options.continuityConfig?.defensiveSpreadFloorBps ?? 0,
       contractMaxQuoteSpreadBps: options.continuityConfig?.contractMaxQuoteSpreadBps,
+      contractOrderStateMaxAgeMs: options.continuityConfig?.contractOrderStateMaxAgeMs,
+      authoritativeOrderStateProvider: () => this._authoritativeOrderState,
       maxReplacementsPerSidePerCycle: options.maxReplacementsPerSidePerCycle ?? 1,
       pendingReplacementTimeoutMs: options.pendingReplacementTimeoutMs || 5000,
       pendingSelfCrossGuardMs: options.pendingSelfCrossGuardMs ?? 5000,
@@ -2337,6 +2340,13 @@ export class MarketMakerOrchestrator extends EventEmitter {
         clearBlockedSides,
         generation,
       });
+      // This scoped REST result, rather than QuoteEngine's process-local
+      // activeOrders cache, is the only authority for finite-cap pair checks.
+      this._authoritativeOrderState = Object.freeze({
+        available: true,
+        timestamp: Date.now(),
+        orders: Object.freeze(reconciledLiveOrders.map((order) => Object.freeze({ ...order }))),
+      });
       if (capitalResult?.state === 'normal' && capitalResult.blockedSides?.length === 0) {
         const liveCandidatesById = new Map();
         for (const live of reconciledLiveOrders) {
@@ -2397,6 +2407,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
         }
       }
     } catch (err) {
+      this._authoritativeOrderState = { available: false, timestamp: 0, orders: [] };
       this.logger.warn(`[Orchestrator] Balance refresh failed (non-fatal): ${err.message}`);
       this.capitalReservationManager?.reconciliationFailed();
       if (requireLiveOrders) throw err;

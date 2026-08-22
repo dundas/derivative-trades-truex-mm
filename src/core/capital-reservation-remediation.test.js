@@ -556,7 +556,9 @@ describe('presence and dispatch remediation', () => {
     };
     const baseOptions = {
       inventoryManager: { canQuote: () => true }, levels: 2, baseSpreadBps: 30,
-      baseSizeBTC: 0.01, minNotional: 1, contractMaxQuoteSpreadBps, logger,
+      baseSizeBTC: 0.01, minNotional: 1, contractMaxQuoteSpreadBps,
+      contractOrderStateMaxAgeMs: 5000,
+      authoritativeOrderStateProvider: () => ({ available: true, timestamp: Date.now() }), logger,
     };
 
     // Missing anchor deliberately takes the mid-based fallback path.

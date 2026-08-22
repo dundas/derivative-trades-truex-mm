@@ -17,6 +17,7 @@ const VALID = {
   MM_FALLBACK_BASE_SPREAD_BPS: '30',
   MM_CONTRACT_MAX_QUOTE_SPREAD_BPS: '100',
   MM_CONTRACT_REQUIRED_LEVELS_PER_SIDE: '1',
+  MM_CONTRACT_ORDER_STATE_MAX_AGE_MS: '5000',
 };
 
 describe('production maker quote-policy config', () => {
@@ -27,6 +28,7 @@ describe('production maker quote-policy config', () => {
       fallbackBaseSpreadBps: 30,
       contractMaxQuoteSpreadBps: 100,
       contractRequiredLevelsPerSide: 1,
+      contractOrderStateMaxAgeMs: 5000,
     });
   });
 
@@ -61,6 +63,7 @@ describe('production continuity config', () => {
       defensiveSpreadFloorBps: 80,
       contractMaxQuoteSpreadBps: 100,
       contractRequiredLevelsPerSide: 1,
+      contractOrderStateMaxAgeMs: 5000,
     });
     expect(Object.isFrozen(config)).toBe(true);
   });
@@ -78,5 +81,6 @@ describe('production continuity config', () => {
     expect(() => buildContinuityConfig({ ...VALID, MM_BASE_QUOTE_SIZE_BTC: '0.0001' }, buildMakerQuotePolicyConfig({ ...VALID, MM_BASE_QUOTE_SIZE_BTC: '0.0001' }))).toThrow('scaled L1');
     expect(() => buildContinuityConfig({ ...VALID, MM_NORMAL_QUOTE_LEVELS: '1' }, buildMakerQuotePolicyConfig({ ...VALID, MM_NORMAL_QUOTE_LEVELS: '1' }))).toThrow('below normal');
     expect(() => buildContinuityConfig({ ...VALID, MM_DEFENSIVE_SPREAD_FLOOR_BPS: '101' }, buildMakerQuotePolicyConfig(VALID))).toThrow('cannot exceed MM_CONTRACT_MAX_QUOTE_SPREAD_BPS');
+    expect(() => buildMakerQuotePolicyConfig({ ...VALID, MM_CONTRACT_ORDER_STATE_MAX_AGE_MS: '0' })).toThrow('must be positive');
   });
 });
