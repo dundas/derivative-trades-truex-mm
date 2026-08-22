@@ -226,6 +226,37 @@ describe('QuoteEngine', () => {
       expect(ask.price - bid.price).toBeCloseTo(21, 1);
     });
 
+    it('steps a mirror out to the configured full-width floor', () => {
+      const engine = createEngine({
+        levels: 1, quoteAnchorMode: 'coinbase-mirror', coinbaseAnchorBufferTicks: 1,
+        levelSpacingTicks: 1, tickSize: 0.50, baseSpreadBps: 1,
+        minimumQuoteWidthBps: 30,
+      });
+      const tightBook = { bestBid: 99999.5, bestAsk: 100000.0 };
+      const quotes = engine.computeDesiredQuotes(100000, { bidSkewTicks: 0, askSkewTicks: 0 }, tightBook);
+      const bid = quotes.find(q => q.side === 'buy');
+      const ask = quotes.find(q => q.side === 'sell');
+      expect(bid.price).toBe(99850);
+      expect(ask.price).toBe(100150);
+      expect((ask.price - bid.price) / 100000 * 1e4).toBe(30);
+    });
+
+    it('keeps an off-tick floor outward after rounding', () => {
+      const engine = createEngine({
+        levels: 1, quoteAnchorMode: 'coinbase-mirror', tickSize: 0.50,
+        minimumQuoteWidthBps: 30,
+      });
+      const mid = 100000.25;
+      const quotes = engine.computeDesiredQuotes(mid, { bidSkewTicks: 0, askSkewTicks: 0 }, {
+        bestBid: mid - 1, bestAsk: mid + 1,
+      });
+      const bid = quotes.find(q => q.side === 'buy');
+      const ask = quotes.find(q => q.side === 'sell');
+      expect(bid.price).toBe(99850);
+      expect(ask.price).toBe(100150.5);
+      expect(ask.price - bid.price).toBeGreaterThanOrEqual(mid * 30 / 1e4);
+    });
+
     it('steps deeper levels outward beyond L1', () => {
       const engine = createEngine({
         levels: 2, quoteAnchorMode: 'coinbase-mirror', coinbaseAnchorBufferTicks: 1,
@@ -248,6 +279,74 @@ describe('QuoteEngine', () => {
       const ask = quotes.find(q => q.side === 'sell');
       expect(bid.price).toBeCloseTo(99749.50, 1);
       expect(ask.price).toBeCloseTo(100250.50, 1);
+    });
+
+    it('applies the same floor to the mid fallback when the mirror book is missing', () => {
+      const engine = createEngine({
+        levels: 1, quoteAnchorMode: 'coinbase-mirror', baseSpreadBps: 1,
+        minimumQuoteWidthBps: 30, levelSpacingTicks: 1, tickSize: 0.50,
+      });
+      const quotes = engine.computeDesiredQuotes(100000, { bidSkewTicks: 0, askSkewTicks: 0 }, null);
+      expect(quotes.find(q => q.side === 'buy').price).toBe(99850);
+      expect(quotes.find(q => q.side === 'sell').price).toBe(100150);
+    });
+
+    it('holds the whole desired set with a machine-readable reason when floor and cap have no tick pair', () => {
+      const engine = createEngine({
+        levels: 1, quoteAnchorMode: 'coinbase-mirror', tickSize: 1,
+        minimumQuoteWidthBps: 0.05, contractMaxQuoteSpreadBps: 0.05,
+        contractOrderStateMaxAgeMs: 1000,
+      });
+      const quotes = engine.computeDesiredQuotes(100000, { bidSkewTicks: 0, askSkewTicks: 0 }, book);
+      expect(quotes).toEqual([]);
+      expect(engine.suppressedLevels.get('buy:1').reason).toBe('minimum-width-contract-cap-no-feasible-tick-pair');
+      expect(engine.suppressedLevels.get('sell:1').reason).toBe('minimum-width-contract-cap-no-feasible-tick-pair');
+    });
+
+    it('suppresses an off-tick floor/cap pair that is passive but narrower than the floor before any send', () => {
+      const sent = [];
+      const engine = createEngine({
+        levels: 1, quoteAnchorMode: 'coinbase-mirror', tickSize: 0.50,
+        minimumQuoteWidthBps: 1, contractMaxQuoteSpreadBps: 1,
+        contractOrderStateMaxAgeMs: 1000, quoteDispatchMode: 'observe',
+        fixConnection: { sendMessage: (message) => sent.push(message) },
+      });
+      const mid = 100000.25;
+      const skew = { bidSkewTicks: 0, askSkewTicks: 0 };
+      const book = { bestBid: mid - 1, bestAsk: mid + 1 };
+
+      expect(engine.computeDesiredQuotes(mid, skew, book)).toEqual([]);
+      expect(engine.suppressedLevels.get('buy:1').reason).toBe('minimum-width-contract-cap-no-feasible-tick-pair');
+      expect(engine.suppressedLevels.get('sell:1').reason).toBe('minimum-width-contract-cap-no-feasible-tick-pair');
+
+      engine.onPriceUpdate({
+        ...makePrice(mid),
+        sources: [{ exchange: 'coinbase', bid: book.bestBid, ask: book.bestAsk, isStale: false }],
+      });
+      expect(sent.filter(message => message['35'] === 'D')).toEqual([]);
+    });
+
+    it('rejects invalid minimum-width configuration before quote generation', () => {
+      expect(() => createEngine({ minimumQuoteWidthBps: -1 }))
+        .toThrow('minimumQuoteWidthBps must be a finite non-negative number');
+      expect(() => createEngine({
+        minimumQuoteWidthBps: 81, contractMaxQuoteSpreadBps: 80, contractOrderStateMaxAgeMs: 1000,
+      })).toThrow('minimumQuoteWidthBps cannot exceed contractMaxQuoteSpreadBps');
+    });
+
+    it('does not send a D in observer mode when the floor is satisfied', () => {
+      const sent = [];
+      const engine = createEngine({
+        levels: 1, quoteAnchorMode: 'coinbase-mirror', minimumQuoteWidthBps: 30,
+        quoteDispatchMode: 'observe', clientId: 'T',
+        fixConnection: { sendMessage: (message) => sent.push(message) },
+      });
+      engine.onPriceUpdate({
+        ...makePrice(100000),
+        sources: [{ exchange: 'coinbase', bid: 99999.5, ask: 100000, isStale: false }],
+      });
+      expect(sent.filter(message => message['35'] === 'D')).toEqual([]);
+      expect(engine.suppressedLevels.get('buy:1').reason).toBe('quote-dispatch-observe-mode');
     });
 
     it('default mode stays mid-anchored even when a book is provided', () => {

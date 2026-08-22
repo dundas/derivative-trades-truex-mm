@@ -230,19 +230,20 @@ describe('MarketMakerOrchestrator — anchor config wiring', () => {
     expect(orch.quoteEngine.config.quoteDispatchMode).toBe('observe');
   });
 
-  it('forwards the validated contractual spread ceiling to the engine', () => {
+  it('forwards the validated contractual width bounds to the engine', () => {
     const orch = makeRealEngineOrch({
       continuityConfig: {
         minActiveLevelsPerSide: 1, minimumFundedQuoteSize: 0.0001,
         l1ReserveBase: 0.01, l1ReserveQuote: 1000, maxSideGapMs: 5000,
         alertThresholdMs: 3000, alertRateLimitMs: 60000, degradedMaxLevels: 1,
         degradedSizeFactor: 0.5, defensiveSpreadFloorBps: 80,
-        contractMaxQuoteSpreadBps: 100, contractRequiredLevelsPerSide: 1,
+        contractMaxQuoteSpreadBps: 100, minimumQuoteWidthBps: 30, contractRequiredLevelsPerSide: 1,
         contractOrderStateMaxAgeMs: 5000,
       },
     });
 
     expect(orch.quoteEngine.config.contractMaxQuoteSpreadBps).toBe(100);
+    expect(orch.quoteEngine.config.minimumQuoteWidthBps).toBe(30);
     expect(orch.quoteEngine.config.contractOrderStateMaxAgeMs).toBe(5000);
     expect(orch.balanceRefreshIntervalMs).toBe(60000);
     expect(orch.authoritativeOrderRefreshIntervalMs).toBe(2500);
