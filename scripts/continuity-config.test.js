@@ -15,6 +15,7 @@ const VALID = {
   MM_NORMAL_QUOTE_LEVELS: '2',
   MM_BASE_QUOTE_SIZE_BTC: '0.01',
   MM_FALLBACK_BASE_SPREAD_BPS: '30',
+  MM_MIN_LIVE_QUOTE_WIDTH_BPS: '30',
   MM_CONTRACT_MAX_QUOTE_SPREAD_BPS: '100',
   MM_CONTRACT_REQUIRED_LEVELS_PER_SIDE: '1',
   MM_CONTRACT_ORDER_STATE_MAX_AGE_MS: '5000',
@@ -26,6 +27,7 @@ describe('production maker quote-policy config', () => {
       normalQuoteLevels: 2,
       baseQuoteSizeBTC: 0.01,
       fallbackBaseSpreadBps: 30,
+      minimumQuoteWidthBps: 30,
       contractMaxQuoteSpreadBps: 100,
       contractRequiredLevelsPerSide: 1,
       contractOrderStateMaxAgeMs: 5000,
@@ -42,6 +44,10 @@ describe('production maker quote-policy config', () => {
     expect(() => buildMakerQuotePolicyConfig({ ...VALID, MM_CONTRACT_REQUIRED_LEVELS_PER_SIDE: '3' }))
       .toThrow('cannot exceed MM_NORMAL_QUOTE_LEVELS');
     expect(() => buildMakerQuotePolicyConfig({ ...VALID, MM_FALLBACK_BASE_SPREAD_BPS: '101' }))
+      .toThrow('cannot exceed MM_CONTRACT_MAX_QUOTE_SPREAD_BPS');
+    expect(() => buildMakerQuotePolicyConfig({ ...VALID, MM_MIN_LIVE_QUOTE_WIDTH_BPS: '' }))
+      .toThrow('MM_MIN_LIVE_QUOTE_WIDTH_BPS is required');
+    expect(() => buildMakerQuotePolicyConfig({ ...VALID, MM_MIN_LIVE_QUOTE_WIDTH_BPS: '101' }))
       .toThrow('cannot exceed MM_CONTRACT_MAX_QUOTE_SPREAD_BPS');
   });
 });
@@ -62,6 +68,7 @@ describe('production continuity config', () => {
       degradedSizeFactor: 0.5,
       defensiveSpreadFloorBps: 80,
       contractMaxQuoteSpreadBps: 100,
+      minimumQuoteWidthBps: 30,
       contractRequiredLevelsPerSide: 1,
       contractOrderStateMaxAgeMs: 5000,
     });
@@ -82,5 +89,7 @@ describe('production continuity config', () => {
     expect(() => buildContinuityConfig({ ...VALID, MM_NORMAL_QUOTE_LEVELS: '1' }, buildMakerQuotePolicyConfig({ ...VALID, MM_NORMAL_QUOTE_LEVELS: '1' }))).toThrow('below normal');
     expect(() => buildContinuityConfig({ ...VALID, MM_DEFENSIVE_SPREAD_FLOOR_BPS: '101' }, buildMakerQuotePolicyConfig(VALID))).toThrow('cannot exceed MM_CONTRACT_MAX_QUOTE_SPREAD_BPS');
     expect(() => buildMakerQuotePolicyConfig({ ...VALID, MM_CONTRACT_ORDER_STATE_MAX_AGE_MS: '0' })).toThrow('must be positive');
+    expect(() => buildContinuityConfig(VALID, buildMakerQuotePolicyConfig({ ...VALID, MM_MIN_LIVE_QUOTE_WIDTH_BPS: '101' })))
+      .toThrow('cannot exceed');
   });
 });

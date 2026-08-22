@@ -142,6 +142,7 @@ const config = {
   quoteAnchorMode: 'coinbase-mirror',
   coinbaseAnchorBufferTicks: 1,      // 1 tick ($0.50) outside Coinbase touch
   baseSpreadBps: makerQuotePolicyConfig.fallbackBaseSpreadBps,
+  minimumQuoteWidthBps: makerQuotePolicyConfig.minimumQuoteWidthBps,
   levelSpacingTicks: 2,
   randomLevelSpacingBpsMin: 0.8,
   randomLevelSpacingBpsMax: 1.2,

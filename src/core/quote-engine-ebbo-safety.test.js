@@ -515,6 +515,79 @@ describe('strict TrueX EBBO maker safety', () => {
     expect(resync).toEqual([expect.objectContaining({ reason: 'contract-spread-actual-pair-violates-cap', strict: true })]);
   });
 
+  test('a fresh REST-only live opposite narrower than the floor suppresses D at the final send boundary', () => {
+    // The local cache intentionally has no ask: policy authority is the
+    // scoped REST snapshot, including live venue state not yet reconciled.
+    const restOrders = [{ orderId: 'rest-only-tight-ask', side: 'sell', status: 'active', price: 100.1, size: 0.01, level: 1 }];
+    const { engine, fixConnection } = makeEngine({
+      contractMaxQuoteSpreadBps: 100,
+      minimumQuoteWidthBps: 30,
+      authoritativeOrderStateProvider: () => ({ available: true, timestamp: Date.now(), orders: restOrders }),
+    });
+    engine.updateTruexEbbo(freshEbbo(99, 105));
+
+    expect(engine.activeOrders.has('rest-only-tight-ask')).toBe(false);
+    expect(engine._sendNewOrder({
+      ...quote('buy', 100), contractReferenceMid: 100, contractOppositePrice: 100.5,
+    })).toBeNull();
+    expect(fixConnection.sendMessage).not.toHaveBeenCalled();
+    expect(engine.getQuoteStatus().suppressed.at(-1).reason).toBe('minimum-width-actual-pair-violates-floor');
+  });
+
+  test('a nearer REST opposite cannot be masked by a farther opposite when enforcing the floor', () => {
+    const restOrders = [
+      { orderId: 'rest-only-tight-ask', side: 'sell', status: 'active', price: 100.1, size: 0.01, level: 1 },
+      { orderId: 'rest-only-wide-ask', side: 'sell', status: 'active', price: 101.5, size: 0.01, level: 1 },
+    ];
+    const { engine, fixConnection } = makeEngine({
+      contractMaxQuoteSpreadBps: 200,
+      minimumQuoteWidthBps: 30,
+      authoritativeOrderStateProvider: () => ({ available: true, timestamp: Date.now(), orders: restOrders }),
+    });
+    engine.updateTruexEbbo(freshEbbo(99, 105));
+
+    expect(engine._sendNewOrder({
+      ...quote('buy', 100), contractReferenceMid: 100, contractOppositePrice: 100.5,
+    })).toBeNull();
+    expect(fixConnection.sendMessage).not.toHaveBeenCalled();
+    expect(engine.getQuoteStatus().suppressed.at(-1).reason).toBe('minimum-width-actual-pair-violates-floor');
+  });
+
+  test('a fresh REST-only live opposite at or beyond the floor permits D', () => {
+    const restOrders = [{ orderId: 'rest-only-wide-ask', side: '2', status: 'A', price: '100.50', size: 0.01, level: 1 }];
+    const { engine, fixConnection } = makeEngine({
+      contractMaxQuoteSpreadBps: 100,
+      minimumQuoteWidthBps: 30,
+      authoritativeOrderStateProvider: () => ({ available: true, timestamp: Date.now(), orders: restOrders }),
+    });
+    engine.updateTruexEbbo(freshEbbo(99, 105));
+
+    expect(engine._sendNewOrder({
+      ...quote('buy', 100), contractReferenceMid: 100, contractOppositePrice: 100.5,
+    })).not.toBeNull();
+    expect(fixConnection.sendMessage.mock.calls.filter(([fields]) => fields['35'] === 'D')).toHaveLength(1);
+  });
+
+  test('replacement preflight retains the old quote when REST-only opposite violates the floor', () => {
+    const restOrders = [{ orderId: 'rest-only-tight-ask', side: 'sell', status: 'cancel_pending', price: 100.1, size: 0.01, level: 1 }];
+    const { engine, fixConnection } = makeEngine({
+      contractMaxQuoteSpreadBps: 100,
+      minimumQuoteWidthBps: 30,
+      authoritativeOrderStateProvider: () => ({ available: true, timestamp: Date.now(), orders: restOrders }),
+    });
+    const oldBid = { ...quote('buy', 99), status: 'active', acknowledgedLive: true };
+    engine.activeOrders.set('old-bid', oldBid);
+    engine.updateTruexEbbo(freshEbbo(99, 105));
+
+    expect(engine._dispatchAction({
+      type: 'replacement-cancel', clOrdID: 'old-bid', order: oldBid,
+      quote: { ...quote('buy', 100), contractReferenceMid: 100, contractOppositePrice: 100.5 },
+    })).toBe(false);
+    expect(engine.activeOrders.get('old-bid')).toMatchObject({ status: 'active', acknowledgedLive: true });
+    expect(fixConnection.sendMessage).not.toHaveBeenCalled();
+    expect(engine.getQuoteStatus().suppressed.at(-1).reason).toBe('minimum-width-actual-pair-violates-floor');
+  });
+
   test('queued and pending-replacement placements recheck current EBBO at final send', () => {
     const { engine, fixConnection } = makeEngine({ maxOrdersPerSecond: 1 });
     engine.updateTruexEbbo(freshEbbo(99, 105));

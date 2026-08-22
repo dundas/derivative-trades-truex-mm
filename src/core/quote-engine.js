@@ -111,6 +111,10 @@ export class QuoteEngine extends EventEmitter {
       // Infinity keeps the reusable engine backwards compatible outside the
       // production policy path; production startup requires a finite value.
       contractMaxQuoteSpreadBps: options.contractMaxQuoteSpreadBps ?? Number.POSITIVE_INFINITY,
+      // Full bid-to-ask floor, including when the L1 is Coinbase-mirrored.
+      // Zero retains reusable-engine behavior; production obtains a positive
+      // deployment value through its policy config.
+      minimumQuoteWidthBps: options.minimumQuoteWidthBps ?? 0,
       contractOrderStateMaxAgeMs: options.contractOrderStateMaxAgeMs ?? 0,
       maxReplacementsPerSidePerCycle: options.maxReplacementsPerSidePerCycle ?? Number.POSITIVE_INFINITY,
       pendingReplacementTimeoutMs: options.pendingReplacementTimeoutMs || 5000,
@@ -161,6 +165,13 @@ export class QuoteEngine extends EventEmitter {
         (!Number.isFinite(this.config.contractOrderStateMaxAgeMs) ||
           this.config.contractOrderStateMaxAgeMs <= 0)) {
       throw new Error('contractOrderStateMaxAgeMs must be a positive finite number with a finite contract cap');
+    }
+    if (!Number.isFinite(this.config.minimumQuoteWidthBps) || this.config.minimumQuoteWidthBps < 0) {
+      throw new Error('minimumQuoteWidthBps must be a finite non-negative number');
+    }
+    if (Number.isFinite(this.config.contractMaxQuoteSpreadBps) &&
+        this.config.minimumQuoteWidthBps > this.config.contractMaxQuoteSpreadBps) {
+      throw new Error('minimumQuoteWidthBps cannot exceed contractMaxQuoteSpreadBps');
     }
     if (typeof this.config.strictTruexMakerSafety !== 'boolean') {
       throw new Error('strictTruexMakerSafety must be boolean');
@@ -482,6 +493,14 @@ export class QuoteEngine extends EventEmitter {
       : baseSpreadBps;
     const effectiveSizeFactor = degraded ? this.config.degradedSizeFactor : 1;
     const halfSpread = (effectiveSpreadBps / 10000) * mid / 2;
+    const minimumWidthBps = this.config.minimumQuoteWidthBps;
+    const minimumHalfSpread = (minimumWidthBps / 10000) * mid / 2;
+    const minimumBidTick = minimumWidthBps > 0
+      ? Math.floor((mid - minimumHalfSpread) / tickSize) * tickSize
+      : Number.POSITIVE_INFINITY;
+    const minimumAskTick = minimumWidthBps > 0
+      ? Math.ceil((mid + minimumHalfSpread) / tickSize) * tickSize
+      : Number.NEGATIVE_INFINITY;
     const contractHalfSpread = Number.isFinite(this.config.contractMaxQuoteSpreadBps)
       ? (this.config.contractMaxQuoteSpreadBps / 10000) * mid / 2
       : Number.POSITIVE_INFINITY;
@@ -546,19 +565,32 @@ export class QuoteEngine extends EventEmitter {
         rawBid = Math.min(rawBid, mid - halfSpread - levelOffset);
         rawAsk = Math.max(rawAsk, mid + halfSpread + levelOffset);
       }
+      // A floor is expressed as the full displayed L1 width around the same
+      // reference mid used by the contractual cap. This makes an otherwise
+      // Coinbase-tight mirror step out rather than merely reporting that its
+      // anchor is too tight. Apply it before directional tick rounding so a
+      // non-tick-aligned floor cannot be rounded inward below the policy.
+      rawBid = Math.min(rawBid, mid - minimumHalfSpread);
+      rawAsk = Math.max(rawAsk, mid + minimumHalfSpread);
       // Clamp both mirror and mid-fallback paths before tick rounding. The
       // directional final clamp accounts for nearest-tick rounding so even a
       // non-tick-aligned contract cap cannot leak a wider displayed pair.
       rawBid = Math.max(rawBid, mid - contractHalfSpread);
       rawAsk = Math.min(rawAsk, mid + contractHalfSpread);
       const bidPrice = Math.max(
-        this.snapToTick(rawBid),
+        Math.min(
+          this.snapToTick(rawBid),
+          minimumBidTick,
+        ),
         Number.isFinite(contractHalfSpread)
           ? Math.ceil((mid - contractHalfSpread) / tickSize) * tickSize
           : Number.NEGATIVE_INFINITY,
       );
       const askPrice = Math.min(
-        this.snapToTick(rawAsk),
+        Math.max(
+          this.snapToTick(rawAsk),
+          minimumAskTick,
+        ),
         Number.isFinite(contractHalfSpread)
           ? Math.floor((mid + contractHalfSpread) / tickSize) * tickSize
           : Number.POSITIVE_INFINITY,
@@ -570,7 +602,9 @@ export class QuoteEngine extends EventEmitter {
       // Suppress both candidates together, before reconciliation can enqueue a
       // new order, and retain a machine-readable reason for the policy gap.
       if (Number.isFinite(contractHalfSpread) && bidPrice >= askPrice) {
-        const reason = 'contract-spread-cap-no-noncrossed-tick-pair';
+        const reason = minimumWidthBps > 0
+          ? 'minimum-width-contract-cap-no-noncrossed-tick-pair'
+          : 'contract-spread-cap-no-noncrossed-tick-pair';
         this._recordSuppression(
           { side: 'buy', level, price: bidPrice, cause: reason, transition: 'contract-spread-cap-suppressed' },
           reason,
@@ -2869,7 +2903,7 @@ export class QuoteEngine extends EventEmitter {
     ]).has(status);
   }
 
-  _actualContractOppositeOrder(quote) {
+  _actualContractOppositeOrder(quote, { selection = 'widest' } = {}) {
     const quoteSide = this._normalizeContractOrderSide(quote?.side);
     if (!quoteSide) return null;
     const oppositeSide = quoteSide === 'buy' ? 'sell' : 'buy';
@@ -2898,14 +2932,19 @@ export class QuoteEngine extends EventEmitter {
     const relevant = sameLevel.length > 0 ? sameLevel : (unlevelled.length > 0 ? unlevelled : []);
     if (relevant.length === 0) return null;
 
-    // When duplicate actual orders are temporarily visible, test the widest
-    // displayed pair. Passing against a nearer peer would not prove the cap
-    // for the farther still-live order.
+    // Duplicate actual orders can be visible while reconciliation converges.
+    // The finite ceiling must prove the farthest live pair is bounded, while
+    // the displayed-width floor must prove the nearest live pair is wide
+    // enough.  Callers select which invariant they are checking; never let a
+    // favorable peer mask another venue-displayed order.
     return relevant.reduce((worst, order) => {
       if (!worst) return order;
-      return quoteSide === 'buy'
-        ? (Number(order.price) > Number(worst.price) ? order : worst)
-        : (Number(order.price) < Number(worst.price) ? order : worst);
+      const orderPrice = Number(order.price);
+      const worstPrice = Number(worst.price);
+      const chooseFarther = quoteSide === 'buy'
+        ? orderPrice > worstPrice
+        : orderPrice < worstPrice;
+      return selection === 'nearest' ? (chooseFarther ? worst : order) : (chooseFarther ? order : worst);
     }, null);
   }
 
@@ -2931,8 +2970,8 @@ export class QuoteEngine extends EventEmitter {
       this._recordSuppression(quote, 'contract-spread-context-missing');
       return false;
     }
-    const actualOpposite = this._actualContractOppositeOrder(quote);
-    const oppositePrice = Number(actualOpposite?.price ?? quote?.contractOppositePrice);
+    const capOpposite = this._actualContractOppositeOrder(quote, { selection: 'widest' });
+    const oppositePrice = Number(capOpposite?.price ?? quote?.contractOppositePrice);
     if (!Number.isFinite(oppositePrice) || oppositePrice <= 0) {
       // A first side may proceed only when compute/reconciliation supplied a
       // synchronized pair plan. Direct legacy sends cannot prove the full
@@ -2943,9 +2982,27 @@ export class QuoteEngine extends EventEmitter {
     const side = this._normalizeContractOrderSide(quote.side);
     const displayedWidth = side === 'buy' ? oppositePrice - price : price - oppositePrice;
     const maxWidth = referenceMid * this.config.contractMaxQuoteSpreadBps / 10_000;
+    const minimumWidth = referenceMid * this.config.minimumQuoteWidthBps / 10_000;
     const epsilon = Math.max(Number.EPSILON * Math.max(referenceMid, oppositePrice, price) * 8, 1e-12);
     if (!side || !Number.isFinite(displayedWidth) || displayedWidth <= 0 || displayedWidth > maxWidth + epsilon) {
-      this._reportContractPolicyBreach(quote, violationReason, actualOpposite);
+      this._reportContractPolicyBreach(quote, violationReason, capOpposite);
+      return false;
+    }
+    // Generation floors are not sufficient: a direct, queued, or replacement
+    // placement can meet a fresh venue-owned opposite after the desired pair
+    // was computed. The finite-policy authority remains the scoped REST
+    // snapshot above, never the local activeOrders cache.
+    const floorOpposite = this._actualContractOppositeOrder(quote, { selection: 'nearest' });
+    const floorOppositePrice = Number(floorOpposite?.price ?? quote?.contractOppositePrice);
+    const floorDisplayedWidth = side === 'buy' ? floorOppositePrice - price : price - floorOppositePrice;
+    if (this.config.minimumQuoteWidthBps > 0 && floorDisplayedWidth + epsilon < minimumWidth) {
+      this._reportContractPolicyBreach(
+        quote,
+        floorOpposite
+          ? 'minimum-width-actual-pair-violates-floor'
+          : 'minimum-width-pair-violates-floor',
+        floorOpposite,
+      );
       return false;
     }
     return true;

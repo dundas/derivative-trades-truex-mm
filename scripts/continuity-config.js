@@ -17,6 +17,7 @@ const POLICY_ENV_FIELDS = {
   normalQuoteLevels: 'MM_NORMAL_QUOTE_LEVELS',
   baseQuoteSizeBTC: 'MM_BASE_QUOTE_SIZE_BTC',
   fallbackBaseSpreadBps: 'MM_FALLBACK_BASE_SPREAD_BPS',
+  minimumQuoteWidthBps: 'MM_MIN_LIVE_QUOTE_WIDTH_BPS',
   contractMaxQuoteSpreadBps: 'MM_CONTRACT_MAX_QUOTE_SPREAD_BPS',
   contractRequiredLevelsPerSide: 'MM_CONTRACT_REQUIRED_LEVELS_PER_SIDE',
   contractOrderStateMaxAgeMs: 'MM_CONTRACT_ORDER_STATE_MAX_AGE_MS',
@@ -52,11 +53,14 @@ export function buildMakerQuotePolicyConfig(env) {
   if (config.contractRequiredLevelsPerSide > config.normalQuoteLevels) {
     throw new Error('MM_CONTRACT_REQUIRED_LEVELS_PER_SIDE cannot exceed MM_NORMAL_QUOTE_LEVELS');
   }
-  for (const field of ['baseQuoteSizeBTC', 'fallbackBaseSpreadBps', 'contractMaxQuoteSpreadBps', 'contractOrderStateMaxAgeMs']) {
+  for (const field of ['baseQuoteSizeBTC', 'fallbackBaseSpreadBps', 'minimumQuoteWidthBps', 'contractMaxQuoteSpreadBps', 'contractOrderStateMaxAgeMs']) {
     if (config[field] <= 0) throw new Error(`${POLICY_ENV_FIELDS[field]} must be positive`);
   }
   if (config.fallbackBaseSpreadBps > config.contractMaxQuoteSpreadBps) {
     throw new Error('MM_FALLBACK_BASE_SPREAD_BPS cannot exceed MM_CONTRACT_MAX_QUOTE_SPREAD_BPS');
+  }
+  if (config.minimumQuoteWidthBps > config.contractMaxQuoteSpreadBps) {
+    throw new Error('MM_MIN_LIVE_QUOTE_WIDTH_BPS cannot exceed MM_CONTRACT_MAX_QUOTE_SPREAD_BPS');
   }
   return Object.freeze({ ...config });
 }
@@ -65,6 +69,7 @@ export function buildContinuityConfig(env, {
   normalQuoteLevels: levels,
   baseQuoteSizeBTC: baseSizeBTC,
   fallbackBaseSpreadBps: baseSpreadBps,
+  minimumQuoteWidthBps,
   contractMaxQuoteSpreadBps,
   contractRequiredLevelsPerSide,
   contractOrderStateMaxAgeMs,
@@ -116,6 +121,10 @@ export function buildContinuityConfig(env, {
       validated.defensiveSpreadFloorBps > contractMaxQuoteSpreadBps) {
     throw new Error('normal and defensive maker spreads cannot exceed MM_CONTRACT_MAX_QUOTE_SPREAD_BPS');
   }
+  if (!Number.isFinite(minimumQuoteWidthBps) || minimumQuoteWidthBps <= 0 ||
+      minimumQuoteWidthBps > contractMaxQuoteSpreadBps) {
+    throw new Error('MM_MIN_LIVE_QUOTE_WIDTH_BPS must be positive and cannot exceed MM_CONTRACT_MAX_QUOTE_SPREAD_BPS');
+  }
   if (!Number.isFinite(contractOrderStateMaxAgeMs) || contractOrderStateMaxAgeMs <= 0) {
     throw new Error('MM_CONTRACT_ORDER_STATE_MAX_AGE_MS must be positive');
   }
@@ -125,6 +134,7 @@ export function buildContinuityConfig(env, {
   return Object.freeze({
     ...validated,
     contractMaxQuoteSpreadBps,
+    minimumQuoteWidthBps,
     contractRequiredLevelsPerSide,
     contractOrderStateMaxAgeMs,
   });

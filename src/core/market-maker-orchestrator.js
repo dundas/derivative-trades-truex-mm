@@ -183,6 +183,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       degradedSizeFactor: options.continuityConfig?.degradedSizeFactor ?? 1,
       defensiveSpreadFloorBps: options.continuityConfig?.defensiveSpreadFloorBps ?? 0,
       contractMaxQuoteSpreadBps: options.continuityConfig?.contractMaxQuoteSpreadBps,
+      minimumQuoteWidthBps: options.continuityConfig?.minimumQuoteWidthBps,
       contractOrderStateMaxAgeMs: options.continuityConfig?.contractOrderStateMaxAgeMs,
       authoritativeOrderStateProvider: () => this._authoritativeOrderState,
       maxReplacementsPerSidePerCycle: options.maxReplacementsPerSidePerCycle ?? 1,
