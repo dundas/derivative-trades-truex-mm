@@ -220,6 +220,12 @@ Computes bid/ask ladder quotes with inventory skew, manages order lifecycle thro
 - `PYUSD_USD_POLL_INTERVAL_MS` defaults to 5000 and may be `0` to disable the optional PYUSD/USD shadow input. `PYUSD_USD_POLL_TIMEOUT_MS` (1000), `PYUSD_USD_STALE_THRESHOLD_MS` (15000), and `TRUEX_EBBO_POLL_INTERVAL_MS` (1000) must be positive integers.
 - Configuration is validated before timers or exchange requests are created; invalid values fail startup instead of creating an uncontrolled polling loop.
 
+**Contractual quote policy:**
+- Production requires operator-approved, non-secret values for `MM_NORMAL_QUOTE_LEVELS`, `MM_BASE_QUOTE_SIZE_BTC`, `MM_FALLBACK_BASE_SPREAD_BPS`, `MM_CONTRACT_MAX_QUOTE_SPREAD_BPS`, `MM_CONTRACT_REQUIRED_LEVELS_PER_SIDE`, and `MM_CONTRACT_ORDER_STATE_MAX_AGE_MS`. The supplied example values are placeholders; Compose rejects absent values and the service rejects contradictory values before it begins operating.
+- Spread values are full bid-to-ask widths in basis points. Normal and degraded depth must satisfy the configured contractual levels, and normal, defensive, and fallback widths must not exceed the contractual ceiling.
+- With a finite contractual ceiling, placement is permitted only from a fresh, instrument-scoped REST snapshot of this maker's own live orders. A missing or stale snapshot suppresses new/replacement `35=D` messages before transport. The order snapshot refreshes independently of the normal balance cadence, and concurrent stale/timer requests are coalesced to avoid a REST retry loop.
+- The policy is a deployment preflight, not a live-quoting switch. Keep `MM_QUOTE_DISPATCH_MODE=observe` until the operator has approved the values and the separate two-sided presence, rollback, and elapsed-time canary gates have passed.
+
 **TrueX book and ALO safety:**
 - Production maker sends use the REST-polled `truexEbbo` as their sole venue marketability
   authority. Coinbase remains the pricing anchor; it is not venue marketability evidence.
