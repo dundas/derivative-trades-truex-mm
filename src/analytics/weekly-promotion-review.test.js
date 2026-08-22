@@ -7,6 +7,17 @@ describe('weekly promotion review', () => {
     expect(review.decision).toBe('HOLD');
     expect(review.productionChangeAuthorized).toBe(false);
   });
+  test('marks an empty weekly PnL aggregate unavailable rather than observed zero', () => {
+    const review = buildWeeklyPromotionReview();
+    expect(review.performance.observed.pnl).toEqual({
+      realizedGross: 0, fees: 0, netRealizedAfterFees: 0,
+      availability: {
+        evidence: 'unavailable', reason: 'no-daily-pnl-evidence',
+        coverage: { reviewedDays: 0, observedDays: 0, unavailableDays: 0 },
+      },
+    });
+    expect(formatWeeklyPromotionReview(review)).toContain('PnL unavailable (0/0 observed; no-daily-pnl-evidence)');
+  });
   test('requires explicit approval even when all evidence is favorable', () => {
     const review = buildWeeklyPromotionReview({ dailyReports: Array.from({ length: 7 }, (_, index) => ({ date: `2026-08-0${index + 1}`, verdict: { status: 'OK', reasons: [] } })), shadowReport: { recommendation: 'PROMOTE_CANDIDATE_FOR_HUMAN_APPROVAL', selectedCandidateId: 'candidate-a' } });
     expect(review.decision).toBe('CANDIDATE_REQUIRES_OPERATOR_APPROVAL');
@@ -76,7 +87,7 @@ describe('weekly promotion review', () => {
       evidence: 'unavailable', reason: 'one-or-more-daily-pnl-components-unavailable',
       coverage: { reviewedDays: 3, observedDays: 1, unavailableDays: 2 },
     });
-    expect(formatWeeklyPromotionReview(review)).toContain('PnL net 2 (incomplete: 1/3 observed; one-or-more-daily-pnl-components-unavailable)');
+    expect(formatWeeklyPromotionReview(review)).toContain('PnL unavailable (1/3 observed; one-or-more-daily-pnl-components-unavailable)');
   });
 
   test('never calculates an aggregate rejection rate when any daily rate is unavailable', () => {

@@ -37,8 +37,10 @@ function buildWeeklyPerformanceSummary(dailyReports) {
   const unavailablePnl = pnlEvidence.filter(value => value.evidence !== 'observed');
   const pnl = sumObserved(dailyReports, report => performanceEvidence(report, 'pnl'), { realizedGross: 0, fees: 0, netRealizedAfterFees: 0 }, (total, value) => ({ realizedGross: total.realizedGross + value.realizedGross, fees: total.fees + value.fees, netRealizedAfterFees: total.netRealizedAfterFees + value.netRealizedAfterFees }));
   pnl.availability = {
-    evidence: unavailablePnl.length === 0 ? 'observed' : 'unavailable',
-    ...(unavailablePnl.length > 0 ? { reason: 'one-or-more-daily-pnl-components-unavailable' } : {}),
+    evidence: dailyReports.length > 0 && unavailablePnl.length === 0 ? 'observed' : 'unavailable',
+    ...(dailyReports.length === 0
+      ? { reason: 'no-daily-pnl-evidence' }
+      : unavailablePnl.length > 0 ? { reason: 'one-or-more-daily-pnl-components-unavailable' } : {}),
     coverage: {
       reviewedDays: dailyReports.length,
       observedDays: pnlEvidence.length - unavailablePnl.length,
@@ -84,6 +86,6 @@ export function formatWeeklyPromotionReview(review) {
   const pnlAvailability = p.observed.pnl.availability;
   const pnlText = pnlAvailability.evidence === 'observed'
     ? `PnL net ${p.observed.pnl.netRealizedAfterFees}`
-    : `PnL net ${p.observed.pnl.netRealizedAfterFees} (incomplete: ${pnlAvailability.coverage.observedDays}/${pnlAvailability.coverage.reviewedDays} observed; ${pnlAvailability.reason})`;
+    : `PnL unavailable (${pnlAvailability.coverage.observedDays}/${pnlAvailability.coverage.reviewedDays} observed; ${pnlAvailability.reason})`;
   return `Weekly promotion review: ${review.decision}\nDaily reports: ${review.dailyReportsReviewed}\nCandidate: ${review.selectedCandidateId || 'none'}\nBlockers: ${review.blockers.join('|') || 'none'}\nObserved performance: same-day opposing-fill proxy (not realized spread) ${p.observed.sameDayOpposingFillProxy.pnl} on ${p.observed.sameDayOpposingFillProxy.matchedQty}; rejects ${p.observed.rejects.rejects}/${p.observed.rejects.attempts}${p.observed.rejects.rateAvailable ? '' : ' (rate unavailable)'}; ${pnlText}\nUnavailable performance evidence: realized spread ${p.unavailable.realizedSpread.days} day(s); same-day opposing-fill proxy ${p.unavailable.sameDayOpposingFillProxy.days} day(s); uptime ${p.unavailable.uptime.days} day(s); rejects ${p.unavailable.rejects.days} day(s); inventory ${p.unavailable.inventory.days} day(s)\nCounterfactual: unavailable (${p.counterfactual.reason})\nProduction change: NOT AUTHORIZED. Required before canary: ${review.requiredBeforeCanary.join('; ')}`;
 }
