@@ -280,6 +280,151 @@ describe('strict TrueX EBBO maker safety', () => {
     expect(Number(fixConnection.sendMessage.mock.calls[0][0]['44'])).toBe(100.5);
   });
 
+  test('a narrow off-tick contract cap suppresses a locked desired pair before any dispatch', () => {
+    const { engine, fixConnection } = makeEngine({
+      contractMaxQuoteSpreadBps: 0.5,
+      levels: 1,
+      baseSpreadBps: 0.5,
+      baseSizeBTC: 0.01,
+      minNotional: 1,
+    });
+
+    const desired = engine.computeDesiredQuotes(100, { bidSkewTicks: 0, askSkewTicks: 0 });
+    expect(desired).toEqual([]);
+    expect(engine.getQuoteStatus().suppressed.filter((entry) =>
+      entry.reason === 'contract-spread-cap-no-noncrossed-tick-pair',
+    )).toHaveLength(2);
+
+    engine.executeActions({ toPlace: desired, toCancel: [], toReplace: [] });
+    expect(fixConnection.sendMessage).not.toHaveBeenCalled();
+  });
+
+  test('strict post-only slide fails closed when contract pair context is unavailable or would exceed its cap', () => {
+    const { engine, fixConnection } = makeEngine({
+      marketablePostOnlyAction: 'slide',
+      contractMaxQuoteSpreadBps: 100,
+    });
+    engine.updateTruexEbbo(freshEbbo(99, 100));
+
+    const base = { ...quote('buy', 100), contractReferenceMid: 100 };
+    expect(engine._sendNewOrder(base)).toBeNull();
+    expect(engine.getQuoteStatus().suppressed.at(-1).reason).toBe('contract-spread-pair-context-missing');
+    expect(fixConnection.sendMessage).not.toHaveBeenCalled();
+
+    expect(engine._sendNewOrder({ ...base, contractOppositePrice: 101.5, level: 2 })).toBeNull();
+    expect(engine.getQuoteStatus().suppressed.at(-1).reason).toBe('contract-spread-slide-violates-cap');
+    expect(fixConnection.sendMessage).not.toHaveBeenCalled();
+  });
+
+  test('finite-cap generated quotes retain pair context for post-only validation', () => {
+    const { engine } = makeEngine({
+      contractMaxQuoteSpreadBps: 100,
+      levels: 1,
+      baseSpreadBps: 100,
+      baseSizeBTC: 0.02,
+      minNotional: 1,
+    });
+    const desired = engine.computeDesiredQuotes(100, { bidSkewTicks: 0, askSkewTicks: 0 });
+    const bid = desired.find((candidate) => candidate.side === 'buy');
+    const ask = desired.find((candidate) => candidate.side === 'sell');
+    expect(bid).toMatchObject({ contractReferenceMid: 100, contractOppositePrice: ask.price });
+    expect(ask).toMatchObject({ contractReferenceMid: 100, contractOppositePrice: bid.price });
+  });
+
+  test('a partial/replenishment candidate cannot send against a farther actual opposite order', () => {
+    const { engine, fixConnection } = makeEngine({ contractMaxQuoteSpreadBps: 100 });
+    engine.updateTruexEbbo(freshEbbo(99, 105));
+    // The planned replacement pair is within 100 bps, but an earlier
+    // partially-filled ask is still actually displayed at a farther price.
+    // FIX side/status/price forms are deliberate: the contract boundary must
+    // normalize venue-shaped order state, not only local happy-path values.
+    engine.activeOrders.set('prior-ask', {
+      side: '2', status: 'partial_fill', price: '101.50', size: 0.004, level: 1,
+      acknowledgedLive: true,
+    });
+
+    expect(engine._sendNewOrder({
+      ...quote('buy', 100), replacesQuoteId: 'prior-bid',
+      contractReferenceMid: 100, contractOppositePrice: 100.5,
+    })).toBeNull();
+    expect(fixConnection.sendMessage).not.toHaveBeenCalled();
+    expect(engine.getQuoteStatus().suppressed.at(-1).reason).toBe('contract-spread-actual-pair-violates-cap');
+  });
+
+  test('an actual-pair cap failure retains the old side during a partial-fill replenishment replacement', () => {
+    const { engine, fixConnection } = makeEngine({ contractMaxQuoteSpreadBps: 100 });
+    engine.updateTruexEbbo(freshEbbo(99, 105));
+    const oldBid = { ...quote('buy', 99), status: 'active', acknowledgedLive: true };
+    engine.activeOrders.set('partial-bid', oldBid);
+    engine.activeOrders.set('farther-ask', {
+      side: 'sell', status: 'active', price: 101.5, size: 0.004, level: 1, acknowledgedLive: true,
+    });
+
+    expect(engine._dispatchAction({
+      type: 'replacement-cancel', clOrdID: 'partial-bid', order: oldBid,
+      quote: { ...quote('buy', 100), contractReferenceMid: 100, contractOppositePrice: 100.5 },
+    })).toBe(false);
+    expect(engine.activeOrders.get('partial-bid')).toMatchObject({ status: 'active', acknowledgedLive: true });
+    expect(fixConnection.sendMessage).not.toHaveBeenCalled();
+  });
+
+  test('a compliant acknowledged or pending actual opposite pair remains sendable under the cap', () => {
+    const { engine, fixConnection } = makeEngine({ contractMaxQuoteSpreadBps: 100 });
+    engine.updateTruexEbbo(freshEbbo(99, 105));
+    engine.activeOrders.set('pending-ask', {
+      side: '2', status: 'A', price: '100.50', size: 0.01, level: 1,
+    });
+
+    expect(engine._sendNewOrder({
+      ...quote('buy', 100), contractReferenceMid: 100, contractOppositePrice: 101.5,
+    })).not.toBeNull();
+    expect(fixConnection.sendMessage.mock.calls.filter(([fields]) => fields['35'] === 'D')).toHaveLength(1);
+  });
+
+  test('a synchronized desired pair permits ordinary first-side sequencing before an actual opposite exists', () => {
+    const { engine, fixConnection } = makeEngine({
+      contractMaxQuoteSpreadBps: 100,
+      levels: 1,
+      baseSpreadBps: 100,
+      baseSizeBTC: 0.02,
+      minNotional: 1,
+    });
+    engine.updateTruexEbbo(freshEbbo(99, 101));
+    const desired = engine.computeDesiredQuotes(100, { bidSkewTicks: 0, askSkewTicks: 0 });
+    const bid = desired.find((candidate) => candidate.side === 'buy');
+    const ask = desired.find((candidate) => candidate.side === 'sell');
+
+    expect(engine._sendNewOrder(bid)).not.toBeNull();
+    expect(engine._sendNewOrder(ask)).not.toBeNull();
+    expect(fixConnection.sendMessage.mock.calls.filter(([fields]) => fields['35'] === 'D')).toHaveLength(2);
+  });
+
+  test('the final send boundary rechecks an actual opposite created during capital reservation', () => {
+    let engine;
+    const abort = mock(() => true);
+    const capitalReservationManager = {
+      reserve: mock(() => {
+        engine.activeOrders.set('late-actual-ask', {
+          side: 'sell', status: 'active', price: 101.5, size: 0.01, level: 1, acknowledgedLive: true,
+        });
+        return { accepted: true };
+      }),
+      newDispatchAborted: abort,
+      getPresence: () => ({ buy: 0, sell: 0 }),
+      getReservations: () => [],
+    };
+    const built = makeEngine({ contractMaxQuoteSpreadBps: 100, capitalReservationManager });
+    engine = built.engine;
+    engine.updateTruexEbbo(freshEbbo(99, 105));
+
+    expect(engine._sendNewOrder({
+      ...quote('buy', 100), contractReferenceMid: 100, contractOppositePrice: 100.5,
+    })).toBeNull();
+    expect(abort).toHaveBeenCalledTimes(1);
+    expect(built.fixConnection.sendMessage).not.toHaveBeenCalled();
+    expect(engine.activeOrders.has('late-actual-ask')).toBe(true);
+  });
+
   test('queued and pending-replacement placements recheck current EBBO at final send', () => {
     const { engine, fixConnection } = makeEngine({ maxOrdersPerSecond: 1 });
     engine.updateTruexEbbo(freshEbbo(99, 105));
