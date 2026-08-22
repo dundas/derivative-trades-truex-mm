@@ -1882,6 +1882,37 @@ describe('MarketMakerOrchestrator strict startup reconciliation', () => {
     expect(orchestrator._capitalResyncInFlight).toBeNull();
   });
 
+  test('non-strict contract-order timer storm during slow REST adds no pending pass and no D', async () => {
+    let releaseRefresh;
+    const fixConnection = { sendMessage: mock(() => true) };
+    const orchestrator = makeStartupOrchestrator();
+    orchestrator._capitalResyncInFlight = null;
+    orchestrator._capitalResyncPending = false;
+    orchestrator._capitalResyncStrictPending = false;
+    orchestrator._capitalResyncStrictDrainSuppressed = false;
+    orchestrator.quoteEngine.fixConnection = fixConnection;
+    orchestrator._refreshBalances = mock(() => new Promise((resolve) => { releaseRefresh = resolve; }));
+
+    const first = orchestrator._onCapitalResyncRequired({
+      side: 'multiple', reason: 'contract-order-state-refresh', strict: false,
+    });
+    for (let turn = 0; turn < 5 && !releaseRefresh; turn += 1) await Promise.resolve();
+    for (let index = 0; index < 20; index += 1) {
+      void orchestrator._onCapitalResyncRequired({
+        side: 'multiple', reason: 'contract-order-state-refresh', strict: false,
+      });
+    }
+    expect(orchestrator._refreshBalances).toHaveBeenCalledTimes(1);
+    expect(orchestrator._capitalResyncPending).toBe(false);
+    expect(orchestrator._capitalResyncStrictPending).toBe(false);
+    expect(fixConnection.sendMessage).not.toHaveBeenCalled();
+
+    releaseRefresh();
+    await first;
+    expect(orchestrator._refreshBalances).toHaveBeenCalledTimes(1);
+    expect(fixConnection.sendMessage).not.toHaveBeenCalled();
+  });
+
   test('failed runtime ghost resync leaves the affected side blocked and failed', async () => {
     const capital = new CapitalReservationManager();
     capital.reconcile({

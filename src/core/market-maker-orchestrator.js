@@ -1296,6 +1296,11 @@ export class MarketMakerOrchestrator extends EventEmitter {
   _onCapitalResyncRequired({ side, reason, strict = false }) {
     if (this._capitalResyncInFlight) {
       const contractSnapshotRequest = String(reason || '').startsWith('contract-order-state-');
+      // A periodic snapshot tick must never add another pass to an already
+      // active reconciliation, irrespective of whether that pass is strict.
+      if (contractSnapshotRequest && !strict) {
+        return this._capitalResyncResult(this._capitalResyncInFlight, { side, reason, strict });
+      }
       // Price ticks and the snapshot timer can both observe the same stale
       // authority while a strict REST recovery is unresolved.  A timer tick
       // adds no value here; a strict price-trigger may request exactly one
