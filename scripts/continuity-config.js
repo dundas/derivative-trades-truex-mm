@@ -73,6 +73,7 @@ export function buildContinuityConfig(env, {
   contractMaxQuoteSpreadBps,
   contractRequiredLevelsPerSide,
   contractOrderStateMaxAgeMs,
+  allowSingleLevel = false,
 } = {}) {
   const config = {};
   for (const [field, envName] of Object.entries(ENV_FIELDS)) {
@@ -98,7 +99,14 @@ export function buildContinuityConfig(env, {
   if (validated.degradedMaxLevels < validated.minActiveLevelsPerSide) {
     throw new Error('MM_DEGRADED_MAX_LEVELS cannot be below MM_MIN_ACTIVE_LEVELS_PER_SIDE');
   }
-  if (!Number.isInteger(levels) || levels < 2 || validated.degradedMaxLevels >= levels) {
+  if (!Number.isInteger(levels) || levels < 1) {
+    throw new Error('MM_NORMAL_QUOTE_LEVELS must be a positive integer');
+  }
+  if (levels === 1 && allowSingleLevel === true) {
+    if (validated.degradedMaxLevels !== 1) {
+      throw new Error('MM_DEGRADED_MAX_LEVELS must equal one for the single-level canary');
+    }
+  } else if (levels < 2 || validated.degradedMaxLevels >= levels) {
     throw new Error('MM_DEGRADED_MAX_LEVELS must be below normal quote levels');
   }
   if (!Number.isInteger(contractRequiredLevelsPerSide) || contractRequiredLevelsPerSide < 1 ||

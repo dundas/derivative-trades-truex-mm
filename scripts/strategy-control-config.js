@@ -1,6 +1,7 @@
 import { validateInventoryRebalanceConfig } from '../src/analytics/inventory-rebalance-model.js';
 import { validateMakerPresenceRecoveryConfig } from '../src/core/maker-presence-recovery.js';
 import { validateInventoryRecoveryQuoteConfig } from '../src/core/inventory-recovery-quote-policy.js';
+import { validateMinimalLiveCanaryConfig } from '../src/core/minimal-live-canary.js';
 import { buildQuoteDispatchMode } from './quote-dispatch-mode-config.js';
 
 function booleanValue(env, name, fallback) {
@@ -78,5 +79,46 @@ export function buildInventoryRecoveryConfig(env = {}, options = {}) {
     minimumMakerParticipation: required('MM_INVENTORY_RECOVERY_MAKER_FLOOR'),
     maxSizeAsymmetry: required('MM_INVENTORY_RECOVERY_MAX_SIZE_ASYMMETRY'),
     maxQuoteSkewBps: required('MM_INVENTORY_RECOVERY_MAX_QUOTE_SKEW_BPS'),
+  });
+}
+
+export function buildMinimalLiveCanaryConfig(env = {}, {
+  quoteDispatchMode, makerQuotePolicyConfig, referenceMarkoutConfig,
+} = {}) {
+  const enabled = booleanValue(env, 'MM_MINIMAL_LIVE_CANARY_ENABLED', false);
+  if (!enabled) return validateMinimalLiveCanaryConfig({ enabled: false });
+  if (quoteDispatchMode !== 'live') {
+    throw new Error('MM_MINIMAL_LIVE_CANARY_ENABLED requires MM_QUOTE_DISPATCH_MODE=live');
+  }
+  if (!referenceMarkoutConfig?.horizonsMs?.includes(60_000)) {
+    throw new Error('MM_MINIMAL_LIVE_CANARY_ENABLED requires enabled 60000ms reference markout evidence');
+  }
+  const oneMinuteMarkoutDeadlineMs = 60_000 +
+    Number(referenceMarkoutConfig.maxLatenessMs) +
+    Number(referenceMarkoutConfig.pollIntervalMs) +
+    Number(referenceMarkoutConfig.claimLeaseMs);
+  const required = (name) => {
+    const raw = env?.[name];
+    if (raw === undefined || raw === null || String(raw).trim() === '') {
+      throw new Error(`${name} is required when MM_MINIMAL_LIVE_CANARY_ENABLED=true`);
+    }
+    return numberValue(env, name);
+  };
+  return validateMinimalLiveCanaryConfig({
+    enabled: true,
+    runId: (() => {
+      const value = env?.MM_MINIMAL_LIVE_CANARY_RUN_ID;
+      if (typeof value !== 'string' || value.trim() === '') {
+        throw new Error('MM_MINIMAL_LIVE_CANARY_RUN_ID is required when MM_MINIMAL_LIVE_CANARY_ENABLED=true');
+      }
+      return value.trim();
+    })(),
+    durationMs: required('MM_MINIMAL_LIVE_CANARY_DURATION_MS'),
+    maxCumulativeFilledBTC: required('MM_MINIMAL_LIVE_CANARY_MAX_CUMULATIVE_FILLED_BTC'),
+    oneMinuteMarkoutDeadlineMs,
+    levels: makerQuotePolicyConfig?.normalQuoteLevels,
+    baseSizeBTC: makerQuotePolicyConfig?.baseQuoteSizeBTC,
+    minimumQuoteWidthBps: makerQuotePolicyConfig?.minimumQuoteWidthBps,
+    contractMaxQuoteSpreadBps: makerQuotePolicyConfig?.contractMaxQuoteSpreadBps,
   });
 }

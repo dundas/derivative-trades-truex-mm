@@ -77,6 +77,126 @@ function makePrice(mid, confidence = 1.0) {
 
 describe('QuoteEngine', () => {
 
+  describe('minimal live canary', () => {
+    const canaryConfig = {
+      enabled: true, runId: 'canary-run-0001', durationMs: 900_000, maxCumulativeFilledBTC: 0.001,
+      oneMinuteMarkoutDeadlineMs: 96_000,
+      levels: 1, baseSizeBTC: 0.0005, minimumQuoteWidthBps: 30, contractMaxQuoteSpreadBps: 80,
+    };
+
+    it('is default-disabled and fails closed after EBBO loss without a new FIX D', () => {
+      const fixConnection = createMockFix();
+      const engine = createEngine({
+        fixConnection, levels: 1, baseSizeBTC: 0.0005, strictTruexMakerSafety: true,
+        quoteDispatchMode: 'live', minimumQuoteWidthBps: 30, contractMaxQuoteSpreadBps: 80,
+        contractOrderStateMaxAgeMs: 5000, minimalLiveCanaryConfig: canaryConfig,
+      });
+      engine._recordSuppression({ side: 'buy', level: 1, price: 100 }, 'truex-ebbo-stale');
+      expect(engine.getQuoteStatus().minimalLiveCanary.stopReason).toBe('truex-ebbo-stale');
+      expect(engine._sendNewOrder({ side: 'buy', level: 1, price: 100, size: 0.0005, postOnly: true })).toBeNull();
+      expect(fixConnection.sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('stops and safely cancels on a venue rejection of a canary order', () => {
+      const fixConnection = createMockFix();
+      const engine = createEngine({
+        fixConnection, levels: 1, baseSizeBTC: 0.0005, strictTruexMakerSafety: true,
+        quoteDispatchMode: 'live', minimumQuoteWidthBps: 30, contractMaxQuoteSpreadBps: 80,
+        contractOrderStateMaxAgeMs: 5000, minimalLiveCanaryConfig: canaryConfig,
+      });
+      engine.activeOrders.set('QCANARY', { side: 'buy', level: 1, price: 100, size: 0.0005, status: 'pending', minimalLiveCanary: true });
+      engine.onExecutionReport({ '11': 'QCANARY', '39': '8', '54': '1', '58': 'venue-reject' });
+      expect(engine.getQuoteStatus().minimalLiveCanary.stopReason).toBe('venue-reject');
+      expect(engine.activeOrders.size).toBe(0);
+    });
+
+    it('stops and safely cancels on the first attributed adverse one-minute markout', () => {
+      const fixConnection = createMockFix();
+      const engine = createEngine({
+        fixConnection, levels: 1, baseSizeBTC: 0.0005, strictTruexMakerSafety: true,
+        quoteDispatchMode: 'live', minimumQuoteWidthBps: 30, contractMaxQuoteSpreadBps: 80,
+        contractOrderStateMaxAgeMs: 5000, minimalLiveCanaryConfig: canaryConfig,
+      });
+      engine.activeOrders.set('QCANARY', { side: 'sell', level: 1, price: 101, size: 0.0005, status: 'active', minimalLiveCanary: true });
+      engine.minimalLiveCanaryFillIds.add('QCANARY-E1');
+      engine.minimalLiveCanary.recordFill(0.0005, 'QCANARY-E1');
+      expect(engine.recordMinimalLiveCanaryMarkout({
+        fillId: 'QCANARY-E1', available: true, attributed: true, observedEdgeBps: -1,
+      })).toBe(false);
+      expect(engine.getQuoteStatus().minimalLiveCanary.stopReason).toBe('adverse-one-minute-markout');
+      expect(fixConnection.sendMessage).toHaveBeenCalledWith(expect.objectContaining({ '35': 'F', '41': 'QCANARY' }));
+    });
+
+    it('stops and cancels when a canary fill lacks verified LastPx evidence', () => {
+      const fixConnection = createMockFix();
+      const engine = createEngine({
+        fixConnection, levels: 1, baseSizeBTC: 0.0005, strictTruexMakerSafety: true,
+        quoteDispatchMode: 'live', minimumQuoteWidthBps: 30, contractMaxQuoteSpreadBps: 80,
+        contractOrderStateMaxAgeMs: 5000, minimalLiveCanaryConfig: canaryConfig,
+      });
+      engine.activeOrders.set('QCANARY', {
+        side: 'sell', level: 1, price: 101, size: 0.0005, status: 'active',
+        minimalLiveCanary: true, sentToVenue: true,
+      });
+
+      engine.onExecutionReport({
+        '11': 'QCANARY', '17': 'E1', '39': '2', '54': '2', '32': '0.0005', '151': '0',
+      });
+
+      expect(engine.getQuoteStatus().minimalLiveCanary.stopReason).toBe('invalid-fill-evidence');
+      expect(engine.minimalLiveCanaryFillIds.size).toBe(0);
+      expect(fixConnection.sendMessage).toHaveBeenCalledWith(expect.objectContaining({ '35': 'F', '41': 'QCANARY' }));
+    });
+
+    it('rejects mismatched engine settings and direct non-passive canary sends', () => {
+      expect(() => createEngine({
+        levels: 2, baseSizeBTC: 0.0005, strictTruexMakerSafety: true, quoteDispatchMode: 'live',
+        minimumQuoteWidthBps: 30, contractMaxQuoteSpreadBps: 80, contractOrderStateMaxAgeMs: 5000,
+        minimalLiveCanaryConfig: canaryConfig,
+      })).toThrow('passive canary engine envelope');
+      expect(() => createEngine({
+        levels: 1, baseSizeBTC: 0.0005, strictTruexMakerSafety: true, quoteDispatchMode: 'live',
+        allowTakerOrders: true, minimumQuoteWidthBps: 30, contractMaxQuoteSpreadBps: 80,
+        contractOrderStateMaxAgeMs: 5000, minimalLiveCanaryConfig: canaryConfig,
+      })).toThrow('passive canary engine envelope');
+      const fixConnection = createMockFix();
+      const engine = createEngine({
+        fixConnection, levels: 1, baseSizeBTC: 0.0005, strictTruexMakerSafety: true,
+        quoteDispatchMode: 'live', minimumQuoteWidthBps: 30, contractMaxQuoteSpreadBps: 80,
+        contractOrderStateMaxAgeMs: 5000, minimalLiveCanaryConfig: canaryConfig,
+      });
+      engine.armMinimalLiveCanary();
+      engine._prepareQuoteForSend = mock(quote => quote);
+      expect(engine._sendNewOrder({ side: 'buy', level: 1, price: 100, size: 0.0005, postOnly: false })).toBeNull();
+      expect(engine.getQuoteStatus().minimalLiveCanary.stopReason).toBe('invalid-order-envelope');
+      expect(fixConnection.sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('does not cancel a local pending order that failed before its FIX D was sent', () => {
+      const fixConnection = createMockFix();
+      const engine = createEngine({
+        fixConnection, levels: 1, baseSizeBTC: 0.0005, strictTruexMakerSafety: true,
+        quoteDispatchMode: 'live', minimumQuoteWidthBps: 30, contractMaxQuoteSpreadBps: 80,
+        contractOrderStateMaxAgeMs: 5000, minimalLiveCanaryConfig: canaryConfig,
+      });
+      engine.activeOrders.set('QUNSENT', {
+        side: 'buy', level: 1, price: 100, size: 0.0005, status: 'pending',
+        minimalLiveCanary: true, sentToVenue: false,
+      });
+      engine.stopMinimalLiveCanary('truex-ebbo-stale');
+      expect(fixConnection.sendMessage).not.toHaveBeenCalled();
+      expect(engine.activeOrders.size).toBe(0);
+    });
+
+    it('allows non-executable shadow observation alongside the passive canary', () => {
+      expect(() => createEngine({
+        levels: 1, baseSizeBTC: 0.0005, strictTruexMakerSafety: true, quoteDispatchMode: 'live',
+        shadowTakeMode: true, minimumQuoteWidthBps: 30, contractMaxQuoteSpreadBps: 80,
+        contractOrderStateMaxAgeMs: 5000, minimalLiveCanaryConfig: canaryConfig,
+      })).not.toThrow();
+    });
+  });
+
   describe('snapToTick', () => {
     it('should snap $99999.73 to nearest $0.50', () => {
       const engine = createEngine();
@@ -2459,6 +2579,23 @@ describe('QuoteEngine', () => {
       expect(events.length).toBe(1);
       expect(events[0].reason).toBe('test reason');
       expect(events[0].orderCount).toBe(1);
+    });
+
+    it('retains a venue-sent canary order through a protective cancel for late-fill attribution', () => {
+      const mockFix = createMockFix();
+      const engine = createEngine({ fixConnection: mockFix, levels: 1, baseSizeBTC: 0.0005,
+        strictTruexMakerSafety: true, quoteDispatchMode: 'live', minimumQuoteWidthBps: 30,
+        contractMaxQuoteSpreadBps: 80, contractOrderStateMaxAgeMs: 5000,
+        minimalLiveCanaryConfig: { enabled: true, runId: 'cancel-race-0001', durationMs: 900000,
+          maxCumulativeFilledBTC: 0.001, oneMinuteMarkoutDeadlineMs: 91000, levels: 1,
+          baseSizeBTC: 0.0005, minimumQuoteWidthBps: 30, contractMaxQuoteSpreadBps: 80 } });
+      engine.armMinimalLiveCanary();
+      engine.activeOrders.set('QCANARY', { side: 'buy', price: 100, size: 0.0005, level: 1,
+        status: 'active', minimalLiveCanary: true, sentToVenue: true });
+
+      engine.cancelAllQuotes('minimal-live-canary:test');
+
+      expect(engine.activeOrders.get('QCANARY')).toMatchObject({ status: 'cancelling', minimalLiveCanary: true });
     });
 
     it('should set isQuoting to false', () => {

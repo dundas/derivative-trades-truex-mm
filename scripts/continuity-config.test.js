@@ -87,6 +87,12 @@ describe('production continuity config', () => {
     expect(() => buildContinuityConfig({ ...VALID, MM_DEFENSIVE_SPREAD_FLOOR_BPS: '0' }, buildMakerQuotePolicyConfig(VALID))).toThrow();
     expect(() => buildContinuityConfig({ ...VALID, MM_BASE_QUOTE_SIZE_BTC: '0.0001' }, buildMakerQuotePolicyConfig({ ...VALID, MM_BASE_QUOTE_SIZE_BTC: '0.0001' }))).toThrow('scaled L1');
     expect(() => buildContinuityConfig({ ...VALID, MM_NORMAL_QUOTE_LEVELS: '1' }, buildMakerQuotePolicyConfig({ ...VALID, MM_NORMAL_QUOTE_LEVELS: '1' }))).toThrow('below normal');
+    const oneLevelPolicy = buildMakerQuotePolicyConfig({
+      ...VALID, MM_NORMAL_QUOTE_LEVELS: '1', MM_CONTRACT_REQUIRED_LEVELS_PER_SIDE: '1',
+    });
+    expect(buildContinuityConfig({ ...VALID, MM_NORMAL_QUOTE_LEVELS: '1', MM_DEGRADED_MAX_LEVELS: '1' }, {
+      ...oneLevelPolicy, allowSingleLevel: true,
+    })).toMatchObject({ degradedMaxLevels: 1 });
     expect(() => buildContinuityConfig({ ...VALID, MM_DEFENSIVE_SPREAD_FLOOR_BPS: '101' }, buildMakerQuotePolicyConfig(VALID))).toThrow('cannot exceed MM_CONTRACT_MAX_QUOTE_SPREAD_BPS');
     expect(() => buildMakerQuotePolicyConfig({ ...VALID, MM_CONTRACT_ORDER_STATE_MAX_AGE_MS: '0' })).toThrow('must be positive');
     expect(() => buildContinuityConfig(VALID, buildMakerQuotePolicyConfig({ ...VALID, MM_MIN_LIVE_QUOTE_WIDTH_BPS: '101' })))

@@ -22,6 +22,8 @@
     { "path": ".env.example", "extractor": "config", "provides": "Required and optional deployment environment variables without live credentials" },
     { "path": "scripts/run-prod.js", "extractor": "generic", "provides": "Production run script — configuration, startup sequence, shutdown" },
     { "path": "scripts/continuity-config.js", "extractor": "config", "provides": "Strict maker continuity obligations and cross-field validation" },
+    { "path": "scripts/strategy-control-config.js", "extractor": "config", "provides": "Validated, default-off strategy controls including the minimal live canary" },
+    { "path": "src/core/minimal-live-canary.js", "extractor": "typescript-api", "provides": "Bounded live-maker canary guard, stop conditions, and one-minute mark-out gate" },
     { "path": "scripts/reference-markout-rollout-config.js", "extractor": "config", "provides": "Default-off production rollout switch and validated reference mark-out configuration" },
     { "path": "scripts/report-reference-markout-coverage.js", "extractor": "cli-commands", "provides": "Bounded reference mark-out coverage audit CLI" },
     { "path": "scripts/smoke-reference-markouts.js", "extractor": "cli-commands", "provides": "Deterministic restart/no-order reference mark-out smoke" },

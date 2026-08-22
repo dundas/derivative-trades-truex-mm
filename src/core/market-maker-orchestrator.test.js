@@ -859,6 +859,126 @@ describe('getHealthStatus', () => {
   });
 });
 
+describe('minimal live canary EBBO authority', () => {
+  it('records a canary fill with its dedicated policy ID', () => {
+    const pipeline = { addFill: jest.fn() };
+    const orch = makeOrch({ dataPipeline: pipeline });
+    orch.inventoryManager.onFill = jest.fn();
+    orch.pnlTracker.onFill = jest.fn();
+    orch.quoteTelemetry.policyId = 'default';
+    orch._onQuoteFill({
+      side: 'buy', price: 100, size: 0.0005, clOrdID: 'QCANARY', execID: 'E1',
+      minimalLiveCanary: true,
+    });
+    expect(pipeline.addFill).toHaveBeenCalledWith(expect.objectContaining({
+      fillId: 'QCANARY-E1', policyId: 'minimal-live-canary-v1',
+    }));
+  });
+
+  it('suppresses external hedging while the minimal live canary is enabled', () => {
+    const orch = makeOrch();
+    orch.isRunning = true;
+    orch.quoteEngine.config = { minimalLiveCanaryConfig: { enabled: true } };
+    orch.hedgeExecutor.executeHedge = jest.fn();
+    orch._onHedgeSignal({ shouldHedge: true, side: 'sell', size: 0.001 });
+    expect(orch.hedgeExecutor.executeHedge).not.toHaveBeenCalled();
+  });
+
+  it('requires an initialized PostgreSQL markout writer before a live canary starts', () => {
+    const orch = makeOrch();
+    orch.quoteEngine.config = { minimalLiveCanaryConfig: { enabled: true } };
+    orch.dataPipeline = { pgManager: null };
+    orch.referenceMarkoutCollector = { writer: null };
+
+    expect(() => orch._requireMinimalLiveCanaryMarkoutWriter()).toThrow(
+      'minimal live canary requires an initialized PostgreSQL reference markout writer',
+    );
+
+    orch.dataPipeline.pgManager = {};
+    orch.referenceMarkoutCollector.writer = {};
+    expect(() => orch._requireMinimalLiveCanaryMarkoutWriter()).not.toThrow();
+  });
+
+  it('refuses canary startup while a prior one-minute markout is unresolved', async () => {
+    const orch = makeOrch();
+    orch.quoteEngine.config = { minimalLiveCanaryConfig: { enabled: true } };
+    orch.referenceMarkoutCollector = {
+      writer: { hasUnresolvedReferenceMarkouts: jest.fn().mockResolvedValue(true) },
+    };
+
+    await expect(orch._requireNoUnresolvedMinimalLiveCanaryMarkouts()).rejects.toThrow(
+      'minimal live canary has unresolved one-minute markout evidence',
+    );
+    expect(orch.referenceMarkoutCollector.writer.hasUnresolvedReferenceMarkouts).toHaveBeenCalledWith({
+      policyId: 'minimal-live-canary-v1', horizonMs: 60_000,
+    });
+  });
+
+  it('claims the operator-approved canary run ID before live startup', async () => {
+    const orch = makeOrch();
+    orch.sessionId = 'test-session';
+    orch.quoteEngine.config = { minimalLiveCanaryConfig: { enabled: true, runId: 'canary-run-0001' } };
+    orch.quoteEngine.armMinimalLiveCanary = jest.fn(() => true);
+    orch.referenceMarkoutCollector = { writer: { claimMinimalLiveCanaryRun: jest.fn().mockResolvedValue(true) } };
+    await expect(orch._claimMinimalLiveCanaryRun()).resolves.toBeUndefined();
+    expect(orch.referenceMarkoutCollector.writer.claimMinimalLiveCanaryRun).toHaveBeenCalledWith(expect.objectContaining({
+      runId: 'canary-run-0001', sessionId: 'test-session',
+    }));
+    expect(orch.quoteEngine.armMinimalLiveCanary).toHaveBeenCalledTimes(1);
+  });
+
+  it('labels durable canary quote and fill evidence separately from observer telemetry', async () => {
+    const orch = makeOrch();
+    orch.quoteTelemetry.record = jest.fn().mockResolvedValue(undefined);
+    orch.quoteTelemetry.policyId = 'default';
+    orch.referenceMarkoutCollector = { scheduleFill: jest.fn(), scheduleFillDurably: jest.fn().mockResolvedValue(1), recordQuoteDecision: jest.fn() };
+
+    await orch._onQuoteLifecycle({
+      eventType: 'full_fill', quoteId: 'QCANARY', executionId: 'E1', side: 'buy',
+      price: 100, size: 0.0005, level: 1, minimalLiveCanary: true,
+    });
+
+    expect(orch.referenceMarkoutCollector.scheduleFillDurably).toHaveBeenCalledWith(expect.objectContaining({
+      fillId: 'QCANARY-E1', policyId: 'minimal-live-canary-v1',
+    }));
+
+    await orch._onQuoteLifecycle({
+      eventType: 'create', quoteId: 'QCANARY2', side: 'buy', price: 100, size: 0.0005,
+      level: 1, minimalLiveCanary: true,
+    });
+    expect(orch.referenceMarkoutCollector.scheduleFillDurably).toHaveBeenCalledTimes(1);
+    expect(orch.referenceMarkoutCollector.recordQuoteDecision).toHaveBeenCalledWith(expect.objectContaining({
+      policyId: 'minimal-live-canary-v1', minimalLiveCanary: true,
+    }));
+  });
+
+  it('forwards only the required one-minute markout horizon', () => {
+    const orch = makeOrch();
+    orch.quoteEngine.recordMinimalLiveCanaryMarkout = jest.fn();
+    expect(orch._onMinimalLiveCanaryMarkout({
+      work: { fillId: 'F1', horizonMs: 30_000 }, available: true, attributed: true, observedEdgeBps: 10,
+    })).toBe(false);
+    expect(orch.quoteEngine.recordMinimalLiveCanaryMarkout).not.toHaveBeenCalled();
+    orch._onMinimalLiveCanaryMarkout({
+      work: { fillId: 'F1', horizonMs: 60_000 }, available: true, attributed: true, observedEdgeBps: 10,
+    });
+    expect(orch.quoteEngine.recordMinimalLiveCanaryMarkout).toHaveBeenCalledWith({
+      fillId: 'F1', available: true, attributed: true, observedEdgeBps: 10,
+    });
+  });
+
+  it('stops the canary when its TrueX EBBO poll fails', async () => {
+    const orch = makeOrch();
+    orch.isRunning = true;
+    orch.restClient = { getInstrument: jest.fn().mockRejectedValue(new Error('unavailable')) };
+    orch.quoteEngine.config = { minimalLiveCanaryConfig: { enabled: true } };
+    orch.quoteEngine.stopMinimalLiveCanary = jest.fn();
+    orch._scheduleNextTruexEbboPoll = jest.fn();
+    await orch._pollTruexEbbo();
+    expect(orch.quoteEngine.stopMinimalLiveCanary).toHaveBeenCalledWith('truex-ebbo-poll-failure');
+  });
+});
+
 // -----------------------------------------------------------------------
 // Task 4.3 — AlertManager wired into Orchestrator
 // -----------------------------------------------------------------------
