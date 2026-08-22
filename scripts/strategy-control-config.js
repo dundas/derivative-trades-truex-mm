@@ -1,5 +1,7 @@
 import { validateInventoryRebalanceConfig } from '../src/analytics/inventory-rebalance-model.js';
 import { validateMakerPresenceRecoveryConfig } from '../src/core/maker-presence-recovery.js';
+import { validateInventoryRecoveryQuoteConfig } from '../src/core/inventory-recovery-quote-policy.js';
+import { buildQuoteDispatchMode } from './quote-dispatch-mode-config.js';
 
 function booleanValue(env, name, fallback) {
   const raw = env?.[name];
@@ -48,5 +50,33 @@ export function buildInventoryRebalanceShadowConfig(env = {}) {
       maxSizeAsymmetry: numberValue(env, 'INVENTORY_REBALANCE_MAX_SIZE_ASYMMETRY', 0.75),
       maxQuoteSkewBps: numberValue(env, 'INVENTORY_REBALANCE_MAX_QUOTE_SKEW_BPS', 10),
     }),
+  });
+}
+
+export function buildInventoryRecoveryConfig(env = {}, options = {}) {
+  const enabled = booleanValue(env, 'MM_INVENTORY_RECOVERY_ENABLED', false);
+  if (!enabled) return validateInventoryRecoveryQuoteConfig({ enabled: false });
+  const quoteDispatchMode = options.quoteDispatchMode ?? buildQuoteDispatchMode(env);
+  if (quoteDispatchMode !== 'observe') {
+    throw new Error('MM_INVENTORY_RECOVERY_ENABLED requires MM_QUOTE_DISPATCH_MODE=observe');
+  }
+  const required = (name) => {
+    const raw = env?.[name];
+    if (raw === undefined || raw === null || String(raw).trim() === '') {
+      throw new Error(`${name} is required when MM_INVENTORY_RECOVERY_ENABLED=true`);
+    }
+    return numberValue(env, name);
+  };
+  return validateInventoryRecoveryQuoteConfig({
+    enabled: true,
+    operateOnExcess: booleanValue(env, 'MM_INVENTORY_RECOVERY_OPERATE_ON_EXCESS', false),
+    interimTargetInventoryBTC: required('MM_INVENTORY_RECOVERY_INTERIM_TARGET_BTC'),
+    inventorySigmaBTC: required('MM_INVENTORY_RECOVERY_SIGMA_BTC'),
+    centerBandSigma: required('MM_INVENTORY_RECOVERY_CENTER_BAND_SIGMA'),
+    softHedgeBandSigma: required('MM_INVENTORY_RECOVERY_SOFT_BAND_SIGMA'),
+    hardHedgeBandSigma: required('MM_INVENTORY_RECOVERY_HARD_BAND_SIGMA'),
+    minimumMakerParticipation: required('MM_INVENTORY_RECOVERY_MAKER_FLOOR'),
+    maxSizeAsymmetry: required('MM_INVENTORY_RECOVERY_MAX_SIZE_ASYMMETRY'),
+    maxQuoteSkewBps: required('MM_INVENTORY_RECOVERY_MAX_QUOTE_SKEW_BPS'),
   });
 }

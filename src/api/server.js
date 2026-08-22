@@ -24,6 +24,7 @@ import { readFileSync, existsSync } from 'fs';
 import { handleAnalyticsBalanceSnapshots as _handleBalanceSnapshots } from './analytics-balance-snapshots.js';
 import { handleAnalyticsSpreadPnl as _handleSpreadPnl } from './analytics-spread-pnl.js';
 import { buildApiStatusSnapshot } from './status-snapshot.js';
+import { buildPublicHealthSnapshot } from './public-health-snapshot.js';
 
 const PORT         = parseInt(process.env.API_PORT || '3100', 10);
 const CORS_ORIGIN  = process.env.CORS_ORIGIN || '*';
@@ -135,33 +136,11 @@ function addTimeFilter(conditions, values, idx, col, from, to) {
 async function handleHealth() {
   const start = Date.now();
   const orchHealth = orchestratorRef?.getHealthStatus() ?? null;
-  const buildBody = (dbInfo) => {
-    const status = orchHealth?.status ?? (dbInfo.connected ? 'healthy' : 'degraded');
-    return {
-      status,
-      // Orchestrator health fields at top level (per FR-2.4)
-      quoting: orchHealth?.quoting ?? null,
-      quoteLoopActive: orchHealth?.quoteLoopActive ?? null,
-      quoteDispatchMode: orchHealth?.quoteDispatchMode ?? null,
-      lastRepriceAge: orchHealth?.lastRepriceAge ?? null,
-      oeConnected: orchHealth?.oeConnected ?? null,
-      mdConnected: orchHealth?.mdConnected ?? null,
-      lastMdAge: orchHealth?.lastMdAge ?? null,
-      feedHealth: orchHealth?.feedHealth ?? null,
-      makerPresence: orchHealth?.makerPresence ?? null,
-      makerPresenceRecovery: orchHealth?.makerPresenceRecovery ?? null,
-      inventoryRebalanceShadow: orchHealth?.inventoryRebalanceShadow ?? null,
-      // Other fields
-      database: dbInfo,
-      uptime: process.uptime(),
-      timestamp: Date.now(),
-    };
-  };
   try {
     await db.query('SELECT 1');
     const latencyMs = Date.now() - start;
     const pool = db.getStats ? db.getStats() : null;
-    const body = buildBody({ connected: true, latencyMs, pool });
+    const body = buildPublicHealthSnapshot(orchHealth, { connected: true, latencyMs, pool });
     if (body.status === 'unhealthy') {
       return new Response(JSON.stringify({ success: true, data: body, meta: {} }), {
         status: 503,
@@ -170,7 +149,7 @@ async function handleHealth() {
     }
     return jsonOk(body);
   } catch (err) {
-    const body = buildBody({ connected: false, error: err.message });
+    const body = buildPublicHealthSnapshot(orchHealth, { connected: false, error: err.message });
     return new Response(JSON.stringify({ success: true, data: body, meta: {} }), {
       status: 503,
       headers: { 'Content-Type': 'application/json', ...corsHeaders() },

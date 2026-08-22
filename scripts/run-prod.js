@@ -50,6 +50,7 @@ import { buildFeedPollConfig } from './feed-poll-config.js';
 import { buildFixLivenessConfig } from './fix-liveness-config.js';
 import {
   buildInventoryRebalanceShadowConfig,
+  buildInventoryRecoveryConfig,
   buildMakerPresenceRecoveryConfig,
 } from './strategy-control-config.js';
 
@@ -108,6 +109,7 @@ const feedPollConfig = buildFeedPollConfig(process.env);
 const fixLivenessConfig = buildFixLivenessConfig(process.env);
 const presenceRecoveryConfig = buildMakerPresenceRecoveryConfig(process.env);
 const inventoryRebalanceShadowConfig = buildInventoryRebalanceShadowConfig(process.env);
+const inventoryRecoveryConfig = buildInventoryRecoveryConfig(process.env, { quoteDispatchMode });
 
 // ---------------------------------------------------------------------------
 // Configuration — PRODUCTION
@@ -518,6 +520,7 @@ async function main() {
     continuityConfig: config.continuityConfig,
     presenceRecoveryConfig,
     inventoryRebalanceShadowConfig,
+    inventoryRecoveryConfig,
     ...config.truexMakerSafety,
     quoteDispatchMode,
     ...orderReconciliationScope,

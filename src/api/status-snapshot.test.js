@@ -28,6 +28,29 @@ describe('authenticated /api/status snapshot', () => {
     });
   });
 
+  it('preserves the safe inventory-recovery decision for authenticated operators', () => {
+    const snapshot = buildApiStatusSnapshot({ getHealthStatus: () => ({
+      status: 'degraded',
+      inventoryRecovery: {
+        enabled: true,
+        interimTargetConfigured: true,
+        interimTargetReached: false,
+        direction: 'accumulate',
+        adjustmentApplied: true,
+        decision: 'below-interim-target',
+      },
+    }) });
+    expect(snapshot.inventoryRecovery).toEqual({
+      enabled: true,
+      interimTargetConfigured: true,
+      interimTargetReached: false,
+      direction: 'accumulate',
+      adjustmentApplied: true,
+      decision: 'below-interim-target',
+    });
+    expect(JSON.stringify(snapshot.inventoryRecovery)).not.toContain('maxQuoteSkewBps');
+  });
+
   it('keeps persistence failures visible without changing health or execution', () => {
     const sendMessage = jest.fn();
     const onPriceUpdate = jest.fn();

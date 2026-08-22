@@ -33,6 +33,18 @@ function freshEbbo(bestBid = 99, bestAsk = 101) {
   return { bestBid, bestAsk, timestamp: Date.now() };
 }
 
+const recoveryConfig = Object.freeze({
+  enabled: true,
+  interimTargetInventoryBTC: 1,
+  inventorySigmaBTC: 0.25,
+  centerBandSigma: 0.5,
+  softHedgeBandSigma: 2,
+  hardHedgeBandSigma: 3,
+  minimumMakerParticipation: 0.25,
+  maxSizeAsymmetry: 0.75,
+  maxQuoteSkewBps: 10,
+});
+
 describe('strict TrueX EBBO maker safety', () => {
   test('observe dispatch mode permits protective cancels but suppresses all placement paths', () => {
     const { engine, fixConnection } = makeEngine({ quoteDispatchMode: 'observe' });
@@ -65,6 +77,88 @@ describe('strict TrueX EBBO maker safety', () => {
 
     expect(engine._sendNewOrder(quote('sell', 100))).toBeNull();
     expect(engine.deferredRepriceNeeded).toBe(false);
+  });
+
+  test('recovery observer candidates retain strict EBBO/post-only reasons before suppression', () => {
+    const capitalReservationManager = { reserve: mock(() => ({ accepted: true })) };
+    const recoveryQuote = (price) => ({ ...quote('buy', price), inventoryRecovery: true });
+
+    const missing = makeEngine({
+      quoteDispatchMode: 'observe', inventoryRecoveryConfig: recoveryConfig, capitalReservationManager,
+    });
+    expect(missing.engine._dispatchAction({ type: 'place', quote: recoveryQuote(100) })).toBe(false);
+    expect(missing.engine.getQuoteStatus().suppressed.at(-1).reason).toBe('truex-ebbo-missing');
+
+    let now = 10_000;
+    const stale = makeEngine({
+      now: () => now, quoteDispatchMode: 'observe', inventoryRecoveryConfig: recoveryConfig,
+      capitalReservationManager,
+    });
+    stale.engine.updateTruexEbbo({ bestBid: 99, bestAsk: 101, timestamp: 7_999 });
+    now = 12_001;
+    expect(stale.engine._sendNewOrder(recoveryQuote(100))).toBeNull();
+    expect(stale.engine.getQuoteStatus().suppressed.at(-1).reason).toBe('truex-ebbo-stale');
+
+    const crossing = makeEngine({
+      quoteDispatchMode: 'observe', inventoryRecoveryConfig: recoveryConfig, capitalReservationManager,
+    });
+    crossing.engine.updateTruexEbbo(freshEbbo(99, 101));
+    expect(crossing.engine._dispatchAction({ type: 'place', quote: recoveryQuote(101) })).toBe(false);
+    expect(crossing.engine.getQuoteStatus().suppressed.at(-1).reason).toBe('marketable-post-only');
+
+    const viable = makeEngine({
+      quoteDispatchMode: 'observe', inventoryRecoveryConfig: recoveryConfig, capitalReservationManager,
+    });
+    viable.engine.updateTruexEbbo(freshEbbo(99, 101));
+    expect(viable.engine._dispatchAction({ type: 'place', quote: recoveryQuote(100) })).toBe(false);
+    expect(viable.engine.getQuoteStatus().suppressed.at(-1).reason).toBe('inventory-recovery-observe-only');
+
+    for (const { engine, fixConnection } of [missing, stale, crossing, viable]) {
+      expect(engine.activeOrders.size).toBe(0);
+      expect(fixConnection.sendMessage).not.toHaveBeenCalled();
+    }
+    expect(capitalReservationManager.reserve).not.toHaveBeenCalled();
+  });
+
+  test('recovery observer diagnostics never activate finite-contract resync paths', () => {
+    const capitalReservationManager = { reserve: mock(() => ({ accepted: true })) };
+    const recoveryQuote = {
+      ...quote('buy', 100),
+      inventoryRecovery: true,
+      contractReferenceMid: 100,
+      contractOppositePrice: 200,
+    };
+    const scenarios = [
+      { name: 'unavailable', orderState: { available: false, timestamp: 0, orders: [] } },
+      { name: 'actual-pair-breach', orderState: {
+        available: true, timestamp: Date.now(),
+        orders: [{ side: 'sell', price: 200, level: 1, status: 'active' }],
+      } },
+    ];
+
+    for (const scenario of scenarios) {
+      const resync = mock(() => {});
+      const { engine, fixConnection } = makeEngine({
+        quoteDispatchMode: 'observe',
+        inventoryRecoveryConfig: recoveryConfig,
+        capitalReservationManager,
+        contractMaxQuoteSpreadBps: 100,
+        minimumQuoteWidthBps: 1,
+        contractOrderStateMaxAgeMs: 2_000,
+        authoritativeOrderStateProvider: () => scenario.orderState,
+      });
+      engine.on('capital-resync-required', resync);
+      engine.updateTruexEbbo(freshEbbo(99, 101));
+      engine.deferredRepriceNeeded = false;
+
+      expect(engine._dispatchAction({ type: 'place', quote: recoveryQuote })).toBe(false);
+      expect(engine.getQuoteStatus().suppressed.at(-1).reason).toBe('inventory-recovery-observe-only');
+      expect(resync).not.toHaveBeenCalled();
+      expect(engine.deferredRepriceNeeded).toBe(false);
+      expect(engine.activeOrders.size).toBe(0);
+      expect(fixConnection.sendMessage).not.toHaveBeenCalled();
+    }
+    expect(capitalReservationManager.reserve).not.toHaveBeenCalled();
   });
 
   test('shadow canary blocks a direct taker call before reservation or local order mutation', () => {

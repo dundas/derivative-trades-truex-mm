@@ -461,6 +461,151 @@ describe('QuoteEngine', () => {
       expect(belowTarget.find(q => q.side === 'buy').price).toBe(unskewed.find(q => q.side === 'buy').price + 1);
       expect(belowTarget.find(q => q.side === 'sell').price).toBe(unskewed.find(q => q.side === 'sell').price + 1);
     });
+
+    it('applies the opt-in Gaussian recovery adjustment only below its interim target', () => {
+      const recoveryConfig = {
+        enabled: true,
+        interimTargetInventoryBTC: 1,
+        inventorySigmaBTC: 0.25,
+        centerBandSigma: 0.5,
+        softHedgeBandSigma: 2,
+        hardHedgeBandSigma: 3,
+        minimumMakerParticipation: 0.25,
+        maxSizeAsymmetry: 0.75,
+        maxQuoteSkewBps: 10,
+      };
+      const inventoryManager = createMockInventory({
+        getPositionSummary: () => ({ netPosition: 0.5, baseBalance: { total: 0.5 } }),
+      });
+      inventoryManager.getPositionSummary = () => ({ netPosition: 0.5, baseBalance: { total: 0.5 } });
+      const base = createEngine({ levels: 1, inventoryManager });
+      const recovery = createEngine({
+        levels: 1, inventoryManager, quoteDispatchMode: 'observe', inventoryRecoveryConfig: recoveryConfig,
+      });
+      const baseQuotes = base.computeDesiredQuotes(100000, { bidSkewTicks: 0, askSkewTicks: 0 });
+      const recoveryQuotes = recovery.computeDesiredQuotes(100000, { bidSkewTicks: 0, askSkewTicks: 0 });
+      const baseBid = baseQuotes.find(q => q.side === 'buy');
+      const baseAsk = baseQuotes.find(q => q.side === 'sell');
+      const recoveryBid = recoveryQuotes.find(q => q.side === 'buy');
+      const recoveryAsk = recoveryQuotes.find(q => q.side === 'sell');
+
+      expect(recoveryBid.price).toBeGreaterThanOrEqual(baseBid.price);
+      expect(recoveryBid.size).toBeGreaterThanOrEqual(baseBid.size);
+      expect(recoveryAsk.price).toBeGreaterThanOrEqual(baseAsk.price);
+      expect(recoveryAsk.size).toBeLessThanOrEqual(baseAsk.size);
+      expect(recovery.getQuoteStatus().inventoryRecovery).toMatchObject({
+        enabled: true, adjustmentApplied: true, reason: 'below-interim-target',
+      });
+
+      inventoryManager.getPositionSummary = () => ({ netPosition: 1, baseBalance: { total: 1 } });
+      expect(recovery.computeDesiredQuotes(100000, { bidSkewTicks: 0, askSkewTicks: 0 }))
+        .toEqual(baseQuotes);
+      expect(recovery.getQuoteStatus().inventoryRecovery).toMatchObject({
+        adjustmentApplied: false, reason: 'interim-target-reached',
+      });
+
+      const symmetric = createEngine({
+        levels: 1,
+        inventoryManager,
+        quoteDispatchMode: 'observe',
+        inventoryRecoveryConfig: { ...recoveryConfig, operateOnExcess: true },
+      });
+      inventoryManager.getPositionSummary = () => ({ netPosition: 1.5, baseBalance: { total: 1.5 } });
+      const excessQuotes = symmetric.computeDesiredQuotes(100000, { bidSkewTicks: 0, askSkewTicks: 0 });
+      expect(excessQuotes.find(q => q.side === 'buy').price).toBeLessThanOrEqual(baseBid.price);
+      expect(excessQuotes.find(q => q.side === 'buy').size).toBeLessThanOrEqual(baseBid.size);
+      expect(excessQuotes.find(q => q.side === 'sell').price).toBeLessThanOrEqual(baseAsk.price);
+      expect(excessQuotes.find(q => q.side === 'sell').size).toBeGreaterThanOrEqual(baseAsk.size);
+    });
+
+    it('keeps recovery-shaped candidates observe-only without local order mutation', () => {
+      const inventoryManager = createMockInventory();
+      inventoryManager.getPositionSummary = () => ({ netPosition: 0.5, baseBalance: { total: 0.5 } });
+      const fixConnection = createMockFix();
+      const engine = createEngine({
+        levels: 1,
+        inventoryManager,
+        fixConnection,
+        quoteDispatchMode: 'observe',
+        inventoryRecoveryConfig: {
+          enabled: true, interimTargetInventoryBTC: 1, inventorySigmaBTC: 0.25,
+          centerBandSigma: 0.5, softHedgeBandSigma: 2, hardHedgeBandSigma: 3,
+          minimumMakerParticipation: 0.25, maxSizeAsymmetry: 0.75, maxQuoteSkewBps: 10,
+        },
+      });
+      engine.onPriceUpdate(makePrice(100000));
+      expect(fixConnection.sendMessage).not.toHaveBeenCalled();
+      expect(engine.activeOrders.size).toBe(0);
+      expect(engine.getQuoteStatus().inventoryRecovery.adjustmentApplied).toBe(true);
+    });
+
+    it('rejects enabled recovery in a live engine and blocks tagged candidates if dispatch state is corrupted', () => {
+      const inventoryManager = createMockInventory();
+      inventoryManager.getPositionSummary = () => ({ netPosition: 0.5, baseBalance: { total: 0.5 } });
+      const fixConnection = createMockFix();
+      const reservations = {
+        reserve: mock(() => ({ accepted: true })),
+        getPresence: mock(() => ({ buy: 0, sell: 0 })),
+        getReservations: mock(() => []),
+        getQuoteCapacityForLevel: mock(() => Number.POSITIVE_INFINITY),
+      };
+      const config = {
+        enabled: true, interimTargetInventoryBTC: 1, inventorySigmaBTC: 0.25,
+        centerBandSigma: 0.5, softHedgeBandSigma: 2, hardHedgeBandSigma: 3,
+        minimumMakerParticipation: 0.25, maxSizeAsymmetry: 0.75, maxQuoteSkewBps: 10,
+      };
+      expect(() => createEngine({ inventoryManager, inventoryRecoveryConfig: config }))
+        .toThrow('inventoryRecoveryConfig requires quoteDispatchMode=observe');
+
+      const engine = createEngine({
+        inventoryManager, fixConnection, capitalReservationManager: reservations,
+        quoteDispatchMode: 'observe', inventoryRecoveryConfig: config,
+      });
+      engine.config.quoteDispatchMode = 'live';
+      expect(engine._sendNewOrder({ side: 'buy', price: 99999, size: 0.1, level: 1, inventoryRecovery: true }))
+        .toBeNull();
+      expect(fixConnection.sendMessage).not.toHaveBeenCalled();
+      expect(reservations.reserve).not.toHaveBeenCalled();
+      expect(engine.activeOrders.size).toBe(0);
+      expect(engine.getQuoteStatus().suppressed.at(-1).reason).toBe('inventory-recovery-observe-only');
+
+      // An untagged direct caller cannot bypass the enabled-recovery gate.
+      expect(engine._sendNewOrder({ side: 'buy', price: 99999, size: 0.1, level: 1 }))
+        .toBeNull();
+      expect(fixConnection.sendMessage).not.toHaveBeenCalled();
+      expect(reservations.reserve).not.toHaveBeenCalled();
+      expect(engine.activeOrders.size).toBe(0);
+
+      // At the interim target the generated ordinary quote has no recovery
+      // marker, yet a tampered live dispatch mode still cannot place it.
+      inventoryManager.getPositionSummary = () => ({ netPosition: 1, baseBalance: { total: 1 } });
+      const targetQuotes = engine.computeDesiredQuotes(100000, { bidSkewTicks: 0, askSkewTicks: 0 });
+      expect(targetQuotes.every((quote) => quote.inventoryRecovery !== true)).toBe(true);
+      engine.onPriceUpdate(makePrice(100000));
+      expect(fixConnection.sendMessage).not.toHaveBeenCalled();
+      expect(reservations.reserve).not.toHaveBeenCalled();
+      expect(engine.activeOrders.size).toBe(0);
+    });
+
+    it('continues to allow a protective pure cancel if recovery dispatch state is corrupted', () => {
+      const fixConnection = createMockFix();
+      const engine = createEngine({
+        fixConnection,
+        quoteDispatchMode: 'observe',
+        inventoryRecoveryConfig: {
+          enabled: true, interimTargetInventoryBTC: 1, inventorySigmaBTC: 0.25,
+          centerBandSigma: 0.5, softHedgeBandSigma: 2, hardHedgeBandSigma: 3,
+          minimumMakerParticipation: 0.25, maxSizeAsymmetry: 0.75, maxQuoteSkewBps: 10,
+        },
+      });
+      engine.config.quoteDispatchMode = 'live';
+      const order = { side: 'buy', price: 99999, size: 0.1, level: 1, status: 'active' };
+      engine.activeOrders.set('C1', order);
+
+      expect(engine._dispatchAction({ type: 'cancel', clOrdID: 'C1', order })).toBe(true);
+      expect(fixConnection.sendMessage).toHaveBeenCalledWith(expect.objectContaining({ '35': 'F' }));
+      expect(order.status).toBe('cancelling');
+    });
   });
 
   describe('reconciliation', () => {

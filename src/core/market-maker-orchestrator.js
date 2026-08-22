@@ -62,6 +62,29 @@ function positiveIntegerOption(value, name) {
   return value;
 }
 
+// Keep operational/API recovery visibility intentionally free of the Gaussian
+// parameters, inventory amount, and quote economics. Operators need only the
+// control state and latest decision to verify an observe canary.
+function recoveryHealthSummary(quoteEngine) {
+  const config = quoteEngine?.config?.inventoryRecoveryConfig;
+  const decision = quoteEngine?.getQuoteStatus?.().inventoryRecovery;
+  const enabled = config?.enabled === true || decision?.enabled === true;
+  const reason = typeof decision?.reason === 'string' ? decision.reason : 'disabled';
+  const direction = reason === 'below-interim-target' ? 'accumulate'
+    : reason === 'above-interim-target' ? 'reduce'
+      : null;
+  return {
+    enabled,
+    interimTargetConfigured: enabled,
+    interimTargetReached: enabled
+      ? ['at-interim-target', 'interim-target-reached'].includes(reason)
+      : null,
+    direction,
+    adjustmentApplied: decision?.adjustmentApplied === true,
+    decision: reason,
+  };
+}
+
 /**
  * MarketMakerOrchestrator - Wires all components and manages lifecycle.
  *
@@ -209,6 +232,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       shadowDetectionTapeMaxAgeMs: options.shadowDetectionTapeMaxAgeMs ?? 30000,
       truexTapeOutlierThresholdBps: options.truexTapeOutlierThresholdBps ?? 50,
       marketDataProvider: () => this.marketDataFeed?.getBestBidAsk?.(),
+      inventoryRecoveryConfig: options.inventoryRecoveryConfig,
       orderIdNamespace: options.orderIdNamespace,
       orderIdBootId: options.orderIdBootId,
       logger: this.logger,
@@ -2872,6 +2896,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
         gaps: continuity.gaps,
       } : null,
       makerPresenceRecovery: this.presenceRecoveryController?.snapshot() || null,
+      inventoryRecovery: recoveryHealthSummary(this.quoteEngine),
       inventoryRebalanceShadow: this.inventoryRebalanceShadow,
       capital: this.capitalReservationManager?.getStatus() || null,
       // Additive observability only. Persistence failures remain visible in
