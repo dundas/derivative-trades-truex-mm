@@ -375,6 +375,8 @@ describe('strict TrueX EBBO maker safety', () => {
       contractMaxQuoteSpreadBps: 100,
       authoritativeOrderStateProvider: () => state,
     });
+    const resync = [];
+    engine.on('capital-resync-required', (event) => resync.push(event));
     engine.updateTruexEbbo({ bestBid: 99, bestAsk: 101, timestamp: now });
     const candidate = { ...quote('buy', 100), contractReferenceMid: 100, contractOppositePrice: 100.5 };
 
@@ -385,6 +387,10 @@ describe('strict TrueX EBBO maker safety', () => {
     expect(engine._sendNewOrder(candidate)).toBeNull();
     expect(engine.getQuoteStatus().suppressed.at(-1).reason).toBe('contract-order-state-stale');
     expect(fixConnection.sendMessage).not.toHaveBeenCalled();
+    expect(resync).toEqual([
+      expect.objectContaining({ reason: 'contract-order-state-unavailable', strict: true }),
+      expect.objectContaining({ reason: 'contract-order-state-stale', strict: true }),
+    ]);
   });
 
   test('an actual-pair cap failure retains the old side during a partial-fill replenishment replacement', () => {

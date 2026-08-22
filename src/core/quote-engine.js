@@ -2914,7 +2914,15 @@ export class QuoteEngine extends EventEmitter {
   } = {}) {
     if (!Number.isFinite(this.config.contractMaxQuoteSpreadBps)) return true;
     if (!this._contractOrderStateUsable()) {
-      this._recordSuppression(quote, this._contractOrderStateReason());
+      const reason = this._contractOrderStateReason();
+      this._recordSuppression(quote, reason);
+      // A strict coalesced reconciliation is the only safe way to restore a
+      // finite-cap authority gap. Never let a stale/missing snapshot turn into
+      // a local-cache placement.
+      this._emitCapitalResyncRequired({
+        side: quote?.side || 'multiple', reason, orderId: quote?.replacesQuoteId || null, strict: true,
+      });
+      this.deferredRepriceNeeded = true;
       return false;
     }
     const referenceMid = Number(quote?.contractReferenceMid);
