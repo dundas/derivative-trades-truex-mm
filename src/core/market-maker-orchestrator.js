@@ -130,6 +130,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this.inventoryRebalanceShadowConfig = options.inventoryRebalanceShadowConfig || null;
     this.inventoryRebalanceShadow = null;
     this._inventoryRebalanceShadowLastAt = 0;
+    this._authoritativeOrderState = { available: false, timestamp: 0, orders: [] };
 
     this.pnlTracker = options.pnlTracker || new PnLTracker({
       truexMakerFeeBps: options.truexMakerFeeBps ?? 0,
@@ -181,6 +182,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
       degradedMaxLevels: options.continuityConfig?.degradedMaxLevels ?? 1,
       degradedSizeFactor: options.continuityConfig?.degradedSizeFactor ?? 1,
       defensiveSpreadFloorBps: options.continuityConfig?.defensiveSpreadFloorBps ?? 0,
+      contractMaxQuoteSpreadBps: options.continuityConfig?.contractMaxQuoteSpreadBps,
+      contractOrderStateMaxAgeMs: options.continuityConfig?.contractOrderStateMaxAgeMs,
+      authoritativeOrderStateProvider: () => this._authoritativeOrderState,
       maxReplacementsPerSidePerCycle: options.maxReplacementsPerSidePerCycle ?? 1,
       pendingReplacementTimeoutMs: options.pendingReplacementTimeoutMs || 5000,
       pendingSelfCrossGuardMs: options.pendingSelfCrossGuardMs ?? 5000,
@@ -296,6 +300,11 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this._now = options.now || Date.now;
     this._sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.balanceRefreshIntervalMs = options.balanceRefreshIntervalMs || 60000; // 1 min
+    const contractOrderStateMaxAgeMs = Number(options.continuityConfig?.contractOrderStateMaxAgeMs);
+    // A finite-cap quote uses a scoped REST own-order snapshot as authority.
+    // Its refresh cadence is independent from the ordinary balance refresh.
+    this.authoritativeOrderRefreshIntervalMs = Number.isFinite(contractOrderStateMaxAgeMs) &&
+      contractOrderStateMaxAgeMs > 0 ? Math.max(1, Math.floor(contractOrderStateMaxAgeMs / 2)) : null;
     this.truexEbboPollIntervalMs = options.truexEbboPollIntervalMs ?? 1000;
     const configuredTruexEbboPollTimeoutMs =
       options.truexEbboPollTimeoutMs ?? Math.max(250, this.truexEbboPollIntervalMs - 100);
@@ -397,6 +406,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this.drainQueueIntervalMs = options.drainQueueIntervalMs || 200;
     this._reconcileTimer = null;
     this._balanceRefreshTimer = null;
+    this._authoritativeOrderRefreshTimer = null;
 
     // Bind handlers to preserve context
     this._onPriceUpdate = this._onPriceUpdate.bind(this);
@@ -410,6 +420,19 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this._onOELogout = this._onOELogout.bind(this);
     this._onFIXLiveness = this._onFIXLiveness.bind(this);
     this._onCapitalResyncRequired = this._onCapitalResyncRequired.bind(this);
+    this._onCapitalResyncEvent = (event) => {
+      // EventEmitter does not await listeners. Keep transport-triggered REST
+      // failures observable without producing an unhandled rejection; callers
+      // that invoke the strict method directly still receive its rejection.
+      try {
+        const result = this._onCapitalResyncRequired(event);
+        void Promise.resolve(result).catch((error) => {
+          this.logger.error(`[Orchestrator] Capital resync event failed: ${error.message}`);
+        });
+      } catch (error) {
+        this.logger.error(`[Orchestrator] Capital resync event failed: ${error.message}`);
+      }
+    };
     this._onLogonResetFallback = this._onLogonResetFallback.bind(this);
     this._onLogonResetFallbackExhausted = this._onLogonResetFallbackExhausted.bind(this);
     this._eventsWired = false;
@@ -423,6 +446,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this._capitalResyncPending = false;
     this._capitalResyncStrictPending = false;
     this._capitalResyncStrictDrainSuppressed = false;
+    this._capitalResyncContractFollowupQueued = false;
   }
 
   /**
@@ -466,7 +490,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       }
     };
     rememberTimers(this, [
-      'drainQueueTimer', '_reconcileTimer', '_balanceRefreshTimer', '_watchdogTimer', '_snapshotTimer',
+      'drainQueueTimer', '_reconcileTimer', '_balanceRefreshTimer', '_authoritativeOrderRefreshTimer', '_watchdogTimer', '_snapshotTimer',
     ], clearInterval, 'orchestrator');
     rememberTimers(this, ['_truexEbboPollTimer', '_pyusdUsdPollTimer'], clearTimeout, 'orchestrator');
     rememberTimers(this.pnlTracker, ['_logTimer'], clearInterval, 'pnl');
@@ -604,6 +628,13 @@ export class MarketMakerOrchestrator extends EventEmitter {
         this.balanceRefreshIntervalMs,
       );
       this.logger.info(`[Orchestrator] Balance refresh enabled (every ${this.balanceRefreshIntervalMs / 1000}s)`);
+      if (this.authoritativeOrderRefreshIntervalMs !== null) {
+        this._authoritativeOrderRefreshTimer = setInterval(
+          () => this._refreshAuthoritativeOrderSnapshot(),
+          this.authoritativeOrderRefreshIntervalMs,
+        );
+        this.logger.info(`[Orchestrator] Authoritative order snapshot refresh enabled (every ${this.authoritativeOrderRefreshIntervalMs / 1000}s)`);
+      }
     }
 
     // Start watchdog
@@ -921,6 +952,10 @@ export class MarketMakerOrchestrator extends EventEmitter {
       clearInterval(this._balanceRefreshTimer);
       this._balanceRefreshTimer = null;
     }
+    if (this._authoritativeOrderRefreshTimer) {
+      clearInterval(this._authoritativeOrderRefreshTimer);
+      this._authoritativeOrderRefreshTimer = null;
+    }
     if (this._truexEbboPollTimer) {
       clearTimeout(this._truexEbboPollTimer);
       this._truexEbboPollTimer = null;
@@ -1130,7 +1165,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     // QuoteEngine fills → Inventory + PnL
     this.quoteEngine.on('fill', this._onQuoteFill);
     this.quoteEngine.on('quote-lifecycle', this._onQuoteLifecycle);
-    this.quoteEngine.on('capital-resync-required', this._onCapitalResyncRequired);
+    this.quoteEngine.on('capital-resync-required', this._onCapitalResyncEvent);
 
     // Inventory hedge signal → HedgeExecutor
     this.inventoryManager.on('hedge-signal', this._onHedgeSignal);
@@ -1159,7 +1194,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this.fixOE.removeListener('logon-reset-fallback-exhausted', this._onLogonResetFallbackExhausted);
     this.quoteEngine.removeListener('fill', this._onQuoteFill);
     this.quoteEngine.removeListener('quote-lifecycle', this._onQuoteLifecycle);
-    this.quoteEngine.removeListener('capital-resync-required', this._onCapitalResyncRequired);
+    this.quoteEngine.removeListener('capital-resync-required', this._onCapitalResyncEvent);
     this.inventoryManager.removeListener('hedge-signal', this._onHedgeSignal);
     this.hedgeExecutor.removeListener('hedge-filled', this._onHedgeFill);
     this.inventoryManager.removeListener('emergency', this._onEmergency);
@@ -1260,6 +1295,24 @@ export class MarketMakerOrchestrator extends EventEmitter {
 
   _onCapitalResyncRequired({ side, reason, strict = false }) {
     if (this._capitalResyncInFlight) {
+      const contractSnapshotRequest = String(reason || '').startsWith('contract-order-state-');
+      // A periodic snapshot tick must never add another pass to an already
+      // active reconciliation, irrespective of whether that pass is strict.
+      if (contractSnapshotRequest && !strict) {
+        return this._capitalResyncResult(this._capitalResyncInFlight, { side, reason, strict });
+      }
+      // Price ticks and the snapshot timer can both observe the same stale
+      // authority while a strict REST recovery is unresolved.  A timer tick
+      // adds no value here; a strict price-trigger may request exactly one
+      // follow-up after the active snapshot, never an unbounded pending loop.
+      if (contractSnapshotRequest && this._capitalResyncStrictDrainSuppressed) {
+        if (strict && !this._capitalResyncContractFollowupQueued) {
+          this._capitalResyncPending = true;
+          this._capitalResyncStrictPending = true;
+          this._capitalResyncContractFollowupQueued = true;
+        }
+        return this._capitalResyncResult(this._capitalResyncInFlight, { side, reason, strict });
+      }
       this._capitalResyncPending = true;
       if (strict) {
         this._capitalResyncStrictPending = true;
@@ -1268,6 +1321,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       return this._capitalResyncResult(this._capitalResyncInFlight, { side, reason, strict });
     }
     this.logger.warn(`[Orchestrator] Capital resync required for ${side}: ${reason}`);
+    this._capitalResyncContractFollowupQueued = false;
     if (strict) {
       this._capitalResyncStrictPending = true;
       this._capitalResyncStrictDrainSuppressed = true;
@@ -1292,6 +1346,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       if (this._capitalResyncInFlight === tracked) {
         this._capitalResyncInFlight = null;
         this._capitalResyncStrictDrainSuppressed = false;
+        this._capitalResyncContractFollowupQueued = false;
       }
     });
     this._capitalResyncInFlight = tracked;
@@ -2265,6 +2320,20 @@ export class MarketMakerOrchestrator extends EventEmitter {
   }
 
   /**
+   * Refresh the scoped own-order snapshot used by finite contractual caps.
+   * `_onCapitalResyncRequired` is single-flight, so timer ticks and a stale
+   * send-boundary request coalesce into one authoritative REST operation.
+   */
+  _refreshAuthoritativeOrderSnapshot() {
+    if (!this.restClient || !this.isRunning || this.authoritativeOrderRefreshIntervalMs === null) {
+      return Promise.resolve();
+    }
+    return this._onCapitalResyncRequired({
+      side: 'multiple', reason: 'contract-order-state-refresh', strict: false,
+    });
+  }
+
+  /**
    * Periodic recovery is bounded by balanceRefreshIntervalMs. Healthy state
    * keeps the lightweight balance-only refresh; failed/blocked capital state
    * requires one coalesced, generation-safe balance + live-order snapshot.
@@ -2336,6 +2405,13 @@ export class MarketMakerOrchestrator extends EventEmitter {
         clearBlockedSides,
         generation,
       });
+      // This scoped REST result, rather than QuoteEngine's process-local
+      // activeOrders cache, is the only authority for finite-cap pair checks.
+      this._authoritativeOrderState = Object.freeze({
+        available: true,
+        timestamp: Date.now(),
+        orders: Object.freeze(reconciledLiveOrders.map((order) => Object.freeze({ ...order }))),
+      });
       if (capitalResult?.state === 'normal' && capitalResult.blockedSides?.length === 0) {
         const liveCandidatesById = new Map();
         for (const live of reconciledLiveOrders) {
@@ -2396,6 +2472,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
         }
       }
     } catch (err) {
+      this._authoritativeOrderState = { available: false, timestamp: 0, orders: [] };
       this.logger.warn(`[Orchestrator] Balance refresh failed (non-fatal): ${err.message}`);
       this.capitalReservationManager?.reconciliationFailed();
       if (requireLiveOrders) throw err;

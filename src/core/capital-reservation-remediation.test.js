@@ -542,6 +542,48 @@ describe('presence and dispatch remediation', () => {
     });
   });
 
+  test('hard-caps the full displayed spread for normal, mirrored, fallback, and degraded quote paths', () => {
+    const contractMaxQuoteSpreadBps = 10;
+    const mid = 100000;
+    const assertCap = (desired) => {
+      for (const level of [1, 2]) {
+        const bid = desired.find((quote) => quote.side === 'buy' && quote.level === level);
+        const ask = desired.find((quote) => quote.side === 'sell' && quote.level === level);
+        expect(ask).toBeDefined();
+        expect(bid).toBeDefined();
+        expect(ask.price - bid.price).toBeLessThanOrEqual(mid * contractMaxQuoteSpreadBps / 10000);
+      }
+    };
+    const baseOptions = {
+      inventoryManager: { canQuote: () => true }, levels: 2, baseSpreadBps: 30,
+      baseSizeBTC: 0.01, minNotional: 1, contractMaxQuoteSpreadBps,
+      contractOrderStateMaxAgeMs: 5000,
+      authoritativeOrderStateProvider: () => ({ available: true, timestamp: Date.now() }), logger,
+    };
+
+    // Missing anchor deliberately takes the mid-based fallback path.
+    assertCap(new QuoteEngine({ ...baseOptions, quoteAnchorMode: 'coinbase-mirror' })
+      .computeDesiredQuotes(mid, { bidSkewTicks: 0, askSkewTicks: 0 }));
+    // An external touch that is much wider than contract is bounded before it
+    // reaches the generated quote set.
+    assertCap(new QuoteEngine({ ...baseOptions, quoteAnchorMode: 'coinbase-mirror' })
+      .computeDesiredQuotes(mid, { bidSkewTicks: -8, askSkewTicks: 8 }, {
+        bestBid: 99000, bestAsk: 101000,
+      }));
+
+    const degraded = new QuoteEngine({
+      ...baseOptions, degradedMaxLevels: 2, degradedSizeFactor: 0.5,
+      defensiveSpreadFloorBps: 80,
+    });
+    degraded.setContinuityState({ executionState: 'degraded', reasons: ['test'] });
+    assertCap(degraded.computeDesiredQuotes(mid, { bidSkewTicks: 0, askSkewTicks: 0 }, {
+      bestBid: 99000, bestAsk: 101000,
+    }));
+
+    expect(() => new QuoteEngine({ contractMaxQuoteSpreadBps: 0, logger }))
+      .toThrow('contractMaxQuoteSpreadBps');
+  });
+
   test('counts unique valid levels and rejects a backward clock', () => {
     let now = 1000;
     const controller = new MakerPresenceController({ ...continuity, minActiveLevelsPerSide: 2 }, { now: () => now });

@@ -34,6 +34,10 @@ export class QuoteEngine extends EventEmitter {
     this.fixConnection = options.fixConnection;
     this.capitalReservationManager = options.capitalReservationManager || null;
     this.continuityStateProvider = options.continuityStateProvider || null;
+    // Finite contractual spread enforcement must not make a displayed-book
+    // claim from process-local lifecycle state after a reconnect or an
+    // out-of-order report. The orchestrator supplies this after REST sync.
+    this.authoritativeOrderStateProvider = options.authoritativeOrderStateProvider || null;
     this.maxExecutionDedupeOrders = options.maxExecutionDedupeOrders ?? 10000;
     if (!Number.isInteger(this.maxExecutionDedupeOrders) || this.maxExecutionDedupeOrders < 1) {
       throw new Error('maxExecutionDedupeOrders must be a positive integer');
@@ -103,6 +107,11 @@ export class QuoteEngine extends EventEmitter {
       degradedMaxLevels: options.degradedMaxLevels ?? 1,
       degradedSizeFactor: options.degradedSizeFactor ?? 1,
       defensiveSpreadFloorBps: options.defensiveSpreadFloorBps ?? 0,
+      // A finite value is the contractual full displayed bid-to-ask width.
+      // Infinity keeps the reusable engine backwards compatible outside the
+      // production policy path; production startup requires a finite value.
+      contractMaxQuoteSpreadBps: options.contractMaxQuoteSpreadBps ?? Number.POSITIVE_INFINITY,
+      contractOrderStateMaxAgeMs: options.contractOrderStateMaxAgeMs ?? 0,
       maxReplacementsPerSidePerCycle: options.maxReplacementsPerSidePerCycle ?? Number.POSITIVE_INFINITY,
       pendingReplacementTimeoutMs: options.pendingReplacementTimeoutMs || 5000,
       pendingSelfCrossGuardMs: options.pendingSelfCrossGuardMs ?? 5000,
@@ -142,6 +151,16 @@ export class QuoteEngine extends EventEmitter {
     }
     if (!Number.isFinite(this.config.defensiveSpreadFloorBps) || this.config.defensiveSpreadFloorBps < 0) {
       throw new Error('defensiveSpreadFloorBps must be a finite non-negative number');
+    }
+    if ((!Number.isFinite(this.config.contractMaxQuoteSpreadBps) &&
+          this.config.contractMaxQuoteSpreadBps !== Number.POSITIVE_INFINITY) ||
+        this.config.contractMaxQuoteSpreadBps <= 0) {
+      throw new Error('contractMaxQuoteSpreadBps must be a positive finite number or Infinity');
+    }
+    if (Number.isFinite(this.config.contractMaxQuoteSpreadBps) &&
+        (!Number.isFinite(this.config.contractOrderStateMaxAgeMs) ||
+          this.config.contractOrderStateMaxAgeMs <= 0)) {
+      throw new Error('contractOrderStateMaxAgeMs must be a positive finite number with a finite contract cap');
     }
     if (typeof this.config.strictTruexMakerSafety !== 'boolean') {
       throw new Error('strictTruexMakerSafety must be boolean');
@@ -463,6 +482,9 @@ export class QuoteEngine extends EventEmitter {
       : baseSpreadBps;
     const effectiveSizeFactor = degraded ? this.config.degradedSizeFactor : 1;
     const halfSpread = (effectiveSpreadBps / 10000) * mid / 2;
+    const contractHalfSpread = Number.isFinite(this.config.contractMaxQuoteSpreadBps)
+      ? (this.config.contractMaxQuoteSpreadBps / 10000) * mid / 2
+      : Number.POSITIVE_INFINITY;
 
     // coinbase-mirror: anchor L1 to the anchor venue's best bid/ask offset out by a small buffer
     // so our spread mirrors that venue's width while staying maker-safe. Deeper levels step out
@@ -524,8 +546,47 @@ export class QuoteEngine extends EventEmitter {
         rawBid = Math.min(rawBid, mid - halfSpread - levelOffset);
         rawAsk = Math.max(rawAsk, mid + halfSpread + levelOffset);
       }
-      const bidPrice = this.snapToTick(rawBid);
-      const askPrice = this.snapToTick(rawAsk);
+      // Clamp both mirror and mid-fallback paths before tick rounding. The
+      // directional final clamp accounts for nearest-tick rounding so even a
+      // non-tick-aligned contract cap cannot leak a wider displayed pair.
+      rawBid = Math.max(rawBid, mid - contractHalfSpread);
+      rawAsk = Math.min(rawAsk, mid + contractHalfSpread);
+      const bidPrice = Math.max(
+        this.snapToTick(rawBid),
+        Number.isFinite(contractHalfSpread)
+          ? Math.ceil((mid - contractHalfSpread) / tickSize) * tickSize
+          : Number.NEGATIVE_INFINITY,
+      );
+      const askPrice = Math.min(
+        this.snapToTick(rawAsk),
+        Number.isFinite(contractHalfSpread)
+          ? Math.floor((mid + contractHalfSpread) / tickSize) * tickSize
+          : Number.POSITIVE_INFINITY,
+      );
+
+      // A narrow, off-tick contractual width can leave no strictly passive
+      // tick pair after rounding (for example, bid=ask=mid).  Do not let the
+      // individual half-envelope clamps turn that into a locked/crossed book.
+      // Suppress both candidates together, before reconciliation can enqueue a
+      // new order, and retain a machine-readable reason for the policy gap.
+      if (Number.isFinite(contractHalfSpread) && bidPrice >= askPrice) {
+        const reason = 'contract-spread-cap-no-noncrossed-tick-pair';
+        this._recordSuppression(
+          { side: 'buy', level, price: bidPrice, cause: reason, transition: 'contract-spread-cap-suppressed' },
+          reason,
+        );
+        this._recordSuppression(
+          { side: 'sell', level, price: askPrice, cause: reason, transition: 'contract-spread-cap-suppressed' },
+          reason,
+        );
+        continue;
+      }
+      const contractContext = Number.isFinite(contractHalfSpread)
+        ? { contractReferenceMid: mid, contractOppositePrice: askPrice }
+        : null;
+      const askContractContext = Number.isFinite(contractHalfSpread)
+        ? { contractReferenceMid: mid, contractOppositePrice: bidPrice }
+        : null;
 
       // Filter bids — cap size to remaining available quote balance
       if (!this._canQuoteSide('buy')) {
@@ -537,7 +598,7 @@ export class QuoteEngine extends EventEmitter {
       } else {
         const cappedBidSize = this._capSizeToBalance('buy', size, bidPrice, bidCommittedQuote, level);
         if (cappedBidSize >= this.config.minimumFundedQuoteSize && bidPrice * cappedBidSize >= minNotional) {
-          bids.push({ side: 'buy', price: bidPrice, size: cappedBidSize, level });
+          bids.push({ side: 'buy', price: bidPrice, size: cappedBidSize, level, ...contractContext });
           bidCommittedQuote += cappedBidSize * bidPrice;
         } else if (cappedBidSize < this.config.minimumFundedQuoteSize) {
           recordDegradedOmission(
@@ -559,7 +620,7 @@ export class QuoteEngine extends EventEmitter {
       } else {
         const cappedAskSize = this._capSizeToBalance('sell', size, askPrice, askCommittedBase, level);
         if (cappedAskSize >= this.config.minimumFundedQuoteSize && askPrice * cappedAskSize >= minNotional) {
-          asks.push({ side: 'sell', price: askPrice, size: cappedAskSize, level });
+          asks.push({ side: 'sell', price: askPrice, size: cappedAskSize, level, ...askContractContext });
           askCommittedBase += cappedAskSize;
         } else if (cappedAskSize < this.config.minimumFundedQuoteSize) {
           recordDegradedOmission(
@@ -1131,6 +1192,11 @@ export class QuoteEngine extends EventEmitter {
       return false;
     }
     if (prepared.postOnly === false) return true;
+    // A reservation callback can synchronously change the local view of the
+    // opposite side. Re-evaluate the actual displayed pair at the transport
+    // boundary, rather than trusting the desired-pair context captured when
+    // this quote was first computed.
+    if (!this._isContractDisplayedPairWithinCap(prepared)) return false;
     if (this._isAloRetryInhibited(prepared)) {
       this._recordSuppression(prepared, 'alo-retry-inhibited');
       return false;
@@ -2627,11 +2693,13 @@ export class QuoteEngine extends EventEmitter {
       return takerQuote;
     }
 
+    if (!this._isWithinContractQuoteEnvelope(prepared)) return null;
+
     if (strictEbboState) return this._prepareStrictMakerQuote(prepared, strictEbboState);
 
     if (!this._isMarketablePostOnly(prepared)) {
       if (!this._wouldSelfCrossTrackedOrder(prepared)) {
-        return prepared;
+        return this._isContractDisplayedPairWithinCap(prepared) ? prepared : null;
       }
       this._recordSuppression(prepared, 'self-cross-tracked-order');
       return null;
@@ -2641,6 +2709,7 @@ export class QuoteEngine extends EventEmitter {
       const book = this._makerSafetyBookState().book;
       if (prepared.side === 'buy' && book?.bestAsk !== null && book?.bestAsk !== undefined) {
         prepared.price = this.snapToTick(book.bestAsk - this.config.tickSize);
+        if (!this._isSlidQuoteWithinContract(prepared)) return null;
         if (this.config.strictTruexMakerSafety && this._isAloRetryInhibited(prepared)) {
           this._recordSuppression(prepared, 'alo-retry-inhibited');
           return null;
@@ -2653,6 +2722,7 @@ export class QuoteEngine extends EventEmitter {
       }
       if (prepared.side === 'sell' && book?.bestBid !== null && book?.bestBid !== undefined) {
         prepared.price = this.snapToTick(book.bestBid + this.config.tickSize);
+        if (!this._isSlidQuoteWithinContract(prepared)) return null;
         if (this.config.strictTruexMakerSafety && this._isAloRetryInhibited(prepared)) {
           this._recordSuppression(prepared, 'alo-retry-inhibited');
           return null;
@@ -2675,6 +2745,7 @@ export class QuoteEngine extends EventEmitter {
       this._recordSuppression(prepared, capturedState.reason);
       return null;
     }
+    if (!this._isWithinContractQuoteEnvelope(prepared)) return null;
     if (this._isAloRetryInhibited(prepared)) {
       this._recordSuppression(prepared, 'alo-retry-inhibited');
       return null;
@@ -2684,7 +2755,9 @@ export class QuoteEngine extends EventEmitter {
       ? prepared.price >= book.bestAsk
       : prepared.price <= book.bestBid;
     if (!marketable) {
-      if (!this._wouldSelfCrossTrackedOrder(prepared)) return prepared;
+      if (!this._wouldSelfCrossTrackedOrder(prepared)) {
+        return this._isContractDisplayedPairWithinCap(prepared) ? prepared : null;
+      }
       this._recordSuppression(prepared, 'self-cross-tracked-order');
       return null;
     }
@@ -2696,6 +2769,7 @@ export class QuoteEngine extends EventEmitter {
         this._recordSuppression(prepared, 'marketable-slide-invalid');
         return null;
       }
+      if (!this._isSlidQuoteWithinContract(prepared)) return null;
       if (this._isAloRetryInhibited(prepared)) {
         this._recordSuppression(prepared, 'alo-retry-inhibited');
         return null;
@@ -2708,6 +2782,173 @@ export class QuoteEngine extends EventEmitter {
     }
     this._recordSuppression(prepared, 'marketable-post-only');
     return null;
+  }
+
+  _isWithinContractQuoteEnvelope(quote) {
+    if (!Number.isFinite(this.config.contractMaxQuoteSpreadBps)) return true;
+    const referenceMid = Number(quote?.contractReferenceMid);
+    const price = Number(quote?.price);
+    if (!Number.isFinite(referenceMid) || referenceMid <= 0 || !Number.isFinite(price) || price <= 0) {
+      this._recordSuppression(quote, 'contract-spread-context-missing');
+      return false;
+    }
+    const halfWidth = referenceMid * this.config.contractMaxQuoteSpreadBps / 20_000;
+    // Price computations may contain insignificant floating-point residue; no
+    // meaningful price increment is tolerated beyond the configured envelope.
+    const epsilon = Math.max(Number.EPSILON * Math.max(referenceMid, price) * 8, 1e-12);
+    if (price < referenceMid - halfWidth - epsilon || price > referenceMid + halfWidth + epsilon) {
+      this._recordSuppression(quote, 'contract-spread-envelope-violation');
+      return false;
+    }
+    return true;
+  }
+
+  _contractOrderStateUsable() {
+    if (!Number.isFinite(this.config.contractMaxQuoteSpreadBps)) return true;
+    let state;
+    try { state = this.authoritativeOrderStateProvider?.(); } catch (_) { state = null; }
+    const timestamp = Number(state?.timestamp);
+    const ageMs = this.now() - timestamp;
+    return state?.available === true && Array.isArray(state?.orders) &&
+      Number.isFinite(timestamp) && timestamp > 0 &&
+      ageMs >= 0 && ageMs <= this.config.contractOrderStateMaxAgeMs;
+  }
+
+  _contractOrderStateReason() {
+    let state;
+    try { state = this.authoritativeOrderStateProvider?.(); } catch (_) { state = null; }
+    const timestamp = Number(state?.timestamp);
+    if (state?.available !== true || !Array.isArray(state?.orders) ||
+        !Number.isFinite(timestamp) || timestamp <= 0) {
+      return 'contract-order-state-unavailable';
+    }
+    return 'contract-order-state-stale';
+  }
+
+  _reportContractPolicyBreach(quote, reason, actualOpposite = null) {
+    const event = Object.freeze({
+      side: quote?.side || null,
+      level: quote?.level || null,
+      reason,
+      orderId: quote?.replacesQuoteId || null,
+      actualOppositeOrderId: actualOpposite?.clOrdID || null,
+      action: 'authoritative-resync-required',
+    });
+    this._recordSuppression({ ...quote, transition: 'contract-policy-breach' }, reason);
+    this.emit('contract-policy-breach', event);
+    this._emitCapitalResyncRequired({
+      side: quote?.side || 'multiple', reason, orderId: quote?.replacesQuoteId || null, strict: true,
+    });
+    this.deferredRepriceNeeded = true;
+  }
+
+  _isSlidQuoteWithinContract(quote) {
+    if (!this._isWithinContractQuoteEnvelope(quote)) return false;
+    return this._isContractDisplayedPairWithinCap(quote, {
+      violationReason: 'contract-spread-slide-violates-cap',
+    });
+  }
+
+  _normalizeContractOrderSide(side) {
+    const normalized = String(side ?? '').trim().toLowerCase();
+    if (normalized === 'buy' || normalized === '1') return 'buy';
+    if (normalized === 'sell' || normalized === '2') return 'sell';
+    return null;
+  }
+
+  _isContractLiveOppositeOrder(order) {
+    if (!order || !Number.isFinite(Number(order.price)) || Number(order.price) <= 0) return false;
+    // These are the normalized local states as well as the execution-report
+    // forms that can briefly be present while reconciliation catches up. A
+    // cancelling acknowledged order remains displayed until terminal evidence
+    // arrives, so it must continue to constrain the contractual pair.
+    const status = String(order.status ?? '').trim().toLowerCase();
+    return new Set([
+      'active', 'pending', 'pending_new', 'new', 'partial_fill', 'partially_filled',
+      'cancelling', 'cancel_pending', '0', 'a', '1', '6', 'e',
+    ]).has(status);
+  }
+
+  _actualContractOppositeOrder(quote) {
+    const quoteSide = this._normalizeContractOrderSide(quote?.side);
+    if (!quoteSide) return null;
+    const oppositeSide = quoteSide === 'buy' ? 'sell' : 'buy';
+    // The finite-cap claim is about exchange-displayed orders.  Do not turn
+    // local lifecycle cache into authority after reconnect/out-of-order FIX;
+    // the provider is a scoped REST snapshot set only by reconciliation.
+    let snapshot;
+    try { snapshot = this.authoritativeOrderStateProvider?.(); } catch (_) { snapshot = null; }
+    const candidates = [];
+    for (const order of snapshot?.orders || []) {
+      if (this._normalizeContractOrderSide(order?.side) !== oppositeSide ||
+          !this._isContractLiveOppositeOrder(order)) continue;
+      candidates.push({ ...order, clOrdID: order?.clOrdID ?? order?.orderId ?? null });
+    }
+    if (candidates.length === 0) return null;
+
+    // A contractual ladder pair is level-local. Prefer actual orders at the
+    // candidate's level; an order with no recorded level is still relevant
+    // when no exact level can be identified, but a different explicit level
+    // is not silently substituted for the intended pair.
+    const level = Number(quote?.level);
+    const sameLevel = Number.isInteger(level) && level > 0
+      ? candidates.filter((order) => Number(order.level) === level)
+      : [];
+    const unlevelled = candidates.filter((order) => !Number.isFinite(Number(order.level)));
+    const relevant = sameLevel.length > 0 ? sameLevel : (unlevelled.length > 0 ? unlevelled : []);
+    if (relevant.length === 0) return null;
+
+    // When duplicate actual orders are temporarily visible, test the widest
+    // displayed pair. Passing against a nearer peer would not prove the cap
+    // for the farther still-live order.
+    return relevant.reduce((worst, order) => {
+      if (!worst) return order;
+      return quoteSide === 'buy'
+        ? (Number(order.price) > Number(worst.price) ? order : worst)
+        : (Number(order.price) < Number(worst.price) ? order : worst);
+    }, null);
+  }
+
+  _isContractDisplayedPairWithinCap(quote, {
+    violationReason = 'contract-spread-actual-pair-violates-cap',
+  } = {}) {
+    if (!Number.isFinite(this.config.contractMaxQuoteSpreadBps)) return true;
+    if (!this._contractOrderStateUsable()) {
+      const reason = this._contractOrderStateReason();
+      this._recordSuppression(quote, reason);
+      // A strict coalesced reconciliation is the only safe way to restore a
+      // finite-cap authority gap. Never let a stale/missing snapshot turn into
+      // a local-cache placement.
+      this._emitCapitalResyncRequired({
+        side: quote?.side || 'multiple', reason, orderId: quote?.replacesQuoteId || null, strict: true,
+      });
+      this.deferredRepriceNeeded = true;
+      return false;
+    }
+    const referenceMid = Number(quote?.contractReferenceMid);
+    const price = Number(quote?.price);
+    if (!Number.isFinite(referenceMid) || referenceMid <= 0 || !Number.isFinite(price) || price <= 0) {
+      this._recordSuppression(quote, 'contract-spread-context-missing');
+      return false;
+    }
+    const actualOpposite = this._actualContractOppositeOrder(quote);
+    const oppositePrice = Number(actualOpposite?.price ?? quote?.contractOppositePrice);
+    if (!Number.isFinite(oppositePrice) || oppositePrice <= 0) {
+      // A first side may proceed only when compute/reconciliation supplied a
+      // synchronized pair plan. Direct legacy sends cannot prove the full
+      // displayed-width contract merely because no opposite is tracked yet.
+      this._recordSuppression(quote, 'contract-spread-pair-context-missing');
+      return false;
+    }
+    const side = this._normalizeContractOrderSide(quote.side);
+    const displayedWidth = side === 'buy' ? oppositePrice - price : price - oppositePrice;
+    const maxWidth = referenceMid * this.config.contractMaxQuoteSpreadBps / 10_000;
+    const epsilon = Math.max(Number.EPSILON * Math.max(referenceMid, oppositePrice, price) * 8, 1e-12);
+    if (!side || !Number.isFinite(displayedWidth) || displayedWidth <= 0 || displayedWidth > maxWidth + epsilon) {
+      this._reportContractPolicyBreach(quote, violationReason, actualOpposite);
+      return false;
+    }
+    return true;
   }
 
   _aloRetryKey(side, price) {

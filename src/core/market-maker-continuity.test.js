@@ -663,6 +663,22 @@ describe('MarketMakerOrchestrator strict startup reconciliation', () => {
     await orchestrator.stop();
   });
 
+  test('capital-resync EventEmitter listener contains async REST failure while direct strict caller receives it', async () => {
+    const orchestrator = makeStartupOrchestrator();
+    const failure = new Error('REST snapshot failed');
+    orchestrator.logger.error = mock(() => {});
+    orchestrator._onCapitalResyncRequired = mock(() => Promise.reject(failure));
+    orchestrator._wireEvents();
+
+    orchestrator.quoteEngine.emit('capital-resync-required', { side: 'buy', strict: true });
+    for (let turn = 0; turn < 3; turn += 1) await Promise.resolve();
+    expect(orchestrator.logger.error).toHaveBeenCalledWith(
+      expect.stringContaining('Capital resync event failed: REST snapshot failed'),
+    );
+    await expect(orchestrator._onCapitalResyncRequired({ side: 'buy', strict: true })).rejects.toThrow('REST snapshot failed');
+    orchestrator._unwireEvents();
+  });
+
   test('later startup failure clears attempt-owned timers and connections before retry', async () => {
     const orchestrator = makeStartupOrchestrator({ postgresManager: {} });
     orchestrator._takeBalanceSnapshot = mock()
@@ -1814,6 +1830,87 @@ describe('MarketMakerOrchestrator strict startup reconciliation', () => {
     expect((await strictObserved).error?.message).toContain('shared fresh snapshot failed');
     expect(orchestrator._refreshBalances).toHaveBeenCalledTimes(1);
     expect(orchestrator._capitalResyncInFlight).toBeNull();
+  });
+
+  test('contract-order snapshot storm schedules at most one strict follow-up and never dispatches D', async () => {
+    let releaseFirst;
+    let releaseSecond;
+    let refreshCalls = 0;
+    const fixConnection = { sendMessage: mock(() => true) };
+    const orchestrator = makeStartupOrchestrator();
+    orchestrator._capitalResyncInFlight = null;
+    orchestrator._capitalResyncPending = false;
+    orchestrator._capitalResyncStrictPending = false;
+    orchestrator._capitalResyncStrictDrainSuppressed = false;
+    orchestrator.quoteEngine.fixConnection = fixConnection;
+    orchestrator._refreshBalances = mock(() => {
+      refreshCalls += 1;
+      if (refreshCalls === 1) return new Promise((resolve) => { releaseFirst = resolve; });
+      if (refreshCalls === 2) return new Promise((resolve) => { releaseSecond = resolve; });
+      return Promise.resolve();
+    });
+
+    const first = orchestrator._onCapitalResyncRequired({
+      side: 'buy', reason: 'contract-order-state-stale', strict: true,
+    });
+    for (let index = 0; index < 20; index += 1) {
+      void orchestrator._onCapitalResyncRequired({
+        side: 'buy', reason: 'contract-order-state-stale', strict: true,
+      });
+      void orchestrator._onCapitalResyncRequired({
+        side: 'multiple', reason: 'contract-order-state-refresh', strict: false,
+      });
+    }
+    for (let turn = 0; turn < 5 && !releaseFirst; turn += 1) await Promise.resolve();
+    expect(typeof releaseFirst).toBe('function');
+    expect(orchestrator._refreshBalances).toHaveBeenCalledTimes(1);
+    expect(fixConnection.sendMessage).not.toHaveBeenCalled();
+
+    releaseFirst();
+    for (let turn = 0; turn < 5 && !releaseSecond; turn += 1) await Promise.resolve();
+    expect(orchestrator._refreshBalances).toHaveBeenCalledTimes(2);
+    for (let index = 0; index < 20; index += 1) {
+      void orchestrator._onCapitalResyncRequired({
+        side: 'buy', reason: 'contract-order-state-stale', strict: true,
+      });
+    }
+    expect(orchestrator._refreshBalances).toHaveBeenCalledTimes(2);
+    expect(fixConnection.sendMessage).not.toHaveBeenCalled();
+    releaseSecond();
+    await first;
+    expect(orchestrator._refreshBalances).toHaveBeenCalledTimes(2);
+    expect(orchestrator._capitalResyncInFlight).toBeNull();
+  });
+
+  test('non-strict contract-order timer storm during slow REST adds no pending pass and no D', async () => {
+    let releaseRefresh;
+    const fixConnection = { sendMessage: mock(() => true) };
+    const orchestrator = makeStartupOrchestrator();
+    orchestrator._capitalResyncInFlight = null;
+    orchestrator._capitalResyncPending = false;
+    orchestrator._capitalResyncStrictPending = false;
+    orchestrator._capitalResyncStrictDrainSuppressed = false;
+    orchestrator.quoteEngine.fixConnection = fixConnection;
+    orchestrator._refreshBalances = mock(() => new Promise((resolve) => { releaseRefresh = resolve; }));
+
+    const first = orchestrator._onCapitalResyncRequired({
+      side: 'multiple', reason: 'contract-order-state-refresh', strict: false,
+    });
+    for (let turn = 0; turn < 5 && !releaseRefresh; turn += 1) await Promise.resolve();
+    for (let index = 0; index < 20; index += 1) {
+      void orchestrator._onCapitalResyncRequired({
+        side: 'multiple', reason: 'contract-order-state-refresh', strict: false,
+      });
+    }
+    expect(orchestrator._refreshBalances).toHaveBeenCalledTimes(1);
+    expect(orchestrator._capitalResyncPending).toBe(false);
+    expect(orchestrator._capitalResyncStrictPending).toBe(false);
+    expect(fixConnection.sendMessage).not.toHaveBeenCalled();
+
+    releaseRefresh();
+    await first;
+    expect(orchestrator._refreshBalances).toHaveBeenCalledTimes(1);
+    expect(fixConnection.sendMessage).not.toHaveBeenCalled();
   });
 
   test('failed runtime ghost resync leaves the affected side blocked and failed', async () => {

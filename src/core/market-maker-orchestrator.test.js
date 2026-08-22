@@ -230,6 +230,49 @@ describe('MarketMakerOrchestrator — anchor config wiring', () => {
     expect(orch.quoteEngine.config.quoteDispatchMode).toBe('observe');
   });
 
+  it('forwards the validated contractual spread ceiling to the engine', () => {
+    const orch = makeRealEngineOrch({
+      continuityConfig: {
+        minActiveLevelsPerSide: 1, minimumFundedQuoteSize: 0.0001,
+        l1ReserveBase: 0.01, l1ReserveQuote: 1000, maxSideGapMs: 5000,
+        alertThresholdMs: 3000, alertRateLimitMs: 60000, degradedMaxLevels: 1,
+        degradedSizeFactor: 0.5, defensiveSpreadFloorBps: 80,
+        contractMaxQuoteSpreadBps: 100, contractRequiredLevelsPerSide: 1,
+        contractOrderStateMaxAgeMs: 5000,
+      },
+    });
+
+    expect(orch.quoteEngine.config.contractMaxQuoteSpreadBps).toBe(100);
+    expect(orch.quoteEngine.config.contractOrderStateMaxAgeMs).toBe(5000);
+    expect(orch.balanceRefreshIntervalMs).toBe(60000);
+    expect(orch.authoritativeOrderRefreshIntervalMs).toBe(2500);
+  });
+
+  it('coalesces a 5s contractual order snapshot refresh independently of a 60s balance cadence', async () => {
+    const orch = makeRealEngineOrch({
+      balanceRefreshIntervalMs: 60000,
+      continuityConfig: {
+        minActiveLevelsPerSide: 1, minimumFundedQuoteSize: 0.0001,
+        l1ReserveBase: 0.01, l1ReserveQuote: 1000, maxSideGapMs: 5000,
+        alertThresholdMs: 3000, alertRateLimitMs: 60000, degradedMaxLevels: 1,
+        degradedSizeFactor: 0.5, defensiveSpreadFloorBps: 80,
+        contractMaxQuoteSpreadBps: 100, contractRequiredLevelsPerSide: 1,
+        contractOrderStateMaxAgeMs: 5000,
+      },
+    });
+    orch.isRunning = true;
+    orch.restClient = {};
+    orch._onCapitalResyncRequired = jest.fn().mockResolvedValue(undefined);
+
+    await orch._refreshAuthoritativeOrderSnapshot();
+
+    expect(orch.authoritativeOrderRefreshIntervalMs).toBe(2500);
+    expect(orch.balanceRefreshIntervalMs).toBe(60000);
+    expect(orch._onCapitalResyncRequired).toHaveBeenCalledWith({
+      side: 'multiple', reason: 'contract-order-state-refresh', strict: false,
+    });
+  });
+
   it('forwards self-match prevention instruction from env when option is unset', () => {
     const previousValue = process.env.TRUEX_SELF_MATCH_PREVENTION_INSTRUCTION;
     process.env.TRUEX_SELF_MATCH_PREVENTION_INSTRUCTION = '1';

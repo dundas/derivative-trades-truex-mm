@@ -41,7 +41,7 @@ import { CoinbaseWsIngest } from '../src/data-pipeline/coinbase-ws-ingest.js';
 import { CoinbaseMarketDataAdapter } from '../src/data-pipeline/coinbase-market-data-adapter.js';
 import { buildReferenceMarkoutRolloutOptions } from './reference-markout-rollout-config.js';
 import { CryptoComReferenceBookFeed } from '../src/connectors/cryptocom/CryptoComReferenceBookFeed.js';
-import { buildContinuityConfig } from './continuity-config.js';
+import { buildContinuityConfig, buildMakerQuotePolicyConfig } from './continuity-config.js';
 import { buildOrderReconciliationScope } from './order-reconciliation-scope-config.js';
 import { startProductionOrchestrator } from './production-orchestrator-startup.js';
 import { buildTruexMakerSafetyConfig } from './truex-maker-safety-config.js';
@@ -113,6 +113,8 @@ const inventoryRebalanceShadowConfig = buildInventoryRebalanceShadowConfig(proce
 // Configuration — PRODUCTION
 // ---------------------------------------------------------------------------
 
+const makerQuotePolicyConfig = buildMakerQuotePolicyConfig(process.env);
+
 const config = {
   // Session
   sessionId: `prod-${Date.now()}`,
@@ -128,11 +130,9 @@ const config = {
   clientId: process.env.TRUEX_CLIENT_ID || '78932725357888855',
   ...fixLivenessConfig,
 
-  // Quote Engine — CONSERVATIVE production sizing
-  //   2 levels per side (TrueX requested; matches available BTC inventory)
-  //   Base size 0.01 BTC (~$1,000 at $100k)
-  //   Total per side: ~0.018 BTC (0.01 + 0.008)
-  levels: 2,
+  // Quote Engine — contractual obligation values are required deployment config.
+  // No source default is allowed because Section 9 values remain operator-owned.
+  levels: makerQuotePolicyConfig.normalQuoteLevels,
   // Mirror Coinbase's book: we are effectively the entire TrueX book (sole liquidity), so
   // anchoring our quotes to Coinbase best bid/ask (offset by a 1-tick buffer) makes TrueX show
   // a Coinbase-tight market. baseSpreadBps is the fallback if the Coinbase book is absent.
@@ -141,14 +141,14 @@ const config = {
   // marketability authority configured below; missing/stale evidence fails closed for D sends.
   quoteAnchorMode: 'coinbase-mirror',
   coinbaseAnchorBufferTicks: 1,      // 1 tick ($0.50) outside Coinbase touch
-  baseSpreadBps: 30,                 // fallback spread (15bps/side) when Coinbase book is absent
+  baseSpreadBps: makerQuotePolicyConfig.fallbackBaseSpreadBps,
   levelSpacingTicks: 2,
   randomLevelSpacingBpsMin: 0.8,
   randomLevelSpacingBpsMax: 1.2,
   // Faster reprice regime for a tight mirrored spread: stale quotes are the main risk when
   // mirroring Coinbase, and repricing only updates our own book. Tightened from 3 ticks/5s.
   repriceThresholdTicks: 1,    // Reprice on any $0.50 move off the anchor
-  baseSizeBTC: 0.01,           // ~$1,000 at $100k BTC
+  baseSizeBTC: makerQuotePolicyConfig.baseQuoteSizeBTC,
   sizeDecayFactor: 0.8,        // Each level 80% of previous
   sizeDecimalPlaces: 4,        // TrueX BTC increment: 0.0001
   // passive-safe replace = cancel+place, so a full 2-level/2-side reprice is ~8 FIX actions.
@@ -215,9 +215,7 @@ const config = {
   shadowPhase2Criteria,
 };
 config.continuityConfig = buildContinuityConfig(process.env, {
-  levels: config.levels,
-  baseSizeBTC: config.baseSizeBTC,
-  baseSpreadBps: config.baseSpreadBps,
+  ...makerQuotePolicyConfig,
 });
 config.truexMakerSafety = buildTruexMakerSafetyConfig(process.env, {
   ebboPollIntervalMs: config.truexEbboPollIntervalMs,
