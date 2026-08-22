@@ -216,6 +216,12 @@ Computes bid/ask ladder quotes with inventory skew, manages order lifecycle thro
 - The placement check is duplicated at action dispatch and immediately before `_sendNewOrder()` reserves state or calls the FIX connection. This protects against direct internal callers as well as ordinary reconciliation.
 - `/api/v1/health` exposes `quoteDispatchMode` and per-feed `feedHealth`. Feed records report whether a feed is enabled and required for order dispatch or shadow evaluation, plus freshness, last-success age, error count, current backoff, and in-flight status.
 
+**Observer-only inventory recovery:**
+- `MM_INVENTORY_RECOVERY_ENABLED` is disabled by default. Enabling it requires `MM_QUOTE_DISPATCH_MODE=observe` and explicit operator-supplied recovery target, distribution, band, maker-floor, size-asymmetry, and skew-limit inputs; `MM_INVENTORY_RECOVERY_OPERATE_ON_EXCESS` is a separate opt-in.
+- Below its interim BTC target, the policy makes passive bids relatively tighter/larger and asks wider/smaller; it stops adjusting at the target unless excess operation is enabled. Standard EBBO, width, capital, and post-only safeguards remain in force.
+- Recovery cannot become a live strategy through configuration corruption or direct callers: non-observe startup and new/replacement placement fail closed. Observer diagnostics check only EBBO and post-only viability; a sanitized recovery decision summary is available only from authenticated status—not public health.
+- A live canary remains a separate authorization after observer evidence, including zero-order behavior and matured 1/5/60-minute markouts.
+
 **Polling configuration:**
 - `PYUSD_USD_POLL_INTERVAL_MS` defaults to 5000 and may be `0` to disable the optional PYUSD/USD shadow input. `PYUSD_USD_POLL_TIMEOUT_MS` (1000), `PYUSD_USD_STALE_THRESHOLD_MS` (15000), and `TRUEX_EBBO_POLL_INTERVAL_MS` (1000) must be positive integers.
 - Configuration is validated before timers or exchange requests are created; invalid values fail startup instead of creating an uncontrolled polling loop.
