@@ -6,25 +6,42 @@ function sumObserved(dailyReports, selector, initial, add) {
   }, initial);
 }
 
-function unavailableEvidence(dailyReports, selector) {
-  const unavailable = dailyReports.map(selector).filter(value => value?.evidence === 'unavailable');
-  return { days: unavailable.length, reasons: [...new Set(unavailable.map(value => value.reason))] };
+function performanceEvidence(report, component) {
+  if (!report?.performance) {
+    return { evidence: 'unavailable', reason: 'daily-performance-missing' };
+  }
+  const value = report.performance[component];
+  if (!value || (value.evidence !== 'observed' && value.evidence !== 'unavailable')) {
+    return { evidence: 'unavailable', reason: `daily-performance-component-missing:${component}` };
+  }
+  return value;
+}
+
+function unavailableEvidence(dailyReports, component) {
+  const evidence = dailyReports.map(report => performanceEvidence(report, component));
+  const unavailable = evidence.filter(value => value.evidence === 'unavailable');
+  return {
+    days: unavailable.length,
+    reasons: [...new Set(unavailable.map(value => value.reason))],
+    coverage: { reviewedDays: dailyReports.length, observedDays: evidence.length - unavailable.length, unavailableDays: unavailable.length },
+  };
 }
 
 function buildWeeklyPerformanceSummary(dailyReports) {
-  const performance = report => report.performance;
-  const sameDayOpposingFillProxy = sumObserved(dailyReports, report => performance(report)?.sameDayOpposingFillProxy, { days: 0, pnl: 0, matchedQty: 0 }, (total, value) => ({ days: total.days + 1, pnl: total.pnl + value.pnl, matchedQty: total.matchedQty + value.matchedQty }));
-  const rejects = sumObserved(dailyReports, report => performance(report)?.rejects, { attempts: 0, rejects: 0, rate: null, rateAvailable: true }, (total, value) => ({ attempts: total.attempts + (value.attempts ?? 0), rejects: total.rejects + value.rejects, rate: null, rateAvailable: total.rateAvailable && value.rate !== null }));
-  rejects.rate = rejects.attempts ? rejects.rejects / rejects.attempts : null;
-  const pnl = sumObserved(dailyReports, report => performance(report)?.pnl, { realizedGross: 0, fees: 0, netRealizedAfterFees: 0 }, (total, value) => ({ realizedGross: total.realizedGross + value.realizedGross, fees: total.fees + value.fees, netRealizedAfterFees: total.netRealizedAfterFees + value.netRealizedAfterFees }));
+  const sameDayOpposingFillProxy = sumObserved(dailyReports, report => performanceEvidence(report, 'sameDayOpposingFillProxy'), { days: 0, pnl: 0, matchedQty: 0 }, (total, value) => ({ days: total.days + 1, pnl: total.pnl + value.pnl, matchedQty: total.matchedQty + value.matchedQty }));
+  const rejectEvidence = dailyReports.map(report => performanceEvidence(report, 'rejects'));
+  const attributableRejectRates = rejectEvidence.every(value => value.evidence === 'observed' && Number.isFinite(value.rate));
+  const rejects = sumObserved(dailyReports, report => performanceEvidence(report, 'rejects'), { attempts: 0, rejects: 0, rate: null, rateAvailable: attributableRejectRates }, (total, value) => ({ attempts: total.attempts + (value.attempts ?? 0), rejects: total.rejects + value.rejects, rate: null, rateAvailable: total.rateAvailable }));
+  rejects.rate = rejects.rateAvailable && rejects.attempts > 0 ? rejects.rejects / rejects.attempts : null;
+  const pnl = sumObserved(dailyReports, report => performanceEvidence(report, 'pnl'), { realizedGross: 0, fees: 0, netRealizedAfterFees: 0 }, (total, value) => ({ realizedGross: total.realizedGross + value.realizedGross, fees: total.fees + value.fees, netRealizedAfterFees: total.netRealizedAfterFees + value.netRealizedAfterFees }));
   return {
     observed: { sameDayOpposingFillProxy, rejects, pnl },
     unavailable: {
-      realizedSpread: unavailableEvidence(dailyReports, report => performance(report)?.realizedSpread),
-      sameDayOpposingFillProxy: unavailableEvidence(dailyReports, report => performance(report)?.sameDayOpposingFillProxy),
-      uptime: unavailableEvidence(dailyReports, report => performance(report)?.uptime),
-      rejects: unavailableEvidence(dailyReports, report => performance(report)?.rejects),
-      inventory: unavailableEvidence(dailyReports, report => performance(report)?.inventory),
+      realizedSpread: unavailableEvidence(dailyReports, 'realizedSpread'),
+      sameDayOpposingFillProxy: unavailableEvidence(dailyReports, 'sameDayOpposingFillProxy'),
+      uptime: unavailableEvidence(dailyReports, 'uptime'),
+      rejects: unavailableEvidence(dailyReports, 'rejects'),
+      inventory: unavailableEvidence(dailyReports, 'inventory'),
     },
     // Weekly aggregation must never turn missing daily counterfactuals into an estimate.
     counterfactual: { evidence: 'unavailable', reason: 'no counterfactual performance is inferred from observed fills' },
