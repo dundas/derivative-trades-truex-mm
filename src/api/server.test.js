@@ -6,6 +6,7 @@
  */
 import { describe, it, expect, jest } from 'bun:test';
 import { handleAnalyticsBalanceSnapshots } from './analytics-balance-snapshots.js';
+import { buildPublicHealthSnapshot } from './public-health-snapshot.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -27,6 +28,22 @@ function makeDb(rows = [], total = rows.length) {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+describe('GET /api/v1/health public payload', () => {
+  it('omits inventory-recovery strategy decisions', () => {
+    const response = buildPublicHealthSnapshot({
+      status: 'healthy',
+      inventoryRecovery: {
+        enabled: true, direction: 'accumulate', adjustmentApplied: true,
+        decision: 'below-interim-target',
+      },
+    }, { connected: true }, { uptime: () => 12 });
+
+    expect(response).not.toHaveProperty('inventoryRecovery');
+    expect(JSON.stringify(response)).not.toContain('accumulate');
+    expect(response.database).toEqual({ connected: true });
+  });
+});
 
 describe('GET /api/v1/analytics/balance-snapshots', () => {
   it('returns all rows when no filters applied', async () => {

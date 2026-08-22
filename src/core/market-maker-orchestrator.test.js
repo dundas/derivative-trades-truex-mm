@@ -193,6 +193,18 @@ describe('strict EBBO presence verification', () => {
 // coinbase-mirror anchor config threads through to the QuoteEngine
 // -----------------------------------------------------------------------
 describe('MarketMakerOrchestrator — anchor config wiring', () => {
+  const recoveryConfig = Object.freeze({
+    enabled: true,
+    interimTargetInventoryBTC: 1,
+    inventorySigmaBTC: 0.25,
+    centerBandSigma: 0.5,
+    softHedgeBandSigma: 2,
+    hardHedgeBandSigma: 3,
+    minimumMakerParticipation: 0.25,
+    maxSizeAsymmetry: 0.75,
+    maxQuoteSkewBps: 10,
+  });
+
   function makeRealEngineOrch(overrides) {
     return new MarketMakerOrchestrator({
       truexHost: 'test.host', truexPort: 1234,
@@ -228,6 +240,85 @@ describe('MarketMakerOrchestrator — anchor config wiring', () => {
     const orch = makeRealEngineOrch({ quoteDispatchMode: 'observe' });
 
     expect(orch.quoteEngine.config.quoteDispatchMode).toBe('observe');
+  });
+
+  it('rejects an incomplete enabled recovery config during construction before startup effects', () => {
+    const fixConnection = new MockFIXConnection();
+    const pnlTracker = { startPeriodicLogging: jest.fn(), stopPeriodicLogging: jest.fn() };
+    expect(() => new MarketMakerOrchestrator({
+      fixConnection,
+      pnlTracker,
+      logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
+      inventoryRecoveryConfig: { enabled: true },
+    })).toThrow('interimTargetInventoryBTC must be explicitly configured');
+    expect(fixConnection.connect).not.toHaveBeenCalled();
+    expect(pnlTracker.startPeriodicLogging).not.toHaveBeenCalled();
+    expect(fixConnection.listenerCount('message')).toBe(0);
+  });
+
+  it('rejects enabled recovery with live dispatch during construction before startup effects', () => {
+    const fixConnection = new MockFIXConnection();
+    expect(() => new MarketMakerOrchestrator({
+      fixConnection,
+      logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
+      quoteDispatchMode: 'live',
+      inventoryRecoveryConfig: recoveryConfig,
+    })).toThrow('inventoryRecoveryConfig requires quoteDispatchMode=observe');
+    expect(fixConnection.connect).not.toHaveBeenCalled();
+    expect(fixConnection.listenerCount('message')).toBe(0);
+  });
+
+  it('keeps a real recovery-shaped observer cycle free of D sends, reservations, and active orders', () => {
+    const fixConnection = new MockFIXConnection();
+    fixConnection.isLoggedOn = true;
+    const inventoryManager = new EventEmitter();
+    inventoryManager.getPositionSummary = jest.fn(() => ({
+      netPosition: 0.5,
+      side: 'long',
+      baseBalance: { total: 0.5, available: 0.5, held: 0 },
+      quoteBalance: { total: 100000, available: 100000, held: 0 },
+      balancesInitialized: true,
+    }));
+    inventoryManager.getSkew = jest.fn(() => ({ bidSkewTicks: 0, askSkewTicks: 0 }));
+    inventoryManager.canQuote = jest.fn(() => true);
+    inventoryManager.shouldHedge = jest.fn(() => ({ shouldHedge: false }));
+    inventoryManager.balancesInitialized = true;
+    const reservations = {
+      getQuoteCapacityForLevel: jest.fn(() => Number.POSITIVE_INFINITY),
+      getPresence: jest.fn(() => ({ buy: 0, sell: 0 })),
+      getReservations: jest.fn(() => []),
+      reserve: jest.fn(),
+      getStatus: jest.fn(() => ({ state: 'normal', blockedSides: [] })),
+    };
+    const orch = makeRealEngineOrch({
+      fixConnection,
+      inventoryManager,
+      capitalReservationManager: reservations,
+      quoteDispatchMode: 'observe',
+      inventoryRecoveryConfig: recoveryConfig,
+      levels: 1,
+      baseSpreadBps: 50,
+      baseSizeBTC: 0.1,
+      minNotional: 1,
+    });
+    orch.isRunning = true;
+    orch._onPriceUpdate({
+      midpoint: 100000, weightedMidpoint: 100000,
+      bestBid: 99995, bestAsk: 100005, confidence: 1,
+      timestamp: Date.now(), symbol: 'BTC-PYUSD', spread: 10, spreadBps: 1, sources: [],
+    });
+
+    expect(fixConnection.sendMessage).not.toHaveBeenCalled();
+    expect(reservations.reserve).not.toHaveBeenCalled();
+    expect(orch.quoteEngine.activeOrders.size).toBe(0);
+    expect(orch.getHealthStatus().inventoryRecovery).toEqual({
+      enabled: true,
+      interimTargetConfigured: true,
+      interimTargetReached: false,
+      direction: 'accumulate',
+      adjustmentApplied: true,
+      decision: 'below-interim-target',
+    });
   });
 
   it('forwards the validated contractual width bounds to the engine', () => {

@@ -1,5 +1,6 @@
 import { EventEmitter } from 'events';
 import { randomBytes } from 'node:crypto';
+import { evaluateInventoryRecoveryQuote, validateInventoryRecoveryQuoteConfig } from './inventory-recovery-quote-policy.js';
 
 // Intentionally duplicated from the CJS FIX builder across the CJS/ESM boundary.
 // Numeric 0 means send 2964=0; boolean/string false disables the tag here via null.
@@ -28,6 +29,7 @@ function normalizeSelfMatchPreventionInstruction(value) {
 export class QuoteEngine extends EventEmitter {
   constructor(options = {}) {
     super();
+    const inventoryRecoveryConfig = validateInventoryRecoveryQuoteConfig(options.inventoryRecoveryConfig);
 
     // Dependencies (injected)
     this.inventoryManager = options.inventoryManager;
@@ -145,6 +147,7 @@ export class QuoteEngine extends EventEmitter {
       shadowDetectionTapeMaxAgeMs: options.shadowDetectionTapeMaxAgeMs ?? 30000,
       truexTapeOutlierThresholdBps: options.truexTapeOutlierThresholdBps ?? 50,
       marketDataProvider: options.marketDataProvider || null,
+      inventoryRecoveryConfig,
     };
     if (!Number.isInteger(this.config.degradedMaxLevels) || this.config.degradedMaxLevels < 1) {
       throw new Error('degradedMaxLevels must be a positive integer');
@@ -179,6 +182,9 @@ export class QuoteEngine extends EventEmitter {
     if (!['live', 'observe'].includes(this.config.quoteDispatchMode)) {
       throw new Error('quoteDispatchMode must be live or observe');
     }
+    if (this.config.inventoryRecoveryConfig.enabled && this.config.quoteDispatchMode !== 'observe') {
+      throw new Error('inventoryRecoveryConfig requires quoteDispatchMode=observe');
+    }
     if (this.config.strictTruexMakerSafety) {
       if (!['skip', 'slide'].includes(this.config.marketablePostOnlyAction)) {
         throw new Error('marketablePostOnlyAction must be skip or slide');
@@ -197,6 +203,7 @@ export class QuoteEngine extends EventEmitter {
     // State
     this.activeOrders = new Map(); // clOrdID -> { side, price, size, level, status, placedAt }
     this.lastMid = 0;
+    this.inventoryRecoveryDecision = Object.freeze({ enabled: false, adjustmentApplied: false, reason: 'disabled' });
     this.lastAnchorBook = null; // { bestBid, bestAsk } from the anchor venue's feed (for coinbase-mirror)
     this.lastRepriceAt = 0;
     this.isQuoting = false;
@@ -504,6 +511,12 @@ export class QuoteEngine extends EventEmitter {
     const contractHalfSpread = Number.isFinite(this.config.contractMaxQuoteSpreadBps)
       ? (this.config.contractMaxQuoteSpreadBps / 10000) * mid / 2
       : Number.POSITIVE_INFINITY;
+    const position = this.inventoryManager?.getPositionSummary?.();
+    const inventoryBTC = Number(position?.baseBalance?.total ?? position?.netPosition);
+    const recovery = evaluateInventoryRecoveryQuote(inventoryBTC, this.config.inventoryRecoveryConfig);
+    this.inventoryRecoveryDecision = recovery;
+    const recoveryQuote = recovery.quote || null;
+    const recoveryMetadata = recovery.adjustmentApplied ? { inventoryRecovery: true } : {};
 
     // coinbase-mirror: anchor L1 to the anchor venue's best bid/ask offset out by a small buffer
     // so our spread mirrors that venue's width while staying maker-safe. Deeper levels step out
@@ -548,18 +561,19 @@ export class QuoteEngine extends EventEmitter {
     for (let level = 1; level <= effectiveLevels; level++) {
       const levelOffset = this._getLevelOffset(mid, level, levelSpacingTicks, tickSize);
       const rawSize = baseSizeBTC * effectiveSizeFactor * Math.pow(sizeDecayFactor, level - 1);
-      const size = parseFloat(rawSize.toFixed(this.config.sizeDecimalPlaces));
+      const bidSize = parseFloat((rawSize * (recoveryQuote?.bidSizeMultiplier ?? 1)).toFixed(this.config.sizeDecimalPlaces));
+      const askSize = parseFloat((rawSize * (recoveryQuote?.askSizeMultiplier ?? 1)).toFixed(this.config.sizeDecimalPlaces));
 
       let rawBid;
       let rawAsk;
       if (useMirror) {
         // L1 sits at the anchor venue's touch ± buffer; deeper levels add the ladder beyond L1.
         const ladder = levelOffset - l1LadderOffset;
-        rawBid = anchorBook.bestBid - mirrorBuffer - ladder - (skew.bidSkewTicks * tickSize);
-        rawAsk = anchorBook.bestAsk + mirrorBuffer + ladder + (skew.askSkewTicks * tickSize);
+        rawBid = anchorBook.bestBid - mirrorBuffer - ladder - (skew.bidSkewTicks * tickSize) - ((recoveryQuote?.bidSkewBps ?? 0) / 10_000 * mid);
+        rawAsk = anchorBook.bestAsk + mirrorBuffer + ladder + (skew.askSkewTicks * tickSize) + ((recoveryQuote?.askSkewBps ?? 0) / 10_000 * mid);
       } else {
-        rawBid = mid - halfSpread - levelOffset - (skew.bidSkewTicks * tickSize);
-        rawAsk = mid + halfSpread + levelOffset + (skew.askSkewTicks * tickSize);
+        rawBid = mid - halfSpread - levelOffset - (skew.bidSkewTicks * tickSize) - ((recoveryQuote?.bidSkewBps ?? 0) / 10_000 * mid);
+        rawAsk = mid + halfSpread + levelOffset + (skew.askSkewTicks * tickSize) + ((recoveryQuote?.askSkewBps ?? 0) / 10_000 * mid);
       }
       if (degraded) {
         rawBid = Math.min(rawBid, mid - halfSpread - levelOffset);
@@ -637,17 +651,17 @@ export class QuoteEngine extends EventEmitter {
         recordDegradedOmission('buy', level, 'can-quote-disabled');
       } else if (!this.withinPriceBand(bidPrice, mid)) {
         recordDegradedOmission('buy', level, 'price-band');
-      } else if (bidPrice * size < minNotional) {
+      } else if (bidPrice * bidSize < minNotional) {
         recordDegradedOmission('buy', level, 'minimum-notional');
       } else {
-        const cappedBidSize = this._capSizeToBalance('buy', size, bidPrice, bidCommittedQuote, level);
+        const cappedBidSize = this._capSizeToBalance('buy', bidSize, bidPrice, bidCommittedQuote, level);
         if (cappedBidSize >= this.config.minimumFundedQuoteSize && bidPrice * cappedBidSize >= minNotional) {
-          bids.push({ side: 'buy', price: bidPrice, size: cappedBidSize, level, ...contractContext });
+          bids.push({ side: 'buy', price: bidPrice, size: cappedBidSize, level, ...contractContext, ...recoveryMetadata });
           bidCommittedQuote += cappedBidSize * bidPrice;
         } else if (cappedBidSize < this.config.minimumFundedQuoteSize) {
           recordDegradedOmission(
             'buy', level,
-            cappedBidSize + 1e-12 < size ? 'balance-cap-below-minimum-size' : 'minimum-funded-size',
+            cappedBidSize + 1e-12 < bidSize ? 'balance-cap-below-minimum-size' : 'minimum-funded-size',
           );
         } else {
           recordDegradedOmission('buy', level, 'minimum-notional-after-cap');
@@ -659,17 +673,17 @@ export class QuoteEngine extends EventEmitter {
         recordDegradedOmission('sell', level, 'can-quote-disabled');
       } else if (!this.withinPriceBand(askPrice, mid)) {
         recordDegradedOmission('sell', level, 'price-band');
-      } else if (askPrice * size < minNotional) {
+      } else if (askPrice * askSize < minNotional) {
         recordDegradedOmission('sell', level, 'minimum-notional');
       } else {
-        const cappedAskSize = this._capSizeToBalance('sell', size, askPrice, askCommittedBase, level);
+        const cappedAskSize = this._capSizeToBalance('sell', askSize, askPrice, askCommittedBase, level);
         if (cappedAskSize >= this.config.minimumFundedQuoteSize && askPrice * cappedAskSize >= minNotional) {
-          asks.push({ side: 'sell', price: askPrice, size: cappedAskSize, level, ...askContractContext });
+          asks.push({ side: 'sell', price: askPrice, size: cappedAskSize, level, ...askContractContext, ...recoveryMetadata });
           askCommittedBase += cappedAskSize;
         } else if (cappedAskSize < this.config.minimumFundedQuoteSize) {
           recordDegradedOmission(
             'sell', level,
-            cappedAskSize + 1e-12 < size ? 'balance-cap-below-minimum-size' : 'minimum-funded-size',
+            cappedAskSize + 1e-12 < askSize ? 'balance-cap-below-minimum-size' : 'minimum-funded-size',
           );
         } else {
           recordDegradedOmission('sell', level, 'minimum-notional-after-cap');
@@ -1002,6 +1016,29 @@ export class QuoteEngine extends EventEmitter {
    */
   _dispatchAction(action) {
     this._refreshContinuityState();
+    // Recovery candidates are structurally observer-only. This remains true
+    // if a caller corrupts quoteDispatchMode after construction: do not
+    // cancel/replace, reserve capital, mutate local state, or send a D.
+    // The config gate is intentionally independent of the candidate marker:
+    // target-reached quotes and direct callers are unmarked, but must still
+    // fail closed while recovery is enabled under a corrupted live mode.
+    const recoveryCandidate = action.quote?.inventoryRecovery === true;
+    const recoveryEnabledOutsideObserve = this.config.inventoryRecoveryConfig.enabled &&
+      this.config.quoteDispatchMode !== 'observe';
+    if (action.type !== 'cancel' && (recoveryCandidate || recoveryEnabledOutsideObserve)) {
+      // In the only permitted mode, retain strict EBBO/post-only diagnostics
+      // for recovery candidates before observer suppression. This diagnostic
+      // deliberately excludes contract/authority validation, whose normal
+      // fail-closed path can request resync or arm a deferred reprice.
+      if (recoveryCandidate && this.config.quoteDispatchMode === 'observe') {
+        const diagnostic = this._diagnoseRecoveryObserverQuote(action.quote);
+        if (!diagnostic) return false;
+        this._recordSuppression(diagnostic, 'inventory-recovery-observe-only');
+        return false;
+      }
+      this._recordSuppression(action.quote, 'inventory-recovery-observe-only');
+      return false;
+    }
     if (this.config.quoteDispatchMode === 'observe' && action.type !== 'cancel') {
       this._recordSuppression(action.quote || action.order, 'quote-dispatch-observe-mode');
       return false;
@@ -1081,6 +1118,19 @@ export class QuoteEngine extends EventEmitter {
    */
   _sendNewOrder(quote) {
     this._refreshContinuityState();
+    const recoveryCandidate = quote?.inventoryRecovery === true;
+    const recoveryEnabledOutsideObserve = this.config.inventoryRecoveryConfig.enabled &&
+      this.config.quoteDispatchMode !== 'observe';
+    if (recoveryCandidate || recoveryEnabledOutsideObserve) {
+      if (recoveryCandidate && this.config.quoteDispatchMode === 'observe') {
+        const diagnostic = this._diagnoseRecoveryObserverQuote(quote);
+        if (!diagnostic) return null;
+        this._recordSuppression(diagnostic, 'inventory-recovery-observe-only');
+        return null;
+      }
+      this._recordSuppression(quote, 'inventory-recovery-observe-only');
+      return null;
+    }
     // Keep the deployment control at the transport-adjacent D boundary as
     // defense in depth. `_dispatchAction` also gates normal reconciliation,
     // but this protects direct and future internal callers of this method.
@@ -2038,6 +2088,7 @@ export class QuoteEngine extends EventEmitter {
       pyusdUsdFresh: this._isPyusdBasisFresh(),
       pyusdBasisSuppressed: this.shouldSuppressBasisDependentDetection(),
       shadowTakeMode: this.config.shadowTakeMode,
+      inventoryRecovery: this.inventoryRecoveryDecision,
       shadowState: {
         activeCandidate: this.shadowState.activeCandidate ? { ...this.shadowState.activeCandidate } : null,
         lastLoggedCandidate: this.shadowState.lastLoggedCandidate ? { ...this.shadowState.lastLoggedCandidate } : null,
@@ -2780,6 +2831,47 @@ export class QuoteEngine extends EventEmitter {
     }
 
     this._recordSuppression(prepared, 'marketable-post-only');
+    return null;
+  }
+
+  /**
+   * Read-only marketability diagnostic for structurally observer-only
+   * recovery candidates. Do not call contract-cap, authoritative-order, or
+   * resync helpers here: those paths intentionally mutate recovery state for
+   * executable quotes, which would make observation itself operational.
+   */
+  _diagnoseRecoveryObserverQuote(quote) {
+    const diagnostic = { ...quote };
+    if (diagnostic.postOnly === false) {
+      this._recordSuppression(diagnostic, 'taker-disabled');
+      return null;
+    }
+    if (!this.config.strictTruexMakerSafety) return diagnostic;
+
+    const state = this._strictEbboState();
+    if (!state.usable) {
+      this._recordSuppression(diagnostic, state.reason);
+      return null;
+    }
+    const marketable = diagnostic.side === 'buy'
+      ? diagnostic.price >= state.book.bestAsk
+      : diagnostic.price <= state.book.bestBid;
+    if (!marketable) return diagnostic;
+    if (this.config.marketablePostOnlyAction === 'skip') {
+      this._recordSuppression(diagnostic, 'marketable-post-only');
+      return null;
+    }
+    if (this.config.marketablePostOnlyAction === 'slide') {
+      diagnostic.price = diagnostic.side === 'buy'
+        ? this.snapToTick(state.book.bestAsk - this.config.tickSize)
+        : this.snapToTick(state.book.bestBid + this.config.tickSize);
+      if (!Number.isFinite(diagnostic.price) || diagnostic.price <= 0) {
+        this._recordSuppression(diagnostic, 'marketable-slide-invalid');
+        return null;
+      }
+      return diagnostic;
+    }
+    this._recordSuppression(diagnostic, 'marketable-post-only');
     return null;
   }
 
