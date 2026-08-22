@@ -299,8 +299,31 @@ describe('QuoteEngine', () => {
       });
       const quotes = engine.computeDesiredQuotes(100000, { bidSkewTicks: 0, askSkewTicks: 0 }, book);
       expect(quotes).toEqual([]);
-      expect(engine.suppressedLevels.get('buy:1').reason).toBe('minimum-width-contract-cap-no-noncrossed-tick-pair');
-      expect(engine.suppressedLevels.get('sell:1').reason).toBe('minimum-width-contract-cap-no-noncrossed-tick-pair');
+      expect(engine.suppressedLevels.get('buy:1').reason).toBe('minimum-width-contract-cap-no-feasible-tick-pair');
+      expect(engine.suppressedLevels.get('sell:1').reason).toBe('minimum-width-contract-cap-no-feasible-tick-pair');
+    });
+
+    it('suppresses an off-tick floor/cap pair that is passive but narrower than the floor before any send', () => {
+      const sent = [];
+      const engine = createEngine({
+        levels: 1, quoteAnchorMode: 'coinbase-mirror', tickSize: 0.50,
+        minimumQuoteWidthBps: 1, contractMaxQuoteSpreadBps: 1,
+        contractOrderStateMaxAgeMs: 1000, quoteDispatchMode: 'observe',
+        fixConnection: { sendMessage: (message) => sent.push(message) },
+      });
+      const mid = 100000.25;
+      const skew = { bidSkewTicks: 0, askSkewTicks: 0 };
+      const book = { bestBid: mid - 1, bestAsk: mid + 1 };
+
+      expect(engine.computeDesiredQuotes(mid, skew, book)).toEqual([]);
+      expect(engine.suppressedLevels.get('buy:1').reason).toBe('minimum-width-contract-cap-no-feasible-tick-pair');
+      expect(engine.suppressedLevels.get('sell:1').reason).toBe('minimum-width-contract-cap-no-feasible-tick-pair');
+
+      engine.onPriceUpdate({
+        ...makePrice(mid),
+        sources: [{ exchange: 'coinbase', bid: book.bestBid, ask: book.bestAsk, isStale: false }],
+      });
+      expect(sent.filter(message => message['35'] === 'D')).toEqual([]);
     });
 
     it('rejects invalid minimum-width configuration before quote generation', () => {

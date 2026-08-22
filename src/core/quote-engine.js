@@ -596,14 +596,24 @@ export class QuoteEngine extends EventEmitter {
           : Number.POSITIVE_INFINITY,
       );
 
-      // A narrow, off-tick contractual width can leave no strictly passive
-      // tick pair after rounding (for example, bid=ask=mid).  Do not let the
-      // individual half-envelope clamps turn that into a locked/crossed book.
+      // A narrow, off-tick contractual width can leave no feasible passive
+      // tick pair after rounding. The cap can produce a locked/crossed pair,
+      // or a noncrossed pair narrower than the configured full-width floor.
       // Suppress both candidates together, before reconciliation can enqueue a
-      // new order, and retain a machine-readable reason for the policy gap.
-      if (Number.isFinite(contractHalfSpread) && bidPrice >= askPrice) {
+      // new order, so a generation-time policy gap cannot turn into repeated
+      // send-time breach/resync cycles.
+      const displayedWidth = askPrice - bidPrice;
+      const minimumWidth = mid * minimumWidthBps / 10_000;
+      const widthEpsilon = Math.max(
+        Number.EPSILON * Math.max(mid, bidPrice, askPrice) * 8,
+        1e-12,
+      );
+      if (Number.isFinite(contractHalfSpread) && (
+        displayedWidth <= 0 ||
+        (minimumWidthBps > 0 && displayedWidth + widthEpsilon < minimumWidth)
+      )) {
         const reason = minimumWidthBps > 0
-          ? 'minimum-width-contract-cap-no-noncrossed-tick-pair'
+          ? 'minimum-width-contract-cap-no-feasible-tick-pair'
           : 'contract-spread-cap-no-noncrossed-tick-pair';
         this._recordSuppression(
           { side: 'buy', level, price: bidPrice, cause: reason, transition: 'contract-spread-cap-suppressed' },
