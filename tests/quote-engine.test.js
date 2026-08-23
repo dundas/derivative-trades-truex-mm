@@ -172,6 +172,99 @@ describe('QuoteEngine', () => {
       expect(fixConnection.sendMessage).not.toHaveBeenCalled();
     });
 
+    it('persists the exact canary decision before its FIX D is sent', async () => {
+      const fixConnection = createMockFix();
+      fixConnection.sendMessage = mock(() => true);
+      const decisionWriter = mock(async decision => {
+        expect(fixConnection.sendMessage).not.toHaveBeenCalled();
+        expect(decision).toMatchObject({
+          eventType: 'create', side: 'buy', price: 100, size: 0.0005, level: 1,
+          minimalLiveCanary: true, decisionPersistenceConfirmed: true,
+        });
+        return true;
+      });
+      const engine = createEngine({
+        fixConnection, levels: 1, baseSizeBTC: 0.0005, strictTruexMakerSafety: true,
+        quoteDispatchMode: 'live', minimumQuoteWidthBps: 30, contractMaxQuoteSpreadBps: 80,
+        contractOrderStateMaxAgeMs: 5000, minimalLiveCanaryConfig: canaryConfig,
+        minimalLiveCanaryDecisionWriter: decisionWriter,
+      });
+      engine._prepareQuoteForSend = mock(quote => ({ ...quote }));
+      engine._isPreparedQuoteSendableNow = mock(() => true);
+      engine.armMinimalLiveCanary();
+
+      expect(engine._dispatchAction({ type: 'place', quote: {
+        side: 'buy', level: 1, price: 100, size: 0.0005, postOnly: true,
+      } })).toBe(true);
+      await new Promise(resolve => setTimeout(resolve, 0));
+
+      expect(decisionWriter).toHaveBeenCalledTimes(1);
+      expect(fixConnection.sendMessage).toHaveBeenCalledWith(expect.objectContaining({ '35': 'D' }));
+    });
+
+    it('fails closed when canary decision persistence is unavailable', async () => {
+      const fixConnection = createMockFix();
+      fixConnection.sendMessage = mock(() => true);
+      const engine = createEngine({
+        fixConnection, levels: 1, baseSizeBTC: 0.0005, strictTruexMakerSafety: true,
+        quoteDispatchMode: 'live', minimumQuoteWidthBps: 30, contractMaxQuoteSpreadBps: 80,
+        contractOrderStateMaxAgeMs: 5000, minimalLiveCanaryConfig: canaryConfig,
+        minimalLiveCanaryDecisionWriter: mock(async () => false),
+      });
+      engine._prepareQuoteForSend = mock(quote => ({ ...quote }));
+      engine.armMinimalLiveCanary();
+
+      engine._dispatchAction({ type: 'place', quote: {
+        side: 'buy', level: 1, price: 100, size: 0.0005, postOnly: true,
+      } });
+      await new Promise(resolve => setTimeout(resolve, 0));
+
+      expect(engine.getQuoteStatus().minimalLiveCanary.stopReason).toBe('durable-decision-persistence-failed');
+      expect(fixConnection.sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('does not revive a quote when a decision write resolves after cancellation', async () => {
+      const fixConnection = createMockFix();
+      fixConnection.sendMessage = mock(() => true);
+      let resolveDecision;
+      const engine = createEngine({
+        fixConnection, levels: 1, baseSizeBTC: 0.0005, strictTruexMakerSafety: true,
+        quoteDispatchMode: 'live', minimumQuoteWidthBps: 30, contractMaxQuoteSpreadBps: 80,
+        contractOrderStateMaxAgeMs: 5000, minimalLiveCanaryConfig: canaryConfig,
+        minimalLiveCanaryDecisionWriter: mock(() => new Promise(resolve => { resolveDecision = resolve; })),
+      });
+      engine._prepareQuoteForSend = mock(quote => ({ ...quote }));
+      engine.armMinimalLiveCanary();
+      engine._dispatchAction({ type: 'place', quote: {
+        side: 'buy', level: 1, price: 100, size: 0.0005, postOnly: true,
+      } });
+      engine.cancelAllQuotes('test-withdrawal');
+      resolveDecision(true);
+      await new Promise(resolve => setTimeout(resolve, 0));
+
+      expect(fixConnection.sendMessage).not.toHaveBeenCalled();
+      expect(engine.activeOrders.size).toBe(0);
+    });
+
+    it('stops the canary when TrueX expires one of its orders', () => {
+      const engine = createEngine({
+        levels: 1, baseSizeBTC: 0.0005, strictTruexMakerSafety: true,
+        quoteDispatchMode: 'live', minimumQuoteWidthBps: 30, contractMaxQuoteSpreadBps: 80,
+        contractOrderStateMaxAgeMs: 5000, minimalLiveCanaryConfig: canaryConfig,
+      });
+      engine.activeOrders.set('QCANARY', {
+        side: 'buy', level: 1, price: 100, size: 0.0005, status: 'active',
+        minimalLiveCanary: true, sentToVenue: true,
+      });
+
+      engine.onExecutionReport({ '11': 'QCANARY', '39': 'C', '54': '1' });
+
+      expect(engine.getQuoteStatus().minimalLiveCanary.stopReason).toBe('venue-expired');
+      expect(engine.fixConnection.sendMessage).not.toHaveBeenCalledWith(
+        expect.objectContaining({ '35': 'F', '41': 'QCANARY' }),
+      );
+    });
+
     it('does not cancel a local pending order that failed before its FIX D was sent', () => {
       const fixConnection = createMockFix();
       const engine = createEngine({

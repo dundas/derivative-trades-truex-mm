@@ -236,6 +236,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       marketDataProvider: () => this.marketDataFeed?.getBestBidAsk?.(),
       inventoryRecoveryConfig: options.inventoryRecoveryConfig,
       minimalLiveCanaryConfig: options.minimalLiveCanaryConfig,
+      minimalLiveCanaryDecisionWriter: event => this._persistMinimalLiveCanaryDecision(event),
       orderIdNamespace: options.orderIdNamespace,
       orderIdBootId: options.orderIdBootId,
       logger: this.logger,
@@ -1686,7 +1687,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     });
   }
 
-  async _onQuoteLifecycle(event) {
+  _enrichQuoteLifecycleEvent(event) {
     const summary = this.inventoryManager.getPositionSummary?.() || {};
     const activeOrders = this.quoteEngine.activeOrders || new Map();
     let committedExposureBTC = 0;
@@ -1701,7 +1702,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     const coinbase = Array.isArray(market.sources)
       ? market.sources.find(source => source?.exchange === 'coinbase') || null
       : null;
-    const enrichedEvent = {
+    return {
       ...event,
       decisionTimestamp: Number.isSafeInteger(event.decisionTimestamp) && event.decisionTimestamp >= 0
         ? event.decisionTimestamp : now,
@@ -1727,17 +1728,35 @@ export class MarketMakerOrchestrator extends EventEmitter {
         marketState: market.marketState ?? null,
       },
     };
+  }
+
+  async _persistMinimalLiveCanaryDecision(event) {
+    const enrichedEvent = this._enrichQuoteLifecycleEvent(event);
+    try {
+      const recorded = await this.referenceMarkoutCollector?.recordQuoteDecision(enrichedEvent);
+      if (recorded !== true) throw new Error('reference quote decision was not durably acknowledged');
+      return true;
+    } catch (error) {
+      this.logger.error(`[Orchestrator] Minimal live canary decision persistence failed: ${error.message}`);
+      return false;
+    }
+  }
+
+  async _onQuoteLifecycle(event) {
+    const enrichedEvent = this._enrichQuoteLifecycleEvent(event);
     this.quoteTelemetry.record(enrichedEvent)
       .catch(err => this.logger.warn(`[Orchestrator] Quote telemetry failed: ${err.message}`));
     if (event.eventType === 'create' || event.eventType === 'replace') {
-      this.referenceMarkoutCollector?.recordQuoteDecision(enrichedEvent);
+      if (event.decisionPersistenceConfirmed !== true) {
+        this.referenceMarkoutCollector?.recordQuoteDecision(enrichedEvent);
+      }
     } else if ((event.eventType === 'partial_fill' || event.eventType === 'full_fill') && event.executionId) {
       const fill = {
         fillId: `${event.quoteId}-${event.executionId}`,
         executionId: event.executionId,
         quoteId: event.quoteId,
         sessionId: this.sessionId,
-        fillTimestamp: now,
+        fillTimestamp: Date.now(),
         decisionTimestamp: enrichedEvent.decisionTimestamp,
         side: event.side,
         level: event.level,
