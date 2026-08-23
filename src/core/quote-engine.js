@@ -274,11 +274,11 @@ export class QuoteEngine extends EventEmitter {
     // for the debounce-bypass trigger; count of momentum-triggered bypasses.
     this.lastRepricedMid = 0;
     this.momentumReprices = 0;
-    // True while a gated placement awaits its cancel confirm. Completion
-    // retries go through _runDeferredReprice, where the flag exempts that one
-    // path from the minRepriceInterval debounce; the ordinary onPriceUpdate
-    // path stays debounced (no global bypass, no extra churn while the cancel
-    // ack is slow).
+    // True while a gated placement awaits its cancel confirm. It records that
+    // a fresh quote must be derived after the cancel resolves; it must not
+    // override the reprice interval. Otherwise the queue-drain timer retries
+    // the same lifecycle transition several times per second while a cancel is
+    // still pending.
     this.heldPlacementsPending = false;
     this.truexBook = null;
     this.truexEbbo = null;
@@ -444,10 +444,9 @@ export class QuoteEngine extends EventEmitter {
       // are exposed to lead-lag pick-off — reprice now instead of waiting out
       // the interval. Each dispatched reprice re-baselines lastRepricedMid, so
       // this fires per N bps of movement, not per tick.
-      // heldPlacementsPending deliberately does NOT bypass here: completion
-      // retries flow through drainQueue → _runDeferredReprice (which carries
-      // the hold exemption). A global bypass would churn unrelated
-      // cancels/replaces on every tick during the hold window.
+      // heldPlacementsPending does not alter this path. A material market move
+      // can still use this bounded momentum bypass; a lifecycle retry alone
+      // cannot turn the queue-drain timer into a replacement loop.
       const moveBps = this.lastRepricedMid > 0
         ? Math.abs(mid - this.lastRepricedMid) / this.lastRepricedMid * 1e4
         : 0;
@@ -492,8 +491,8 @@ export class QuoteEngine extends EventEmitter {
     // intra-cycle holds (a same-side replacement-cancel marks its order
     // 'cancelling' before later same-side placements are evaluated), which
     // implicitly disables this debounce for every tick until a hold clears.
-    // The completion-retry exemption lives solely in _runDeferredReprice's
-    // heldPlacementsPending check.
+    // Deferred lifecycle retries use the same interval below; only a material
+    // move can take the bounded momentum-bypass path above.
     if (dispatched || this.config.quoteDispatchMode === 'observe') {
       this.lastRepriceAt = Date.now();
       this.lastRepricedMid = mid;
@@ -3603,8 +3602,7 @@ export class QuoteEngine extends EventEmitter {
     }
     if (this.config.minRepriceIntervalMs > 0 &&
         this.lastRepriceAt &&
-        (now - this.lastRepriceAt) < this.config.minRepriceIntervalMs &&
-        !this.heldPlacementsPending) {
+        (now - this.lastRepriceAt) < this.config.minRepriceIntervalMs) {
       this.deferredRepriceNeeded = true;
       return false;
     }
@@ -3622,9 +3620,8 @@ export class QuoteEngine extends EventEmitter {
         // Stamp on ANY dispatched cycle (matches onPriceUpdate semantics):
         // - lastRepricedMid must track every dispatched reprice, else the
         //   momentum trigger retriggers too early during hold windows.
-        // - lastRepriceAt debounces ordinary ticks after real work went out;
-        //   completion retries are exempt via heldPlacementsPending in the
-        //   staleness check above, so gating the stamp is unnecessary.
+        // - lastRepriceAt debounces every reprice path after real work went
+        //   out, including deferred lifecycle retries.
         this.lastRepriceAt = Date.now();
         this.lastRepricedMid = this.lastMid;
       }
