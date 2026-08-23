@@ -90,7 +90,11 @@ isn't working → escalate to the next phase lever.
 - **Kill switches**: `MOMENTUM_REPRICE_BPS=0` (defense off), kill-switch.js (cancel all),
   container stop (graceful cancel-first)
 - **Sizing**: never quotes beyond available-minus-holds; placements wait for cancel confirms
-- **Debounce exemptions**: completion retries only, never the ordinary path
+- **Reprice debounce**: every reconciliation attempt with quote work is bounded by the
+  configured interval, including safety-gated and deferred retries. `lastRepriceAt`
+  remains execution-only telemetry; a separate attempt timestamp prevents a no-send
+  retry loop. Only a material move (configured `MOMENTUM_REPRICE_BPS`, currently 10bps)
+  may bypass the interval, and it still uses the normal passive-safe send path.
 - **Deploy**: human-gated, clean-worktree rsync, serialized build→recreate→verify
 - **Known gaps** (tracked in production-readiness.md): prod NTP skew, mid-history for
   true fair-value mark-out (currently proxied by next-opposite-fill), `liquidityind`
