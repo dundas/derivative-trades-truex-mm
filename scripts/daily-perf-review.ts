@@ -204,6 +204,67 @@ interface SessionRow {
   lu: string | null; // lastupdated — diagnostics only, never an end signal
 }
 
+type ReportDbClient = {
+  query: (text: string, params?: unknown[]) => Promise<{ rows: unknown[] }>;
+  /** Passing an error destroys the connection instead of returning it to the pool. */
+  release: (error?: Error) => void;
+  on?: (event: 'error', listener: (error: Error) => void) => unknown;
+  removeListener?: (event: 'error', listener: (error: Error) => void) => unknown;
+};
+
+type ReportDbPool = {
+  connect: () => Promise<ReportDbClient>;
+  end: () => Promise<void>;
+};
+
+const DEFAULT_CONNECTION_TIMEOUT_MS = 10_000;
+
+export interface ReportDataOptions {
+  /**
+   * Aborting destroys the checked-out client.  Closing its socket makes
+   * PostgreSQL cancel an in-flight statement instead of letting it continue
+   * after the caller has timed out.
+   */
+  signal?: AbortSignal;
+  /** Server and client query deadline, in addition to signal cancellation. */
+  timeoutMs?: number;
+}
+
+type ReportDbPoolOptions = ReportDataOptions & {
+  /** Never let connection acquisition outlive the enclosing report deadline. */
+  connectionTimeoutMs: number;
+};
+
+function abortError(signal: AbortSignal): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error('report database read aborted');
+}
+
+/**
+ * `pg.Pool#connect` does not accept an AbortSignal.  Let the report caller
+ * stop waiting immediately, while a separate completion handler below cleans
+ * up a connection the driver may still deliver after the cancellation.
+ */
+function awaitConnection<T>(
+  connection: Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (!signal) return connection;
+  if (signal.aborted) return Promise.reject(abortError(signal));
+
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      cleanup();
+      reject(abortError(signal));
+    };
+    const cleanup = () => signal.removeEventListener('abort', onAbort);
+    signal.addEventListener('abort', onAbort, { once: true });
+    connection.then(
+      value => { cleanup(); resolve(value); },
+      error => { cleanup(); reject(error); },
+    );
+  });
+}
+
 export async function fetchReportData(
   dbUrl: string,
   dayStart: number,
@@ -212,11 +273,76 @@ export async function fetchReportData(
   tradingMode?: string,
   markoutHorizonMs = 0,
   sinceMs?: number,
-  poolFactory: () => { query: (text: string, params?: unknown[]) => Promise<{ rows: unknown[] }>; end: () => Promise<void> } = () => new pg.Pool({ connectionString: dbUrl, connectionTimeoutMillis: 10000, statement_timeout: 60000 })
+  poolFactory: (options: ReportDbPoolOptions) => ReportDbPool = ({ timeoutMs, connectionTimeoutMs }) => new pg.Pool({
+    connectionString: dbUrl,
+    connectionTimeoutMillis: connectionTimeoutMs,
+    // statement_timeout cancels work on the server; query_timeout provides a
+    // second client-side deadline if the server cannot answer.
+    statement_timeout: timeoutMs ?? 60000,
+    query_timeout: timeoutMs,
+  }),
+  options: ReportDataOptions = {},
 ) {
-  const pool = poolFactory();
+  const pool = poolFactory({
+    ...options,
+    connectionTimeoutMs: Math.min(options.timeoutMs ?? DEFAULT_CONNECTION_TIMEOUT_MS, DEFAULT_CONNECTION_TIMEOUT_MS),
+  });
+  let client: ReportDbClient | undefined;
+  let released = false;
+  let poolEnd: Promise<void> | undefined;
+  let abortReason = options.signal?.aborted ? abortError(options.signal) : undefined;
+  const releaseClient = (target: ReportDbClient | undefined, error?: Error) => {
+    if (target && !released) {
+      released = true;
+      target.release(error);
+    }
+  };
+  const releaseAbortedClient = () => {
+    abortReason = abortError(options.signal!);
+    releaseClient(client, abortReason);
+  };
+  const releaseErroredClient = (error: Error) => releaseClient(client, error);
+  const closePool = () => {
+    if (!poolEnd) {
+      // Defer invocation so a synchronous driver failure is observed as a
+      // rejected promise, which keeps the cleanup path below intact.
+      poolEnd = Promise.resolve().then(() => pool.end());
+      // When an abort wins the race below, pg-pool may still finish closing
+      // later. Keep that result observed without delaying the caller.
+      void poolEnd.catch(() => undefined);
+    }
+    return poolEnd;
+  };
+  options.signal?.addEventListener('abort', releaseAbortedClient, { once: true });
+
   try {
-    const q = async (text: string, params: unknown[] = []) => (await pool.query(text, params)).rows;
+    // Keep observing the non-cancellable driver operation after the caller
+    // has stopped waiting. If it resolves late, destroy that client rather
+    // than returning a cancelled report's connection to the pool. Starting
+    // this inside try also guarantees cleanup if connect throws synchronously.
+    const connection = pool.connect();
+    void connection.then(
+      lateClient => { if (abortReason) releaseClient(lateClient, abortReason); },
+      () => undefined,
+    );
+    client = await awaitConnection(connection, options.signal);
+    client.on?.('error', releaseErroredClient);
+    if (options.signal?.aborted) {
+      releaseAbortedClient();
+      throw abortError(options.signal);
+    }
+    const q = async (text: string, params: unknown[] = []) => {
+      if (options.signal?.aborted) throw abortError(options.signal);
+      try {
+        return (await client!.query(text, params)).rows;
+      } catch (error) {
+        // The connection close can surface as a driver/socket error.  Preserve
+        // the timeout/abort reason at this boundary for useful job logs.
+        if (options.signal?.aborted) throw abortError(options.signal);
+        releaseClient(client, error instanceof Error ? error : new Error(String(error)));
+        throw error;
+      }
+    };
 
     // Only endedat/completedat are true end signals. lastupdated is a
     // heartbeat and must not be treated as an end time (it would wrongly
@@ -290,7 +416,13 @@ export async function fetchReportData(
 
     return { sessions, orderRows, orderCountByStatus, fillRows, quoteLifecycleEvents, quoteLifecycleAvailable };
   } finally {
-    await pool.end();
+    options.signal?.removeEventListener('abort', releaseAbortedClient);
+    client?.removeListener?.('error', releaseErroredClient);
+    releaseClient(client);
+    // pg-pool can wait for a pending connect in end().  Begin shutdown in all
+    // cases, but do not let that non-cancellable driver operation outlive an
+    // abort deadline.
+    await awaitConnection(closePool(), options.signal);
   }
 }
 

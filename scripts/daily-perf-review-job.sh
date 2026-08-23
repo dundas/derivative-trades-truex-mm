@@ -95,8 +95,15 @@ fi
 # does not change the job exit code (the review outcome dominates).
 if [ "$RC" -le 1 ]; then
   "$BUN" scripts/daily-perf-email.ts --date "$DATE_UTC" --send \
-    >> "$LOG_DIR/email.log" 2>&1 \
-    || echo "WARN: email digest failed (see $LOG_DIR/email.log)"
+    >> "$LOG_DIR/email.log" 2>&1
+  EMAIL_RC=$?
+  if [ "$EMAIL_RC" -ne 0 ]; then
+    echo "WARN: email digest failed (exit $EMAIL_RC; see $LOG_DIR/email.log)"
+    # Use the independent brain-message transport: the failed service may be
+    # CircleInbox itself, so an email-only alert could fail silently too.
+    send_alert "daily-perf digest ERROR $DATE_UTC" \
+      "TrueX MM daily digest failed (exit $EMAIL_RC) for $DATE_UTC; delivery is not confirmed. Last output: $(tail -c 300 "$LOG_DIR/email.log" | tr '\n' ' ')."
+  fi
 fi
 
 exit "$RC"

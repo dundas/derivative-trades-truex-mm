@@ -99,6 +99,10 @@ The review runs automatically every day and alerts on bad outcomes:
 - **Alerts (ADMP → `decisive`)**: exit 1 (WARN verdict) sends the verdict +
   key figures; exit ≥ 2 (job failure) sends the error tail. Alert-send
   failure is logged and never masks the exit code. OK days are silent.
+- **Delivery bounds**: report construction, Pages deployment, and CircleInbox
+  delivery have independent finite deadlines. If the digest fails after an OK
+  or WARN review, the wrapper sends an ADMP delivery-failure alert without
+  changing the review's exit code.
 - **Layout**: the job runs from a dedicated clean worktree of `main`
   (CODE_ROOT, default `<repo>-ops`, branch `ops/daily-perf-review`) so it
   never depends on the dirty daily worktree; reports/memory land in the
@@ -121,6 +125,11 @@ DRY_RUN=1 bash ops/launchd/install-daily-perf-review.sh
 
 Overrides: `TRUEX_PERF_CODE_ROOT`, `TRUEX_PERF_DATA_ROOT`, `BUN_BIN`
 (installer renders them into the plist; the wrapper consumes them).
+Set `DAILY_REPORT_BUILD_TIMEOUT_MS`, `DAILY_REPORT_DEPLOY_TIMEOUT_MS`, and
+`DAILY_REPORT_EMAIL_TIMEOUT_MS` to positive integer millisecond values to
+override the respective 120s, 120s, and 30s defaults. Run the installer again
+after changing them so launchd receives the new values. These controls bound
+report delivery only; they do not change quote generation or trading.
 The installer refuses a non-fast-forwardable CODE_ROOT unless `ALLOW_STALE=1`
 — scheduled runs should never execute stale code.
 

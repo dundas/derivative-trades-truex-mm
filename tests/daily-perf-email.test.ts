@@ -1,9 +1,17 @@
 import { describe, it, expect } from 'bun:test';
+import { chmod, mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import {
   subjectLine,
   renderHtml,
   renderIndex,
   emailText,
+  timeoutMs,
+  buildDayReport,
+  buildTrend,
+  deployPages,
+  sendEmail,
 } from '../scripts/daily-perf-email';
 
 // Minimal fixture matching buildReport's output shape
@@ -156,5 +164,160 @@ describe('wrapper env propagation (roborev round 2)', () => {
     const { readFileSync } = await import('node:fs');
     const src = readFileSync(new URL('../scripts/daily-perf-review-job.sh', import.meta.url), 'utf8');
     expect(src).toContain('export TRUEX_PERF_DATA_ROOT="$DATA_ROOT"');
+  });
+
+  it('renders all delivery timeout overrides into the scheduled-job template', async () => {
+    const { readFileSync } = await import('node:fs');
+    const installer = readFileSync(new URL('../ops/launchd/install-daily-perf-review.sh', import.meta.url), 'utf8');
+    const plist = readFileSync(new URL('../ops/launchd/com.dundas.truex-daily-perf-review.plist', import.meta.url), 'utf8');
+    for (const name of ['BUILD', 'DEPLOY', 'EMAIL']) {
+      expect(installer).toContain(`DAILY_REPORT_${name}_TIMEOUT_MS`);
+      expect(installer).toContain(`{{REPORT_${name}_TIMEOUT_MS}}`);
+      expect(plist).toContain(`{{REPORT_${name}_TIMEOUT_MS}}`);
+    }
+    expect(installer).toContain('validate_timeout_ms DAILY_REPORT_BUILD_TIMEOUT_MS "$REPORT_BUILD_TIMEOUT_MS"');
+    expect(installer).toContain('must be a positive integer of milliseconds no greater than 2147483647');
+  });
+
+  it('rejects an invalid scheduled-delivery timeout before touching worktrees', async () => {
+    const proc = Bun.spawn(['bash', 'ops/launchd/install-daily-perf-review.sh'], {
+      cwd: import.meta.dir + '/..',
+      env: { ...process.env, DAILY_REPORT_DEPLOY_TIMEOUT_MS: '0' },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    expect(await proc.exited).toBe(2);
+    expect(await new Response(proc.stdout).text()).toContain('DAILY_REPORT_DEPLOY_TIMEOUT_MS must be a positive integer');
+  });
+
+  it('alerts through the independent brain-message transport if the digest fails', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'daily-perf-wrapper-'));
+    const codeRoot = join(root, 'code');
+    const dataRoot = join(root, 'data');
+    const marker = join(root, 'alert-called');
+    const fakeBun = join(root, 'fake-bun.sh');
+    const brainMsg = join(dataRoot, '.claude', 'skills', 'cross-brain-message', 'brain-msg.ts');
+    try {
+      await mkdir(codeRoot, { recursive: true });
+      await mkdir(join(dataRoot, '.claude', 'skills', 'cross-brain-message'), { recursive: true });
+      await writeFile(brainMsg, '# mock brain-msg\n');
+      await writeFile(fakeBun, `#!/bin/bash
+if [ "$1" = "scripts/daily-perf-review.ts" ]; then
+  printf 'VERDICT: OK\\n  day: $1.00\\nMark-out: n/a\\n'
+  exit 0
+fi
+if [ "$1" = "scripts/daily-perf-email.ts" ]; then exit 3; fi
+if [ "$1" = "${brainMsg}" ]; then touch "$ALERT_MARKER"; exit 0; fi
+exit 99
+`);
+      await chmod(fakeBun, 0o755);
+      const proc = Bun.spawn(['bash', 'scripts/daily-perf-review-job.sh'], {
+        cwd: import.meta.dir + '/..',
+        env: {
+          ...process.env,
+          TRUEX_PERF_BUN: fakeBun,
+          TRUEX_PERF_CODE_ROOT: codeRoot,
+          TRUEX_PERF_DATA_ROOT: dataRoot,
+          ALERT_MARKER: marker,
+        },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      expect(await proc.exited).toBe(0);
+      expect(await Bun.file(marker).exists()).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('report operation timeouts', () => {
+  it('uses defaults and rejects invalid timer configuration', () => {
+    const original = process.env.DAILY_REPORT_BUILD_TIMEOUT_MS;
+    try {
+      delete process.env.DAILY_REPORT_BUILD_TIMEOUT_MS;
+      expect(timeoutMs('DAILY_REPORT_BUILD_TIMEOUT_MS', 123)).toBe(123);
+      process.env.DAILY_REPORT_BUILD_TIMEOUT_MS = '0';
+      expect(() => timeoutMs('DAILY_REPORT_BUILD_TIMEOUT_MS', 123)).toThrow('must be a positive integer');
+      process.env.DAILY_REPORT_BUILD_TIMEOUT_MS = '1.5';
+      expect(() => timeoutMs('DAILY_REPORT_BUILD_TIMEOUT_MS', 123)).toThrow('must be a positive integer');
+      process.env.DAILY_REPORT_BUILD_TIMEOUT_MS = '2147483647';
+      expect(timeoutMs('DAILY_REPORT_BUILD_TIMEOUT_MS', 123)).toBe(2147483647);
+      process.env.DAILY_REPORT_BUILD_TIMEOUT_MS = '2147483648';
+      expect(() => timeoutMs('DAILY_REPORT_BUILD_TIMEOUT_MS', 123)).toThrow('no greater than 2147483647');
+    } finally {
+      if (original === undefined) delete process.env.DAILY_REPORT_BUILD_TIMEOUT_MS;
+      else process.env.DAILY_REPORT_BUILD_TIMEOUT_MS = original;
+    }
+  });
+
+  it('uses one aggregate deadline and gives each trend read only its remaining budget', async () => {
+    let clock = 0;
+    const budgets: number[] = [];
+    const buildDay = async (_dbUrl: string, _date: string, timeout: number) => {
+      budgets.push(timeout);
+      clock += 30;
+      return fixtureDay();
+    };
+    await buildTrend('postgres://example', '2026-08-08', 3, 100, buildDay as any, () => clock);
+    expect(budgets).toEqual([100, 70, 40]);
+    await expect(buildTrend('postgres://example', '2026-08-08', 4, 100, buildDay as any, () => clock))
+      .rejects.toThrow('Daily report build timed out after 100ms');
+  });
+
+  it('rejects a trend day that completes after the aggregate deadline', async () => {
+    let clock = 0;
+    const buildDay = async () => {
+      clock = 101;
+      return fixtureDay();
+    };
+
+    await expect(buildTrend('postgres://example', '2026-08-08', 1, 100, buildDay as any, () => clock))
+      .rejects.toThrow('Daily report build timed out after 100ms');
+  });
+
+  it('escalates a timed-out deployment from SIGTERM to SIGKILL and waits for exit', async () => {
+    const signals: string[] = [];
+    let exit!: (code: number) => void;
+    await expect(deployPages(5, () => ({
+      exited: new Promise<number>((resolve) => { exit = resolve; }),
+      kill: (signal = 'SIGTERM') => {
+        signals.push(signal);
+        if (signal === 'SIGKILL') exit(137);
+      },
+      stderr: null,
+    }), 1)).rejects.toThrow('Cloudflare Pages deployment timed out after 5ms');
+    expect(signals).toEqual(['SIGTERM', 'SIGKILL']);
+  });
+
+  it('passes an abort signal to the report fetch and rejects when its deadline expires', async () => {
+    let capturedSignal: AbortSignal | undefined;
+    const fetchData = async (...args: any[]) => {
+      capturedSignal = args[8].signal;
+      await new Promise((_, reject) => capturedSignal!.addEventListener('abort', () => reject(capturedSignal!.reason), { once: true }));
+      return fixtureDay();
+    };
+    await expect(buildDayReport('postgres://example', '2026-08-08', 5, fetchData as any)).rejects.toThrow();
+    expect(capturedSignal).toBeDefined();
+    expect(capturedSignal!.aborted).toBe(true);
+  });
+
+  it('rejects a timed-out CircleInbox send using the supplied fetch implementation', async () => {
+    const original = process.env.CIRCLEINBOX_API_KEY;
+    process.env.CIRCLEINBOX_API_KEY = 'test-key';
+    let capturedSignal: AbortSignal | undefined;
+    try {
+      const fetchFn = async (_url: string | URL | Request, init?: RequestInit) => {
+        capturedSignal = init?.signal as AbortSignal;
+        await new Promise((_, reject) => capturedSignal!.addEventListener('abort', () => reject(capturedSignal!.reason), { once: true }));
+        return new Response();
+      };
+      await expect(sendEmail('to@example.com', 'subject', '<p>html</p>', 'text', 5, fetchFn as typeof fetch)).rejects.toThrow();
+      expect(capturedSignal).toBeDefined();
+      expect(capturedSignal!.aborted).toBe(true);
+    } finally {
+      if (original === undefined) delete process.env.CIRCLEINBOX_API_KEY;
+      else process.env.CIRCLEINBOX_API_KEY = original;
+    }
   });
 });

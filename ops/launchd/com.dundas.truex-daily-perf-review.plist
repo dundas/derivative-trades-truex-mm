@@ -34,6 +34,12 @@
         <string>{{CODE_ROOT}}</string>
         <key>TRUEX_PERF_DATA_ROOT</key>
         <string>{{DATA_ROOT}}</string>
+        <key>DAILY_REPORT_BUILD_TIMEOUT_MS</key>
+        <string>{{REPORT_BUILD_TIMEOUT_MS}}</string>
+        <key>DAILY_REPORT_DEPLOY_TIMEOUT_MS</key>
+        <string>{{REPORT_DEPLOY_TIMEOUT_MS}}</string>
+        <key>DAILY_REPORT_EMAIL_TIMEOUT_MS</key>
+        <string>{{REPORT_EMAIL_TIMEOUT_MS}}</string>
     </dict>
 
     <key>StandardOutPath</key>
