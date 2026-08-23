@@ -328,6 +328,12 @@ export class TrueXPostgreSQLManager {
         await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_markout_attribution_v3 ON fill_reference_markout_work(session_id, quote_id)`);
         await this.db.query(`DROP INDEX IF EXISTS idx_reference_markout_pending_attribution_v2`);
         await this.db.query(`CREATE INDEX IF NOT EXISTS idx_reference_markout_unfinished_window_v2 ON fill_reference_markout_work(due_timestamp, deadline_timestamp) WHERE state <> 'completed'`);
+        await this.db.query(`CREATE TABLE IF NOT EXISTS minimal_live_canary_runs (
+          run_id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          claimed_at BIGINT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )`);
 
         await this.db.query(`
           CREATE TABLE IF NOT EXISTS fill_reference_markout_evidence (
@@ -672,7 +678,9 @@ export class TrueXPostgreSQLManager {
     const result = await this._referenceQuery(`WITH candidates AS (
       SELECT work.fill_id, work.horizon_ms,
         COALESCE(work.decision_timestamp, decision.decision_timestamp) AS recovered_decision_timestamp,
-        COALESCE(work.policy_id, decision.policy_id) AS recovered_policy_id
+        COALESCE(work.policy_id, decision.policy_id) AS recovered_policy_id,
+        (work.quote_id IS NOT NULL AND work.session_id IS NOT NULL
+          AND decision.decision_timestamp IS NOT NULL) AS has_quote_attribution
       FROM fill_reference_markout_work work
       LEFT JOIN LATERAL (
         SELECT decision_timestamp, policy_id FROM reference_quote_decisions
@@ -693,12 +701,13 @@ export class TrueXPostgreSQLManager {
         policy_id = candidates.recovered_policy_id
     FROM candidates
     WHERE work.fill_id = candidates.fill_id AND work.horizon_ms = candidates.horizon_ms
-    RETURNING work.*`, [now, batchSize, claimToken, leaseMs]);
+    RETURNING work.*, candidates.has_quote_attribution`, [now, batchSize, claimToken, leaseMs]);
     return (result.rows || []).map(row => ({
       fillId: row.fill_id, horizonMs: Number(row.horizon_ms), executionId: row.execution_id,
       quoteId: row.quote_id, sessionId: row.session_id, fillTimestamp: Number(row.fill_timestamp),
       decisionTimestamp: row.decision_timestamp === null ? null : Number(row.decision_timestamp),
       side: row.side, level: row.level, policyId: row.policy_id,
+      hasQuoteAttribution: row.has_quote_attribution === true,
       price: row.fill_price === null ? null : Number(row.fill_price),
       size: row.fill_size === null ? null : Number(row.fill_size),
       dueTimestamp: Number(row.due_timestamp), deadlineTimestamp: Number(row.deadline_timestamp),
@@ -713,6 +722,29 @@ export class TrueXPostgreSQLManager {
       LIMIT 1
     ) AS has_open_window`, [now]);
     return result.rows?.[0]?.has_open_window === true;
+  }
+
+  async hasUnresolvedReferenceMarkouts({ policyId, horizonMs } = {}) {
+    if (typeof policyId !== 'string' || policyId.length === 0) {
+      throw new Error('policyId must be a non-empty string');
+    }
+    if (!Number.isSafeInteger(horizonMs) || horizonMs <= 0) {
+      throw new Error('horizonMs must be a positive safe integer');
+    }
+    const result = await this._referenceQuery(`SELECT EXISTS (
+      SELECT 1 FROM fill_reference_markout_work
+      WHERE state <> 'completed' AND policy_id = $1 AND horizon_ms = $2
+      LIMIT 1
+    ) AS has_unresolved_markouts`, [policyId, horizonMs]);
+    return result.rows?.[0]?.has_unresolved_markouts === true;
+  }
+
+  async claimMinimalLiveCanaryRun({ runId, sessionId, claimedAt } = {}) {
+    if (typeof runId !== 'string' || runId.length === 0 || typeof sessionId !== 'string' || sessionId.length === 0 ||
+        !Number.isSafeInteger(claimedAt) || claimedAt < 0) throw new Error('invalid minimal live canary run claim');
+    const result = await this._referenceQuery(`INSERT INTO minimal_live_canary_runs (run_id, session_id, claimed_at)
+      VALUES ($1, $2, $3) ON CONFLICT (run_id) DO NOTHING RETURNING run_id`, [runId, sessionId, claimedAt]);
+    return (result.rowCount ?? result.rows?.length ?? 0) === 1;
   }
 
   async releaseReferenceMarkoutClaim(work, claimToken, reason) {

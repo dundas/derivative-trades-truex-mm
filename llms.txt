@@ -43,6 +43,7 @@ to Kraken. DataPipelineManager: audit JSONL → Redis → PG.
 - `scripts/daily-perf-email.ts` — Daily email digest: HTML report + 7-day trend published to Cloudflare Pages (truex-mm-reports.pages.dev), summary emailed via CircleInbox from truex-mm@derivative.email to DAILY_REPORT_EMAIL (flags: --date --to --send --skip-deploy --dry-run; archive persists in TRUEX_PERF_DATA_ROOT/logs/reports-site)
 - `src/connectors/cryptocom/CryptoComReferenceBookFeed.js` — Isolated Crypto.com BTC_PYUSD full-book reference feed; never supplies pricing or execution
 - `src/data-pipeline/reference-markout-collector.js` — Default-off, restart-safe 1/5/60m direct BTC-PYUSD mark-out evidence collector; no order/FIX capability
+- `src/core/minimal-live-canary.js` — Default-off first-live-maker guard: durable single-use PostgreSQL run ID, one 0.0005 BTC level/side, 30–80 bps width, 15-minute maximum, first-fill no-replenishment, and mandatory attributed 60-second mark-out stop gate
 - `scripts/report-reference-markout-coverage.js` — Bounded grouped coverage audit (`--from`, `--to`, `--limit`)
 - `docs/REFERENCE_MARKOUTS.md` — Rollout, evidence semantics, configuration, verification, and rollback
 - `ops/launchd/install-daily-perf-review.sh` — Idempotent LaunchAgent installer (DRY_RUN=1 supported)
@@ -72,6 +73,16 @@ Use `observe` for a fresh safety canary. Do not change a live session to
 `observe` expecting reprice-driven replacement cancels to flatten existing
 orders: replacement-cancel actions are suppressed because they would otherwise
 lead to a new `35=D`; use an explicit safe cancellation procedure instead.
+
+### Minimal live-maker canary
+
+`MM_MINIMAL_LIVE_CANARY_ENABLED` defaults to false. Enabling it requires live dispatch, a
+configured PostgreSQL `DATABASE_URL`, enabled direct reference mark-outs with a 60-second
+horizon, and a new `MM_MINIMAL_LIVE_CANARY_RUN_ID` (8–64 characters). PostgreSQL atomically
+claims that ID before startup, so it cannot be reused after a restart. The fixed envelope is one
+0.0005 BTC level per side, 30–80 bps width, and at most 15 minutes. It stops/cancels on stale or
+invalid TrueX EBBO, venue reject/cancel, invalid fill evidence, fill cap, adverse or unavailable
+attributed one-minute mark-out, or expiry; it never enables taker orders or external hedging.
 
 ### Order Cancel (35=F) — NOT 35=G
 Tags: 11=newClOrdID, 41=origClOrdID. Party block required. NO tag 54 (Side).

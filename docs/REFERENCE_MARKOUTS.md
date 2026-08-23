@@ -99,6 +99,28 @@ Invalid enabled configuration fails before production startup. Settings are not 
 feature is disabled. Credentials remain in the existing ignored environment/secret mechanism;
 never commit database URLs or exchange credentials.
 
+## Minimal live-maker canary
+
+`MM_MINIMAL_LIVE_CANARY_ENABLED=false` is the default. When explicitly enabled, this is the only
+supported transition from observation to a first live maker test; it is not a general strategy
+mode. It requires `MM_QUOTE_DISPATCH_MODE=live`, enabled direct reference mark-outs including the
+60-second horizon, a PostgreSQL writer, and the exact fixed envelope below. Startup claims the
+operator-provided run ID in PostgreSQL before any live quote can be sent, so a restart cannot reset
+the elapsed-duration, fill, or mark-out controls. A new canary requires a newly approved ID.
+
+| Variable | Requirement |
+|---|---|
+| `MM_MINIMAL_LIVE_CANARY_RUN_ID` | New 8–64 character, operator-approved, single-use ID |
+| `MM_MINIMAL_LIVE_CANARY_DURATION_MS` | Positive and at most 900000 (15 minutes) |
+| `MM_MINIMAL_LIVE_CANARY_MAX_CUMULATIVE_FILLED_BTC` | Positive cap of at least 0.001 BTC |
+
+The quote envelope is fixed at one level per side, 0.0005 BTC per order, and 30–80 bps width.
+The canary never enables taker execution or external hedging. It cancels and stops on a lost or
+invalid TrueX EBBO, venue rejection/cancellation, missing or un-attributed 60-second mark-out,
+negative 60-second mark-out, invalid fill-price evidence, fill-cap breach, or expiry. After the
+first fill it does not replenish. Canary decisions and fills use policy ID
+`minimal-live-canary-v1`, separate from observer telemetry.
+
 `marketObservationsRecorded=0` and `lastMarketObservationAt=null` are healthy while
 `openWindow=false` and `samplingState=idle-no-open-window`. Sampling occurs only while unfinished
 durable horizon work is open. Queue/pool pressure, invalid-sample reasons, and retention backlog

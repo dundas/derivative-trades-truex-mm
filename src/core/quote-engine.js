@@ -1,6 +1,7 @@
 import { EventEmitter } from 'events';
 import { randomBytes } from 'node:crypto';
 import { evaluateInventoryRecoveryQuote, validateInventoryRecoveryQuoteConfig } from './inventory-recovery-quote-policy.js';
+import { MinimalLiveCanary, validateMinimalLiveCanaryConfig } from './minimal-live-canary.js';
 
 // Intentionally duplicated from the CJS FIX builder across the CJS/ESM boundary.
 // Numeric 0 means send 2964=0; boolean/string false disables the tag here via null.
@@ -30,10 +31,16 @@ export class QuoteEngine extends EventEmitter {
   constructor(options = {}) {
     super();
     const inventoryRecoveryConfig = validateInventoryRecoveryQuoteConfig(options.inventoryRecoveryConfig);
+    const minimalLiveCanaryConfig = validateMinimalLiveCanaryConfig(options.minimalLiveCanaryConfig);
 
     // Dependencies (injected)
     this.inventoryManager = options.inventoryManager;
     this.fixConnection = options.fixConnection;
+    // The minimal live canary is the sole execution path that requires a
+    // durable decision record before a FIX NewOrderSingle. The callback is
+    // intentionally injected rather than coupled to the analytics writer so
+    // the reusable engine remains storage-agnostic.
+    this.minimalLiveCanaryDecisionWriter = options.minimalLiveCanaryDecisionWriter || null;
     this.capitalReservationManager = options.capitalReservationManager || null;
     this.continuityStateProvider = options.continuityStateProvider || null;
     // Finite contractual spread enforcement must not make a displayed-book
@@ -148,6 +155,7 @@ export class QuoteEngine extends EventEmitter {
       truexTapeOutlierThresholdBps: options.truexTapeOutlierThresholdBps ?? 50,
       marketDataProvider: options.marketDataProvider || null,
       inventoryRecoveryConfig,
+      minimalLiveCanaryConfig,
     };
     if (!Number.isInteger(this.config.degradedMaxLevels) || this.config.degradedMaxLevels < 1) {
       throw new Error('degradedMaxLevels must be a positive integer');
@@ -185,6 +193,18 @@ export class QuoteEngine extends EventEmitter {
     if (this.config.inventoryRecoveryConfig.enabled && this.config.quoteDispatchMode !== 'observe') {
       throw new Error('inventoryRecoveryConfig requires quoteDispatchMode=observe');
     }
+    if (this.config.minimalLiveCanaryConfig.enabled &&
+        (this.config.quoteDispatchMode !== 'live' || !this.config.strictTruexMakerSafety)) {
+      throw new Error('minimalLiveCanaryConfig requires live dispatch and strict TrueX maker safety');
+    }
+    if (this.config.minimalLiveCanaryConfig.enabled &&
+        (this.config.allowTakerOrders ||
+         this.config.levels !== this.config.minimalLiveCanaryConfig.levels ||
+         this.config.baseSizeBTC !== this.config.minimalLiveCanaryConfig.baseSizeBTC ||
+         this.config.minimumQuoteWidthBps !== this.config.minimalLiveCanaryConfig.minimumQuoteWidthBps ||
+         this.config.contractMaxQuoteSpreadBps !== this.config.minimalLiveCanaryConfig.contractMaxQuoteSpreadBps)) {
+      throw new Error('minimalLiveCanaryConfig must match the passive canary engine envelope');
+    }
     if (this.config.strictTruexMakerSafety) {
       if (!['skip', 'slide'].includes(this.config.marketablePostOnlyAction)) {
         throw new Error('marketablePostOnlyAction must be skip or slide');
@@ -204,6 +224,15 @@ export class QuoteEngine extends EventEmitter {
     this.activeOrders = new Map(); // clOrdID -> { side, price, size, level, status, placedAt }
     this.lastMid = 0;
     this.inventoryRecoveryDecision = Object.freeze({ enabled: false, adjustmentApplied: false, reason: 'disabled' });
+    this.minimalLiveCanary = new MinimalLiveCanary(this.config.minimalLiveCanaryConfig, {
+      now: this.now,
+      setTimer: options.setTimer,
+      clearTimer: options.clearTimer,
+      stop: reason => this.cancelAllQuotes(`minimal-live-canary:${reason}`),
+    });
+    this.minimalLiveCanaryFillIds = new Set();
+    this.pendingMinimalLiveCanaryDispatches = new Set();
+    this.minimalLiveCanaryDispatchGeneration = 0;
     this.lastAnchorBook = null; // { bestBid, bestAsk } from the anchor venue's feed (for coinbase-mirror)
     this.lastRepriceAt = 0;
     this.isQuoting = false;
@@ -338,6 +367,11 @@ export class QuoteEngine extends EventEmitter {
   suspendQuoting() {
     this.quotingSuspended = true;
     this.isQuoting = false;
+    // Durable canary decision writes may still be awaiting PostgreSQL. Any
+    // suspension invalidates those pre-cancel decisions so they cannot revive
+    // a quote after an emergency, stale-feed, or low-confidence withdrawal.
+    this.minimalLiveCanaryDispatchGeneration++;
+    this.pendingMinimalLiveCanaryDispatches.clear();
   }
 
   resumeQuoting() {
@@ -1043,6 +1077,10 @@ export class QuoteEngine extends EventEmitter {
       this._recordSuppression(action.quote || action.order, 'quote-dispatch-observe-mode');
       return false;
     }
+    if (action.type !== 'cancel' && this.config.minimalLiveCanaryConfig.enabled && !this.minimalLiveCanary.canPlace()) {
+      this._recordSuppression(action.quote || action.order, `minimal-live-canary:${this.minimalLiveCanary.stopReason || 'post-fill-placement-paused'}`);
+      return false;
+    }
     if (action.type === 'replacement-cancel' &&
         this.activeOrders.get(action.clOrdID)?.dispatchOutcomeUnknown) return false;
     if (this.continuityState.executionState === 'unsafe' && action.type !== 'cancel') {
@@ -1086,6 +1124,9 @@ export class QuoteEngine extends EventEmitter {
       }
       return true;
     } else if (action.type === 'place') {
+      if (this.config.minimalLiveCanaryConfig.enabled) {
+        return this._dispatchMinimalLiveCanaryOrder(action.quote);
+      }
       return Boolean(this._sendNewOrder(action.quote));
     }
     return false;
@@ -1116,7 +1157,7 @@ export class QuoteEngine extends EventEmitter {
   /**
    * Send a FIX New Order Single (35=D).
    */
-  _sendNewOrder(quote) {
+  _sendNewOrder(quote, { persistedMinimalLiveCanaryDecision = null } = {}) {
     this._refreshContinuityState();
     const recoveryCandidate = quote?.inventoryRecovery === true;
     const recoveryEnabledOutsideObserve = this.config.inventoryRecoveryConfig.enabled &&
@@ -1138,6 +1179,14 @@ export class QuoteEngine extends EventEmitter {
       this._recordSuppression(quote, 'quote-dispatch-observe-mode');
       return null;
     }
+    if (this.quotingSuspended) {
+      this._recordSuppression(quote, 'quoting-suspended');
+      return null;
+    }
+    if (this.config.minimalLiveCanaryConfig.enabled && !this.minimalLiveCanary.canPlace()) {
+      this._recordSuppression(quote, `minimal-live-canary:${this.minimalLiveCanary.stopReason || 'post-fill-placement-paused'}`);
+      return null;
+    }
     // Shadow evaluation is deliberately non-executable. Keep this protection at
     // the transport-adjacent boundary as well as in _prepareTakerQuote so a
     // direct or future internal caller cannot reserve capital, mutate local
@@ -1150,10 +1199,24 @@ export class QuoteEngine extends EventEmitter {
       this._recordSuppression(quote, 'unsafe-execution-gate');
       return null;
     }
-    const prepared = this._prepareQuoteForSend(quote);
+    const prepared = persistedMinimalLiveCanaryDecision?.preparedQuote || this._prepareQuoteForSend(quote);
     if (!prepared) return null;
+    if (this.config.minimalLiveCanaryConfig.enabled &&
+        (prepared.postOnly === false || prepared.level !== 1 ||
+         prepared.size !== this.config.minimalLiveCanaryConfig.baseSizeBTC)) {
+      this.minimalLiveCanary.stop('invalid-order-envelope');
+      this._recordSuppression(prepared, 'minimal-live-canary:invalid-order-envelope');
+      return null;
+    }
+    // Direct/future callers cannot bypass the durable pre-send attribution
+    // boundary. Reconciliation uses `_dispatchMinimalLiveCanaryOrder`, which
+    // supplies the reviewed token after PostgreSQL has acknowledged it.
+    if (this.config.minimalLiveCanaryConfig.enabled && !persistedMinimalLiveCanaryDecision) {
+      this._recordSuppression(prepared, 'minimal-live-canary:durable-decision-required');
+      return null;
+    }
 
-    const clOrdID = this.generateClOrdID();
+    const clOrdID = persistedMinimalLiveCanaryDecision?.quoteId || this.generateClOrdID();
     if (this.capitalReservationManager) {
       const reservation = this.capitalReservationManager.reserve({
         orderId: clOrdID,
@@ -1202,9 +1265,11 @@ export class QuoteEngine extends EventEmitter {
       status: 'pending',
       acknowledgedLive: false,
       placedAt,
-      decisionTimestamp: placedAt,
+      decisionTimestamp: persistedMinimalLiveCanaryDecision?.decisionTimestamp || placedAt,
       orderIntent: prepared.orderIntent || (prepared.postOnly === false ? 'taker_opportunity' : 'maker_quote'),
       liquidityRoleExpected: prepared.postOnly === false ? 'taker' : 'maker',
+      minimalLiveCanary: this.config.minimalLiveCanaryConfig.enabled,
+      sentToVenue: false,
     });
     // Everything above may invoke injected synchronous code (notably capital reserve). Recheck
     // the exact prepared price immediately at the transport boundary; never re-slide here because
@@ -1214,8 +1279,19 @@ export class QuoteEngine extends EventEmitter {
       this.deferredRepriceNeeded = true;
       return null;
     }
+    if (this.config.minimalLiveCanaryConfig.enabled &&
+        (this.quotingSuspended ||
+         persistedMinimalLiveCanaryDecision?.dispatchGeneration !== this.minimalLiveCanaryDispatchGeneration)) {
+      this._rollbackUnsentNewOrder(clOrdID);
+      this._recordSuppression(prepared, 'minimal-live-canary:dispatch-invalidated');
+      return null;
+    }
 
     if (this.fixConnection) {
+      // Mark before calling the transport: a synchronous adapter can trigger
+      // a stop callback during enqueue, and cancellation is only legal after
+      // this order may have reached the venue.
+      this.activeOrders.get(clOrdID).sentToVenue = true;
       let dispatchAccepted;
       try {
         dispatchAccepted = this.fixConnection.sendMessage(fields);
@@ -1254,12 +1330,78 @@ export class QuoteEngine extends EventEmitter {
       eventType: prepared.replacesQuoteId ? 'replace' : 'create', quoteId: clOrdID,
       replacesQuoteId: prepared.replacesQuoteId || null, side: prepared.side, price: prepared.price,
       size: prepared.size, level: prepared.level, action: prepared.replacesQuoteId ? 'replace' : 'place',
-      decisionTimestamp: placedAt,
+      decisionTimestamp: persistedMinimalLiveCanaryDecision?.decisionTimestamp || placedAt,
+      minimalLiveCanary: this.config.minimalLiveCanaryConfig.enabled,
+      decisionPersistenceConfirmed: persistedMinimalLiveCanaryDecision !== null,
     });
     if (prepared.postOnly === false) {
       this._recordTakerOrder(prepared.size * prepared.price);
     }
     return clOrdID;
+  }
+
+  /**
+   * The canary's asynchronous, fail-closed placement lane. Normal quoting is
+   * deliberately not slowed by telemetry, but this explicitly bounded live
+   * experiment must have its decision attribution durably acknowledged before
+   * a D can be sent.
+   */
+  _dispatchMinimalLiveCanaryOrder(quote) {
+    const key = `${quote?.side || 'unknown'}:${quote?.level || 'unknown'}`;
+    if (this.pendingMinimalLiveCanaryDispatches.has(key)) return false;
+    if (typeof this.minimalLiveCanaryDecisionWriter !== 'function') {
+      this.minimalLiveCanary.stop('durable-decision-writer-unavailable');
+      this._recordSuppression(quote, 'minimal-live-canary:durable-decision-writer-unavailable');
+      return false;
+    }
+
+    const dispatchGeneration = this.minimalLiveCanaryDispatchGeneration;
+    this.pendingMinimalLiveCanaryDispatches.add(key);
+    void this._persistThenSendMinimalLiveCanaryOrder(quote, key, dispatchGeneration);
+    return true;
+  }
+
+  async _persistThenSendMinimalLiveCanaryOrder(quote, key, dispatchGeneration) {
+    try {
+      // Re-run all normal send preparation before persisting. The exact
+      // prepared price (including any passive slide) is then the one sent.
+      if (!this.minimalLiveCanary.canPlace()) return;
+      const prepared = this._prepareQuoteForSend(quote);
+      if (!prepared || prepared.postOnly === false || prepared.level !== 1 ||
+          prepared.size !== this.config.minimalLiveCanaryConfig.baseSizeBTC) {
+        this.minimalLiveCanary.stop('invalid-order-envelope');
+        return;
+      }
+      const quoteId = this.generateClOrdID();
+      const decisionTimestamp = Date.now();
+      const persisted = await this.minimalLiveCanaryDecisionWriter({
+        eventType: prepared.replacesQuoteId ? 'replace' : 'create',
+        quoteId,
+        replacesQuoteId: prepared.replacesQuoteId || null,
+        side: prepared.side,
+        price: prepared.price,
+        size: prepared.size,
+        level: prepared.level,
+        action: prepared.replacesQuoteId ? 'replace' : 'place',
+        decisionTimestamp,
+        minimalLiveCanary: true,
+        decisionPersistenceConfirmed: true,
+      });
+      if (persisted !== true) {
+        this.minimalLiveCanary.stop('durable-decision-persistence-failed');
+        return;
+      }
+      if (dispatchGeneration !== this.minimalLiveCanaryDispatchGeneration || this.quotingSuspended ||
+          !this.minimalLiveCanary.canPlace()) return;
+      this._sendNewOrder(prepared, {
+        persistedMinimalLiveCanaryDecision: { quoteId, decisionTimestamp, dispatchGeneration, preparedQuote: prepared },
+      });
+    } catch (error) {
+      this.logger.error(`[QuoteEngine] Minimal live canary decision persistence failed: ${error.message}`);
+      this.minimalLiveCanary.stop('durable-decision-persistence-failed');
+    } finally {
+      this.pendingMinimalLiveCanaryDispatches.delete(key);
+    }
   }
 
   _rollbackUnsentNewOrder(clOrdID) {
@@ -1413,6 +1555,19 @@ export class QuoteEngine extends EventEmitter {
    */
   _emitFillEvent(resolvedClOrdID, side, price, size, execID, metadata = {}) {
     const tracked = this.activeOrders.get(resolvedClOrdID);
+    if (tracked?.minimalLiveCanary === true) {
+      const fillId = execID ? `${resolvedClOrdID}-${execID}` : null;
+      // The canary's 1-minute markout is meaningful only against a verified
+      // execution price. Never substitute its resting limit for a missing
+      // LastPx: an adverse fill could otherwise look benign and leave a
+      // second resting canary order live.
+      if (metadata.estimated === true || metadata.evidenceGap === true) {
+        this.minimalLiveCanary.stop('invalid-fill-evidence');
+      } else {
+        this.minimalLiveCanary.recordFill(size, fillId);
+        if (fillId) this.minimalLiveCanaryFillIds.add(fillId);
+      }
+    }
     this.emit('fill', {
       side,
       price,
@@ -1422,9 +1577,23 @@ export class QuoteEngine extends EventEmitter {
       orderIntent: tracked?.orderIntent || 'maker_quote',
       liquidityRoleExpected: tracked?.liquidityRoleExpected || 'maker',
       isMaker: (tracked?.liquidityRoleExpected || 'maker') === 'maker',
+      minimalLiveCanary: tracked?.minimalLiveCanary === true,
       ...metadata,
     });
     return tracked;
+  }
+
+  recordMinimalLiveCanaryMarkout({ fillId, available, attributed, observedEdgeBps } = {}) {
+    if (!this.minimalLiveCanaryFillIds.delete(fillId)) return false;
+    return this.minimalLiveCanary.recordMarkout({ fillId, available, attributed, observedEdgeBps });
+  }
+
+  stopMinimalLiveCanary(reason) {
+    return this.minimalLiveCanary.stop(reason);
+  }
+
+  armMinimalLiveCanary() {
+    return this.minimalLiveCanary.arm();
   }
 
   _emitCapitalEvidenceGap(orderId) {
@@ -1614,6 +1783,7 @@ export class QuoteEngine extends EventEmitter {
                 eventType: 'partial_fill', quoteId: resolvedClOrdID, executionId: execID, side,
                 price: effectivePrice, size: lastQty, level: tracked?.level, action: 'partial_fill',
                 decisionTimestamp: tracked?.decisionTimestamp ?? tracked?.placedAt ?? null,
+                minimalLiveCanary: tracked?.minimalLiveCanary === true,
                 ...(priceEstimated ? { estimated: true, evidenceGap: true } : {}),
               });
               if (tracked) {
@@ -1661,6 +1831,7 @@ export class QuoteEngine extends EventEmitter {
             eventType: 'partial_fill', quoteId: resolvedClOrdID, executionId: execID, side,
             price: effectivePrice, size: effectiveLastQty, level: tracked?.level, action: 'partial_fill',
             decisionTimestamp: tracked?.decisionTimestamp ?? tracked?.placedAt ?? null,
+            minimalLiveCanary: tracked?.minimalLiveCanary === true,
             ...(estimatedEvidence ? { estimated: true, evidenceGap: true } : {}),
           });
           if (tracked) {
@@ -1736,6 +1907,7 @@ export class QuoteEngine extends EventEmitter {
               side, price: effectivePrice, size: preTerminalRemaining,
               level: tracked?.level, action: 'full_fill',
               decisionTimestamp: tracked?.decisionTimestamp ?? tracked?.placedAt ?? null,
+              minimalLiveCanary: tracked?.minimalLiveCanary === true,
               ...(estimatedEvidence ? { estimated: true, evidenceGap: true } : {}),
             });
           }
@@ -1765,6 +1937,7 @@ export class QuoteEngine extends EventEmitter {
             eventType: 'full_fill', quoteId: resolvedClOrdID, executionId: execID, side,
             price: effectivePrice, size: preTerminalRemaining, level: tracked?.level, action: 'full_fill',
             decisionTimestamp: tracked?.decisionTimestamp ?? tracked?.placedAt ?? null,
+            minimalLiveCanary: tracked?.minimalLiveCanary === true,
             ...(estimatedEvidence ? { estimated: true, evidenceGap: true } : {}),
           });
           this._recordExecutionIdentity(resolvedClOrdID, execID, { terminal: true });
@@ -1782,6 +1955,9 @@ export class QuoteEngine extends EventEmitter {
         const cancelled = this.activeOrders.get(resolvedClOrdID);
         {
           const selfInitiated = !!origClOrdID || cancelled?.status === 'cancelling';
+          if (cancelled?.minimalLiveCanary === true && !selfInitiated) {
+            this.minimalLiveCanary.stop('venue-cancel');
+          }
           if (cancelled && !selfInitiated) {
             const reason = fields['58'] || 'unsolicited';
             // Venue text is diagnostic only. Any unsolicited cancellation of a
@@ -1817,6 +1993,8 @@ export class QuoteEngine extends EventEmitter {
           this.rejectBackoffUntil = Date.now() + 5000;
           this.logger.warn(`[QuoteEngine] ${this.consecutiveRejects} consecutive rejects — backing off for 5s`);
         }
+        const rejected = this.activeOrders.get(resolvedClOrdID);
+        if (rejected?.minimalLiveCanary === true) this.minimalLiveCanary.stop('venue-reject');
         if (origClOrdID) {
           // Cancel was rejected — original order still lives on TrueX
           // Restore to 'active' so reconciler knows the level is occupied
@@ -1849,12 +2027,27 @@ export class QuoteEngine extends EventEmitter {
         break;
 
       case 'C': // Expired
+        const expired = this.activeOrders.get(resolvedClOrdID);
+        if (expired?.minimalLiveCanary === true) {
+          // A venue expiry is terminal for this order. Finalize local capital
+          // and identity first; stopping invokes cancelAllQuotes, which must
+          // only see other still-live canary orders.
+          this.capitalReservationManager?.expired(resolvedClOrdID);
+          this.activeOrders.delete(resolvedClOrdID);
+          this.unknownStatusDedupeByOrder.delete(resolvedClOrdID);
+          this.emit('quote-lifecycle', {
+            eventType: 'cancel', quoteId: resolvedClOrdID, executionId: execID,
+            side: expired.side || side, price: expired.price, size: expired.size,
+            level: expired.level, action: 'expired', reason: fields['58'] || 'expired',
+          });
+          this.minimalLiveCanary.stop('venue-expired');
+          break;
+        }
         if (!this.capitalReservationManager) {
           this.logger.warn(`[QuoteEngine] Unhandled execution report ordStatus=${ordStatus} clOrdID=${clOrdID} execID=${execID}`);
           break;
         }
-        if (this.capitalReservationManager.expired(resolvedClOrdID)) {
-          const expired = this.activeOrders.get(resolvedClOrdID);
+        if (this.capitalReservationManager?.expired(resolvedClOrdID)) {
           this.activeOrders.delete(resolvedClOrdID);
           this.unknownStatusDedupeByOrder.delete(resolvedClOrdID);
           this.emit('quote-lifecycle', {
@@ -1995,11 +2188,20 @@ export class QuoteEngine extends EventEmitter {
     this.logger.warn(`[QuoteEngine] Cancelling all ${orderCount} quotes: ${reason || 'emergency'}`);
 
     for (const [clOrdID, order] of this.activeOrders) {
+      if (order.sentToVenue === false) continue;
       this._sendCancel(clOrdID, order);
     }
 
-    // Emergency: clear all active orders immediately (don't wait for cancel acks)
-    this.activeOrders.clear();
+    // Retain canary orders until their terminal venue outcome. A fill can race
+    // a protective cancel; dropping its identity would lose the mandatory
+    // fill-cap and one-minute markout attribution.
+    for (const [clOrdID, order] of this.activeOrders) {
+      if (order.minimalLiveCanary === true && order.sentToVenue !== false) {
+        order.status = 'cancelling';
+      } else {
+        this.activeOrders.delete(clOrdID);
+      }
+    }
 
     this.isQuoting = false;
     this.emit('cancel-all', { reason: reason || 'emergency', orderCount });
@@ -2089,6 +2291,7 @@ export class QuoteEngine extends EventEmitter {
       pyusdBasisSuppressed: this.shouldSuppressBasisDependentDetection(),
       shadowTakeMode: this.config.shadowTakeMode,
       inventoryRecovery: this.inventoryRecoveryDecision,
+      minimalLiveCanary: this.minimalLiveCanary.snapshot(),
       shadowState: {
         activeCandidate: this.shadowState.activeCandidate ? { ...this.shadowState.activeCandidate } : null,
         lastLoggedCandidate: this.shadowState.lastLoggedCandidate ? { ...this.shadowState.lastLoggedCandidate } : null,
@@ -2702,6 +2905,9 @@ export class QuoteEngine extends EventEmitter {
       quote: { ...quote },
     };
     this.suppressedLevels.set(key, value);
+    if (this.config.minimalLiveCanaryConfig.enabled && String(reason).startsWith('truex-ebbo-')) {
+      this.minimalLiveCanary.stop(reason);
+    }
     if (reason === 'marketable-post-only') {
       this.lastMarketableAloSkip = value;
     }

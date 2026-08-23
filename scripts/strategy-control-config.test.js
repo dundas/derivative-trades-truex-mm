@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import {
   buildInventoryRebalanceShadowConfig,
   buildInventoryRecoveryConfig,
+  buildMinimalLiveCanaryConfig,
   buildMakerPresenceRecoveryConfig,
 } from './strategy-control-config.js';
 
@@ -57,5 +58,54 @@ describe('strategy control config', () => {
     expect(() => buildInventoryRecoveryConfig({ MM_INVENTORY_RECOVERY_ENABLED: 'true' }, {
       quoteDispatchMode: 'live',
     })).toThrow('MM_QUOTE_DISPATCH_MODE=observe');
+  });
+});
+
+describe('minimal live canary config', () => {
+  const policy = Object.freeze({
+    normalQuoteLevels: 1, baseQuoteSizeBTC: 0.0005,
+    minimumQuoteWidthBps: 30, contractMaxQuoteSpreadBps: 80,
+  });
+  const markouts = Object.freeze({ horizonsMs: [60_000], maxLatenessMs: 30_000, pollIntervalMs: 1_000, claimLeaseMs: 5_000 });
+
+  test('is explicitly disabled by default and requires bounded controls when live', () => {
+    expect(buildMinimalLiveCanaryConfig()).toEqual({ enabled: false });
+    expect(() => buildMinimalLiveCanaryConfig({
+      MM_MINIMAL_LIVE_CANARY_ENABLED: 'true', MM_MINIMAL_LIVE_CANARY_RUN_ID: 'canary-run-0001',
+    }, {
+      quoteDispatchMode: 'live', makerQuotePolicyConfig: policy, referenceMarkoutConfig: markouts,
+    })).toThrow('MM_MINIMAL_LIVE_CANARY_DURATION_MS is required');
+    expect(() => buildMinimalLiveCanaryConfig({
+      MM_MINIMAL_LIVE_CANARY_ENABLED: 'true',
+      MM_MINIMAL_LIVE_CANARY_RUN_ID: 'canary-run-0001',
+      MM_MINIMAL_LIVE_CANARY_DURATION_MS: '900000',
+      MM_MINIMAL_LIVE_CANARY_MAX_CUMULATIVE_FILLED_BTC: '0.001',
+    }, { quoteDispatchMode: 'observe', makerQuotePolicyConfig: policy, referenceMarkoutConfig: markouts }))
+      .toThrow('MM_QUOTE_DISPATCH_MODE=live');
+  });
+
+  test('accepts only the reviewed live envelope', () => {
+    expect(buildMinimalLiveCanaryConfig({
+      MM_MINIMAL_LIVE_CANARY_ENABLED: 'true',
+      MM_MINIMAL_LIVE_CANARY_RUN_ID: 'canary-run-0001',
+      MM_MINIMAL_LIVE_CANARY_DURATION_MS: '900000',
+      MM_MINIMAL_LIVE_CANARY_MAX_CUMULATIVE_FILLED_BTC: '0.001',
+    }, { quoteDispatchMode: 'live', makerQuotePolicyConfig: policy, referenceMarkoutConfig: markouts }))
+      .toMatchObject({ enabled: true, durationMs: 900000, maxCumulativeFilledBTC: 0.001,
+        oneMinuteMarkoutDeadlineMs: 96_000 });
+    expect(() => buildMinimalLiveCanaryConfig({
+      MM_MINIMAL_LIVE_CANARY_ENABLED: 'true',
+      MM_MINIMAL_LIVE_CANARY_RUN_ID: 'canary-run-0001',
+      MM_MINIMAL_LIVE_CANARY_DURATION_MS: '900001',
+      MM_MINIMAL_LIVE_CANARY_MAX_CUMULATIVE_FILLED_BTC: '0.001',
+    }, { quoteDispatchMode: 'live', makerQuotePolicyConfig: policy, referenceMarkoutConfig: markouts }))
+      .toThrow('15 minutes');
+    expect(() => buildMinimalLiveCanaryConfig({
+      MM_MINIMAL_LIVE_CANARY_ENABLED: 'true',
+      MM_MINIMAL_LIVE_CANARY_RUN_ID: 'canary-run-0001',
+      MM_MINIMAL_LIVE_CANARY_DURATION_MS: '900000',
+      MM_MINIMAL_LIVE_CANARY_MAX_CUMULATIVE_FILLED_BTC: '0.001',
+    }, { quoteDispatchMode: 'live', makerQuotePolicyConfig: policy }))
+      .toThrow('60000ms');
   });
 });

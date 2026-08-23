@@ -16,6 +16,8 @@ import { MakerPresenceController } from './maker-presence-controller.js';
 import { MakerPresenceRecoveryController } from './maker-presence-recovery.js';
 import { evaluateInventoryRebalance } from '../analytics/inventory-rebalance-model.js';
 
+const MINIMAL_LIVE_CANARY_MARKOUT_POLICY_ID = 'minimal-live-canary-v1';
+
 function strictPositiveRestNumber(value) {
   if ((typeof value !== 'string' && typeof value !== 'number') ||
       (typeof value === 'string' && value.trim() === '')) return null;
@@ -233,6 +235,8 @@ export class MarketMakerOrchestrator extends EventEmitter {
       truexTapeOutlierThresholdBps: options.truexTapeOutlierThresholdBps ?? 50,
       marketDataProvider: () => this.marketDataFeed?.getBestBidAsk?.(),
       inventoryRecoveryConfig: options.inventoryRecoveryConfig,
+      minimalLiveCanaryConfig: options.minimalLiveCanaryConfig,
+      minimalLiveCanaryDecisionWriter: event => this._persistMinimalLiveCanaryDecision(event),
       orderIdNamespace: options.orderIdNamespace,
       orderIdBootId: options.orderIdBootId,
       logger: this.logger,
@@ -292,6 +296,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
           ? () => options.referenceBookFeed?.getBook?.() || null
           : () => this.lastAggregatedPrice,
         basisProvider: () => this.pyusdUsd,
+        onMarkoutCompletion: event => this._onMinimalLiveCanaryMarkout(event),
       }) : null);
     this.policyVector = {
       targetInventoryBTC: Number(options.targetInventoryBTC ?? 0), maxSkewTicks: Number(options.maxSkewTicks ?? 3),
@@ -474,6 +479,50 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this._capitalResyncContractFollowupQueued = false;
   }
 
+  _onMinimalLiveCanaryMarkout({ work, available, attributed, observedEdgeBps } = {}) {
+    if (work?.horizonMs !== 60_000) return false;
+    return this.quoteEngine.recordMinimalLiveCanaryMarkout?.({
+      fillId: work.fillId, available, attributed, observedEdgeBps,
+    }) ?? false;
+  }
+
+  _requireMinimalLiveCanaryMarkoutWriter() {
+    if (this.quoteEngine.config?.minimalLiveCanaryConfig?.enabled !== true) return;
+    if (!this.dataPipeline?.pgManager || !this.referenceMarkoutCollector?.writer) {
+      throw new Error(
+        'minimal live canary requires an initialized PostgreSQL reference markout writer',
+      );
+    }
+  }
+
+  async _requireNoUnresolvedMinimalLiveCanaryMarkouts() {
+    if (this.quoteEngine.config?.minimalLiveCanaryConfig?.enabled !== true) return;
+    const writer = this.referenceMarkoutCollector?.writer;
+    if (typeof writer?.hasUnresolvedReferenceMarkouts !== 'function') {
+      throw new Error('minimal live canary requires unresolved reference markout recovery');
+    }
+    const unresolved = await writer.hasUnresolvedReferenceMarkouts({
+      policyId: MINIMAL_LIVE_CANARY_MARKOUT_POLICY_ID,
+      horizonMs: 60_000,
+    });
+    if (unresolved !== false) {
+      throw new Error('minimal live canary has unresolved one-minute markout evidence');
+    }
+  }
+
+  async _claimMinimalLiveCanaryRun() {
+    const config = this.quoteEngine.config?.minimalLiveCanaryConfig;
+    if (config?.enabled !== true) return;
+    const writer = this.referenceMarkoutCollector?.writer;
+    if (typeof writer?.claimMinimalLiveCanaryRun !== 'function' ||
+        await writer.claimMinimalLiveCanaryRun({ runId: config.runId, sessionId: this.sessionId, claimedAt: Date.now() }) !== true) {
+      throw new Error('minimal live canary run ID is already claimed or cannot be persisted');
+    }
+    if (this.quoteEngine.armMinimalLiveCanary?.() !== true) {
+      throw new Error('minimal live canary could not be armed after its durable run claim');
+    }
+  }
+
   /**
    * Start the market maker: connect, wire events, begin quoting.
    */
@@ -635,6 +684,13 @@ export class MarketMakerOrchestrator extends EventEmitter {
         this.referenceMarkoutCollector.setWriter(this.dataPipeline.pgManager);
       }
     }
+
+    // A live canary must observe its first-fill 1-minute markout durably. The
+    // normal observer pipeline can degrade without PostgreSQL, but permitting
+    // that degradation here would allow quoting without the stop evidence.
+    this._requireMinimalLiveCanaryMarkoutWriter();
+    await this._requireNoUnresolvedMinimalLiveCanaryMarkouts();
+    await this._claimMinimalLiveCanaryRun();
 
     // 7. Start PnL periodic logging
     if (!attempt.pnlInitiallyRunning) {
@@ -949,6 +1005,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this.logger.info('[Orchestrator] Stopping market maker...');
 
     // 1. Cancel all active quotes
+    this.quoteEngine.minimalLiveCanary?.dispose?.();
     this.quoteEngine.cancelAllQuotes('shutdown');
     this.logger.info('[Orchestrator] All quotes cancelled');
 
@@ -1570,7 +1627,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
 
   _onQuoteFill({
     side, price, size, clOrdID, execID, orderIntent, liquidityRoleExpected,
-    isMaker = true, estimated = false, evidenceGap = false,
+    isMaker = true, estimated = false, evidenceGap = false, minimalLiveCanary = false,
   }) {
     // Route fill to InventoryManager
     this.inventoryManager.onFill({
@@ -1603,6 +1660,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
       orderId: clOrdID,
       sessionId: this.sessionId,
       symbol: this.symbol,
+      policyId: minimalLiveCanary === true
+        ? MINIMAL_LIVE_CANARY_MARKOUT_POLICY_ID
+        : this.quoteTelemetry.policyId,
       side,
       quantity: size,
       price,
@@ -1627,7 +1687,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     });
   }
 
-  _onQuoteLifecycle(event) {
+  _enrichQuoteLifecycleEvent(event) {
     const summary = this.inventoryManager.getPositionSummary?.() || {};
     const activeOrders = this.quoteEngine.activeOrders || new Map();
     let committedExposureBTC = 0;
@@ -1642,12 +1702,15 @@ export class MarketMakerOrchestrator extends EventEmitter {
     const coinbase = Array.isArray(market.sources)
       ? market.sources.find(source => source?.exchange === 'coinbase') || null
       : null;
-    const enrichedEvent = {
+    return {
       ...event,
       decisionTimestamp: Number.isSafeInteger(event.decisionTimestamp) && event.decisionTimestamp >= 0
         ? event.decisionTimestamp : now,
       sessionId: this.sessionId,
       symbol: this.symbol,
+      policyId: event.minimalLiveCanary === true
+        ? MINIMAL_LIVE_CANARY_MARKOUT_POLICY_ID
+        : this.quoteTelemetry.policyId,
       targetInventoryBTC: summary.targetInventoryBTC ?? this.inventoryManager.targetInventoryBTC,
       policyVector: this.policyVector,
       inventoryDeviationBTC: summary.inventoryDeviationBTC,
@@ -1665,24 +1728,53 @@ export class MarketMakerOrchestrator extends EventEmitter {
         marketState: market.marketState ?? null,
       },
     };
+  }
+
+  async _persistMinimalLiveCanaryDecision(event) {
+    const enrichedEvent = this._enrichQuoteLifecycleEvent(event);
+    try {
+      const recorded = await this.referenceMarkoutCollector?.recordQuoteDecision(enrichedEvent);
+      if (recorded !== true) throw new Error('reference quote decision was not durably acknowledged');
+      return true;
+    } catch (error) {
+      this.logger.error(`[Orchestrator] Minimal live canary decision persistence failed: ${error.message}`);
+      return false;
+    }
+  }
+
+  async _onQuoteLifecycle(event) {
+    const enrichedEvent = this._enrichQuoteLifecycleEvent(event);
     this.quoteTelemetry.record(enrichedEvent)
       .catch(err => this.logger.warn(`[Orchestrator] Quote telemetry failed: ${err.message}`));
     if (event.eventType === 'create' || event.eventType === 'replace') {
-      this.referenceMarkoutCollector?.recordQuoteDecision(enrichedEvent);
+      if (event.decisionPersistenceConfirmed !== true) {
+        this.referenceMarkoutCollector?.recordQuoteDecision(enrichedEvent);
+      }
     } else if ((event.eventType === 'partial_fill' || event.eventType === 'full_fill') && event.executionId) {
-      this.referenceMarkoutCollector?.scheduleFill({
+      const fill = {
         fillId: `${event.quoteId}-${event.executionId}`,
         executionId: event.executionId,
         quoteId: event.quoteId,
         sessionId: this.sessionId,
-        fillTimestamp: now,
+        fillTimestamp: Date.now(),
         decisionTimestamp: enrichedEvent.decisionTimestamp,
         side: event.side,
         level: event.level,
-        policyId: this.quoteTelemetry.policyId,
+        policyId: enrichedEvent.policyId,
         price: event.price,
         size: event.size,
-      });
+      };
+      if (event.minimalLiveCanary === true) {
+        try {
+          await this.referenceMarkoutCollector?.scheduleFillDurably?.(fill);
+        } catch (error) {
+          this.quoteEngine.stopMinimalLiveCanary?.('durable-markout-scheduling-failed');
+          this.logger.error(`[Orchestrator] Minimal live canary markout persistence failed: ${error.message}`);
+          return false;
+        }
+      } else {
+        this.referenceMarkoutCollector?.scheduleFill(fill);
+      }
     }
   }
 
@@ -1695,6 +1787,10 @@ export class MarketMakerOrchestrator extends EventEmitter {
   }
 
   _onHedgeSignal({ shouldHedge, side, size }) {
+    if (this.quoteEngine.config?.minimalLiveCanaryConfig?.enabled === true) {
+      this.logger.warn('[Orchestrator] Suppressed external hedge while minimal live canary is enabled');
+      return;
+    }
     if (!shouldHedge || !this.isRunning) return;
 
     this.logger.info(`[Orchestrator] Hedge signal: ${side} ${size.toFixed(6)} BTC`);
@@ -2269,6 +2365,10 @@ export class MarketMakerOrchestrator extends EventEmitter {
         symbol: this.symbol,
       });
       this.quoteEngine.updateTruexEbbo(parsed);
+      if (this.quoteEngine.config?.minimalLiveCanaryConfig?.enabled &&
+          this.quoteEngine._strictEbboState?.().usable !== true) {
+        this.quoteEngine.stopMinimalLiveCanary?.('truex-ebbo-invalid');
+      }
       await this._processShadowEvaluation('truex-ebbo-poll', { refreshTape: true });
 
       const hadFailureAlert = this._truexEbboFailureAlertActive;
@@ -2282,6 +2382,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
           .catch((err) => this.logger.error(`[Orchestrator] TrueX EBBO recovery alert failed: ${err.message}`));
       }
     } catch (err) {
+      this.quoteEngine.stopMinimalLiveCanary?.('truex-ebbo-poll-failure');
       this._truexEbboConsecutiveErrors++;
       const status = err?.status || err?.cause?.status;
       const multiplier = status === 429 ? 2 : 1.5;

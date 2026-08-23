@@ -133,6 +133,12 @@ services:
       - TRUEX_ALO_RETRY_MAX_ENTRIES=${TRUEX_ALO_RETRY_MAX_ENTRIES:?required}
       # `observe` permits data collection and protective cancels but never a new FIX D.
       - MM_QUOTE_DISPATCH_MODE=${MM_QUOTE_DISPATCH_MODE:-live}
+      # Default false. A separately approved live canary must provide both
+      # bounded controls; blank values are rejected by run-prod when enabled.
+      - MM_MINIMAL_LIVE_CANARY_ENABLED=${MM_MINIMAL_LIVE_CANARY_ENABLED:-false}
+      - MM_MINIMAL_LIVE_CANARY_RUN_ID=${MM_MINIMAL_LIVE_CANARY_RUN_ID:-}
+      - MM_MINIMAL_LIVE_CANARY_DURATION_MS=${MM_MINIMAL_LIVE_CANARY_DURATION_MS:-}
+      - MM_MINIMAL_LIVE_CANARY_MAX_CUMULATIVE_FILLED_BTC=${MM_MINIMAL_LIVE_CANARY_MAX_CUMULATIVE_FILLED_BTC:-}
       # Feed controls remain operator-configurable; stale data continues to fail closed.
       - PYUSD_USD_POLL_INTERVAL_MS=${PYUSD_USD_POLL_INTERVAL_MS:-5000}
       - PYUSD_USD_POLL_TIMEOUT_MS=${PYUSD_USD_POLL_TIMEOUT_MS:-1000}

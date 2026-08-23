@@ -248,15 +248,17 @@ describe('TrueXPostgreSQLManager', () => {
       mockDb.query.mockResolvedValueOnce({ rows: [{
         fill_id: 'F-1', horizon_ms: '60000', fill_timestamp: '2000', due_timestamp: '62000',
         deadline_timestamp: '92000', fill_price: '100', fill_size: '0.1', level: 1,
+        has_quote_attribution: true,
       }] });
       const rows = await pgManager.claimDueReferenceMarkouts({
         now: 62_001, claimToken: 'owner-1', leaseMs: 5000, batchSize: 10,
       });
       expect(mockDb.query).toHaveBeenLastCalledWith(
-        expect.stringMatching(/session_id = work\.session_id[\s\S]*FOR UPDATE OF work SKIP LOCKED[\s\S]*state = 'claimed'/),
+        expect.stringMatching(/session_id = work\.session_id[\s\S]*FOR UPDATE OF work SKIP LOCKED[\s\S]*state = 'claimed'[\s\S]*RETURNING work\.\*, candidates\.has_quote_attribution/),
         [62_001, 10, 'owner-1', 5000],
       );
-      expect(rows[0]).toMatchObject({ fillId: 'F-1', horizonMs: 60_000, dueTimestamp: 62_000 });
+      expect(rows[0]).toMatchObject({ fillId: 'F-1', horizonMs: 60_000, dueTimestamp: 62_000,
+        hasQuoteAttribution: true });
     });
 
     it('checks an indexed unfinished window without mutating work', async () => {
@@ -268,6 +270,30 @@ describe('TrueXPostgreSQLManager', () => {
       expect(sql).toContain('deadline_timestamp >= $1');
       expect(sql).not.toContain('UPDATE');
       expect(values).toEqual([1_000]);
+    });
+
+    it('checks whether a named policy has unresolved markouts without mutating work', async () => {
+      mockDb.query.mockResolvedValueOnce({ rows: [{ has_unresolved_markouts: true }] });
+      await expect(pgManager.hasUnresolvedReferenceMarkouts({
+        policyId: 'minimal-live-canary-v1', horizonMs: 60_000,
+      })).resolves.toBe(true);
+      const [sql, values] = mockDb.query.mock.calls.at(-1);
+      expect(sql).toContain("state <> 'completed'");
+      expect(sql).toContain('policy_id = $1');
+      expect(sql).toContain('horizon_ms = $2');
+      expect(sql).not.toContain('UPDATE');
+      expect(values).toEqual(['minimal-live-canary-v1', 60_000]);
+    });
+
+    it('claims each operator canary run ID at most once', async () => {
+      mockDb.query.mockResolvedValueOnce({ rowCount: 1, rows: [{ run_id: 'canary-run-0001' }] });
+      await expect(pgManager.claimMinimalLiveCanaryRun({
+        runId: 'canary-run-0001', sessionId: 'session-1', claimedAt: 1_000,
+      })).resolves.toBe(true);
+      const [sql, values] = mockDb.query.mock.calls.at(-1);
+      expect(sql).toContain('minimal_live_canary_runs');
+      expect(sql).toContain('ON CONFLICT (run_id) DO NOTHING');
+      expect(values).toEqual(['canary-run-0001', 'session-1', 1_000]);
     });
 
     it('persists immutable market samples and selects the earliest sample in the due window', async () => {

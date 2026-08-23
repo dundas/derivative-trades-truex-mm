@@ -177,7 +177,7 @@ export class ReferenceMarkoutCollector {
     sourceFeed = null,
     config, logger = console, now = () => Date.now(), monotonicNow = () => performance.now(),
     yieldFn = ms => new Promise(resolve => setTimeout(resolve, ms)),
-    claimTokenNamespace = randomUUID() } = {}) {
+    claimTokenNamespace = randomUUID(), onMarkoutCompletion = null } = {}) {
     this.config = validateReferenceMarkoutConfig(config);
     this.writer = writer;
     this.marketProvider = marketProvider;
@@ -191,6 +191,10 @@ export class ReferenceMarkoutCollector {
       throw new Error('claimTokenNamespace must be a non-empty string');
     }
     this._claimTokenNamespace = claimTokenNamespace;
+    if (onMarkoutCompletion !== null && typeof onMarkoutCompletion !== 'function') {
+      throw new Error('onMarkoutCompletion must be a function or null');
+    }
+    this.onMarkoutCompletion = onMarkoutCompletion;
     this._processing = false;
     this._timer = null;
     this._retentionTimer = null;
@@ -635,6 +639,30 @@ export class ReferenceMarkoutCollector {
     }
   }
 
+  // Used only by the live canary. Unlike the ordinary telemetry lane, this
+  // waits for PostgreSQL to acknowledge the work row before resolving.
+  async scheduleFillDurably(fill = {}) {
+    if (!this.writer?.scheduleReferenceMarkouts) throw new Error('reference markout writer is unavailable');
+    if (typeof fill.fillId !== 'string' || fill.fillId.length === 0) throw new Error('fillId is required');
+    if (!['buy', 'sell'].includes(fill.side) || !finitePositive(fill.price)) {
+      throw new Error('fill requires side buy/sell and a positive price');
+    }
+    const fillTimestamp = finiteTimestamp(fill.fillTimestamp) ? fill.fillTimestamp : this.now();
+    const horizonsMs = [60_000];
+    const dueTimestamps = horizonsMs.map(horizon => fillTimestamp + horizon);
+    const deadlineTimestamps = dueTimestamps.map(due => due + this.config.maxLatenessMs);
+    if ([...dueTimestamps, ...deadlineTimestamps].some(value => !Number.isSafeInteger(value))) {
+      throw new Error('fill horizon timestamp exceeds safe integer range');
+    }
+    const recorded = await this.writer.scheduleReferenceMarkouts({
+      ...fill, fillTimestamp, horizonsMs, dueTimestamps, deadlineTimestamps,
+      product: this.config.product, quoteCurrency: this.config.quoteCurrency,
+      sourceExchange: this.config.sourceExchange, sourceType: this.config.sourceType,
+    });
+    this.stats.fillsScheduled += 1;
+    return recorded;
+  }
+
   async getCoverageAudit(filters = {}) {
     if (!this.writer?.getReferenceMarkoutCoverage) {
       return { groups: [], truncated: false, limit: this.config.auditMaxGroups };
@@ -806,9 +834,22 @@ export class ReferenceMarkoutCollector {
           ? (work.side === 'buy' ? adjustedMidpoint - work.price : work.price - adjustedMidpoint) /
             work.price * 10_000
           : null;
-        await this.writer.completeReferenceMarkout(work, claimToken, {
+        const completed = await this.writer.completeReferenceMarkout(work, claimToken, {
           ...observation, adjustedMidpoint, observedEdgeBps,
         });
+        if (completed !== true) {
+          this._warn('markout completion was not durably acknowledged');
+          continue;
+        }
+        try {
+          this.onMarkoutCompletion?.({ work, available: observation.available === true,
+            // A completed market observation is not sufficient evidence that it belongs to
+            // this fill. The durable claim query attests the matching pre-fill quote decision.
+            // Omit/unknown fails closed for consumers such as the live canary.
+            attributed: work.hasQuoteAttribution === true, observedEdgeBps });
+        } catch (error) {
+          this._warn('markout completion callback failed', error);
+        }
         this.stats.observationsCompleted += 1;
         if (!observation.available) this.stats.unavailableCompleted += 1;
         result.completed += 1;

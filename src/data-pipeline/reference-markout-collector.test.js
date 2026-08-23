@@ -712,7 +712,7 @@ describe('ReferenceMarkoutCollector', () => {
     const now = 70_000;
     const work = { fillId: 'F-direct', horizonMs: 60_000, dueTimestamp: 60_000,
       deadlineTimestamp: 90_000, quoteId: 'Q-direct', decisionTimestamp: 9_000,
-      side: 'buy', level: 1, policyId: 'maker-v1', price: 100 };
+      side: 'buy', level: 1, policyId: 'maker-v1', price: 100, hasQuoteAttribution: true };
     let persisted;
     const writer = {
       hasOpenReferenceMarkoutWindow: jest.fn(async () => true),
@@ -731,8 +731,9 @@ describe('ReferenceMarkoutCollector', () => {
       sourceEndpoint: 'wss://stream.crypto.com/exchange/v1/market',
       sourceBookHash: 'a'.repeat(64), depth: 10, bidQty: 2, askQty: 3,
       bidCount: 1, askCount: 1 };
+    const onMarkoutCompletion = jest.fn();
     const collector = new ReferenceMarkoutCollector({ writer, config: DIRECT_CONFIG,
-      now: () => now, marketProvider: () => directBook });
+      now: () => now, marketProvider: () => directBook, onMarkoutCompletion });
 
     await collector.processDue();
 
@@ -741,6 +742,37 @@ describe('ReferenceMarkoutCollector', () => {
     expect(writer.completeReferenceMarkout).toHaveBeenCalledWith(work, expect.any(String),
       expect.objectContaining({ adjustedMidpoint: 101, observedEdgeBps: 100,
         basisPrice: null, referenceMode: 'cryptocom-direct' }));
+    expect(onMarkoutCompletion).toHaveBeenCalledWith(expect.objectContaining({
+      work, available: true, attributed: true, observedEdgeBps: 100,
+    }));
+  });
+
+  test('fails closed in completion callbacks when the durable quote attribution is absent', async () => {
+    const work = { fillId: 'F-unattributed', horizonMs: 60_000, dueTimestamp: 60_000,
+      deadlineTimestamp: 90_000, quoteId: 'Q-missing', decisionTimestamp: 9_000,
+      side: 'buy', level: 1, policyId: 'maker-v1', price: 100, hasQuoteAttribution: false };
+    const writer = {
+      hasOpenReferenceMarkoutWindow: jest.fn(async () => true),
+      recordReferenceMarketObservation: jest.fn(async () => true),
+      claimDueReferenceMarkouts: jest.fn(async () => [work]),
+      completeReferenceMarkout: jest.fn(async () => true),
+    };
+    const onMarkoutCompletion = jest.fn();
+    const directBook = { exchange: 'cryptocom', sourceType: 'public-ws-book',
+      instrument: 'BTC_PYUSD', channel: 'book.BTC_PYUSD.10', bid: 100, ask: 102,
+      sourceTimestamp: 69_950, bookUpdateTimestamp: 69_000, receivedTimestamp: 69_975,
+      sequence: 41, generation: 2, sourceSessionId: 'session-123',
+      sourceEndpoint: 'wss://stream.crypto.com/exchange/v1/market',
+      sourceBookHash: 'a'.repeat(64), depth: 10, bidQty: 2, askQty: 3,
+      bidCount: 1, askCount: 1 };
+    const collector = new ReferenceMarkoutCollector({ writer, config: DIRECT_CONFIG,
+      now: () => 70_000, marketProvider: () => directBook, onMarkoutCompletion });
+
+    await collector.processDue();
+
+    expect(onMarkoutCompletion).toHaveBeenCalledWith(expect.objectContaining({
+      work, available: true, attributed: false, observedEdgeBps: 100,
+    }));
   });
 
   test('bounds coverage groups and runs retention outside due processing', async () => {

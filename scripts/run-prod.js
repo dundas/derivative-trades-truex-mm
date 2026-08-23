@@ -51,6 +51,7 @@ import { buildFixLivenessConfig } from './fix-liveness-config.js';
 import {
   buildInventoryRebalanceShadowConfig,
   buildInventoryRecoveryConfig,
+  buildMinimalLiveCanaryConfig,
   buildMakerPresenceRecoveryConfig,
 } from './strategy-control-config.js';
 
@@ -217,9 +218,6 @@ const config = {
   truexTapeMaxAgeMs: parseInt(process.env.SHADOW_SEND_TAPE_MAX_AGE_MS || '5000', 10),
   shadowPhase2Criteria,
 };
-config.continuityConfig = buildContinuityConfig(process.env, {
-  ...makerQuotePolicyConfig,
-});
 config.truexMakerSafety = buildTruexMakerSafetyConfig(process.env, {
   ebboPollIntervalMs: config.truexEbboPollIntervalMs,
   maxOrdersPerSecond: config.maxOrdersPerSecond,
@@ -227,6 +225,15 @@ config.truexMakerSafety = buildTruexMakerSafetyConfig(process.env, {
 const referenceMarkoutRolloutOptions = buildReferenceMarkoutRolloutOptions(process.env, {
   maxQuoteDecisionsPerSecond: config.maxOrdersPerSecond,
   basisPollTimeoutMs: config.pyusdUsdPollTimeoutMs,
+});
+const minimalLiveCanaryConfig = buildMinimalLiveCanaryConfig(process.env, {
+  quoteDispatchMode,
+  makerQuotePolicyConfig,
+  referenceMarkoutConfig: referenceMarkoutRolloutOptions.referenceMarkoutConfig,
+});
+config.continuityConfig = buildContinuityConfig(process.env, {
+  ...makerQuotePolicyConfig,
+  allowSingleLevel: minimalLiveCanaryConfig.enabled,
 });
 const referenceBookFeed = referenceMarkoutRolloutOptions.referenceBookFeedConfig
   ? new CryptoComReferenceBookFeed(referenceMarkoutRolloutOptions.referenceBookFeedConfig) : null;
@@ -305,6 +312,11 @@ function validateEnv() {
   const missing = required.filter(k => !process.env[k]);
   if (missing.length > 0) {
     logger.error(`Missing required environment variables: ${missing.join(', ')}`);
+    process.exit(1);
+  }
+
+  if (minimalLiveCanaryConfig.enabled && !config.pgUrl) {
+    logger.error('MM_MINIMAL_LIVE_CANARY_ENABLED requires DATABASE_URL for durable reference markouts');
     process.exit(1);
   }
 
@@ -521,6 +533,7 @@ async function main() {
     presenceRecoveryConfig,
     inventoryRebalanceShadowConfig,
     inventoryRecoveryConfig,
+    minimalLiveCanaryConfig,
     ...config.truexMakerSafety,
     quoteDispatchMode,
     ...orderReconciliationScope,
