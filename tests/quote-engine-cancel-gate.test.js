@@ -209,7 +209,7 @@ describe('_runDeferredReprice — gate interaction', () => {
 });
 
 describe('minRepriceInterval debounce — gate interaction', () => {
-  it('completion retry after a gated cycle bypasses the minRepriceInterval debounce', () => {
+  it('completion retry after a gated cycle honours the minRepriceInterval debounce', () => {
     const { engine, fixConnection } = createEngine({ minRepriceIntervalMs: 60000 });
     engine.lastMid = 100000;
     engine.lastRepriceAt = 1; // aged out — first cycle passes the debounce
@@ -218,19 +218,20 @@ describe('minRepriceInterval debounce — gate interaction', () => {
     const ran = engine._runDeferredReprice();
     expect(ran).toBe(false);
     expect(engine.heldPlacementsPending).toBe(true);
-    // Gated cycles stamp on dispatch (aligned with onPriceUpdate semantics);
-    // the essential invariant is that the completion retry still bypasses the
-    // debounce via heldPlacementsPending — asserted below.
+    // Gated cycles stamp on dispatch (aligned with onPriceUpdate semantics).
+    const sendsAfterGatedCycle = fixConnection.sendMessage.mock.calls.length;
 
     // Cancel confirm arrives, then a fresh debounce stamp lands (would block for 60s)
     engine.activeOrders.delete('B1');
     engine.lastRepriceAt = Date.now();
 
-    // Completion retry must not be debounced behind it
+    // A pending placement cannot bypass the interval; the queue-drain timer
+    // must not turn an outstanding cancel into a rapid replacement loop.
     const ranAgain = engine._runDeferredReprice();
-    expect(ranAgain).toBe(true);
-    expect(engine.heldPlacementsPending).toBe(false);
-    expect(fixConnection.sendMessage).toHaveBeenCalled();
+    expect(ranAgain).toBe(false);
+    expect(engine.deferredRepriceNeeded).toBe(true);
+    expect(engine.heldPlacementsPending).toBe(true);
+    expect(fixConnection.sendMessage.mock.calls.length).toBe(sendsAfterGatedCycle);
   });
 
   it('ordinary debouncing still applies when nothing is held', () => {
@@ -241,6 +242,7 @@ describe('minRepriceInterval debounce — gate interaction', () => {
 
     expect(engine._runDeferredReprice()).toBe(false);
   });
+
 });
 
 describe('debounce bypass is scoped to the completion-retry path (roborev round 3)', () => {
