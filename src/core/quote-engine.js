@@ -235,6 +235,11 @@ export class QuoteEngine extends EventEmitter {
     this.minimalLiveCanaryDispatchGeneration = 0;
     this.lastAnchorBook = null; // { bestBid, bestAsk } from the anchor venue's feed (for coinbase-mirror)
     this.lastRepriceAt = 0;
+    // Most recent reconciliation attempt that found work. This is deliberately
+    // distinct from lastRepriceAt: a safety-gated/rate-limited cycle must not
+    // claim that it sent an order, but it also must not recompute identical
+    // work on every market-data tick until the next retry window.
+    this.lastRepriceAttemptAt = 0;
     this.isQuoting = false;
     this.quotingSuspended = false;
     this.orderSequence = 0;
@@ -436,9 +441,10 @@ export class QuoteEngine extends EventEmitter {
     if (this.rejectBackoffUntil > now) {
       return;
     }
+    const lastDebounceAt = Math.max(this.lastRepriceAt, this.lastRepriceAttemptAt);
     if (this.config.minRepriceIntervalMs > 0 &&
-        this.lastRepriceAt &&
-        (now - this.lastRepriceAt) < this.config.minRepriceIntervalMs) {
+        lastDebounceAt &&
+        (now - lastDebounceAt) < this.config.minRepriceIntervalMs) {
       // Inside the debounce window. Momentum bypass: if the mid has moved
       // >= momentumRepriceBps since the last dispatched reprice, stale quotes
       // are exposed to lead-lag pick-off — reprice now instead of waiting out
@@ -482,6 +488,13 @@ export class QuoteEngine extends EventEmitter {
       this.logger.info(`[QuoteEngine] Reprice: mid=$${mid.toFixed(2)} active=${this.activeOrders.size} (${JSON.stringify(statusCounts)}) | place=${actions.toPlace.length} cancel=${actions.toCancel.length} replace=${actions.toReplace.length}`);
     }
 
+    // Mark the reconciliation attempt before dispatch. If every action is
+    // safety-gated or rate-limited, lastRepriceAt remains an honest execution
+    // timestamp while this attempt timestamp prevents a tick-driven hot loop.
+    if (actions.toPlace.length || actions.toCancel.length || actions.toReplace.length) {
+      this.lastRepriceAttemptAt = Date.now();
+    }
+
     // Execute rate-limited
     const dispatched = this.executeActions(actions);
 
@@ -495,6 +508,7 @@ export class QuoteEngine extends EventEmitter {
     // move can take the bounded momentum-bypass path above.
     if (dispatched || this.config.quoteDispatchMode === 'observe') {
       this.lastRepriceAt = Date.now();
+      this.lastRepriceAttemptAt = this.lastRepriceAt;
       this.lastRepricedMid = mid;
       if (dispatched && momentumBypass) {
         this.momentumReprices++;
@@ -3600,9 +3614,10 @@ export class QuoteEngine extends EventEmitter {
       this.deferredRepriceNeeded = true;
       return false;
     }
+    const lastDebounceAt = Math.max(this.lastRepriceAt, this.lastRepriceAttemptAt);
     if (this.config.minRepriceIntervalMs > 0 &&
-        this.lastRepriceAt &&
-        (now - this.lastRepriceAt) < this.config.minRepriceIntervalMs) {
+        lastDebounceAt &&
+        (now - lastDebounceAt) < this.config.minRepriceIntervalMs) {
       this.deferredRepriceNeeded = true;
       return false;
     }
@@ -3615,6 +3630,7 @@ export class QuoteEngine extends EventEmitter {
     const actions = this.reconcileOrders(desired, this.activeOrders);
     if (actions.toPlace.length || actions.toCancel.length || actions.toReplace.length) {
       this.deferredRepriceNeeded = false;
+      this.lastRepriceAttemptAt = Date.now();
       const dispatched = this.executeActions(actions);
       if (dispatched) {
         // Stamp on ANY dispatched cycle (matches onPriceUpdate semantics):
@@ -3623,6 +3639,7 @@ export class QuoteEngine extends EventEmitter {
         // - lastRepriceAt debounces every reprice path after real work went
         //   out, including deferred lifecycle retries.
         this.lastRepriceAt = Date.now();
+        this.lastRepriceAttemptAt = this.lastRepriceAt;
         this.lastRepricedMid = this.lastMid;
       }
       return !this.deferredRepriceNeeded;

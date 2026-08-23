@@ -1433,8 +1433,8 @@ describe('QuoteEngine', () => {
       expect(fixMock.sendMessage).toHaveBeenCalledTimes(1);
     });
 
-    it('should not advance lastRepriceAt when a passive-safe reprice defers all outbound actions', () => {
-      const engine = createEngine();
+    it('records an attempt timestamp when a passive-safe reprice defers all outbound actions', () => {
+      const engine = createEngine({ minRepriceIntervalMs: 60_000 });
       engine.lastRepriceAt = 123;
       engine.computeDesiredQuotes = () => [{ side: 'buy', price: 99100, size: 0.1, level: 1 }];
       engine.reconcileOrders = () => ({
@@ -1442,7 +1442,9 @@ describe('QuoteEngine', () => {
         toPlace: [],
         toReplace: [{ cancel: 'B1', cancelOrder: { side: 'buy', level: 1 }, place: { side: 'buy', price: 99100, size: 0.1, level: 1 } }],
       });
+      let executions = 0;
       engine.executeActions = () => {
+        executions++;
         engine.deferredRepriceNeeded = true;
         return false;
       };
@@ -1451,6 +1453,38 @@ describe('QuoteEngine', () => {
 
       expect(engine.deferredRepriceNeeded).toBe(true);
       expect(engine.lastRepriceAt).toBe(123);
+      expect(engine.lastRepriceAttemptAt).toBeGreaterThan(123);
+      expect(executions).toBe(1);
+
+      // Identical follow-up market data must respect the attempt debounce even
+      // though no order was sent in the first cycle.
+      engine.onPriceUpdate(makePrice(100000, 0.95));
+      expect(executions).toBe(1);
+    });
+
+    it('uses the same attempt debounce for deferred retry cycles that dispatch nothing', () => {
+      const engine = createEngine({ minRepriceIntervalMs: 60_000 });
+      engine.lastMid = 100000;
+      engine.computeDesiredQuotes = () => [{ side: 'buy', price: 99100, size: 0.1, level: 1 }];
+      engine.reconcileOrders = () => ({
+        toCancel: [],
+        toPlace: [],
+        toReplace: [{ cancel: 'B1', cancelOrder: { side: 'buy', level: 1 }, place: { side: 'buy', price: 99100, size: 0.1, level: 1 } }],
+      });
+      let executions = 0;
+      engine.executeActions = () => {
+        executions++;
+        engine.deferredRepriceNeeded = true;
+        return false;
+      };
+
+      expect(engine._runDeferredReprice()).toBe(false);
+      expect(engine.lastRepriceAt).toBe(0);
+      expect(engine.lastRepriceAttemptAt).toBeGreaterThan(0);
+      expect(executions).toBe(1);
+
+      expect(engine._runDeferredReprice()).toBe(false);
+      expect(executions).toBe(1);
     });
 
     it('should clear deferred reprices when cancelAllQuotes suspends quoting', () => {
