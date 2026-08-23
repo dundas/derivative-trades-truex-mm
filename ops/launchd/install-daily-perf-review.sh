@@ -10,7 +10,8 @@
 #      lints it, installs to ~/Library/LaunchAgents, and bootstraps it
 #
 # Usage: bash ops/launchd/install-daily-perf-review.sh
-# Env overrides: TRUEX_PERF_CODE_ROOT, TRUEX_PERF_DATA_ROOT
+# Env overrides: TRUEX_PERF_CODE_ROOT, TRUEX_PERF_DATA_ROOT,
+#                DAILY_REPORT_{BUILD,DEPLOY,EMAIL}_TIMEOUT_MS
 #                DRY_RUN=1 → set up roots + render/lint plist, skip bootstrap
 #
 set -euo pipefail
@@ -22,11 +23,29 @@ DATA_ROOT="${TRUEX_PERF_DATA_ROOT:-$DATA_ROOT_DEFAULT}"
 CODE_ROOT="${TRUEX_PERF_CODE_ROOT:-$DATA_ROOT-ops}"
 BUN_BIN="${BUN_BIN:-$(command -v bun || echo "$HOME/.bun/bin/bun")}"
 BUN_DIR="$(dirname "$BUN_BIN")"
+REPORT_BUILD_TIMEOUT_MS="${DAILY_REPORT_BUILD_TIMEOUT_MS:-120000}"
+REPORT_DEPLOY_TIMEOUT_MS="${DAILY_REPORT_DEPLOY_TIMEOUT_MS:-120000}"
+REPORT_EMAIL_TIMEOUT_MS="${DAILY_REPORT_EMAIL_TIMEOUT_MS:-30000}"
 PLIST_SRC="$SCRIPT_DIR/$LABEL.plist"
 PLIST_DST="$HOME/Library/LaunchAgents/$LABEL.plist"
 
+validate_timeout_ms() {
+  local name="$1" value="$2"
+  if ! [[ "$value" =~ ^[1-9][0-9]*$ ]] ||
+    [ "${#value}" -gt 10 ] ||
+    { [ "${#value}" -eq 10 ] && [[ "$value" > "2147483647" ]]; }; then
+    echo "FATAL: $name must be a positive integer of milliseconds no greater than 2147483647"
+    exit 2
+  fi
+}
+
+validate_timeout_ms DAILY_REPORT_BUILD_TIMEOUT_MS "$REPORT_BUILD_TIMEOUT_MS"
+validate_timeout_ms DAILY_REPORT_DEPLOY_TIMEOUT_MS "$REPORT_DEPLOY_TIMEOUT_MS"
+validate_timeout_ms DAILY_REPORT_EMAIL_TIMEOUT_MS "$REPORT_EMAIL_TIMEOUT_MS"
+
 echo "==> DATA_ROOT: $DATA_ROOT"
 echo "==> CODE_ROOT: $CODE_ROOT"
+echo "==> Report timeouts (build/deploy/email ms): $REPORT_BUILD_TIMEOUT_MS/$REPORT_DEPLOY_TIMEOUT_MS/$REPORT_EMAIL_TIMEOUT_MS"
 
 # --- 1. Code root: clean worktree at main with deps + .env -------------------
 if [ ! -e "$CODE_ROOT/.git" ]; then
@@ -67,6 +86,9 @@ sed -e "s|{{CODE_ROOT}}|$CODE_ROOT|g" \
     -e "s|{{DATA_ROOT}}|$DATA_ROOT|g" \
     -e "s|{{BUN_BIN}}|$BUN_BIN|g" \
     -e "s|{{BUN_DIR}}|$BUN_DIR|g" \
+    -e "s|{{REPORT_BUILD_TIMEOUT_MS}}|$REPORT_BUILD_TIMEOUT_MS|g" \
+    -e "s|{{REPORT_DEPLOY_TIMEOUT_MS}}|$REPORT_DEPLOY_TIMEOUT_MS|g" \
+    -e "s|{{REPORT_EMAIL_TIMEOUT_MS}}|$REPORT_EMAIL_TIMEOUT_MS|g" \
   "$PLIST_SRC" > "$TMP_PLIST"
 plutil -lint "$TMP_PLIST"
 

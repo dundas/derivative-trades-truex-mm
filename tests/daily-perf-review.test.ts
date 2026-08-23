@@ -355,7 +355,10 @@ describe('fetchReportData query boundaries', () => {
     const rows = [[], [], [], [], [{ relation: null }]];
     const data = await fetchReportData('postgres://ignored', dayStart, dayEnd, 'BTC-PYUSD', 'live', 60000, 123,
       () => ({
-        query: async (text, params = []) => { calls.push({ text, params }); return { rows: rows.shift() ?? [] }; },
+        connect: async () => ({
+          query: async (text, params = []) => { calls.push({ text, params }); return { rows: rows.shift() ?? [] }; },
+          release: () => {},
+        }),
         end: async () => { ended = true; },
       })
     );
@@ -374,7 +377,13 @@ describe('fetchReportData query boundaries', () => {
     const calls: Array<{ text: string; params: unknown[] }> = [];
     const rows = [[], [], [], [], [{ relation: 'quote_lifecycle_events' }], [{ eventType: 'reject', timestamp: String(dayStart + 1), side: 'sell', reason: 'venue' }]];
     const data = await fetchReportData('postgres://ignored', dayStart, dayEnd, 'BTC-PYUSD', 'observe', 0, 0,
-      () => ({ query: async (text, params = []) => { calls.push({ text, params }); return { rows: rows.shift() ?? [] }; }, end: async () => {} })
+      () => ({
+        connect: async () => ({
+          query: async (text, params = []) => { calls.push({ text, params }); return { rows: rows.shift() ?? [] }; },
+          release: () => {},
+        }),
+        end: async () => {},
+      })
     );
     expect(data.quoteLifecycleAvailable).toBe(true);
     expect(data.quoteLifecycleEvents).toHaveLength(1);
@@ -383,6 +392,106 @@ describe('fetchReportData query boundaries', () => {
     expect(lifecycle.text).toContain('symbol = $3');
     expect(lifecycle.text).toContain('tradingmode = $4');
     expect(lifecycle.params).toEqual([dayStart, dayEnd, 'BTC-PYUSD', 'observe']);
+  });
+
+  test('aborting an in-flight report query destroys its client and waits for pool cleanup', async () => {
+    const controller = new AbortController();
+    const events: string[] = [];
+    let startQuery!: () => void;
+    let rejectQuery!: (reason: Error) => void;
+    const queryStarted = new Promise<void>(resolve => { startQuery = resolve; });
+    const result = fetchReportData('postgres://ignored', dayStart, dayEnd, 'BTC-PYUSD', undefined, 0, 0,
+      () => ({
+        connect: async () => ({
+          query: async () => {
+            startQuery();
+            return await new Promise<{ rows: unknown[] }>((_, reject) => { rejectQuery = reject; });
+          },
+          release: (error?: Error) => {
+            events.push('release');
+            if (error) rejectQuery(error);
+          },
+        }),
+        end: async () => { events.push('end'); },
+      }),
+      { signal: controller.signal, timeoutMs: 10 },
+    );
+
+    await queryStarted;
+    controller.abort(new Error('database read for 2026-08-05 timed out after 10ms'));
+    await expect(result).rejects.toThrow('database read for 2026-08-05 timed out after 10ms');
+    expect(events).toEqual(['release', 'end']);
+  });
+
+  test('aborts pending connection acquisition promptly despite a stuck pool shutdown, then destroys a late client once', async () => {
+    const controller = new AbortController();
+    const reason = new Error('database read for 2026-08-05 timed out after 10ms');
+    let resolveConnect!: (client: { query: () => Promise<{ rows: unknown[] }>; release: (error?: Error) => void }) => void;
+    const releases: Error[] = [];
+    let endCalls = 0;
+    let observeEndStart!: () => void;
+    const endStarted = new Promise<void>(resolve => { observeEndStart = resolve; });
+    const lateClient = {
+      query: async () => ({ rows: [] }),
+      release: (error?: Error) => { if (error) releases.push(error); },
+    };
+    const result = fetchReportData('postgres://ignored', dayStart, dayEnd, 'BTC-PYUSD', undefined, 0, 0,
+      () => ({
+        connect: () => new Promise(resolve => { resolveConnect = resolve; }),
+        end: () => {
+          endCalls += 1;
+          observeEndStart();
+          return new Promise<void>(() => {});
+        },
+      }),
+      { signal: controller.signal, timeoutMs: 10 },
+    );
+
+    controller.abort(reason);
+    await endStarted;
+    // The next event-loop turn deterministically proves result was not held
+    // behind the intentionally never-settling pool.end() promise.
+    let outcome = 'pending';
+    void result.then(() => { outcome = 'resolved'; }, () => { outcome = 'rejected'; });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(outcome).toBe('rejected');
+    expect(endCalls).toBe(1);
+    expect(releases).toEqual([]);
+
+    resolveConnect(lateClient);
+    await Promise.resolve();
+    expect(releases).toEqual([reason]);
+    expect(endCalls).toBe(1);
+  });
+
+  test('caps database connection acquisition by the report deadline', async () => {
+    let connectionTimeoutMs: number | undefined;
+    await fetchReportData('postgres://ignored', dayStart, dayEnd, 'BTC-PYUSD', undefined, 0, 0,
+      (options) => {
+        connectionTimeoutMs = options.connectionTimeoutMs;
+        return {
+          connect: async () => ({ query: async () => ({ rows: [] }), release: () => {} }),
+          end: async () => {},
+        };
+      },
+      { timeoutMs: 1 },
+    );
+    expect(connectionTimeoutMs).toBe(1);
+  });
+
+  test('destroys a checked-out client when a query fails', async () => {
+    const queryError = new Error('socket closed');
+    const releaseErrors: Error[] = [];
+    await expect(fetchReportData('postgres://ignored', dayStart, dayEnd, 'BTC-PYUSD', undefined, 0, 0,
+      () => ({
+        connect: async () => ({
+          query: async () => { throw queryError; },
+          release: (error?: Error) => { if (error) releaseErrors.push(error); },
+        }),
+        end: async () => {},
+      })
+    )).rejects.toThrow('socket closed');
+    expect(releaseErrors).toEqual([queryError]);
   });
 });
 

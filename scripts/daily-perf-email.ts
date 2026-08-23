@@ -33,6 +33,13 @@ const PAGES_PROJECT = 'truex-mm-reports';
 const PAGES_BASE = `https://${PAGES_PROJECT}.pages.dev`;
 const SENDER_EMAIL = 'truex-mm@derivative.email';
 const SENDER_NAME = 'TrueX MM';
+const DEFAULT_BUILD_TIMEOUT_MS = 120_000;
+const DEFAULT_DEPLOY_TIMEOUT_MS = 120_000;
+const DEFAULT_DEPLOY_TERMINATION_GRACE_MS = 5_000;
+const DEFAULT_EMAIL_TIMEOUT_MS = 30_000;
+// Node timers clamp delays greater than this value, potentially turning a
+// long-running report operation into an immediate timeout.
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 // fileURLToPath decodes URL-encoded characters (paths with spaces/non-ASCII)
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -43,18 +50,34 @@ const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const DATA_ROOT = process.env.TRUEX_PERF_DATA_ROOT ?? REPO_ROOT;
 const SITE_DIR = join(DATA_ROOT, 'logs', 'reports-site');
 
+export function timeoutMs(envName: string, fallback: number): number {
+  const value = process.env[envName];
+  if (value === undefined) return fallback;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0 || parsed > MAX_TIMER_DELAY_MS) {
+    throw new Error(`${envName} must be a positive integer of milliseconds no greater than ${MAX_TIMER_DELAY_MS}`);
+  }
+  return parsed;
+}
+
 // ---------------------------------------------------------------------------
 // Report building (pure-ish; DB reads through task-0007 exports)
 // ---------------------------------------------------------------------------
 
 export type DayReport = ReturnType<typeof buildReport>;
 
-export async function buildDayReport(dbUrl: string, date: string): Promise<DayReport> {
+export async function buildDayReport(
+  dbUrl: string,
+  date: string,
+  buildTimeoutMs = DEFAULT_BUILD_TIMEOUT_MS,
+  fetchData: typeof fetchReportData = fetchReportData,
+): Promise<DayReport> {
   const dayStart = Date.parse(`${date}T00:00:00Z`);
   if (Number.isNaN(dayStart)) throw new Error(`invalid date: ${date}`);
   const dayEnd = dayStart + 86400000;
-  const data = await fetchReportData(
-    dbUrl, dayStart, dayEnd, 'BTC-PYUSD', undefined, MARKOUT_WINDOW_MIN * 60000, ERA_SINCE_MS
+  const data = await fetchData(
+    dbUrl, dayStart, dayEnd, 'BTC-PYUSD', undefined, MARKOUT_WINDOW_MIN * 60000, ERA_SINCE_MS, undefined,
+    { signal: AbortSignal.timeout(buildTimeoutMs), timeoutMs: buildTimeoutMs },
   );
   return buildReport({
     date,
@@ -71,12 +94,29 @@ export async function buildDayReport(dbUrl: string, date: string): Promise<DayRe
   });
 }
 
-export async function buildTrend(dbUrl: string, endDate: string, days = 7): Promise<DayReport[]> {
+export async function buildTrend(
+  dbUrl: string,
+  endDate: string,
+  days = 7,
+  buildTimeoutMs = DEFAULT_BUILD_TIMEOUT_MS,
+  buildDay: typeof buildDayReport = buildDayReport,
+  now: () => number = Date.now,
+): Promise<DayReport[]> {
   const end = Date.parse(`${endDate}T00:00:00Z`);
   const trend: DayReport[] = [];
+  const deadline = now() + buildTimeoutMs;
   for (let i = days - 1; i >= 0; i--) {
     const d = new Date(end - i * 86400000).toISOString().slice(0, 10);
-    trend.push(await buildDayReport(dbUrl, d));
+    console.log(`Building trend day ${d} (${days - i}/${days})...`);
+    const remainingMs = deadline - now();
+    if (remainingMs <= 0) {
+      throw new Error(`Daily report build timed out after ${buildTimeoutMs}ms`);
+    }
+    const day = await buildDay(dbUrl, d, remainingMs);
+    if (deadline - now() <= 0) {
+      throw new Error(`Daily report build timed out after ${buildTimeoutMs}ms`);
+    }
+    trend.push(day);
   }
   return trend;
 }
@@ -269,7 +309,37 @@ function writeSiteFiles(day: DayReport, trend: DayReport[]): string {
   return pagePath;
 }
 
-async function deployPages(): Promise<void> {
+export type DeployProcess = {
+  exited: Promise<number>;
+  kill(signal?: 'SIGTERM' | 'SIGKILL'): void;
+  stderr: Blob | ArrayBuffer | ArrayBufferView | string | null;
+};
+
+export type DeploySpawner = (cmd: string[], options: { stdout: 'pipe'; stderr: 'pipe'; cwd: string }) => DeployProcess;
+
+const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+async function stopDeployProcess(proc: DeployProcess, graceMs: number): Promise<void> {
+  proc.kill();
+  const exitedAfterTerm = await Promise.race([
+    proc.exited.then(() => true, () => true),
+    delay(graceMs).then(() => false),
+  ]);
+  if (exitedAfterTerm) return;
+
+  proc.kill('SIGKILL');
+  // A process that somehow survives SIGKILL must not keep the daily job alive.
+  await Promise.race([
+    proc.exited.then(() => undefined, () => undefined),
+    delay(graceMs),
+  ]);
+}
+
+export async function deployPages(
+  timeout: number,
+  spawn: DeploySpawner = Bun.spawn as DeploySpawner,
+  terminationGraceMs = DEFAULT_DEPLOY_TERMINATION_GRACE_MS,
+): Promise<void> {
   const localWrangler = join(REPO_ROOT, 'node_modules', '.bin', 'wrangler');
   // --branch main pins the deployment to the PRODUCTION environment —
   // without it wrangler infers the current git branch (worktrees deploy to
@@ -277,18 +347,43 @@ async function deployPages(): Promise<void> {
   const cmd = existsSync(localWrangler)
     ? [localWrangler, 'pages', 'deploy', SITE_DIR, '--project-name', PAGES_PROJECT, '--branch', 'main']
     : ['bunx', 'wrangler', 'pages', 'deploy', SITE_DIR, '--project-name', PAGES_PROJECT, '--branch', 'main'];
-  const proc = Bun.spawn(cmd, { stdout: 'pipe', stderr: 'pipe', cwd: REPO_ROOT });
-  const exit = await proc.exited;
+  const proc = spawn(cmd, { stdout: 'pipe', stderr: 'pipe', cwd: REPO_ROOT });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let timedOut = false;
+  const result = await Promise.race([
+    proc.exited.then((exit) => timedOut ? { timedOut: true } : { exit }),
+    new Promise<{ timedOut: true }>((resolve) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        void stopDeployProcess(proc, terminationGraceMs).finally(() => {
+          resolve({ timedOut: true });
+        });
+      }, timeout);
+    }),
+  ]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+  if (result.timedOut) {
+    throw new Error(`Cloudflare Pages deployment timed out after ${timeout}ms`);
+  }
+  const { exit } = result;
   if (exit !== 0) {
     const err = await new Response(proc.stderr).text();
     throw new Error(`wrangler pages deploy failed (exit ${exit}): ${err.slice(0, 500)}`);
   }
 }
 
-async function sendEmail(to: string, subject: string, html: string, text: string): Promise<void> {
+export async function sendEmail(
+  to: string,
+  subject: string,
+  html: string,
+  text: string,
+  timeout: number,
+  fetchFn: typeof fetch = fetch,
+): Promise<void> {
   const apiKey = process.env.CIRCLEINBOX_API_KEY;
   if (!apiKey) throw new Error('CIRCLEINBOX_API_KEY not set');
-  const res = await fetch('https://circleinbox.com/api/v1/send', {
+  const res = await fetchFn('https://circleinbox.com/api/v1/send', {
     method: 'POST',
     headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -298,6 +393,7 @@ async function sendEmail(to: string, subject: string, html: string, text: string
       text,
       html,
     }),
+    signal: AbortSignal.timeout(timeout),
   });
   const body = await res.text();
   if (!res.ok) throw new Error(`CircleInbox send failed (${res.status}): ${body.slice(0, 300)}`);
@@ -332,8 +428,11 @@ export async function main(argv: string[]): Promise<number> {
   if (!dbUrl) { console.error('ERROR: DATABASE_URL not set'); return 2; }
 
   try {
+    const buildTimeout = timeoutMs('DAILY_REPORT_BUILD_TIMEOUT_MS', DEFAULT_BUILD_TIMEOUT_MS);
+    const deployTimeout = timeoutMs('DAILY_REPORT_DEPLOY_TIMEOUT_MS', DEFAULT_DEPLOY_TIMEOUT_MS);
+    const emailTimeout = timeoutMs('DAILY_REPORT_EMAIL_TIMEOUT_MS', DEFAULT_EMAIL_TIMEOUT_MS);
     console.log(`Building report for ${date} (+7-day trend)...`);
-    const trend = await buildTrend(dbUrl, date, 7);
+    const trend = await buildTrend(dbUrl, date, 7, buildTimeout);
     const day = trend[trend.length - 1];
 
     const pagePath = writeSiteFiles(day, trend);
@@ -347,7 +446,7 @@ export async function main(argv: string[]): Promise<number> {
 
     if (!args['skip-deploy']) {
       console.log('Deploying to Cloudflare Pages...');
-      await deployPages();
+      await deployPages(deployTimeout);
       console.log(`Published: ${url}`);
     }
 
@@ -358,7 +457,7 @@ export async function main(argv: string[]): Promise<number> {
         return 0;
       }
       const subject = subjectLine(day);
-      await sendEmail(to, subject, renderHtml(day, trend), emailText(day, url));
+      await sendEmail(to, subject, renderHtml(day, trend), emailText(day, url), emailTimeout);
       console.log(`Email sent to ${to}: ${subject}`);
     } else {
       console.log('No --send flag — email skipped.');
