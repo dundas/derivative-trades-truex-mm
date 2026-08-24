@@ -686,25 +686,30 @@ export class QuoteEngine extends EventEmitter {
         );
         continue;
       }
+      const touchPair = this._minimalLiveCanaryTouchPair({
+        level, mid, bidPrice, askPrice,
+      });
+      const effectiveBidPrice = touchPair?.bidPrice ?? bidPrice;
+      const effectiveAskPrice = touchPair?.askPrice ?? askPrice;
       const contractContext = Number.isFinite(contractHalfSpread)
-        ? { contractReferenceMid: mid, contractOppositePrice: askPrice }
+        ? { contractReferenceMid: mid, contractOppositePrice: effectiveAskPrice }
         : null;
       const askContractContext = Number.isFinite(contractHalfSpread)
-        ? { contractReferenceMid: mid, contractOppositePrice: bidPrice }
+        ? { contractReferenceMid: mid, contractOppositePrice: effectiveBidPrice }
         : null;
 
       // Filter bids — cap size to remaining available quote balance
       if (!this._canQuoteSide('buy')) {
         recordDegradedOmission('buy', level, 'can-quote-disabled');
-      } else if (!this.withinPriceBand(bidPrice, mid)) {
+      } else if (!this.withinPriceBand(effectiveBidPrice, mid)) {
         recordDegradedOmission('buy', level, 'price-band');
-      } else if (bidPrice * bidSize < minNotional) {
+      } else if (effectiveBidPrice * bidSize < minNotional) {
         recordDegradedOmission('buy', level, 'minimum-notional');
       } else {
-        const cappedBidSize = this._capSizeToBalance('buy', bidSize, bidPrice, bidCommittedQuote, level);
-        if (cappedBidSize >= this.config.minimumFundedQuoteSize && bidPrice * cappedBidSize >= minNotional) {
-          bids.push({ side: 'buy', price: bidPrice, size: cappedBidSize, level, ...contractContext, ...recoveryMetadata });
-          bidCommittedQuote += cappedBidSize * bidPrice;
+        const cappedBidSize = this._capSizeToBalance('buy', bidSize, effectiveBidPrice, bidCommittedQuote, level);
+        if (cappedBidSize >= this.config.minimumFundedQuoteSize && effectiveBidPrice * cappedBidSize >= minNotional) {
+          bids.push({ side: 'buy', price: effectiveBidPrice, size: cappedBidSize, level, ...contractContext, ...recoveryMetadata });
+          bidCommittedQuote += cappedBidSize * effectiveBidPrice;
         } else if (cappedBidSize < this.config.minimumFundedQuoteSize) {
           recordDegradedOmission(
             'buy', level,
@@ -718,14 +723,14 @@ export class QuoteEngine extends EventEmitter {
       // Filter asks — cap size to remaining available base balance
       if (!this._canQuoteSide('sell')) {
         recordDegradedOmission('sell', level, 'can-quote-disabled');
-      } else if (!this.withinPriceBand(askPrice, mid)) {
+      } else if (!this.withinPriceBand(effectiveAskPrice, mid)) {
         recordDegradedOmission('sell', level, 'price-band');
-      } else if (askPrice * askSize < minNotional) {
+      } else if (effectiveAskPrice * askSize < minNotional) {
         recordDegradedOmission('sell', level, 'minimum-notional');
       } else {
-        const cappedAskSize = this._capSizeToBalance('sell', askSize, askPrice, askCommittedBase, level);
-        if (cappedAskSize >= this.config.minimumFundedQuoteSize && askPrice * cappedAskSize >= minNotional) {
-          asks.push({ side: 'sell', price: askPrice, size: cappedAskSize, level, ...askContractContext, ...recoveryMetadata });
+        const cappedAskSize = this._capSizeToBalance('sell', askSize, effectiveAskPrice, askCommittedBase, level);
+        if (cappedAskSize >= this.config.minimumFundedQuoteSize && effectiveAskPrice * cappedAskSize >= minNotional) {
+          asks.push({ side: 'sell', price: effectiveAskPrice, size: cappedAskSize, level, ...askContractContext, ...recoveryMetadata });
           askCommittedBase += cappedAskSize;
         } else if (cappedAskSize < this.config.minimumFundedQuoteSize) {
           recordDegradedOmission(
@@ -756,6 +761,43 @@ export class QuoteEngine extends EventEmitter {
           controlReasons: ['degraded-size-factor', 'defensive-spread-floor'],
         }))
       : desired;
+  }
+
+  // The live canary is allowed to join, never improve, the venue touch.  Keep
+  // this deliberately local to L1 and require the same strict EBBO and width
+  // invariants that still run again at the transport-adjacent send boundary.
+  // Returning null preserves the ordinary quote calculation when the touch
+  // cannot safely satisfy the existing passive canary envelope.
+  _minimalLiveCanaryTouchPair({ level, mid }) {
+    if (!this.config.minimalLiveCanaryConfig.enabled || level !== 1) return null;
+    const strictEbbo = this._strictEbboState();
+    if (!strictEbbo.usable) return null;
+
+    const touchBid = Number(strictEbbo.book.bestBid);
+    const touchAsk = Number(strictEbbo.book.bestAsk);
+    if (!Number.isFinite(touchBid) || !Number.isFinite(touchAsk) || touchBid <= 0 || touchAsk <= touchBid) {
+      return null;
+    }
+    const epsilon = Math.max(Number.EPSILON * Math.max(mid, touchBid, touchAsk) * 8, 1e-12);
+    // The EBBO prices are venue tick-valid observations. Preserve them exactly
+    // so this path cannot quote through a touch by rounding. Use a tolerance
+    // because decimal tick sizes can leave harmless IEEE-754 residue.
+    if (Math.abs(this.snapToTick(touchBid) - touchBid) > epsilon ||
+        Math.abs(this.snapToTick(touchAsk) - touchAsk) > epsilon) return null;
+
+    const width = touchAsk - touchBid;
+    const minWidth = mid * this.config.minimumQuoteWidthBps / 10_000;
+    const maxWidth = Number.isFinite(this.config.contractMaxQuoteSpreadBps)
+      ? mid * this.config.contractMaxQuoteSpreadBps / 10_000
+      : Number.POSITIVE_INFINITY;
+    if (width + epsilon < minWidth || width > maxWidth + epsilon) return null;
+
+    const touchBidQuote = { side: 'buy', level, price: touchBid, contractReferenceMid: mid };
+    const touchAskQuote = { side: 'sell', level, price: touchAsk, contractReferenceMid: mid };
+    if (!this._isWithinContractQuoteEnvelope(touchBidQuote) ||
+        !this._isWithinContractQuoteEnvelope(touchAskQuote)) return null;
+
+    return { bidPrice: touchBid, askPrice: touchAsk };
   }
 
   /**
