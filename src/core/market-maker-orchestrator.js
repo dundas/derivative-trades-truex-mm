@@ -239,6 +239,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       minimalLiveCanaryDecisionWriter: event => this._persistMinimalLiveCanaryDecision(event),
       orderIdNamespace: options.orderIdNamespace,
       orderIdBootId: options.orderIdBootId,
+      now: options.now,
       logger: this.logger,
     });
     this.truexInstrumentId = options.truexInstrumentId ?? null;
@@ -1924,7 +1925,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     const maxAgeMs = Number(this.quoteEngine.config?.truexMakerEbboMaxAgeMs);
     if (!this.isRunning || !config?.enabled || !Number.isFinite(receivedAt) || !Number.isFinite(maxAgeMs)) return;
 
-    const delayMs = Math.max(0, receivedAt + maxAgeMs - Date.now()) + 1;
+    const delayMs = Math.max(0, receivedAt + maxAgeMs - this._now()) + 1;
     this._minimalLiveCanaryEbboExpiryTimer = setTimeout(() => {
       this._minimalLiveCanaryEbboExpiryTimer = null;
       if (this.isRunning && this.quoteEngine.config?.minimalLiveCanaryConfig?.enabled &&
@@ -1932,6 +1933,22 @@ export class MarketMakerOrchestrator extends EventEmitter {
         this.quoteEngine.stopMinimalLiveCanary?.('truex-ebbo-expired-during-poll-failure');
       }
     }, delayMs);
+  }
+
+  _freshCanaryEbboRetryDelay(backoffMs, status) {
+    if (status === 429 || this.quoteEngine.config?.minimalLiveCanaryConfig?.enabled !== true) {
+      return backoffMs;
+    }
+    const strictEbbo = this.quoteEngine._strictEbboState?.();
+    const receivedAt = Number(this.quoteEngine.truexEbbo?.receivedAt);
+    const maxAgeMs = Number(this.quoteEngine.config?.truexMakerEbboMaxAgeMs);
+    if (strictEbbo?.usable !== true || !Number.isFinite(receivedAt) || !Number.isFinite(maxAgeMs)) {
+      return backoffMs;
+    }
+    const retryBudgetMs = receivedAt + maxAgeMs - this._now() - this.truexEbboPollTimeoutMs;
+    // A non-positive budget cannot produce a verified refresh before the
+    // existing expiry timer. Do not extend stale authority or add a retry.
+    return retryBudgetMs > 0 ? Math.min(backoffMs, retryBudgetMs) : backoffMs;
   }
 
   _buildPyusdUsdReferenceSources(configuredSources) {
@@ -2379,6 +2396,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     }
 
     this._truexEbboPollInFlight = true;
+    let scheduledDelayMs = null;
     try {
       const instrumentId = await this._resolveTruexEbboInstrumentId();
       const rawQuote = await this.restClient.getMarketQuote(
@@ -2431,6 +2449,10 @@ export class MarketMakerOrchestrator extends EventEmitter {
           Math.ceil(this._truexEbboCurrentBackoffMs * multiplier),
         ),
       );
+      scheduledDelayMs = this._freshCanaryEbboRetryDelay(
+        this._truexEbboCurrentBackoffMs,
+        status,
+      );
 
       this.logger.warn(
         `[Orchestrator] TrueX EBBO poll failed (${this._truexEbboConsecutiveErrors} consecutive): ${err.message}`
@@ -2456,7 +2478,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
     } finally {
       this._truexEbboPollInFlight = false;
       if (this.isRunning) {
-        this._scheduleNextTruexEbboPoll(this._truexEbboCurrentBackoffMs || this.truexEbboPollIntervalMs);
+        this._scheduleNextTruexEbboPoll(
+          scheduledDelayMs ?? (this._truexEbboCurrentBackoffMs || this.truexEbboPollIntervalMs),
+        );
       }
     }
   }

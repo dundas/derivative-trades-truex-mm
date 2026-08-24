@@ -409,6 +409,192 @@ describe('MarketMakerOrchestrator', () => {
       }));
     });
 
+    test('caps a non-429 canary retry so a fresh EBBO request can finish before expiry', async () => {
+      const now = 12_000;
+      const quoteEngine = createMockQuoteEngine();
+      quoteEngine.config = {
+        minimalLiveCanaryConfig: { enabled: true },
+        truexMakerEbboMaxAgeMs: 3_000,
+      };
+      quoteEngine.truexEbbo = { receivedAt: 10_000 };
+      quoteEngine._strictEbboState = jest.fn(() => ({ usable: true }));
+      quoteEngine.stopMinimalLiveCanary = jest.fn();
+      const { orchestrator } = createOrchestrator({
+        quoteEngine, now: () => now, truexEbboPollIntervalMs: 1_000, truexEbboPollTimeoutMs: 900,
+      });
+      orchestrator.restClient = {
+        getInstrument: jest.fn(async () => ({ id: 'instrument-1' })),
+        getMarketQuote: jest.fn(async () => { throw new Error('transient timeout'); }),
+      };
+      orchestrator.isRunning = true;
+      orchestrator._scheduleNextTruexEbboPoll = jest.fn();
+
+      await orchestrator._pollTruexEbbo();
+
+      // Normal 1.5x backoff is 1500ms; only 100ms remains after reserving the
+      // existing 900ms request timeout inside the three-second freshness window.
+      expect(orchestrator._scheduleNextTruexEbboPoll).toHaveBeenCalledWith(100);
+      expect(quoteEngine.stopMinimalLiveCanary).not.toHaveBeenCalled();
+    });
+
+    test('uses the injected clock to arm expiry after the freshness-aware retry budget', () => {
+      const quoteEngine = createMockQuoteEngine();
+      quoteEngine.config = {
+        minimalLiveCanaryConfig: { enabled: true },
+        truexMakerEbboMaxAgeMs: 3_000,
+      };
+      quoteEngine.truexEbbo = { receivedAt: 10_000 };
+      quoteEngine._strictEbboState = jest.fn(() => ({ usable: true }));
+      quoteEngine.stopMinimalLiveCanary = jest.fn();
+      const { orchestrator } = createOrchestrator({ quoteEngine, now: () => 12_000 });
+      orchestrator.isRunning = true;
+      const setTimeoutSpy = jest.spyOn(globalThis, 'setTimeout').mockImplementation(() => ({ mocked: true }));
+
+      orchestrator._armMinimalLiveCanaryEbboExpiry();
+
+      // The strict deadline is 13,000ms, so the expiry timer remains 1,001ms
+      // away; it cannot fire ahead of a retry whose request budget is 100ms.
+      expect(setTimeoutSpy).toHaveBeenCalledWith(expect.any(Function), 1_001);
+      expect(quoteEngine.stopMinimalLiveCanary).not.toHaveBeenCalled();
+      setTimeoutSpy.mockRestore();
+    });
+
+    test('shares an injected clock with an internally constructed QuoteEngine', () => {
+      let now = 10_000;
+      const canaryConfig = {
+        enabled: true, runId: 'canary-run-0001', durationMs: 900_000, maxCumulativeFilledBTC: 0.001,
+        oneMinuteMarkoutDeadlineMs: 60_000, levels: 1, baseSizeBTC: 0.0005,
+        minimumQuoteWidthBps: 30, contractMaxQuoteSpreadBps: 80,
+      };
+      const { orchestrator } = createOrchestrator({
+        quoteEngine: undefined, now: () => now, levels: 1, baseSizeBTC: 0.0005,
+        strictTruexMakerSafety: true, quoteDispatchMode: 'live', truexMakerEbboMaxAgeMs: 3_000,
+        continuityConfig: {
+          contractMaxQuoteSpreadBps: 80, minimumQuoteWidthBps: 30, contractOrderStateMaxAgeMs: 5_000,
+          minActiveLevelsPerSide: 1, minimumFundedQuoteSize: 0.0005,
+          l1ReserveBase: 0.0005, l1ReserveQuote: 1, maxSideGapMs: 1_000,
+          alertThresholdMs: 1_000, alertRateLimitMs: 1_000, defensiveSpreadFloorBps: 1,
+          degradedMaxLevels: 1, degradedSizeFactor: 1,
+        },
+        minimalLiveCanaryConfig: canaryConfig,
+      });
+      orchestrator.quoteEngine.updateTruexEbbo({ bestBid: 100, bestAsk: 101, timestamp: now });
+      orchestrator.isRunning = true;
+      const setTimeoutSpy = jest.spyOn(globalThis, 'setTimeout').mockImplementation(() => ({ mocked: true }));
+
+      expect(orchestrator.quoteEngine.truexEbbo.receivedAt).toBe(10_000);
+      expect(orchestrator.quoteEngine._strictEbboState().usable).toBe(true);
+      orchestrator._armMinimalLiveCanaryEbboExpiry();
+      expect(setTimeoutSpy).toHaveBeenCalledWith(expect.any(Function), 3_001);
+
+      now = 13_001;
+      expect(orchestrator.quoteEngine._strictEbboState().usable).toBe(false);
+      setTimeoutSpy.mockRestore();
+    });
+
+    test('retains 429 exponential backoff even with a fresh canary EBBO', async () => {
+      const quoteEngine = createMockQuoteEngine();
+      quoteEngine.config = {
+        minimalLiveCanaryConfig: { enabled: true },
+        truexMakerEbboMaxAgeMs: 3_000,
+      };
+      quoteEngine.truexEbbo = { receivedAt: 10_000 };
+      quoteEngine._strictEbboState = jest.fn(() => ({ usable: true }));
+      const { orchestrator } = createOrchestrator({
+        quoteEngine, now: () => 12_000, truexEbboPollIntervalMs: 1_000, truexEbboPollTimeoutMs: 900,
+      });
+      orchestrator.restClient = {
+        getInstrument: jest.fn(async () => ({ id: 'instrument-1' })),
+        getMarketQuote: jest.fn(async () => {
+          const error = new Error('rate limited');
+          error.status = 429;
+          throw error;
+        }),
+      };
+      orchestrator.isRunning = true;
+      orchestrator._scheduleNextTruexEbboPoll = jest.fn();
+
+      await orchestrator._pollTruexEbbo();
+
+      expect(orchestrator._scheduleNextTruexEbboPoll).toHaveBeenCalledWith(2_000);
+    });
+
+    test('keeps uncapped backoff state when a capped canary retry is followed by 429', async () => {
+      const quoteEngine = createMockQuoteEngine();
+      quoteEngine.config = {
+        minimalLiveCanaryConfig: { enabled: true },
+        truexMakerEbboMaxAgeMs: 3_000,
+      };
+      quoteEngine.truexEbbo = { receivedAt: 10_000 };
+      quoteEngine._strictEbboState = jest.fn(() => ({ usable: true }));
+      const { orchestrator } = createOrchestrator({
+        quoteEngine, now: () => 12_000, truexEbboPollIntervalMs: 1_000, truexEbboPollTimeoutMs: 900,
+      });
+      let calls = 0;
+      orchestrator.restClient = {
+        getInstrument: jest.fn(async () => ({ id: 'instrument-1' })),
+        getMarketQuote: jest.fn(async () => {
+          calls++;
+          const error = new Error(calls === 1 ? 'transient timeout' : 'rate limited');
+          if (calls === 2) error.status = 429;
+          throw error;
+        }),
+      };
+      orchestrator.isRunning = true;
+      orchestrator._scheduleNextTruexEbboPoll = jest.fn();
+
+      await orchestrator._pollTruexEbbo();
+      await orchestrator._pollTruexEbbo();
+
+      expect(orchestrator._scheduleNextTruexEbboPoll.mock.calls.map(([delay]) => delay)).toEqual([100, 3_000]);
+      expect(orchestrator._truexEbboCurrentBackoffMs).toBe(3_000);
+    });
+
+    test('does not cap a retry after a cached canary EBBO has expired', async () => {
+      const quoteEngine = createMockQuoteEngine();
+      quoteEngine.config = {
+        minimalLiveCanaryConfig: { enabled: true },
+        truexMakerEbboMaxAgeMs: 3_000,
+      };
+      quoteEngine.truexEbbo = { receivedAt: 8_000 };
+      quoteEngine._strictEbboState = jest.fn(() => ({ usable: false }));
+      quoteEngine.stopMinimalLiveCanary = jest.fn();
+      const { orchestrator } = createOrchestrator({
+        quoteEngine, now: () => 12_000, truexEbboPollIntervalMs: 1_000, truexEbboPollTimeoutMs: 900,
+      });
+      orchestrator.restClient = {
+        getInstrument: jest.fn(async () => ({ id: 'instrument-1' })),
+        getMarketQuote: jest.fn(async () => { throw new Error('transient timeout'); }),
+      };
+      orchestrator.isRunning = true;
+      orchestrator._scheduleNextTruexEbboPoll = jest.fn();
+
+      await orchestrator._pollTruexEbbo();
+
+      expect(quoteEngine.stopMinimalLiveCanary).toHaveBeenCalledWith('truex-ebbo-poll-failure');
+      expect(orchestrator._scheduleNextTruexEbboPoll).toHaveBeenCalledWith(1_500);
+    });
+
+    test('retains normal transient-failure backoff outside the canary even with cache fields present', async () => {
+      const quoteEngine = createMockQuoteEngine();
+      quoteEngine.config = { truexMakerEbboMaxAgeMs: 3_000 };
+      quoteEngine.truexEbbo = { receivedAt: 10_000 };
+      quoteEngine._strictEbboState = jest.fn(() => ({ usable: true }));
+      const { orchestrator } = createOrchestrator({
+        quoteEngine, now: () => 12_000, truexEbboPollIntervalMs: 1_000, truexEbboPollTimeoutMs: 900,
+      });
+      orchestrator.restClient = {
+        getInstrument: jest.fn(async () => ({ id: 'instrument-1' })),
+        getMarketQuote: jest.fn(async () => { throw new Error('transient timeout'); }),
+      };
+      orchestrator.isRunning = true;
+      orchestrator._scheduleNextTruexEbboPoll = jest.fn();
+
+      await orchestrator._pollTruexEbbo();
+
+      expect(orchestrator._scheduleNextTruexEbboPoll).toHaveBeenCalledWith(1_500);
+    });
+
     test('skips overlapping ticks while a poll is already in flight', async () => {
       const { orchestrator } = createOrchestrator({ truexEbboPollIntervalMs: 1000 });
       orchestrator.restClient = {
