@@ -208,6 +208,31 @@ describe('MarketMakerOrchestrator — maker-presence telemetry', () => {
       eventType: 'maker_presence', action: 'not-two-sided',
     }));
   });
+
+  it('contains a presence-observation failure so execution bookkeeping completes', () => {
+    const presenceController = { observe: jest.fn(() => { throw new Error('clock must be monotonic'); }) };
+    const capitalReservationManager = {
+      getReservations: jest.fn().mockReturnValue([]),
+      getStatus: jest.fn().mockReturnValue({ state: 'normal', blockedSides: [] }),
+      getQuoteCapacity: jest.fn().mockReturnValue(1),
+    };
+    const pipeline = { logFIXMessage: jest.fn(), addOrder: jest.fn(), addFill: jest.fn() };
+    const orch = makeOrch({ presenceController, capitalReservationManager, dataPipeline: pipeline });
+    orch.presenceObservationConfig = { enabled: true, sampleIntervalMs: 30_000 };
+    orch.quoteEngine.onExecutionReport = jest.fn();
+
+    orch._onFIXMessage({ fields: {
+      '35': '8', '11': 'order-1', '17': 'execution-1', '39': '1',
+      '31': '100', '32': '0.01', '38': '0.02', '44': '100', '54': '1',
+    } });
+
+    expect(orch.quoteEngine.onExecutionReport).toHaveBeenCalledTimes(1);
+    expect(pipeline.addOrder).toHaveBeenCalledTimes(1);
+    expect(pipeline.addFill).toHaveBeenCalledWith(expect.objectContaining({
+      fillId: 'order-1-execution-1', quantity: 0.01,
+    }));
+    expect(orch.logger.warn).toHaveBeenCalledWith(expect.stringContaining('Maker-presence telemetry failed'));
+  });
 });
 
 describe('strict EBBO presence verification', () => {

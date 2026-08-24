@@ -740,9 +740,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
     if (this.presenceObservationConfig?.enabled) {
       const intervalMs = this.presenceObservationConfig.sampleIntervalMs;
       this._makerPresenceObservationTimer = setInterval(() => {
-        this._recordMakerPresenceObservation(this._getContinuityStatus());
+        this._captureMakerPresenceObservation();
       }, intervalMs);
-      this._recordMakerPresenceObservation(this._getContinuityStatus());
+      this._captureMakerPresenceObservation();
     }
     if (this.referenceMarkoutCollector?.writer && !attempt.referenceCollectorInitiallyRunning) {
       attempt.referenceCollectorActivationAttempted = true;
@@ -1387,7 +1387,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this._lastRepriceTime = Date.now();
     const postRepriceContinuity = this._getContinuityStatus();
     this._maybeRecoverMakerPresence(postRepriceContinuity);
-    this._recordMakerPresenceObservation(postRepriceContinuity);
+    this._recordMakerPresenceObservationSafely(postRepriceContinuity);
     this._updateInventoryRebalanceShadow();
 
     if (this._shouldTriggerShadowReevaluation(aggregatedPrice)) {
@@ -1522,7 +1522,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     if (!config?.enabled || !status || typeof this.quoteTelemetry?.record !== 'function') return false;
     const intervalMs = Number(config.sampleIntervalMs);
     if (!Number.isSafeInteger(intervalMs) || intervalMs <= 0) return false;
-    const now = Date.now();
+    const now = this._now();
     const snapshot = {
       executionState: status.executionState,
       twoSided: status.present?.twoSided === true,
@@ -1543,6 +1543,26 @@ export class MarketMakerOrchestrator extends EventEmitter {
       context: { makerPresence: snapshot },
     })).catch(error => this.logger.warn(`[Orchestrator] Maker-presence telemetry failed: ${error.message}`));
     return true;
+  }
+
+  // Presence telemetry is strictly observational. It must not let a
+  // clock/provider/telemetry error interrupt FIX bookkeeping or live quoting.
+  _recordMakerPresenceObservationSafely(status) {
+    try {
+      return this._recordMakerPresenceObservation(status);
+    } catch (error) {
+      this.logger.warn(`[Orchestrator] Maker-presence telemetry failed: ${error.message}`);
+      return false;
+    }
+  }
+
+  _captureMakerPresenceObservation() {
+    try {
+      return this._recordMakerPresenceObservation(this._getContinuityStatus());
+    } catch (error) {
+      this.logger.warn(`[Orchestrator] Maker-presence telemetry failed: ${error.message}`);
+      return false;
+    }
   }
 
   _maybeRecoverMakerPresence(status) {
@@ -1619,7 +1639,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     // Route OrderCancelReject (35=9) to QuoteEngine
     if (msgType === '9') {
       this.quoteEngine.onOrderCancelReject(message.fields);
-      this._recordMakerPresenceObservation(this._getContinuityStatus());
+      this._captureMakerPresenceObservation();
       return;
     }
 
@@ -1628,7 +1648,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
 
     // Route to QuoteEngine for order state management
     this.quoteEngine.onExecutionReport(message.fields);
-    this._recordMakerPresenceObservation(this._getContinuityStatus());
+    this._captureMakerPresenceObservation();
 
     // Track order state and fills in data pipeline
     const pipeline = this.dataPipeline || this.dataManager;
@@ -2955,7 +2975,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     // watchdog cancel-all path: a missing side must preserve the funded live side.
     const continuity = this._getContinuityStatus();
     this._maybeRecoverMakerPresence(continuity);
-    this._recordMakerPresenceObservation(continuity);
+    this._recordMakerPresenceObservationSafely(continuity);
 
     // Check OE FIX
     if (!this._isFixExecutionHealthy()) {
