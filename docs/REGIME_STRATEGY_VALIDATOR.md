@@ -18,6 +18,22 @@ npm run test:regime
 bun scripts/smoke-regime-strategy.js
 ```
 
+Durable production reference rows can be exported without schema initialization or writes:
+
+```bash
+bun scripts/export-regime-validator-evidence.js \
+  --from 1786924800000 --to 1787011199999 > evidence.json
+bun scripts/validate-regime-strategy.js evidence.json --pretty
+```
+
+The exporter opens a PostgreSQL `READ ONLY` transaction, uses the same verified TLS and validated
+reference-source configuration as production, and fails rather than silently truncating its bounded
+fill/reference row limits. It includes pending/incomplete natural fills so missing horizons reduce
+coverage honestly. Candidate identity, candidate buffer sensitivity, and shadow survival remain
+unset; database export cannot self-attest them. Consequently, the direct export remains `HOLD`
+until separately observed candidate-bound shadow evidence is reviewed and supplied through a
+versioned evidence artifact.
+
 The CLI writes one JSON report to stdout. Invalid arguments exit `2`; invalid JSON or invalid evidence/configuration exits `1`; a valid report exits `0` even when its recommendation is `HOLD`. Callers must inspect `recommendation` and `blockers` rather than treating exit `0` as strategy approval.
 
 ## Evidence shape
@@ -90,4 +106,3 @@ Passing those gates produces only `CANDIDATE_FOR_HUMAN_REVIEW`. Every report ret
 ## August 10–16 replay
 
 The retained production replay contains 86 valid fills and 68 held-out independent clusters. Historical promotion-grade point-in-time references and candidate-bound shadow survival evidence are unavailable, so the validator returns `HOLD` with zero scored clusters and zero dispatch. Coinbase one-minute candles used in the exploratory diagnosis remain diagnostic-only evidence.
-
