@@ -10,15 +10,15 @@ rebalance policy, depth, or the existing canary envelope.
 
 1. The feature is disabled by default and activates only within the existing
    `MM_MINIMAL_LIVE_CANARY_ENABLED` envelope.
-2. On a fresh, valid TrueX EBBO, L1 joins the same-side touch. It may improve
-   by no more than one tick only when the existing strict maker-safety,
-   contractual-width, and post-only checks permit it.
+2. On a fresh, valid TrueX EBBO, L1 joins the same-side touch exactly. It never
+   improves beyond the touch, and existing strict maker-safety,
+   contractual-width, and post-only checks still apply.
 3. L2 and all non-canary quoting remain unchanged.
 4. Missing, stale, crossed, or invalid EBBO preserves existing fail-closed
    behaviour; no new order is sent.
 5. Existing canary stop/cancel controls remain the authority for expiry,
    rejects, cancels, fill cap, and adverse markout.
-6. Tests cover default-off behaviour, touch join, one-tick bound, and safety
+6. Tests cover default-off behaviour, exact touch join, decimal tick handling, and safety
    rejections.
 
 ## Non-goals

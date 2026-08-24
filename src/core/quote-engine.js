@@ -768,7 +768,7 @@ export class QuoteEngine extends EventEmitter {
   // invariants that still run again at the transport-adjacent send boundary.
   // Returning null preserves the ordinary quote calculation when the touch
   // cannot safely satisfy the existing passive canary envelope.
-  _minimalLiveCanaryTouchPair({ level, mid, bidPrice, askPrice }) {
+  _minimalLiveCanaryTouchPair({ level, mid }) {
     if (!this.config.minimalLiveCanaryConfig.enabled || level !== 1) return null;
     const strictEbbo = this._strictEbboState();
     if (!strictEbbo.usable) return null;
@@ -778,16 +778,18 @@ export class QuoteEngine extends EventEmitter {
     if (!Number.isFinite(touchBid) || !Number.isFinite(touchAsk) || touchBid <= 0 || touchAsk <= touchBid) {
       return null;
     }
-    // The EBBO prices are venue tick-valid observations.  Preserve them
-    // exactly so this path cannot quote through a touch by rounding.
-    if (this.snapToTick(touchBid) !== touchBid || this.snapToTick(touchAsk) !== touchAsk) return null;
+    const epsilon = Math.max(Number.EPSILON * Math.max(mid, touchBid, touchAsk) * 8, 1e-12);
+    // The EBBO prices are venue tick-valid observations. Preserve them exactly
+    // so this path cannot quote through a touch by rounding. Use a tolerance
+    // because decimal tick sizes can leave harmless IEEE-754 residue.
+    if (Math.abs(this.snapToTick(touchBid) - touchBid) > epsilon ||
+        Math.abs(this.snapToTick(touchAsk) - touchAsk) > epsilon) return null;
 
     const width = touchAsk - touchBid;
     const minWidth = mid * this.config.minimumQuoteWidthBps / 10_000;
     const maxWidth = Number.isFinite(this.config.contractMaxQuoteSpreadBps)
       ? mid * this.config.contractMaxQuoteSpreadBps / 10_000
       : Number.POSITIVE_INFINITY;
-    const epsilon = Math.max(Number.EPSILON * Math.max(mid, touchBid, touchAsk) * 8, 1e-12);
     if (width + epsilon < minWidth || width > maxWidth + epsilon) return null;
 
     const touchBidQuote = { side: 'buy', level, price: touchBid, contractReferenceMid: mid };

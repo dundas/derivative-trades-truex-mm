@@ -119,6 +119,17 @@ describe('QuoteEngine', () => {
       ]));
     });
 
+    it('joins a decimal tick-aligned TrueX touch despite floating-point residue', () => {
+      const engine = strictCanaryEngine({ baseSpreadBps: 60, tickSize: 0.01 });
+      engine.updateTruexEbbo({ bestBid: 10000.05, bestAsk: 10050.05, timestamp: Date.now() });
+
+      const quotes = engine.computeDesiredQuotes(10025.05, { bidSkewTicks: 0, askSkewTicks: 0 });
+      expect(quotes).toEqual(expect.arrayContaining([
+        expect.objectContaining({ side: 'buy', level: 1, price: 10000.05 }),
+        expect.objectContaining({ side: 'sell', level: 1, price: 10050.05 }),
+      ]));
+    });
+
     it('never improves beyond the TrueX touch and preserves the normal pair when its width is unsafe', () => {
       const engine = strictCanaryEngine({ baseSpreadBps: 60, tickSize: 0.5 });
       engine.updateTruexEbbo({ bestBid: 10000, bestAsk: 10005, timestamp: Date.now() });
