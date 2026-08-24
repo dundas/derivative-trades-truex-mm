@@ -44,6 +44,11 @@ describe('regime evidence export', () => {
     ]) expect(() => validateEvidenceExportOptions(options)).toThrow();
   });
 
+  test('requires the direct Crypto.com reference mode', () => {
+    expect(() => buildValidatorSourceQuality({ ...direct, referenceMode: 'kraken-direct' }))
+      .toThrow('regime evidence export currently requires cryptocom-direct mode');
+  });
+
   test('maps durable fills and exact direct provenance into validator input', async () => {
     const calls = [];
     const db = { query: async (sql, params) => {
@@ -105,6 +110,15 @@ describe('regime evidence export', () => {
       fromTimestamp: 1, toTimestamp: 2, maxFills: 2, maxReferences: 10,
       maxHorizonMs: 60_000, referenceMaxAgeMs: 30_000, sourceQuality: direct,
     })).rejects.toThrow('fill export exceeds maxFills=2');
+
+    const referenceOverflow = { query: async sql => sql.includes('fill_reference_markout_work')
+      ? { rows: [] }
+      : { rows: [referenceRow(), referenceRow({ timestamp: '1001' }),
+        referenceRow({ timestamp: '1002' })] } };
+    await expect(loadRegimeValidatorEvidence(referenceOverflow, {
+      fromTimestamp: 1, toTimestamp: 2, maxFills: 10, maxReferences: 2,
+      maxHorizonMs: 60_000, referenceMaxAgeMs: 30_000, sourceQuality: direct,
+    })).rejects.toThrow('reference export exceeds maxReferences=2');
   });
 
   test('rejects conflicting cross-horizon attribution and keeps contradictory references', async () => {
