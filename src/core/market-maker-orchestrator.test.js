@@ -233,6 +233,20 @@ describe('MarketMakerOrchestrator — maker-presence telemetry', () => {
     }));
     expect(orch.logger.warn).toHaveBeenCalledWith(expect.stringContaining('Maker-presence telemetry failed'));
   });
+
+  it('contains a non-Error asynchronous telemetry rejection', async () => {
+    const orch = makeOrch({ sessionId: 'presence-session' });
+    orch.presenceObservationConfig = { enabled: true, sampleIntervalMs: 30_000 };
+    orch.quoteTelemetry.record = jest.fn(() => Promise.reject(null));
+
+    expect(orch._recordMakerPresenceObservation({
+      executionState: 'normal', present: { buy: true, sell: true, twoSided: true },
+      activeLevels: { buy: 1, sell: 1 },
+    })).toBe(true);
+    await Promise.resolve();
+
+    expect(orch.logger.warn).toHaveBeenCalledWith(expect.stringContaining('Maker-presence telemetry failed: null'));
+  });
 });
 
 describe('strict EBBO presence verification', () => {

@@ -1541,7 +1541,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       action: snapshot.twoSided ? 'two-sided' : 'not-two-sided',
       reason: snapshot.executionState,
       context: { makerPresence: snapshot },
-    })).catch(error => this.logger.warn(`[Orchestrator] Maker-presence telemetry failed: ${error.message}`));
+    })).catch(error => this.logger.warn(`[Orchestrator] Maker-presence telemetry failed: ${String(error?.message ?? error)}`));
     return true;
   }
 
