@@ -11,7 +11,7 @@ configuration or schema change is needed.
 
 ## Tasks
 
-- [ ] 1.0 Preserve strict authority while recovering one transient canary poll failure
+- [x] 1.0 Preserve strict authority while recovering one transient canary poll failure
   - [x] 1.1 Commit these planning artifacts before implementation.
   - [x] 1.2 Add a canary-only, non-429 retry-delay cap based on cached EBBO
     receipt time, existing strict maximum age, and existing poll timeout.
@@ -21,5 +21,5 @@ configuration or schema change is needed.
   - [x] 1.5 Run focused tests and L1 canary smoke.
   - [x] 1.6 Run adversarial review, Semgrep, roborev, and smoke before push.
   - [x] 1.7 Open PR naming this PRD/task list; solicit Claude review.
-  - [ ] 1.8 Run the PR review loop, merge after Claude pass, deploy from a
+  - [x] 1.8 Run the PR review loop, merge after Claude pass, deploy from a
     clean worktree, and verify normal live health before any new canary.
