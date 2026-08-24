@@ -210,7 +210,7 @@ describe('MarketMakerOrchestrator — maker-presence telemetry', () => {
   });
 
   it('contains a presence-observation failure so execution bookkeeping completes', () => {
-    const presenceController = { observe: jest.fn(() => { throw new Error('clock must be monotonic'); }) };
+    const presenceController = { observe: jest.fn(() => { throw null; }) };
     const capitalReservationManager = {
       getReservations: jest.fn().mockReturnValue([]),
       getStatus: jest.fn().mockReturnValue({ state: 'normal', blockedSides: [] }),

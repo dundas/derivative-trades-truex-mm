@@ -1551,7 +1551,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     try {
       return this._recordMakerPresenceObservation(status);
     } catch (error) {
-      this.logger.warn(`[Orchestrator] Maker-presence telemetry failed: ${error.message}`);
+      this.logger.warn(`[Orchestrator] Maker-presence telemetry failed: ${String(error?.message ?? error)}`);
       return false;
     }
   }
@@ -1560,7 +1560,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     try {
       return this._recordMakerPresenceObservation(this._getContinuityStatus());
     } catch (error) {
-      this.logger.warn(`[Orchestrator] Maker-presence telemetry failed: ${error.message}`);
+      this.logger.warn(`[Orchestrator] Maker-presence telemetry failed: ${String(error?.message ?? error)}`);
       return false;
     }
   }
