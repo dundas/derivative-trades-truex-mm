@@ -2396,6 +2396,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     }
 
     this._truexEbboPollInFlight = true;
+    let scheduledDelayMs = null;
     try {
       const instrumentId = await this._resolveTruexEbboInstrumentId();
       const rawQuote = await this.restClient.getMarketQuote(
@@ -2448,7 +2449,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
           Math.ceil(this._truexEbboCurrentBackoffMs * multiplier),
         ),
       );
-      this._truexEbboCurrentBackoffMs = this._freshCanaryEbboRetryDelay(
+      scheduledDelayMs = this._freshCanaryEbboRetryDelay(
         this._truexEbboCurrentBackoffMs,
         status,
       );
@@ -2477,7 +2478,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
     } finally {
       this._truexEbboPollInFlight = false;
       if (this.isRunning) {
-        this._scheduleNextTruexEbboPoll(this._truexEbboCurrentBackoffMs || this.truexEbboPollIntervalMs);
+        this._scheduleNextTruexEbboPoll(
+          scheduledDelayMs ?? (this._truexEbboCurrentBackoffMs || this.truexEbboPollIntervalMs),
+        );
       }
     }
   }

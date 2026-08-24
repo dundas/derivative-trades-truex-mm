@@ -519,6 +519,37 @@ describe('MarketMakerOrchestrator', () => {
       expect(orchestrator._scheduleNextTruexEbboPoll).toHaveBeenCalledWith(2_000);
     });
 
+    test('keeps uncapped backoff state when a capped canary retry is followed by 429', async () => {
+      const quoteEngine = createMockQuoteEngine();
+      quoteEngine.config = {
+        minimalLiveCanaryConfig: { enabled: true },
+        truexMakerEbboMaxAgeMs: 3_000,
+      };
+      quoteEngine.truexEbbo = { receivedAt: 10_000 };
+      quoteEngine._strictEbboState = jest.fn(() => ({ usable: true }));
+      const { orchestrator } = createOrchestrator({
+        quoteEngine, now: () => 12_000, truexEbboPollIntervalMs: 1_000, truexEbboPollTimeoutMs: 900,
+      });
+      let calls = 0;
+      orchestrator.restClient = {
+        getInstrument: jest.fn(async () => ({ id: 'instrument-1' })),
+        getMarketQuote: jest.fn(async () => {
+          calls++;
+          const error = new Error(calls === 1 ? 'transient timeout' : 'rate limited');
+          if (calls === 2) error.status = 429;
+          throw error;
+        }),
+      };
+      orchestrator.isRunning = true;
+      orchestrator._scheduleNextTruexEbboPoll = jest.fn();
+
+      await orchestrator._pollTruexEbbo();
+      await orchestrator._pollTruexEbbo();
+
+      expect(orchestrator._scheduleNextTruexEbboPoll.mock.calls.map(([delay]) => delay)).toEqual([100, 3_000]);
+      expect(orchestrator._truexEbboCurrentBackoffMs).toBe(3_000);
+    });
+
     test('does not cap a retry after a cached canary EBBO has expired', async () => {
       const quoteEngine = createMockQuoteEngine();
       quoteEngine.config = {

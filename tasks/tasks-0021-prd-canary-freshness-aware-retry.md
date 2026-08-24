@@ -13,10 +13,10 @@ configuration or schema change is needed.
 
 - [ ] 1.0 Preserve strict authority while recovering one transient canary poll failure
   - [ ] 1.1 Commit these planning artifacts before implementation.
-  - [ ] 1.2 Add a canary-only, non-429 retry-delay cap based on cached EBBO
+  - [x] 1.2 Add a canary-only, non-429 retry-delay cap based on cached EBBO
     receipt time, existing strict maximum age, and existing poll timeout.
-  - [ ] 1.3 Retain normal and 429 backoff behavior; do not extend freshness.
-  - [ ] 1.4 Add deterministic tests for timely retry, 429 preservation, and
+  - [x] 1.3 Retain normal and 429 backoff behavior; do not extend freshness.
+  - [x] 1.4 Add deterministic tests for timely retry, 429 preservation, and
     expiry fallback.
   - [ ] 1.5 Run focused tests and L1 canary smoke.
   - [ ] 1.6 Run adversarial review, Semgrep, roborev, and smoke before push.
