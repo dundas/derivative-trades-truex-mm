@@ -389,6 +389,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     /** Normalized watchdog issue keys that were present on the last tick (for recovery diffing) */
     this._activeWatchdogIssues = new Set();
     this._truexEbboPollTimer = null;
+    this._minimalLiveCanaryEbboExpiryTimer = null;
     this._truexEbboPollInFlight = false;
     this._truexEbboConsecutiveErrors = 0;
     this._truexEbboCurrentBackoffMs = this.truexEbboPollIntervalMs;
@@ -1041,6 +1042,10 @@ export class MarketMakerOrchestrator extends EventEmitter {
     if (this._truexEbboPollTimer) {
       clearTimeout(this._truexEbboPollTimer);
       this._truexEbboPollTimer = null;
+    }
+    if (this._minimalLiveCanaryEbboExpiryTimer) {
+      clearTimeout(this._minimalLiveCanaryEbboExpiryTimer);
+      this._minimalLiveCanaryEbboExpiryTimer = null;
     }
     if (this._pyusdUsdPollTimer) {
       clearTimeout(this._pyusdUsdPollTimer);
@@ -1909,6 +1914,26 @@ export class MarketMakerOrchestrator extends EventEmitter {
     }, delayMs);
   }
 
+  _armMinimalLiveCanaryEbboExpiry() {
+    if (this._minimalLiveCanaryEbboExpiryTimer) {
+      clearTimeout(this._minimalLiveCanaryEbboExpiryTimer);
+      this._minimalLiveCanaryEbboExpiryTimer = null;
+    }
+    const config = this.quoteEngine.config?.minimalLiveCanaryConfig;
+    const receivedAt = Number(this.quoteEngine.truexEbbo?.receivedAt);
+    const maxAgeMs = Number(this.quoteEngine.config?.truexMakerEbboMaxAgeMs);
+    if (!this.isRunning || !config?.enabled || !Number.isFinite(receivedAt) || !Number.isFinite(maxAgeMs)) return;
+
+    const delayMs = Math.max(0, receivedAt + maxAgeMs - Date.now()) + 1;
+    this._minimalLiveCanaryEbboExpiryTimer = setTimeout(() => {
+      this._minimalLiveCanaryEbboExpiryTimer = null;
+      if (this.isRunning && this.quoteEngine.config?.minimalLiveCanaryConfig?.enabled &&
+          this.quoteEngine._strictEbboState?.().usable !== true) {
+        this.quoteEngine.stopMinimalLiveCanary?.('truex-ebbo-expired-during-poll-failure');
+      }
+    }, delayMs);
+  }
+
   _buildPyusdUsdReferenceSources(configuredSources) {
     const fallbackSources = [
       { type: 'kraken-rest', pair: 'PYUSD/USD' },
@@ -2365,6 +2390,10 @@ export class MarketMakerOrchestrator extends EventEmitter {
         symbol: this.symbol,
       });
       this.quoteEngine.updateTruexEbbo(parsed);
+      if (this._minimalLiveCanaryEbboExpiryTimer) {
+        clearTimeout(this._minimalLiveCanaryEbboExpiryTimer);
+        this._minimalLiveCanaryEbboExpiryTimer = null;
+      }
       if (this.quoteEngine.config?.minimalLiveCanaryConfig?.enabled &&
           this.quoteEngine._strictEbboState?.().usable !== true) {
         this.quoteEngine.stopMinimalLiveCanary?.('truex-ebbo-invalid');
@@ -2389,6 +2418,8 @@ export class MarketMakerOrchestrator extends EventEmitter {
       if (this.quoteEngine.config?.minimalLiveCanaryConfig?.enabled &&
           this.quoteEngine._strictEbboState?.().usable !== true) {
         this.quoteEngine.stopMinimalLiveCanary?.('truex-ebbo-poll-failure');
+      } else {
+        this._armMinimalLiveCanaryEbboExpiry();
       }
       this._truexEbboConsecutiveErrors++;
       const status = err?.status || err?.cause?.status;

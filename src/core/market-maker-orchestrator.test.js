@@ -990,6 +990,29 @@ describe('minimal live canary EBBO authority', () => {
     await orch._pollTruexEbbo();
     expect(orch.quoteEngine.stopMinimalLiveCanary).toHaveBeenCalledWith('truex-ebbo-poll-failure');
   });
+
+  it('cancels a canary when a fresh cached EBBO expires during poll backoff', () => {
+    const orch = makeOrch();
+    orch.isRunning = true;
+    orch.quoteEngine.config = {
+      minimalLiveCanaryConfig: { enabled: true },
+      truexMakerEbboMaxAgeMs: 3000,
+    };
+    orch.quoteEngine.truexEbbo = { receivedAt: Date.now() };
+    orch.quoteEngine._strictEbboState = jest.fn(() => ({ usable: true }));
+    orch.quoteEngine.stopMinimalLiveCanary = jest.fn();
+    const setTimeoutSpy = jest.spyOn(global, 'setTimeout');
+
+    orch._armMinimalLiveCanaryEbboExpiry();
+    const expiryCallback = setTimeoutSpy.mock.calls.at(-1)[0];
+    orch.quoteEngine._strictEbboState.mockReturnValue({ usable: false });
+    expiryCallback();
+    setTimeoutSpy.mockRestore();
+
+    expect(orch.quoteEngine.stopMinimalLiveCanary).toHaveBeenCalledWith(
+      'truex-ebbo-expired-during-poll-failure'
+    );
+  });
 });
 
 // -----------------------------------------------------------------------
