@@ -236,6 +236,9 @@ Computes bid/ask ladder quotes with inventory skew, manages order lifecycle thro
 **TrueX book and ALO safety:**
 - Production maker sends use the REST-polled `truexEbbo` as their sole venue marketability
   authority. Coinbase remains the pricing anchor; it is not venue marketability evidence.
+- The default-off minimal live-maker canary may make only level 1 join a fresh, valid EBBO touch
+  exactly. Stale, crossed, tick-invalid, or envelope-incompatible touch data falls back to the
+  normal safe quote calculation; level 2 and all non-canary quoting remain unchanged.
 - Missing, stale, crossed, or invalid TrueX EBBO suppresses new and replacement `D` messages while
   pure cancels and acknowledged live quotes remain untouched.
 - Freshness is measured from the locally stamped REST receipt time; the venue source timestamp is
