@@ -545,7 +545,13 @@ export class QuoteEngine extends EventEmitter {
     const effectiveSpreadBps = degraded
       ? Math.max(baseSpreadBps, this.config.defensiveSpreadFloorBps)
       : baseSpreadBps;
-    const effectiveSizeFactor = degraded ? this.config.degradedSizeFactor : 1;
+    // A fresh canary process is expected to begin with no acknowledged quotes,
+    // which briefly classifies continuity as degraded. Its fixed 0.0005 BTC
+    // envelope must survive that bootstrap state; all other degraded controls
+    // (depth, defensive prices, monitoring, capital, and send checks) remain.
+    const effectiveSizeFactor = degraded && !this.config.minimalLiveCanaryConfig.enabled
+      ? this.config.degradedSizeFactor
+      : 1;
     const halfSpread = (effectiveSpreadBps / 10000) * mid / 2;
     const minimumWidthBps = this.config.minimumQuoteWidthBps;
     const minimumHalfSpread = (minimumWidthBps / 10000) * mid / 2;
