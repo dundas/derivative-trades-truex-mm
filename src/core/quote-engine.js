@@ -233,6 +233,7 @@ export class QuoteEngine extends EventEmitter {
     this.minimalLiveCanaryFillIds = new Set();
     this.pendingMinimalLiveCanaryDispatches = new Set();
     this.minimalLiveCanaryDispatchGeneration = 0;
+    this.minimalLiveCanaryBootstrapPending = this.config.minimalLiveCanaryConfig.enabled;
     this.lastAnchorBook = null; // { bestBid, bestAsk } from the anchor venue's feed (for coinbase-mirror)
     this.lastRepriceAt = 0;
     // Most recent reconciliation attempt that found work. This is deliberately
@@ -545,7 +546,21 @@ export class QuoteEngine extends EventEmitter {
     const effectiveSpreadBps = degraded
       ? Math.max(baseSpreadBps, this.config.defensiveSpreadFloorBps)
       : baseSpreadBps;
-    const effectiveSizeFactor = degraded ? this.config.degradedSizeFactor : 1;
+    const bootstrapContinuityReasons = new Set([
+      'missing-acknowledged-buy', 'missing-acknowledged-sell',
+      'buy-side-gap-exceeded', 'sell-side-gap-exceeded',
+    ]);
+    const continuityReasons = this.continuityState.reasons || [];
+    const canaryBootstrapDegraded = this.minimalLiveCanaryBootstrapPending && degraded &&
+      continuityReasons.includes('missing-acknowledged-buy') &&
+      continuityReasons.includes('missing-acknowledged-sell') &&
+      continuityReasons.every(reason => bootstrapContinuityReasons.has(reason));
+    // A fresh canary process starts without acknowledged quotes. Preserve its
+    // fixed envelope only for that bootstrap state; all other degraded states
+    // retain their configured size reduction and every existing safety gate.
+    const effectiveSizeFactor = degraded && !canaryBootstrapDegraded
+      ? this.config.degradedSizeFactor
+      : 1;
     const halfSpread = (effectiveSpreadBps / 10000) * mid / 2;
     const minimumWidthBps = this.config.minimumQuoteWidthBps;
     const minimumHalfSpread = (minimumWidthBps / 10000) * mid / 2;
@@ -1378,6 +1393,9 @@ export class QuoteEngine extends EventEmitter {
         }
         this.deferredRepriceNeeded = true;
         return null;
+      }
+      if (this.config.minimalLiveCanaryConfig.enabled) {
+        this.minimalLiveCanaryBootstrapPending = false;
       }
     }
     this.lastActionByClOrdID.set(clOrdID, Date.now());

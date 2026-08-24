@@ -130,6 +130,48 @@ describe('QuoteEngine', () => {
       ]));
     });
 
+    it('retains the fixed L1 canary size during degraded startup', () => {
+      const engine = strictCanaryEngine({ baseSpreadBps: 60, tickSize: 0.5, degradedSizeFactor: 0.5 });
+      engine.setContinuityState({ executionState: 'degraded', reasons: [
+        'missing-acknowledged-buy', 'missing-acknowledged-sell',
+      ] });
+      engine.updateTruexEbbo({ bestBid: 10000, bestAsk: 10050, timestamp: Date.now() });
+
+      const quotes = engine.computeDesiredQuotes(10025, { bidSkewTicks: 0, askSkewTicks: 0 });
+      expect(quotes).toEqual(expect.arrayContaining([
+        expect.objectContaining({ side: 'buy', level: 1, price: 10000, size: 0.0005 }),
+        expect.objectContaining({ side: 'sell', level: 1, price: 10050, size: 0.0005 }),
+      ]));
+    });
+
+    it('retains the degraded size factor when a previously live canary loses both sides', () => {
+      const engine = strictCanaryEngine({ baseSpreadBps: 60, tickSize: 0.5, degradedSizeFactor: 0.5 });
+      engine.minimalLiveCanaryBootstrapPending = false;
+      engine.setContinuityState({ executionState: 'degraded', reasons: [
+        'missing-acknowledged-buy', 'missing-acknowledged-sell',
+      ] });
+      engine.updateTruexEbbo({ bestBid: 10000, bestAsk: 10050, timestamp: Date.now() });
+
+      const quotes = engine.computeDesiredQuotes(10025, { bidSkewTicks: 0, askSkewTicks: 0 });
+      expect(quotes).toHaveLength(2);
+      expect(quotes.every(quote => quote.size === 0.00025)).toBe(true);
+    });
+
+    it('keeps the degraded size factor when the canary is disabled', () => {
+      const engine = createEngine({
+        levels: 1, baseSizeBTC: 0.0005, baseSpreadBps: 60, tickSize: 0.5,
+        strictTruexMakerSafety: true, quoteDispatchMode: 'live',
+        minimumQuoteWidthBps: 30, contractMaxQuoteSpreadBps: 80,
+        contractOrderStateMaxAgeMs: 5000, degradedSizeFactor: 0.5,
+      });
+      engine.setContinuityState({ executionState: 'degraded', reasons: ['capital-reconciliation-degraded'] });
+      engine.updateTruexEbbo({ bestBid: 10000, bestAsk: 10050, timestamp: Date.now() });
+
+      const quotes = engine.computeDesiredQuotes(10025, { bidSkewTicks: 0, askSkewTicks: 0 });
+      expect(quotes).toHaveLength(2);
+      expect(quotes.every(quote => quote.size === 0.00025)).toBe(true);
+    });
+
     it('never improves beyond the TrueX touch and preserves the normal pair when its width is unsafe', () => {
       const engine = strictCanaryEngine({ baseSpreadBps: 60, tickSize: 0.5 });
       engine.updateTruexEbbo({ bestBid: 10000, bestAsk: 10005, timestamp: Date.now() });
