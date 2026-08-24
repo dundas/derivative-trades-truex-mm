@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { readFileSync } from 'node:fs';
 import {
   buildInventoryRebalanceShadowConfig,
   buildInventoryRecoveryConfig,
@@ -26,6 +27,12 @@ describe('strategy control config', () => {
     })).toEqual({ enabled: false, sampleIntervalMs: 5000 });
     expect(() => buildMakerPresenceObservationConfig({ MM_PRESENCE_OBSERVATION_INTERVAL_MS: '4999' }))
       .toThrow('[5000,300000]');
+  });
+
+  test('production Compose forwards operator-configurable presence observation controls', () => {
+    const compose = readFileSync(new URL('../docker-compose.prod.yml', import.meta.url), 'utf8');
+    expect(compose).toContain('MM_PRESENCE_OBSERVATION_ENABLED=${MM_PRESENCE_OBSERVATION_ENABLED:-true}');
+    expect(compose).toContain('MM_PRESENCE_OBSERVATION_INTERVAL_MS=${MM_PRESENCE_OBSERVATION_INTERVAL_MS:-30000}');
   });
 
   test('accepts explicit policy overrides and rejects ambiguous controls', () => {
