@@ -84,6 +84,80 @@ describe('QuoteEngine', () => {
       levels: 1, baseSizeBTC: 0.0005, minimumQuoteWidthBps: 30, contractMaxQuoteSpreadBps: 80,
     };
 
+    const strictCanaryEngine = (overrides = {}) => createEngine({
+      levels: 1, baseSizeBTC: 0.0005, strictTruexMakerSafety: true,
+      quoteDispatchMode: 'live', minimumQuoteWidthBps: 30, contractMaxQuoteSpreadBps: 80,
+      contractOrderStateMaxAgeMs: 5000, minimalLiveCanaryConfig: canaryConfig,
+      authoritativeOrderStateProvider: () => ({ available: true, timestamp: Date.now(), orders: [] }),
+      ...overrides,
+    });
+
+    it('keeps the normal L1 placement when the touch canary is disabled', () => {
+      const engine = createEngine({
+        levels: 1, baseSizeBTC: 0.0005, baseSpreadBps: 60, tickSize: 0.5,
+        strictTruexMakerSafety: true, quoteDispatchMode: 'live',
+        minimumQuoteWidthBps: 30, contractMaxQuoteSpreadBps: 80,
+        contractOrderStateMaxAgeMs: 5000,
+      });
+      engine.updateTruexEbbo({ bestBid: 10000, bestAsk: 10050, timestamp: Date.now() });
+
+      const quotes = engine.computeDesiredQuotes(10025, { bidSkewTicks: 0, askSkewTicks: 0 });
+      expect(quotes).toEqual(expect.arrayContaining([
+        expect.objectContaining({ side: 'buy', level: 1, price: 9994.5 }),
+        expect.objectContaining({ side: 'sell', level: 1, price: 10055.5 }),
+      ]));
+    });
+
+    it('joins the fresh TrueX touch on both L1 sides within the canary envelope', () => {
+      const engine = strictCanaryEngine({ baseSpreadBps: 60, tickSize: 0.5 });
+      engine.updateTruexEbbo({ bestBid: 10000, bestAsk: 10050, timestamp: Date.now() });
+
+      const quotes = engine.computeDesiredQuotes(10025, { bidSkewTicks: 0, askSkewTicks: 0 });
+      expect(quotes).toEqual(expect.arrayContaining([
+        expect.objectContaining({ side: 'buy', level: 1, price: 10000, contractOppositePrice: 10050 }),
+        expect.objectContaining({ side: 'sell', level: 1, price: 10050, contractOppositePrice: 10000 }),
+      ]));
+    });
+
+    it('never improves beyond the TrueX touch and preserves the normal pair when its width is unsafe', () => {
+      const engine = strictCanaryEngine({ baseSpreadBps: 60, tickSize: 0.5 });
+      engine.updateTruexEbbo({ bestBid: 10000, bestAsk: 10005, timestamp: Date.now() });
+
+      const quotes = engine.computeDesiredQuotes(10002.5, { bidSkewTicks: 0, askSkewTicks: 0 });
+      expect(quotes).toEqual(expect.arrayContaining([
+        expect.objectContaining({ side: 'buy', level: 1, price: 9972 }),
+        expect.objectContaining({ side: 'sell', level: 1, price: 10033 }),
+      ]));
+      expect(quotes.find(quote => quote.side === 'buy').price).toBeLessThanOrEqual(10000);
+      expect(quotes.find(quote => quote.side === 'sell').price).toBeGreaterThanOrEqual(10005);
+    });
+
+    it.each([
+      ['stale', (engine, advance) => {
+        engine.updateTruexEbbo({ bestBid: 10000, bestAsk: 10050, timestamp: 1 });
+        advance(3_001);
+      }, 'truex-ebbo-stale'],
+      ['crossed', (engine) => engine.updateTruexEbbo({ bestBid: 10050, bestAsk: 10000, timestamp: 1 }), 'truex-ebbo-invalid'],
+      ['invalid', (engine) => engine.updateTruexEbbo({ bestBid: 'not-a-price', bestAsk: 10050, timestamp: 1 }), 'truex-ebbo-invalid'],
+    ])('does not dispatch a canary D when TrueX EBBO is %s', (_name, arrange, reason) => {
+      let now = 1_000_000;
+      const fixConnection = createMockFix();
+      const engine = strictCanaryEngine({ fixConnection, now: () => now, truexMakerEbboMaxAgeMs: 3_000 });
+      expect(engine.armMinimalLiveCanary()).toBe(true);
+      arrange(engine, (elapsed) => { now += elapsed; });
+
+      expect(engine._sendNewOrder({
+        side: 'buy', level: 1, price: 10000, size: 0.0005, postOnly: true,
+        contractReferenceMid: 10025, contractOppositePrice: 10050,
+      })).toBeNull();
+      expect(fixConnection.sendMessage).not.toHaveBeenCalledWith(expect.objectContaining({ '35': 'D' }));
+      expect(engine.getQuoteStatus().suppressed.at(-1).reason).toBe(reason);
+    });
+
+    it('enforces the one-level canary envelope, leaving L2 unavailable', () => {
+      expect(() => strictCanaryEngine({ levels: 2 })).toThrow('passive canary engine envelope');
+    });
+
     it('is default-disabled and fails closed after EBBO loss without a new FIX D', () => {
       const fixConnection = createMockFix();
       const engine = createEngine({
