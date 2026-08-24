@@ -179,6 +179,9 @@ describe('MarketMakerOrchestrator — maker-presence telemetry', () => {
     expect(orch._recordMakerPresenceObservation(twoSided)).toBe(true);
     expect(orch._recordMakerPresenceObservation(twoSided)).toBe(false);
     expect(orch._recordMakerPresenceObservation({
+      ...twoSided, activeLevels: { buy: 2, sell: 1 },
+    })).toBe(false);
+    expect(orch._recordMakerPresenceObservation({
       ...twoSided, present: { buy: true, sell: false, twoSided: false },
       activeLevels: { buy: 1, sell: 0 }, executionState: 'degraded',
     })).toBe(true);
