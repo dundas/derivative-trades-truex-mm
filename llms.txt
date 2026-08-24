@@ -83,6 +83,9 @@ claims that ID before startup, so it cannot be reused after a restart. The fixed
 0.0005 BTC level per side, 30–80 bps width, and at most 15 minutes. It stops/cancels on stale or
 invalid TrueX EBBO, venue reject/cancel, invalid fill evidence, fill cap, adverse or unavailable
 attributed one-minute mark-out, or expiry; it never enables taker orders or external hedging.
+When this canary is enabled, only level 1 may join the fresh, valid TrueX EBBO touch exactly.
+If that touch is stale, crossed, tick-invalid, or outside the existing safe quote envelope, level 1
+uses the normal safe quote calculation instead; level 2 and all non-canary quoting are unchanged.
 
 ### Order Cancel (35=F) — NOT 35=G
 Tags: 11=newClOrdID, 41=origClOrdID. Party block required. NO tag 54 (Side).
