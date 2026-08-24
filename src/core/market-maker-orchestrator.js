@@ -1934,6 +1934,22 @@ export class MarketMakerOrchestrator extends EventEmitter {
     }, delayMs);
   }
 
+  _freshCanaryEbboRetryDelay(backoffMs, status) {
+    if (status === 429 || this.quoteEngine.config?.minimalLiveCanaryConfig?.enabled !== true) {
+      return backoffMs;
+    }
+    const strictEbbo = this.quoteEngine._strictEbboState?.();
+    const receivedAt = Number(this.quoteEngine.truexEbbo?.receivedAt);
+    const maxAgeMs = Number(this.quoteEngine.config?.truexMakerEbboMaxAgeMs);
+    if (strictEbbo?.usable !== true || !Number.isFinite(receivedAt) || !Number.isFinite(maxAgeMs)) {
+      return backoffMs;
+    }
+    const retryBudgetMs = receivedAt + maxAgeMs - this._now() - this.truexEbboPollTimeoutMs;
+    // A non-positive budget cannot produce a verified refresh before the
+    // existing expiry timer. Do not extend stale authority or add a retry.
+    return retryBudgetMs > 0 ? Math.min(backoffMs, retryBudgetMs) : backoffMs;
+  }
+
   _buildPyusdUsdReferenceSources(configuredSources) {
     const fallbackSources = [
       { type: 'kraken-rest', pair: 'PYUSD/USD' },
@@ -2430,6 +2446,10 @@ export class MarketMakerOrchestrator extends EventEmitter {
           this.truexEbboPollIntervalMs,
           Math.ceil(this._truexEbboCurrentBackoffMs * multiplier),
         ),
+      );
+      this._truexEbboCurrentBackoffMs = this._freshCanaryEbboRetryDelay(
+        this._truexEbboCurrentBackoffMs,
+        status,
       );
 
       this.logger.warn(
