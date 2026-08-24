@@ -405,13 +405,16 @@ export async function fetchReportData(
     const quoteLifecycleAvailable = Boolean(lifecycleTable[0]?.relation);
     const quoteLifecycleEvents = quoteLifecycleAvailable ? await q(
       `select event_id as "eventId", event_type as "eventType", event_timestamp as timestamp,
-              quote_id as "quoteId", side, reason
+              quote_id as "quoteId", side, reason, context
        from quote_lifecycle_events
        where event_timestamp >= $1 and event_timestamp < $2 and symbol = $3
          and ($4::text is null or session_id in
               (select sessionid from sessions where tradingmode = $4 and symbol = $3))
        order by event_timestamp`,
-      [dayStart, dayEnd, symbol, tradingMode ?? null]
+      // The validated writer interval is at most five minutes. Two intervals
+      // before the day boundary are enough to establish starting state without
+      // treating a missing historical sample as uptime.
+      [dayStart - 600_000, dayEnd, symbol, tradingMode ?? null]
     ) : [];
 
     return { sessions, orderRows, orderCountByStatus, fillRows, quoteLifecycleEvents, quoteLifecycleAvailable };
@@ -437,7 +440,7 @@ export interface ReportInput {
   orderCountByStatus: { status: string; n: number }[];
   fillRows: { timestamp: string; side: string; qty: string; price: string; fee: string | null }[];
   /** Immutable quote-lifecycle events observed during the reviewed UTC day. */
-  quoteLifecycleEvents?: { eventId?: string | null; eventType: string; timestamp: string; quoteId?: string | null; side?: string | null; reason?: string | null }[];
+  quoteLifecycleEvents?: { eventId?: string | null; eventType: string; timestamp: string; quoteId?: string | null; side?: string | null; reason?: string | null; context?: unknown }[];
   /** Whether the immutable lifecycle source exists for this report. */
   quoteLifecycleAvailable?: boolean;
   seed?: { qty: number; price: number };
@@ -450,19 +453,77 @@ type Evidence<T> = ({ evidence: 'observed' } & T) | { evidence: 'unavailable'; r
 
 /**
  * Builds report-only metrics from immutable lifecycle and fill evidence.
- * It deliberately does not reconstruct acknowledgement uptime or hypothetical
- * outcomes: neither is present in the input evidence.
+ * It deliberately does not reconstruct hypothetical outcomes. Acknowledged
+ * uptime is only reported from explicit maker-presence samples, never inferred
+ * from create/replace traffic.
  */
+function parsePresenceSample(event: NonNullable<ReportInput['quoteLifecycleEvents']>[number]) {
+  if (event.eventType !== 'maker_presence') return null;
+  const context = typeof event.context === 'string' ? (() => {
+    try { return JSON.parse(event.context); } catch { return null; }
+  })() : event.context;
+  const value = (context as { makerPresence?: unknown } | null)?.makerPresence;
+  if (!value || typeof value !== 'object') return null;
+  const snapshot = value as { twoSided?: unknown; sampleIntervalMs?: unknown };
+  const timestamp = Number(event.timestamp);
+  const sampleIntervalMs = Number(snapshot.sampleIntervalMs);
+  if (!Number.isSafeInteger(timestamp) || typeof snapshot.twoSided !== 'boolean' ||
+      !Number.isSafeInteger(sampleIntervalMs) || sampleIntervalMs < 5_000 || sampleIntervalMs > 300_000) {
+    return null;
+  }
+  return { timestamp, twoSided: snapshot.twoSided, sampleIntervalMs };
+}
+
+function buildAcknowledgedPresenceUptime(events: ReportInput['quoteLifecycleEvents'], dayStart: number, dayEnd: number) {
+  const samples = (events ?? []).map(parsePresenceSample).filter((sample): sample is NonNullable<typeof sample> => sample !== null)
+    .sort((left, right) => left.timestamp - right.timestamp);
+  if (samples.length === 0) {
+    return { evidence: 'unavailable' as const, reason: 'no acknowledged two-sided presence observations' };
+  }
+  const prior = samples.filter(sample => sample.timestamp <= dayStart).at(-1);
+  if (!prior) return { evidence: 'unavailable' as const, reason: 'no acknowledged two-sided presence sample before day start' };
+  let state = prior;
+  let cursor = dayStart;
+  let twoSidedMs = 0;
+  let currentOneSidedGapMs = state.twoSided ? 0 : 0;
+  let maxOneSidedGapMs = 0;
+  const consume = (until: number) => {
+    const duration = until - cursor;
+    if (state.twoSided) {
+      twoSidedMs += duration;
+      currentOneSidedGapMs = 0;
+    } else {
+      currentOneSidedGapMs += duration;
+      maxOneSidedGapMs = Math.max(maxOneSidedGapMs, currentOneSidedGapMs);
+    }
+    cursor = until;
+  };
+  for (const sample of samples.filter(sample => sample.timestamp > dayStart && sample.timestamp < dayEnd)) {
+    if (sample.timestamp - state.timestamp > state.sampleIntervalMs * 2) {
+      return { evidence: 'unavailable' as const, reason: 'acknowledged presence sample gap exceeds two intervals' };
+    }
+    consume(sample.timestamp);
+    state = sample;
+  }
+  if (dayEnd - state.timestamp > state.sampleIntervalMs * 2) {
+    return { evidence: 'unavailable' as const, reason: 'acknowledged presence sample missing before day end' };
+  }
+  consume(dayEnd);
+  return { evidence: 'observed' as const, twoSidedMs, twoSidedUptimePct: (twoSidedMs / (dayEnd - dayStart)) * 100, maxOneSidedGapMs, samples: samples.length };
+}
+
 function buildPerformanceDecomposition({
-  dayFills, positionBeforeDay, fifo, matchedQty, buyVwap, sellVwap, fees, dayPnl, quoteLifecycleEvents, quoteLifecycleAvailable,
+  dayFills, positionBeforeDay, fifo, matchedQty, buyVwap, sellVwap, fees, dayPnl, quoteLifecycleEvents, quoteLifecycleAvailable, dayStart, dayEnd,
 }: {
   dayFills: Fill[]; positionBeforeDay: number; fifo: FifoResult; matchedQty: number;
   buyVwap: number; sellVwap: number; fees: number; dayPnl: number;
   quoteLifecycleEvents: ReportInput['quoteLifecycleEvents'];
   quoteLifecycleAvailable: boolean;
+  dayStart: number; dayEnd: number;
 }) {
-  const attemptEvents = (quoteLifecycleEvents ?? []).filter(event => event.eventType === 'create' || event.eventType === 'replace');
-  const rejected = (quoteLifecycleEvents ?? []).filter(event => event.eventType === 'reject');
+  const dayEvents = (quoteLifecycleEvents ?? []).filter(event => Number(event.timestamp) >= dayStart && Number(event.timestamp) < dayEnd);
+  const attemptEvents = dayEvents.filter(event => event.eventType === 'create' || event.eventType === 'replace');
+  const rejected = dayEvents.filter(event => event.eventType === 'reject');
   // A lifecycle event is an observation, not necessarily a distinct order
   // attempt. Quote IDs are the durable identity from QuoteEngine. Count an
   // attempt once per in-day quote ID, then pair each reject with an unused
@@ -518,7 +579,9 @@ function buildPerformanceDecomposition({
   return {
     realizedSpread: { evidence: 'unavailable' as const, reason: 'no quote-linked FIFO lot attribution' },
     sameDayOpposingFillProxy,
-    uptime: { evidence: 'unavailable' as const, reason: 'no acknowledged two-sided presence observations' },
+    uptime: quoteLifecycleAvailable
+      ? buildAcknowledgedPresenceUptime(quoteLifecycleEvents, dayStart, dayEnd)
+      : { evidence: 'unavailable' as const, reason: 'quote lifecycle source unavailable' },
     rejects,
     inventory,
     pnl: {
@@ -594,6 +657,7 @@ export function buildReport(input: ReportInput) {
     dayFills, positionBeforeDay, fifo, matchedQty: matched, buyVwap: vwap(buys), sellVwap: vwap(sells), fees,
     dayPnl, quoteLifecycleEvents: input.quoteLifecycleEvents,
     quoteLifecycleAvailable: input.quoteLifecycleAvailable ?? input.quoteLifecycleEvents !== undefined,
+    dayStart, dayEnd,
   });
 
   return {

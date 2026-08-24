@@ -29,6 +29,17 @@ export function buildMakerPresenceRecoveryConfig(env = {}) {
   });
 }
 
+export function buildMakerPresenceObservationConfig(env = {}) {
+  const sampleIntervalMs = numberValue(env, 'MM_PRESENCE_OBSERVATION_INTERVAL_MS', 30_000);
+  if (!Number.isInteger(sampleIntervalMs) || sampleIntervalMs < 5_000 || sampleIntervalMs > 300_000) {
+    throw new Error('MM_PRESENCE_OBSERVATION_INTERVAL_MS must be an integer in [5000,300000]');
+  }
+  return Object.freeze({
+    enabled: booleanValue(env, 'MM_PRESENCE_OBSERVATION_ENABLED', true),
+    sampleIntervalMs,
+  });
+}
+
 export function buildInventoryRebalanceShadowConfig(env = {}) {
   const targetInventoryBTC = numberValue(env, 'INVENTORY_REBALANCE_TARGET_BTC', 0.014);
   const inventorySigmaBTC = numberValue(

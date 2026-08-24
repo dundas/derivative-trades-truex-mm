@@ -152,6 +152,9 @@ export class MarketMakerOrchestrator extends EventEmitter {
       (options.presenceRecoveryConfig
         ? new MakerPresenceRecoveryController(options.presenceRecoveryConfig, { now: options.now || Date.now })
         : null);
+    this.presenceObservationConfig = options.presenceObservationConfig || { enabled: false };
+    this._lastMakerPresenceObservation = null;
+    this._makerPresenceObservationSequence = 0;
     this.inventoryRebalanceShadowConfig = options.inventoryRebalanceShadowConfig || null;
     this.inventoryRebalanceShadow = null;
     this._inventoryRebalanceShadowLastAt = 0;
@@ -439,6 +442,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this._reconcileTimer = null;
     this._balanceRefreshTimer = null;
     this._authoritativeOrderRefreshTimer = null;
+    this._makerPresenceObservationTimer = null;
 
     // Bind handlers to preserve context
     this._onPriceUpdate = this._onPriceUpdate.bind(this);
@@ -566,7 +570,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       }
     };
     rememberTimers(this, [
-      'drainQueueTimer', '_reconcileTimer', '_balanceRefreshTimer', '_authoritativeOrderRefreshTimer', '_watchdogTimer', '_snapshotTimer',
+      'drainQueueTimer', '_reconcileTimer', '_balanceRefreshTimer', '_authoritativeOrderRefreshTimer', '_makerPresenceObservationTimer', '_watchdogTimer', '_snapshotTimer',
     ], clearInterval, 'orchestrator');
     rememberTimers(this, ['_truexEbboPollTimer', '_pyusdUsdPollTimer'], clearTimeout, 'orchestrator');
     rememberTimers(this.pnlTracker, ['_logTimer'], clearInterval, 'pnl');
@@ -733,6 +737,13 @@ export class MarketMakerOrchestrator extends EventEmitter {
 
     this.isRunning = true;
     this.startedAt = Date.now();
+    if (this.presenceObservationConfig?.enabled) {
+      const intervalMs = this.presenceObservationConfig.sampleIntervalMs;
+      this._makerPresenceObservationTimer = setInterval(() => {
+        this._recordMakerPresenceObservation(this._getContinuityStatus());
+      }, intervalMs);
+      this._recordMakerPresenceObservation(this._getContinuityStatus());
+    }
     if (this.referenceMarkoutCollector?.writer && !attempt.referenceCollectorInitiallyRunning) {
       attempt.referenceCollectorActivationAttempted = true;
       this.referenceMarkoutCollector.start();
@@ -1039,6 +1050,10 @@ export class MarketMakerOrchestrator extends EventEmitter {
     if (this._authoritativeOrderRefreshTimer) {
       clearInterval(this._authoritativeOrderRefreshTimer);
       this._authoritativeOrderRefreshTimer = null;
+    }
+    if (this._makerPresenceObservationTimer) {
+      clearInterval(this._makerPresenceObservationTimer);
+      this._makerPresenceObservationTimer = null;
     }
     if (this._truexEbboPollTimer) {
       clearTimeout(this._truexEbboPollTimer);
@@ -1372,6 +1387,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this._lastRepriceTime = Date.now();
     const postRepriceContinuity = this._getContinuityStatus();
     this._maybeRecoverMakerPresence(postRepriceContinuity);
+    this._recordMakerPresenceObservation(postRepriceContinuity);
     this._updateInventoryRebalanceShadow();
 
     if (this._shouldTriggerShadowReevaluation(aggregatedPrice)) {
@@ -1501,6 +1517,34 @@ export class MarketMakerOrchestrator extends EventEmitter {
     return status;
   }
 
+  _recordMakerPresenceObservation(status) {
+    const config = this.presenceObservationConfig;
+    if (!config?.enabled || !status || typeof this.quoteTelemetry?.record !== 'function') return false;
+    const intervalMs = Number(config.sampleIntervalMs);
+    if (!Number.isSafeInteger(intervalMs) || intervalMs <= 0) return false;
+    const now = Date.now();
+    const snapshot = {
+      executionState: status.executionState,
+      twoSided: status.present?.twoSided === true,
+      buy: status.present?.buy === true,
+      sell: status.present?.sell === true,
+      activeLevels: status.activeLevels || null,
+      sampleIntervalMs: intervalMs,
+    };
+    const fingerprint = JSON.stringify(snapshot);
+    const last = this._lastMakerPresenceObservation;
+    if (last?.fingerprint === fingerprint && now - last.timestamp < intervalMs) return false;
+    this._lastMakerPresenceObservation = { timestamp: now, fingerprint };
+    this.quoteTelemetry.record(this._enrichQuoteLifecycleEvent({
+      eventId: `maker-presence:${this.sessionId}:${now}:${++this._makerPresenceObservationSequence}`,
+      eventType: 'maker_presence', timestamp: now, decisionTimestamp: now,
+      action: snapshot.twoSided ? 'two-sided' : 'not-two-sided',
+      reason: snapshot.executionState,
+      context: { makerPresence: snapshot },
+    })).catch(error => this.logger.warn(`[Orchestrator] Maker-presence telemetry failed: ${error.message}`));
+    return true;
+  }
+
   _maybeRecoverMakerPresence(status) {
     if (!this.presenceRecoveryController || !status) return null;
     const decision = this.presenceRecoveryController.observe(status, {
@@ -1575,6 +1619,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     // Route OrderCancelReject (35=9) to QuoteEngine
     if (msgType === '9') {
       this.quoteEngine.onOrderCancelReject(message.fields);
+      this._recordMakerPresenceObservation(this._getContinuityStatus());
       return;
     }
 
@@ -1583,6 +1628,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
 
     // Route to QuoteEngine for order state management
     this.quoteEngine.onExecutionReport(message.fields);
+    this._recordMakerPresenceObservation(this._getContinuityStatus());
 
     // Track order state and fills in data pipeline
     const pipeline = this.dataPipeline || this.dataManager;
@@ -1732,6 +1778,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
         feedAgeMs: market.timestamp ? Math.max(0, now - market.timestamp) : null,
         volatility: market.volatility ?? null,
         marketState: market.marketState ?? null,
+        makerPresence: event.context?.makerPresence || null,
       },
     };
   }
@@ -2908,6 +2955,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     // watchdog cancel-all path: a missing side must preserve the funded live side.
     const continuity = this._getContinuityStatus();
     this._maybeRecoverMakerPresence(continuity);
+    this._recordMakerPresenceObservation(continuity);
 
     // Check OE FIX
     if (!this._isFixExecutionHealthy()) {

@@ -52,6 +52,7 @@ import {
   buildInventoryRebalanceShadowConfig,
   buildInventoryRecoveryConfig,
   buildMinimalLiveCanaryConfig,
+  buildMakerPresenceObservationConfig,
   buildMakerPresenceRecoveryConfig,
 } from './strategy-control-config.js';
 
@@ -109,6 +110,7 @@ const quoteDispatchMode = buildQuoteDispatchMode(process.env);
 const feedPollConfig = buildFeedPollConfig(process.env);
 const fixLivenessConfig = buildFixLivenessConfig(process.env);
 const presenceRecoveryConfig = buildMakerPresenceRecoveryConfig(process.env);
+const presenceObservationConfig = buildMakerPresenceObservationConfig(process.env);
 const inventoryRebalanceShadowConfig = buildInventoryRebalanceShadowConfig(process.env);
 const inventoryRecoveryConfig = buildInventoryRecoveryConfig(process.env, { quoteDispatchMode });
 
@@ -531,6 +533,7 @@ async function main() {
     referenceBookFeed,
     continuityConfig: config.continuityConfig,
     presenceRecoveryConfig,
+    presenceObservationConfig,
     inventoryRebalanceShadowConfig,
     inventoryRecoveryConfig,
     minimalLiveCanaryConfig,

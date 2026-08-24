@@ -3,6 +3,7 @@ import {
   buildInventoryRebalanceShadowConfig,
   buildInventoryRecoveryConfig,
   buildMinimalLiveCanaryConfig,
+  buildMakerPresenceObservationConfig,
   buildMakerPresenceRecoveryConfig,
 } from './strategy-control-config.js';
 
@@ -16,6 +17,15 @@ describe('strategy control config', () => {
       minimumMakerParticipation: 0.25,
       maxQuoteSkewBps: 10,
     });
+  });
+
+  test('enables bounded presence observations by default and rejects unsafe cadence', () => {
+    expect(buildMakerPresenceObservationConfig()).toEqual({ enabled: true, sampleIntervalMs: 30_000 });
+    expect(buildMakerPresenceObservationConfig({
+      MM_PRESENCE_OBSERVATION_ENABLED: 'false', MM_PRESENCE_OBSERVATION_INTERVAL_MS: '5000',
+    })).toEqual({ enabled: false, sampleIntervalMs: 5000 });
+    expect(() => buildMakerPresenceObservationConfig({ MM_PRESENCE_OBSERVATION_INTERVAL_MS: '4999' }))
+      .toThrow('[5000,300000]');
   });
 
   test('accepts explicit policy overrides and rejects ambiguous controls', () => {

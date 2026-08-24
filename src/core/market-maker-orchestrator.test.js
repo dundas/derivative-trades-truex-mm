@@ -167,6 +167,49 @@ describe('MarketMakerOrchestrator — Redis wiring (Task 1.4)', () => {
   });
 });
 
+describe('MarketMakerOrchestrator — maker-presence telemetry', () => {
+  it('records a bounded snapshot only on cadence or acknowledged-state transition', () => {
+    const orch = makeOrch({ sessionId: 'presence-session' });
+    orch.presenceObservationConfig = { enabled: true, sampleIntervalMs: 5_000 };
+    orch.quoteTelemetry.record = jest.fn(() => Promise.resolve());
+    const twoSided = {
+      executionState: 'normal', present: { buy: true, sell: true, twoSided: true },
+      activeLevels: { buy: 1, sell: 1 },
+    };
+    expect(orch._recordMakerPresenceObservation(twoSided)).toBe(true);
+    expect(orch._recordMakerPresenceObservation(twoSided)).toBe(false);
+    expect(orch._recordMakerPresenceObservation({
+      ...twoSided, present: { buy: true, sell: false, twoSided: false },
+      activeLevels: { buy: 1, sell: 0 }, executionState: 'degraded',
+    })).toBe(true);
+    expect(orch.quoteTelemetry.record).toHaveBeenCalledTimes(2);
+    expect(orch.quoteTelemetry.record).toHaveBeenLastCalledWith(expect.objectContaining({
+      eventType: 'maker_presence', action: 'not-two-sided', reason: 'degraded',
+      context: expect.objectContaining({ makerPresence: expect.objectContaining({
+        twoSided: false, sampleIntervalMs: 5_000,
+      }) }),
+    }));
+  });
+
+  it('records an immediate snapshot after a FIX execution report changes order state', () => {
+    const orch = makeOrch({ sessionId: 'presence-session' });
+    orch.presenceObservationConfig = { enabled: true, sampleIntervalMs: 30_000 };
+    orch.quoteTelemetry.record = jest.fn(() => Promise.resolve());
+    orch._getContinuityStatus = jest.fn(() => ({
+      executionState: 'degraded', present: { buy: true, sell: false, twoSided: false },
+      activeLevels: { buy: 1, sell: 0 },
+    }));
+    orch.quoteEngine.onExecutionReport = jest.fn();
+
+    orch._onFIXMessage({ fields: { '35': '8', '11': 'order-1', '39': '4' } });
+
+    expect(orch.quoteEngine.onExecutionReport).toHaveBeenCalledTimes(1);
+    expect(orch.quoteTelemetry.record).toHaveBeenCalledWith(expect.objectContaining({
+      eventType: 'maker_presence', action: 'not-two-sided',
+    }));
+  });
+});
+
 describe('strict EBBO presence verification', () => {
   it('uses the strict dispatch predicate, not legacy EBBO freshness', () => {
     const presenceController = { observe: jest.fn().mockReturnValue({ alerts: [] }) };
