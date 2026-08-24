@@ -144,9 +144,12 @@ describe('QuoteEngine', () => {
       ]));
     });
 
-    it('retains the degraded size factor for a non-bootstrap canary degradation', () => {
+    it('retains the degraded size factor when a previously live canary loses both sides', () => {
       const engine = strictCanaryEngine({ baseSpreadBps: 60, tickSize: 0.5, degradedSizeFactor: 0.5 });
-      engine.setContinuityState({ executionState: 'degraded', reasons: ['capital-reconciliation-degraded'] });
+      engine.minimalLiveCanaryBootstrapPending = false;
+      engine.setContinuityState({ executionState: 'degraded', reasons: [
+        'missing-acknowledged-buy', 'missing-acknowledged-sell',
+      ] });
       engine.updateTruexEbbo({ bestBid: 10000, bestAsk: 10050, timestamp: Date.now() });
 
       const quotes = engine.computeDesiredQuotes(10025, { bidSkewTicks: 0, askSkewTicks: 0 });

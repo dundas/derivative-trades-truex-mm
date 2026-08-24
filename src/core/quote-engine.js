@@ -233,6 +233,7 @@ export class QuoteEngine extends EventEmitter {
     this.minimalLiveCanaryFillIds = new Set();
     this.pendingMinimalLiveCanaryDispatches = new Set();
     this.minimalLiveCanaryDispatchGeneration = 0;
+    this.minimalLiveCanaryBootstrapPending = this.config.minimalLiveCanaryConfig.enabled;
     this.lastAnchorBook = null; // { bestBid, bestAsk } from the anchor venue's feed (for coinbase-mirror)
     this.lastRepriceAt = 0;
     // Most recent reconciliation attempt that found work. This is deliberately
@@ -550,8 +551,7 @@ export class QuoteEngine extends EventEmitter {
       'buy-side-gap-exceeded', 'sell-side-gap-exceeded',
     ]);
     const continuityReasons = this.continuityState.reasons || [];
-    const canaryBootstrapDegraded = this.config.minimalLiveCanaryConfig.enabled &&
-      degraded && this.activeOrders.size === 0 &&
+    const canaryBootstrapDegraded = this.minimalLiveCanaryBootstrapPending && degraded &&
       continuityReasons.includes('missing-acknowledged-buy') &&
       continuityReasons.includes('missing-acknowledged-sell') &&
       continuityReasons.every(reason => bootstrapContinuityReasons.has(reason));
@@ -1393,6 +1393,9 @@ export class QuoteEngine extends EventEmitter {
         }
         this.deferredRepriceNeeded = true;
         return null;
+      }
+      if (this.config.minimalLiveCanaryConfig.enabled) {
+        this.minimalLiveCanaryBootstrapPending = false;
       }
     }
     this.lastActionByClOrdID.set(clOrdID, Date.now());
