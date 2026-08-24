@@ -545,11 +545,20 @@ export class QuoteEngine extends EventEmitter {
     const effectiveSpreadBps = degraded
       ? Math.max(baseSpreadBps, this.config.defensiveSpreadFloorBps)
       : baseSpreadBps;
-    // A fresh canary process is expected to begin with no acknowledged quotes,
-    // which briefly classifies continuity as degraded. Its fixed 0.0005 BTC
-    // envelope must survive that bootstrap state; all other degraded controls
-    // (depth, defensive prices, monitoring, capital, and send checks) remain.
-    const effectiveSizeFactor = degraded && !this.config.minimalLiveCanaryConfig.enabled
+    const bootstrapContinuityReasons = new Set([
+      'missing-acknowledged-buy', 'missing-acknowledged-sell',
+      'buy-side-gap-exceeded', 'sell-side-gap-exceeded',
+    ]);
+    const continuityReasons = this.continuityState.reasons || [];
+    const canaryBootstrapDegraded = this.config.minimalLiveCanaryConfig.enabled &&
+      degraded && this.activeOrders.size === 0 &&
+      continuityReasons.includes('missing-acknowledged-buy') &&
+      continuityReasons.includes('missing-acknowledged-sell') &&
+      continuityReasons.every(reason => bootstrapContinuityReasons.has(reason));
+    // A fresh canary process starts without acknowledged quotes. Preserve its
+    // fixed envelope only for that bootstrap state; all other degraded states
+    // retain their configured size reduction and every existing safety gate.
+    const effectiveSizeFactor = degraded && !canaryBootstrapDegraded
       ? this.config.degradedSizeFactor
       : 1;
     const halfSpread = (effectiveSpreadBps / 10000) * mid / 2;

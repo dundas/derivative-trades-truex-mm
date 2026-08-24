@@ -132,7 +132,9 @@ describe('QuoteEngine', () => {
 
     it('retains the fixed L1 canary size during degraded startup', () => {
       const engine = strictCanaryEngine({ baseSpreadBps: 60, tickSize: 0.5, degradedSizeFactor: 0.5 });
-      engine.setContinuityState({ executionState: 'degraded', reasons: ['startup-no-acknowledged-quotes'] });
+      engine.setContinuityState({ executionState: 'degraded', reasons: [
+        'missing-acknowledged-buy', 'missing-acknowledged-sell',
+      ] });
       engine.updateTruexEbbo({ bestBid: 10000, bestAsk: 10050, timestamp: Date.now() });
 
       const quotes = engine.computeDesiredQuotes(10025, { bidSkewTicks: 0, askSkewTicks: 0 });
@@ -142,6 +144,16 @@ describe('QuoteEngine', () => {
       ]));
     });
 
+    it('retains the degraded size factor for a non-bootstrap canary degradation', () => {
+      const engine = strictCanaryEngine({ baseSpreadBps: 60, tickSize: 0.5, degradedSizeFactor: 0.5 });
+      engine.setContinuityState({ executionState: 'degraded', reasons: ['capital-reconciliation-degraded'] });
+      engine.updateTruexEbbo({ bestBid: 10000, bestAsk: 10050, timestamp: Date.now() });
+
+      const quotes = engine.computeDesiredQuotes(10025, { bidSkewTicks: 0, askSkewTicks: 0 });
+      expect(quotes).toHaveLength(2);
+      expect(quotes.every(quote => quote.size === 0.00025)).toBe(true);
+    });
+
     it('keeps the degraded size factor when the canary is disabled', () => {
       const engine = createEngine({
         levels: 1, baseSizeBTC: 0.0005, baseSpreadBps: 60, tickSize: 0.5,
@@ -149,7 +161,7 @@ describe('QuoteEngine', () => {
         minimumQuoteWidthBps: 30, contractMaxQuoteSpreadBps: 80,
         contractOrderStateMaxAgeMs: 5000, degradedSizeFactor: 0.5,
       });
-      engine.setContinuityState({ executionState: 'degraded', reasons: ['startup-no-acknowledged-quotes'] });
+      engine.setContinuityState({ executionState: 'degraded', reasons: ['capital-reconciliation-degraded'] });
       engine.updateTruexEbbo({ bestBid: 10000, bestAsk: 10050, timestamp: Date.now() });
 
       const quotes = engine.computeDesiredQuotes(10025, { bidSkewTicks: 0, askSkewTicks: 0 });
