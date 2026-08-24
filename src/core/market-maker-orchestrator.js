@@ -1531,7 +1531,15 @@ export class MarketMakerOrchestrator extends EventEmitter {
       activeLevels: status.activeLevels || null,
       sampleIntervalMs: intervalMs,
     };
-    const fingerprint = JSON.stringify(snapshot);
+    // L2 replenishment churn is expected during normal quoting.  It remains
+    // visible in periodic samples, but only execution/L1 presence changes
+    // warrant an immediate write.
+    const fingerprint = JSON.stringify({
+      executionState: snapshot.executionState,
+      twoSided: snapshot.twoSided,
+      buy: snapshot.buy,
+      sell: snapshot.sell,
+    });
     const last = this._lastMakerPresenceObservation;
     if (last?.fingerprint === fingerprint && now - last.timestamp < intervalMs) return false;
     this._lastMakerPresenceObservation = { timestamp: now, fingerprint };
