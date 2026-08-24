@@ -967,11 +967,24 @@ describe('minimal live canary EBBO authority', () => {
     });
   });
 
-  it('stops the canary when its TrueX EBBO poll fails', async () => {
+  it('keeps the canary running after a failed EBBO poll while cached EBBO remains fresh', async () => {
     const orch = makeOrch();
     orch.isRunning = true;
     orch.restClient = { getInstrument: jest.fn().mockRejectedValue(new Error('unavailable')) };
     orch.quoteEngine.config = { minimalLiveCanaryConfig: { enabled: true } };
+    orch.quoteEngine._strictEbboState = jest.fn(() => ({ usable: true }));
+    orch.quoteEngine.stopMinimalLiveCanary = jest.fn();
+    orch._scheduleNextTruexEbboPoll = jest.fn();
+    await orch._pollTruexEbbo();
+    expect(orch.quoteEngine.stopMinimalLiveCanary).not.toHaveBeenCalled();
+  });
+
+  it('stops the canary when a failed EBBO poll leaves no fresh cached EBBO', async () => {
+    const orch = makeOrch();
+    orch.isRunning = true;
+    orch.restClient = { getInstrument: jest.fn().mockRejectedValue(new Error('unavailable')) };
+    orch.quoteEngine.config = { minimalLiveCanaryConfig: { enabled: true } };
+    orch.quoteEngine._strictEbboState = jest.fn(() => ({ usable: false }));
     orch.quoteEngine.stopMinimalLiveCanary = jest.fn();
     orch._scheduleNextTruexEbboPoll = jest.fn();
     await orch._pollTruexEbbo();

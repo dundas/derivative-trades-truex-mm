@@ -2382,7 +2382,14 @@ export class MarketMakerOrchestrator extends EventEmitter {
           .catch((err) => this.logger.error(`[Orchestrator] TrueX EBBO recovery alert failed: ${err.message}`));
       }
     } catch (err) {
-      this.quoteEngine.stopMinimalLiveCanary?.('truex-ebbo-poll-failure');
+      // A failed refresh does not invalidate a still-fresh, previously
+      // verified EBBO. Strict maker safety independently blocks sends once it
+      // becomes stale; stop/cancel the canary only after that safety state is
+      // no longer usable.
+      if (this.quoteEngine.config?.minimalLiveCanaryConfig?.enabled &&
+          this.quoteEngine._strictEbboState?.().usable !== true) {
+        this.quoteEngine.stopMinimalLiveCanary?.('truex-ebbo-poll-failure');
+      }
       this._truexEbboConsecutiveErrors++;
       const status = err?.status || err?.cause?.status;
       const multiplier = status === 429 ? 2 : 1.5;
