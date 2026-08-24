@@ -437,6 +437,28 @@ describe('MarketMakerOrchestrator', () => {
       expect(quoteEngine.stopMinimalLiveCanary).not.toHaveBeenCalled();
     });
 
+    test('uses the injected clock to arm expiry after the freshness-aware retry budget', () => {
+      const quoteEngine = createMockQuoteEngine();
+      quoteEngine.config = {
+        minimalLiveCanaryConfig: { enabled: true },
+        truexMakerEbboMaxAgeMs: 3_000,
+      };
+      quoteEngine.truexEbbo = { receivedAt: 10_000 };
+      quoteEngine._strictEbboState = jest.fn(() => ({ usable: true }));
+      quoteEngine.stopMinimalLiveCanary = jest.fn();
+      const { orchestrator } = createOrchestrator({ quoteEngine, now: () => 12_000 });
+      orchestrator.isRunning = true;
+      const setTimeoutSpy = jest.spyOn(globalThis, 'setTimeout').mockImplementation(() => ({ mocked: true }));
+
+      orchestrator._armMinimalLiveCanaryEbboExpiry();
+
+      // The strict deadline is 13,000ms, so the expiry timer remains 1,001ms
+      // away; it cannot fire ahead of a retry whose request budget is 100ms.
+      expect(setTimeoutSpy).toHaveBeenCalledWith(expect.any(Function), 1_001);
+      expect(quoteEngine.stopMinimalLiveCanary).not.toHaveBeenCalled();
+      setTimeoutSpy.mockRestore();
+    });
+
     test('retains 429 exponential backoff even with a fresh canary EBBO', async () => {
       const quoteEngine = createMockQuoteEngine();
       quoteEngine.config = {

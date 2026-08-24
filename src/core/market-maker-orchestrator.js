@@ -1924,7 +1924,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
     const maxAgeMs = Number(this.quoteEngine.config?.truexMakerEbboMaxAgeMs);
     if (!this.isRunning || !config?.enabled || !Number.isFinite(receivedAt) || !Number.isFinite(maxAgeMs)) return;
 
-    const delayMs = Math.max(0, receivedAt + maxAgeMs - Date.now()) + 1;
+    const delayMs = Math.max(0, receivedAt + maxAgeMs - this._now()) + 1;
     this._minimalLiveCanaryEbboExpiryTimer = setTimeout(() => {
       this._minimalLiveCanaryEbboExpiryTimer = null;
       if (this.isRunning && this.quoteEngine.config?.minimalLiveCanaryConfig?.enabled &&
