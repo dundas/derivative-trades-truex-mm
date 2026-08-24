@@ -459,6 +459,39 @@ describe('MarketMakerOrchestrator', () => {
       setTimeoutSpy.mockRestore();
     });
 
+    test('shares an injected clock with an internally constructed QuoteEngine', () => {
+      let now = 10_000;
+      const canaryConfig = {
+        enabled: true, runId: 'canary-run-0001', durationMs: 900_000, maxCumulativeFilledBTC: 0.001,
+        oneMinuteMarkoutDeadlineMs: 60_000, levels: 1, baseSizeBTC: 0.0005,
+        minimumQuoteWidthBps: 30, contractMaxQuoteSpreadBps: 80,
+      };
+      const { orchestrator } = createOrchestrator({
+        quoteEngine: undefined, now: () => now, levels: 1, baseSizeBTC: 0.0005,
+        strictTruexMakerSafety: true, quoteDispatchMode: 'live', truexMakerEbboMaxAgeMs: 3_000,
+        continuityConfig: {
+          contractMaxQuoteSpreadBps: 80, minimumQuoteWidthBps: 30, contractOrderStateMaxAgeMs: 5_000,
+          minActiveLevelsPerSide: 1, minimumFundedQuoteSize: 0.0005,
+          l1ReserveBase: 0.0005, l1ReserveQuote: 1, maxSideGapMs: 1_000,
+          alertThresholdMs: 1_000, alertRateLimitMs: 1_000, defensiveSpreadFloorBps: 1,
+          degradedMaxLevels: 1, degradedSizeFactor: 1,
+        },
+        minimalLiveCanaryConfig: canaryConfig,
+      });
+      orchestrator.quoteEngine.updateTruexEbbo({ bestBid: 100, bestAsk: 101, timestamp: now });
+      orchestrator.isRunning = true;
+      const setTimeoutSpy = jest.spyOn(globalThis, 'setTimeout').mockImplementation(() => ({ mocked: true }));
+
+      expect(orchestrator.quoteEngine.truexEbbo.receivedAt).toBe(10_000);
+      expect(orchestrator.quoteEngine._strictEbboState().usable).toBe(true);
+      orchestrator._armMinimalLiveCanaryEbboExpiry();
+      expect(setTimeoutSpy).toHaveBeenCalledWith(expect.any(Function), 3_001);
+
+      now = 13_001;
+      expect(orchestrator.quoteEngine._strictEbboState().usable).toBe(false);
+      setTimeoutSpy.mockRestore();
+    });
+
     test('retains 429 exponential backoff even with a fresh canary EBBO', async () => {
       const quoteEngine = createMockQuoteEngine();
       quoteEngine.config = {

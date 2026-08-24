@@ -239,6 +239,7 @@ export class MarketMakerOrchestrator extends EventEmitter {
       minimalLiveCanaryDecisionWriter: event => this._persistMinimalLiveCanaryDecision(event),
       orderIdNamespace: options.orderIdNamespace,
       orderIdBootId: options.orderIdBootId,
+      now: options.now,
       logger: this.logger,
     });
     this.truexInstrumentId = options.truexInstrumentId ?? null;
