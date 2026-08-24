@@ -38,6 +38,21 @@ describe('QuoteLifecycleTelemetry', () => {
     expect(event.context.coinbase).toBeNull();
   });
 
+  test('preserves only the explicit maker-presence observation payload', async () => {
+    const telemetry = new QuoteLifecycleTelemetry({ now: () => 3000 });
+    const event = await telemetry.record({
+      eventType: 'maker_presence', context: {
+        makerPresence: { twoSided: true, activeLevels: { buy: 1, sell: 1 }, sampleIntervalMs: 30_000, secret: 'drop-me-too' },
+        unrelated: 'drop-me',
+      },
+    });
+    expect(event.context.makerPresence).toMatchObject({
+      twoSided: true, activeLevels: { buy: 1, sell: 1 }, sampleIntervalMs: 30_000,
+    });
+    expect(JSON.stringify(event.context)).not.toContain('drop-me');
+    expect(JSON.stringify(event.context)).not.toContain('drop-me-too');
+  });
+
   test('does not coerce absent source timestamps to epoch zero', async () => {
     const telemetry = new QuoteLifecycleTelemetry({ now: () => 3000 });
     const event = await telemetry.record({

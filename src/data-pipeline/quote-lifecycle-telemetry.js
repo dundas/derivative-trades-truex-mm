@@ -55,6 +55,25 @@ export class QuoteLifecycleTelemetry {
       timestamp: numberOrNull(book.timestamp),
       receivedTimestamp: numberOrNull(book.receivedTimestamp),
     } : null;
+    const allowMakerPresence = value => {
+      if (!value || typeof value !== 'object') return null;
+      const levels = value.activeLevels && typeof value.activeLevels === 'object'
+        ? {
+          buy: numberOrNull(value.activeLevels.buy),
+          sell: numberOrNull(value.activeLevels.sell),
+        }
+        : null;
+      const sampleIntervalMs = numberOrNull(value.sampleIntervalMs);
+      return {
+        executionState: ['normal', 'degraded', 'unsafe'].includes(value.executionState)
+          ? value.executionState : null,
+        twoSided: typeof value.twoSided === 'boolean' ? value.twoSided : null,
+        buy: typeof value.buy === 'boolean' ? value.buy : null,
+        sell: typeof value.sell === 'boolean' ? value.sell : null,
+        activeLevels: levels,
+        sampleIntervalMs: Number.isSafeInteger(sampleIntervalMs) ? sampleIntervalMs : null,
+      };
+    };
     return {
       schemaVersion: '1.0', eventId: input.eventId, eventType: input.eventType,
       timestamp: input.timestamp, decisionTimestamp: numberOrNull(input.decisionTimestamp) ?? input.timestamp,
@@ -72,6 +91,7 @@ export class QuoteLifecycleTelemetry {
         coinbase: allowBook(input.context?.coinbase), truexEbbo: allowBook(input.context?.truexEbbo),
         fairValue: numberOrNull(input.context?.fairValue), feedAgeMs: numberOrNull(input.context?.feedAgeMs),
         volatility: numberOrNull(input.context?.volatility), marketState: input.context?.marketState || null,
+        makerPresence: allowMakerPresence(input.context?.makerPresence),
       },
     };
   }

@@ -281,6 +281,30 @@ describe('buildReport end-to-end on fixture data (AC5 shape)', () => {
     expect(r.performance.rejects).toEqual({ evidence: 'unavailable', reason: 'no quote lifecycle attempt observations' });
     expect(r.performance.inventory).toEqual({ evidence: 'unavailable', reason: 'no in-day fills for inventory distribution' });
   });
+
+  test('reports acknowledged two-sided uptime only from complete sampled evidence', () => {
+    const presence = (timestamp: number, twoSided = true) => ({
+      eventType: 'maker_presence', timestamp: String(timestamp),
+      context: { makerPresence: { twoSided, sampleIntervalMs: 300_000 } },
+    });
+    const samples = [presence(dayStart - 1), ...Array.from({ length: 288 }, (_, index) =>
+      presence(dayStart + index * 300_000))];
+    const r = buildReport({ ...input, quoteLifecycleEvents: samples });
+    expect(r.performance.uptime).toMatchObject({
+      evidence: 'observed', twoSidedUptimePct: 100, maxOneSidedGapMs: 0,
+    });
+  });
+
+  test('fails closed when an acknowledged-presence sample gap prevents uptime proof', () => {
+    const presence = (timestamp: number) => ({
+      eventType: 'maker_presence', timestamp: String(timestamp),
+      context: { makerPresence: { twoSided: true, sampleIntervalMs: 30_000 } },
+    });
+    const r = buildReport({ ...input, quoteLifecycleEvents: [presence(dayStart - 1), presence(dayStart + 30_000)] });
+    expect(r.performance.uptime).toEqual({
+      evidence: 'unavailable', reason: 'acknowledged presence sample missing before day end',
+    });
+  });
 });
 
 describe('performance evidence attribution', () => {
@@ -391,7 +415,7 @@ describe('fetchReportData query boundaries', () => {
     expect(lifecycle.text).toContain('from quote_lifecycle_events');
     expect(lifecycle.text).toContain('symbol = $3');
     expect(lifecycle.text).toContain('tradingmode = $4');
-    expect(lifecycle.params).toEqual([dayStart, dayEnd, 'BTC-PYUSD', 'observe']);
+    expect(lifecycle.params).toEqual([dayStart - 600_000, dayEnd, 'BTC-PYUSD', 'observe']);
   });
 
   test('aborting an in-flight report query destroys its client and waits for pool cleanup', async () => {

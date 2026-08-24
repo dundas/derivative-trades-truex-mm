@@ -568,6 +568,8 @@ PostgreSQL-backed analytics server using `Bun.serve()` on port 3100.
 | `MM_PRESENCE_RECOVERY_ATTEMPT_WINDOW_MS` | No | `3600000` | Rolling attempt-budget window |
 | `MM_PRESENCE_RECOVERY_MAX_ATTEMPTS` | No | `3` | Maximum recovery attempts in the rolling window |
 | `MM_PRESENCE_RECOVERY_REARM_TIMEOUT_MS` | No | `30000` | Time allowed for acknowledged two-sided presence to return after reconciliation |
+| `MM_PRESENCE_OBSERVATION_ENABLED` | No | `true` | Persist append-only acknowledged maker-presence samples for read-only soak reporting; does not alter quote decisions or dispatch |
+| `MM_PRESENCE_OBSERVATION_INTERVAL_MS` | No | `30000` | Sampling cadence in milliseconds; validated integer in `[5000,300000]`; state transitions are recorded immediately |
 | `INVENTORY_REBALANCE_SHADOW_ENABLED` | No | `true` | Emit observe-only bell-curve inventory guidance; never changes or sends orders |
 | `INVENTORY_REBALANCE_SHADOW_INTERVAL_MS` | No | `5000` | Minimum interval between shadow policy samples |
 | `INVENTORY_REBALANCE_TARGET_BTC` | No | `0.014` | Shadow policy inventory center |
