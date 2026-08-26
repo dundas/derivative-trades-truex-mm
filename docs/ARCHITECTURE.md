@@ -586,6 +586,9 @@ PostgreSQL-backed analytics server using `Bun.serve()` on port 3100.
 | `HEDGE_TAKER_FEE_BPS` | No | `0` | Hedge venue taker fee in basis points |
 | `LOG_LEVEL` | No | `info` | Log level (`info` or `debug`) |
 | `TRUEX_DEBUG_MODE` | No | -- | Set to `true` to log raw FIX messages |
+| `FIX_LOGON_RESET_FALLBACK` | No | `true` | After N consecutive post-Logon timeouts on a reconnect, force a fresh session via `ResetSeqNumFlag=Y` (141=Y) and seqnum=1. Recovers automatically from counterparty FIX-gateway restarts that leave us looping on GapFill without Logon-Ack. Set to `false` to disable and revert to resume-only behavior. |
+| `FIX_LOGON_RESET_THRESHOLD` | No | `3` | Consecutive post-Logon timeouts before the reset-fallback fires. Invalid values (NaN/0/negative) silently coerce to default. |
+| `FIX_MAX_LOGON_RESET_FALLBACKS` | No | `3` | Loop guard: if the reset-fallback fires this many times in a row without a successful Logon Ack, the client stops trying resets (real cause is elsewhere) and emits `logon-reset-fallback-exhausted` for ops escalation. Reset on next successful Logon. |
 
 The ten `MM_*` continuity settings are deliberately required and have no runtime defaults. Copy
 their non-secret examples from `.env.example`, then validate reserves and thresholds against the
