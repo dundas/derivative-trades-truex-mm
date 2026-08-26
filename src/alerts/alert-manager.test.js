@@ -63,7 +63,7 @@ describe('AlertManager — Slack', () => {
 
     expect(r1.sent).toBe(true);
     expect(r2.suppressed).toBe(true);
-    // fetch called only once (for slack) plus possibly email/sms skips — but Slack only once
+    // fetch called only once (for slack) plus possibly email skip — but Slack only once
     const slackCalls = fetchMock.mock.calls.filter(([url]) =>
       url === 'https://hooks.slack.com/test'
     );
@@ -206,102 +206,6 @@ describe('AlertManager — Slack', () => {
     await expect(am.sendAlert({ reason: 'test' })).resolves.toEqual(
       expect.objectContaining({ sent: true })
     );
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-});
-
-// -----------------------------------------------------------------------
-// SMS
-// -----------------------------------------------------------------------
-describe('AlertManager — SMS', () => {
-  it('calls fetch with Telnyx endpoint and correct Authorization header', async () => {
-    const fetchMock = makeFetchMock();
-    global.fetch = fetchMock;
-
-    const am = new AlertManager({
-      telnyxApiKey: 'test-api-key',
-      telnyxFromNumber: '+15551234567',
-      alertPhone: '+15557654321',
-      logger: makeLogger(),
-      cooldownMs: 0,
-    });
-
-    await am._sendSms('Test alert message');
-
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    const [url, opts] = fetchMock.mock.calls[0];
-    expect(url).toBe('https://api.telnyx.com/v2/messages');
-    expect(opts.headers['Authorization']).toBe('Bearer test-api-key');
-  });
-
-  it('sends correct from/to/text in Telnyx payload', async () => {
-    const fetchMock = makeFetchMock();
-    global.fetch = fetchMock;
-
-    const am = new AlertManager({
-      telnyxApiKey: 'my-key',
-      telnyxFromNumber: '+10001112222',
-      alertPhone: '+13334445555',
-      logger: makeLogger(),
-      cooldownMs: 0,
-    });
-
-    await am._sendSms('Hello SMS');
-
-    const [, opts] = fetchMock.mock.calls[0];
-    const body = JSON.parse(opts.body);
-    expect(body.from).toBe('+10001112222');
-    expect(body.to).toBe('+13334445555');
-    expect(body.text).toBe('Hello SMS');
-  });
-
-  it('truncates SMS text to 160 chars for long messages', async () => {
-    const fetchMock = makeFetchMock();
-    global.fetch = fetchMock;
-
-    const am = new AlertManager({
-      telnyxApiKey: 'k',
-      telnyxFromNumber: '+1',
-      alertPhone: '+2',
-      logger: makeLogger(),
-    });
-
-    const longMsg = 'A'.repeat(200);
-    await am._sendSms(longMsg);
-
-    const [, opts] = fetchMock.mock.calls[0];
-    const body = JSON.parse(opts.body);
-    expect(body.text.length).toBeLessThanOrEqual(160);
-    expect(body.text.endsWith('...')).toBe(true);
-  });
-
-  it('does not call fetch when telnyxApiKey is missing', async () => {
-    const fetchMock = makeFetchMock();
-    global.fetch = fetchMock;
-
-    const am = new AlertManager({
-      telnyxApiKey: null, // missing
-      telnyxFromNumber: '+15551234567',
-      alertPhone: '+15557654321',
-      logger: makeLogger(),
-    });
-
-    await am._sendSms('Test');
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-
-  it('does not call fetch when alertPhone is missing', async () => {
-    const fetchMock = makeFetchMock();
-    global.fetch = fetchMock;
-
-    const am = new AlertManager({
-      telnyxApiKey: 'key',
-      telnyxFromNumber: '+15551234567',
-      alertPhone: null, // missing
-      logger: makeLogger(),
-    });
-
-    await am._sendSms('Test');
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });

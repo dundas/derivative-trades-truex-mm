@@ -15,9 +15,6 @@ export class AlertManager {
   constructor(options = {}) {
     this.slackWebhookUrl = options.slackWebhookUrl || null;
     this.alertEmail = options.alertEmail || null;
-    this.alertPhone = options.alertPhone || null;
-    this.telnyxApiKey = options.telnyxApiKey || null;
-    this.telnyxFromNumber = options.telnyxFromNumber || null;
     this.cooldownMs = options.cooldownMs || 600000; // 10 minutes
     this.logger = options.logger || console;
     this._lastAlertTime = {}; // keyed by reason
@@ -39,7 +36,6 @@ export class AlertManager {
     const results = await Promise.allSettled([
       this._sendSlack(message, { reason, level, details }),
       this._sendEmail(`[TrueX MM] ALERT: ${reason}`, message),
-      this._sendSms(`[TrueX MM] ALERT: ${reason} | ${new Date(now).toISOString()}`),
     ]);
 
     return { sent: true, results };
@@ -53,7 +49,6 @@ export class AlertManager {
     await Promise.allSettled([
       this._sendSlack(message, { reason, level: 'recovery', details }),
       this._sendEmail(`[TrueX MM] RECOVERY: ${reason}`, message),
-      this._sendSms(`[TrueX MM] RECOVERY: ${reason} | ${new Date().toISOString()}`),
     ]);
   }
 
@@ -116,29 +111,6 @@ export class AlertManager {
       if (!resp.ok) this.logger.warn(`[AlertManager] CircleInbox email failed: ${resp.status}`);
     } catch (err) {
       this.logger.warn(`[AlertManager] Email send error: ${err.message}`);
-    }
-  }
-
-  async _sendSms(message) {
-    if (!this.telnyxApiKey || !this.telnyxFromNumber || !this.alertPhone) return;
-    // Truncate to 160 chars for SMS
-    const text = message.length > 160 ? message.slice(0, 157) + '...' : message;
-    try {
-      const resp = await fetch('https://api.telnyx.com/v2/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${this.telnyxApiKey}`,
-        },
-        body: JSON.stringify({
-          from: this.telnyxFromNumber,
-          to: this.alertPhone,
-          text,
-        }),
-      });
-      if (!resp.ok) this.logger.warn(`[AlertManager] Telnyx SMS failed: ${resp.status}`);
-    } catch (err) {
-      this.logger.warn(`[AlertManager] SMS send error: ${err.message}`);
     }
   }
 }

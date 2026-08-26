@@ -430,9 +430,6 @@ export class MarketMakerOrchestrator extends EventEmitter {
     this.alertManager = options.alertManager || new AlertManager({
       slackWebhookUrl: process.env.DEFAULT_SLACK_WEBHOOK_URL || null,
       alertEmail: process.env.ALERT_EMAIL || null,
-      alertPhone: process.env.ALERT_PHONE || null,
-      telnyxApiKey: process.env.TELNYX_API_KEY || null,
-      telnyxFromNumber: process.env.TELNYX_FROM_NUMBER || null,
       logger: this.logger,
     });
 
