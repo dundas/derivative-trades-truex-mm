@@ -5,7 +5,7 @@ Assessment as of 2026-10-20: **local collection and shadow-evaluation module val
 ## Verified implementation and operations
 
 - The public Kraken and True Markets feeds ran locally for both target symbols. The module also subscribes to live USDC/USD rather than assuming parity.
-- The focused suite passed 35 tests/104 assertions. TypeScript checking and Bun builds passed. A local independent reviewer found two persistence/exclusivity bugs; fixes and regressions passed the follow-up review.
+- The focused suite passed 36 tests/110 assertions. TypeScript checking and Bun builds passed. A separate local same-provider reviewer found two persistence/exclusivity bugs; fixes and regressions passed the follow-up review.
 - The default configuration suppresses proposals when mappings or inventory are unverified, and on stale, invalid or disconnected inputs. Live smoke runs produced zero proposals. Some valid connections carried stale prices; these intervals did not count as healthy coverage.
 - A bounded local collector is running under `com.dundas.truex-equity-observer`. `logs/equity-shadow/current/status.json` is the current coverage authority. A running process does not prove a completed observation.
 - A 15-minute progress pairing is registered separately. Its last outcome, raw voices and evidence snapshot are under `logs/equity-pairing/latest.json`. It does not authorize trading or complete tasks automatically.
@@ -30,6 +30,14 @@ Kraken distinguishes xStock equity/display units from raw onchain/SPV-token unit
 The live REST/WebSocket comparison in `logs/equity-shadow/kraken-unit-comparison.json` showed Nvidia's WebSocket and REST quotes near one another, while multiplying the REST price by `token_multiplier` introduced a material discrepancy. This is empirical evidence against blindly applying that multiplier. REST requests with `rebase_multiplier=base` and `rebased` returned identical ticker values; the current public ticker documentation does not specify that parameter. An ignored parameter is not evidence of supported unit selection.
 
 Before enabling a mapping, confirm the exact **price and quantity units** of Kraken's v2 BBO, the unit used for each True Markets token, and the correct conversion of both prices and available sizes. Do not mark verification complete merely because a price looks plausible. The example remains unverified; no default values were changed based on the comparison.
+
+## Coverage interpretation
+
+The collector reports healthy time separately from elapsed observation time. Its configured completion flags require 24 healthy hours per symbol; a 25-hour process window can end before this threshold is met. A representative 24-hour wall-clock span is also incomplete until open, close and overnight observations actually exist. Preserve both facts rather than lowering thresholds or treating raw records as verified normalized evidence.
+
+The 19:33Z checkpoint matched 539 append-only samples per symbol to the status counters over about nine elapsed minutes. Complete BBO inputs existed for 531 Nvidia and 510 Tesla samples; early missing inputs and stale quotes remained recorded. This verifies persistence at that checkpoint, not price-unit equivalence or observation completion. Evidence: `logs/equity-shadow/raw-checkpoint.json`.
+
+A separate 45-second Kraken capture received 98 ticker messages and 44 heartbeats and reproduced four backward source timestamps (206–3921 ms). The adapter now retains its last accepted timestamp even after clearing a rejected quote, preventing a second delayed message from restoring an older quote. The collector was gracefully restarted with retained observations; distinguish adapter versions by the run IDs in `logs/equity-shadow/timestamp-fix-cutover.json`. The first diagnostic attempt failed its handshake and received no data; it is retained separately rather than counted as a successful sample. [Kraken ticker timestamp and event trigger documentation](https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/ticker).
 
 ## Remaining gates and questions
 

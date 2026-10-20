@@ -3,7 +3,7 @@
   "goalThread": "01a15a8b-a217-7ad1-8c31-e4b925b3cd41",
   "status": "active",
   "scope": "Local read-only module and evidence; live trading excluded",
-  "updatedAt": "2026-10-20T19:28:47.061Z",
+  "updatedAt": "2026-10-20T19:36:37.320244+00:00",
   "tasks": [
     {
       "id": "E1",
@@ -36,9 +36,10 @@
         "E1"
       ],
       "evidence": [
-        "35 focused tests pass;104 assertions",
+        "36 focused tests pass;110 assertions",
         "narrow TypeScript check passed",
-        "local same-provider review resolved recorder restart gap and stale-lock race; external Claude source review not authorized"
+        "local same-provider review resolved recorder restart gap and stale-lock race; external Claude source review not authorized",
+        "logs/equity-shadow/timestamp-fix-cutover.json:retained timestamp baseline across consecutive delayed messages;controlled collector restart"
       ]
     },
     {
@@ -49,7 +50,7 @@
         "E1"
       ],
       "evidence": [
-        "35 focused tests pass;104 assertions",
+        "36 focused tests pass;110 assertions",
         "narrow TypeScript check passed",
         "local same-provider review resolved recorder restart gap and stale-lock race; external Claude source review not authorized"
       ]
@@ -63,14 +64,14 @@
         "E4"
       ],
       "evidence": [
-        "35 focused tests pass;104 assertions",
+        "36 focused tests pass;110 assertions",
         "narrow TypeScript check passed",
         "local same-provider review resolved recorder restart gap and stale-lock race; external Claude source review not authorized"
       ]
     },
     {
       "id": "E6",
-      "title": "Failure tests and independent review",
+      "title": "Failure tests and local same-provider review",
       "status": "complete",
       "dependsOn": [
         "E3",
@@ -78,7 +79,7 @@
         "E5"
       ],
       "evidence": [
-        "35 focused tests pass;104 assertions",
+        "36 focused tests pass;110 assertions",
         "narrow TypeScript check passed",
         "local same-provider review resolved recorder restart gap and stale-lock race; external Claude source review not authorized"
       ]
@@ -110,7 +111,8 @@
         "logs/equity-shadow/current/status.json:live sampling advancing",
         "logs/equity-shadow/normalization-evidence.json:target contract identities match venue and issuer",
         "logs/equity-shadow/kraken-unit-comparison.json:bounded source-unit comparison;no guessed mapping enabled",
-        "docs/equity-readiness.md:preliminary NO-GO pilot decision"
+        "docs/equity-readiness.md:preliminary NO-GO pilot decision",
+        "logs/equity-shadow/raw-checkpoint.json:append-only sample counts match coverage;raw BBO input audit"
       ],
       "blockers": [
         "Representative healthy coverage not yet collected",

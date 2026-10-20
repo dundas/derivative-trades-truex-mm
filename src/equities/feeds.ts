@@ -15,6 +15,7 @@ export class PublicFeed {
   private socket: any;
   private running = false;
   private attempts = 0;
+  private lastSourceAt = new Map<string,number>();
   private reconnectTimer?: ReturnType<typeof setTimeout>;
   private connectTimer?: ReturnType<typeof setTimeout>;
   private watchdog?: ReturnType<typeof setInterval>;
@@ -44,7 +45,7 @@ export class PublicFeed {
     this.invalidate('stopped');
   }
   private invalidate(reason: string) {
-    this.connected=false; this.quotes.clear(); this.active.clear();
+    this.connected=false; this.quotes.clear(); this.active.clear(); this.lastSourceAt.clear();
     this.event({type:'feed_state',venue:this.venue,connected:false,reason,at:Date.now()});
   }
   private fault(reason: string) {
@@ -114,11 +115,15 @@ export class PublicFeed {
       this.quotes.delete(quote.symbol);
       this.event({type:'invalid_quote',venue:this.venue,symbol:quote.symbol,at:quote.receivedAt});return;
     }
-    const previous=this.quotes.get(quote.symbol);
-    if(previous && quote.sourceAt<previous.sourceAt) {
-      this.quotes.delete(quote.symbol);this.event({type:'out_of_order_quote',venue:this.venue,symbol:quote.symbol,at:quote.receivedAt});return;
+    // Keep the timestamp after invalidating the cached quote, so a sequence of
+    // delayed updates cannot restore an older price after the first rejection.
+    const previousSourceAt=this.lastSourceAt.get(quote.symbol);
+    if(previousSourceAt!==undefined && quote.sourceAt<previousSourceAt) {
+      this.quotes.delete(quote.symbol);this.event({type:'out_of_order_quote',venue:this.venue,symbol:quote.symbol,
+        sourceAt:quote.sourceAt,previousSourceAt,at:quote.receivedAt});return;
     }
     this.attempts=0;
+    this.lastSourceAt.set(quote.symbol,quote.sourceAt);
     this.quotes.set(quote.symbol,quote);
   }
 }

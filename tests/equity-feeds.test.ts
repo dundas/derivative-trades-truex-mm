@@ -37,6 +37,23 @@ test('True Markets extracts nanosecond book time and invalidates a halted instru
   feed.ingest(JSON.stringify({channel:'INSTRUMENT',data:{status:'HALTED',info:{symbol:'NVDAC-USDC'}}}));
   expect(feed.active.size).toBe(0);expect(feed.quotes.size).toBe(0);
 });
+test('consecutive delayed updates stay suppressed until the last accepted timestamp is recovered',()=>{
+  const events:any[]=[];
+  const feed=new PublicFeed('kraken',['NVDAx/USD'],settings,e=>events.push(e));const at=Date.now();
+  feed.ingest(ticker('NVDAx/USD',at));
+  feed.ingest(ticker('NVDAx/USD',at-4000));
+  feed.ingest(ticker('NVDAx/USD',at-3000));
+  expect(feed.quotes.size).toBe(0);
+  expect(events.filter(e=>e.type==='out_of_order_quote').length).toBe(2);
+  expect(events.at(-1).previousSourceAt).toBe(at);
+  expect(events.at(-1).sourceAt).toBe(at-3000);
+  feed.ingest(ticker('NVDAx/USD',at+1));
+  expect(feed.quotes.get('NVDAx/USD')?.sourceAt).toBe(at+1);
+  feed.stop();
+  // A new connection establishes its own timestamp baseline.
+  feed.ingest(ticker('NVDAx/USD',at-2000));
+  expect(feed.quotes.get('NVDAx/USD')?.sourceAt).toBe(at-2000);
+});
 test('transport silence reconnects and stop cancels retry timers',async()=>{
   const sockets:FakeSocket[]=[];
   const feed=new PublicFeed('kraken',['NVDAx/USD'],{...settings,silenceTimeoutMs:15},()=>{},()=>{const s=new FakeSocket();sockets.push(s);return s;});
