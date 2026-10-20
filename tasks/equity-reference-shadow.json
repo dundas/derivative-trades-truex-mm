@@ -3,7 +3,7 @@
   "goalThread": "01a15a8b-a217-7ad1-8c31-e4b925b3cd41",
   "status": "active",
   "scope": "Local read-only module and evidence; live trading excluded",
-  "updatedAt": "2026-10-20T19:25:08.996Z",
+  "updatedAt": "2026-10-20T19:28:47.061Z",
   "tasks": [
     {
       "id": "E1",
@@ -107,11 +107,14 @@
       ],
       "evidence": [
         "launchd com.dundas.truex-equity-observer;read-only25-hour process window",
-        "logs/equity-shadow/current/status.json:live sampling advancing"
+        "logs/equity-shadow/current/status.json:live sampling advancing",
+        "logs/equity-shadow/normalization-evidence.json:target contract identities match venue and issuer",
+        "logs/equity-shadow/kraken-unit-comparison.json:bounded source-unit comparison;no guessed mapping enabled",
+        "docs/equity-readiness.md:preliminary NO-GO pilot decision"
       ],
       "blockers": [
-        "Actual representative healthy coverage not yet collected",
-        "Token contract, multiplier and source price-unit verification pending",
+        "Representative healthy coverage not yet collected",
+        "Source price and quantity unit semantics unverified;target catalog identity corroborated",
         "DROPCOPY topic format and FIX TestReqID behavior need exchange clarification before trading readiness"
       ]
     }
