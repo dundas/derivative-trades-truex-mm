@@ -60,3 +60,18 @@ test('transport silence reconnects and stop cancels retry timers',async()=>{
   feed.start();sockets[0].emit('open');await Bun.sleep(40);expect(feed.reconnects).toBeGreaterThan(0);
   feed.stop();const count=sockets.length;await Bun.sleep(20);expect(sockets.length).toBe(count);
 });
+test('a malformed stream invalidates a live quote and resubscribes on a fresh socket',async()=>{
+  const sockets:FakeSocket[]=[];const events:any[]=[];
+  const feed=new PublicFeed('kraken',['NVDAx/USD'],settings,e=>events.push(e),()=>{const s=new FakeSocket();sockets.push(s);return s;});
+  try {
+    feed.start();sockets[0].emit('open');sockets[0].emit('message',ticker());
+    expect(feed.quotes.size).toBe(1);
+    sockets[0].emit('message','{"channel":"ticker","data":');
+    expect(feed.connected).toBe(false);expect(feed.quotes.size).toBe(0);
+    expect(events.some(e=>e.reason==='malformed_json')).toBe(true);
+    await Bun.sleep(20);sockets[1].emit('open');
+    expect(sockets[1].sent[0].params.symbol).toEqual(['NVDAx/USD']);
+    expect(feed.quotes.size).toBe(0);
+    sockets[1].emit('message',ticker());expect(feed.quotes.size).toBe(1);
+  } finally {feed.stop();}
+});

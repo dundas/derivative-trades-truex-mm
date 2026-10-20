@@ -3,7 +3,7 @@
   "goalThread": "01a15a8b-a217-7ad1-8c31-e4b925b3cd41",
   "status": "active",
   "scope": "Local read-only module and evidence; live trading excluded",
-  "updatedAt": "2026-10-20T19:36:37.320244+00:00",
+  "updatedAt": "2026-10-20T19:38:04.388747+00:00",
   "tasks": [
     {
       "id": "E1",
@@ -36,7 +36,7 @@
         "E1"
       ],
       "evidence": [
-        "36 focused tests pass;110 assertions",
+        "37 focused tests pass;117 assertions",
         "narrow TypeScript check passed",
         "local same-provider review resolved recorder restart gap and stale-lock race; external Claude source review not authorized",
         "logs/equity-shadow/timestamp-fix-cutover.json:retained timestamp baseline across consecutive delayed messages;controlled collector restart"
@@ -50,7 +50,7 @@
         "E1"
       ],
       "evidence": [
-        "36 focused tests pass;110 assertions",
+        "37 focused tests pass;117 assertions",
         "narrow TypeScript check passed",
         "local same-provider review resolved recorder restart gap and stale-lock race; external Claude source review not authorized"
       ]
@@ -64,7 +64,7 @@
         "E4"
       ],
       "evidence": [
-        "36 focused tests pass;110 assertions",
+        "37 focused tests pass;117 assertions",
         "narrow TypeScript check passed",
         "local same-provider review resolved recorder restart gap and stale-lock race; external Claude source review not authorized"
       ]
@@ -79,9 +79,10 @@
         "E5"
       ],
       "evidence": [
-        "36 focused tests pass;110 assertions",
+        "37 focused tests pass;117 assertions",
         "narrow TypeScript check passed",
-        "local same-provider review resolved recorder restart gap and stale-lock race; external Claude source review not authorized"
+        "local same-provider review resolved recorder restart gap and stale-lock race; external Claude source review not authorized",
+        "malformed live JSON test verifies invalidation, reconnection, resubscription and fresh-quote recovery"
       ]
     },
     {

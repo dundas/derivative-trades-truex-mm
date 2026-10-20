@@ -5,10 +5,24 @@ Assessment as of 2026-10-20: **local collection and shadow-evaluation module val
 ## Verified implementation and operations
 
 - The public Kraken and True Markets feeds ran locally for both target symbols. The module also subscribes to live USDC/USD rather than assuming parity.
-- The focused suite passed 36 tests/110 assertions. TypeScript checking and Bun builds passed. A separate local same-provider reviewer found two persistence/exclusivity bugs; fixes and regressions passed the follow-up review.
+- The focused suite passed 37 tests/117 assertions. TypeScript checking and Bun builds passed. A separate local same-provider reviewer found two persistence/exclusivity bugs; fixes and regressions passed the follow-up review.
 - The default configuration suppresses proposals when mappings or inventory are unverified, and on stale, invalid or disconnected inputs. Live smoke runs produced zero proposals. Some valid connections carried stale prices; these intervals did not count as healthy coverage.
 - A bounded local collector is running under `com.dundas.truex-equity-observer`. `logs/equity-shadow/current/status.json` is the current coverage authority. A running process does not prove a completed observation.
 - A 15-minute progress pairing is registered separately. Its last outcome, raw voices and evidence snapshot are under `logs/equity-pairing/latest.json`. It does not authorize trading or complete tasks automatically.
+
+## Acceptance audit
+
+| Requirement | Current evidence and limit | Result |
+| --- | --- | --- |
+| Reconnect, resubscribe and freshness safeguards | `tests/equity-feeds.test.ts` exercises socket closure, malformed live frames, silence and consecutive delayed updates; shadow tests reject stale/future/crossed data. Live collector receives both venues. | Locally validated |
+| Verified normalization | Fixture tests prove ratio, depth and conservative FX arithmetic. Target token identities are corroborated. Actual source price/quantity units remain unverified, so configuration suppresses output. | Incomplete |
+| Bounded shadow quotes | Fixture tests exercise capital/position caps, held inventory, outward rounding and target crossing checks. No live normalized proposals have been validated. | Logic validated; live evidence pending |
+| Durable collector and coverage | Restart/lock regression tests plus retained raw records and run-ID cutover evidence. Coverage excludes unhealthy intervals and restart gaps. | Locally validated |
+| Representative observation | Current collector is live, but open/close/overnight and a full 24-hour span have not been collected. | In progress |
+| Recurring scope review | Live local daemon; first scheduled two-voice review completed and facilitator synthesis saved. Reviews cannot mark implementation tasks complete. | Schedule verified; ongoing |
+| Readiness decision | Preliminary NO-GO with unit, coverage and operational questions below. This is a provisional assessment, not a completed evidence review. | Provisional |
+
+The runnable module and automated tests are available now. The full goal remains active until the incomplete evidence requirements are resolved; passing local tests alone does not satisfy them.
 
 ## Target identity evidence
 
