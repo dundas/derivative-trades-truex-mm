@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "goalThread": "01a15a8b-a217-7ad1-8c31-e4b925b3cd41",
+  "status": "active",
+  "scope": "Local read-only module and evidence; live trading excluded",
+  "updatedAt": "2026-10-20T19:12:00Z",
+  "tasks": [
+    {"id":"E1","title":"Requirements and isolated worktree","status":"complete","dependsOn":[],"evidence":["tasks/equity-reference-shadow.md","branch feat/equity-reference-shadow; lease wt-b0eda5a9d0814e57"]},
+    {"id":"E2","title":"15-minute pairing review schedule","status":"in_progress","dependsOn":["E1"],"evidence":[]},
+    {"id":"E3","title":"Reconnectable public feed adapter","status":"pending","dependsOn":["E1"],"evidence":[]},
+    {"id":"E4","title":"Normalization and bounded shadow evaluator","status":"pending","dependsOn":["E1"],"evidence":[]},
+    {"id":"E5","title":"Collector, persistence and coverage report","status":"pending","dependsOn":["E3","E4"],"evidence":[]},
+    {"id":"E6","title":"Failure tests and independent review","status":"pending","dependsOn":["E3","E4","E5"],"evidence":[]},
+    {"id":"E7","title":"Local live smoke and operating instructions","status":"pending","dependsOn":["E5","E6"],"evidence":[]},
+    {"id":"E8","title":"Representative 24-hour observation and pilot decision","status":"pending","dependsOn":["E7"],"evidence":[],"blockers":["Actual elapsed healthy coverage and verified asset normalization required"]}
+  ]
+}
