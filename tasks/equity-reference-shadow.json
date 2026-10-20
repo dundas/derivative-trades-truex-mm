@@ -3,15 +3,119 @@
   "goalThread": "01a15a8b-a217-7ad1-8c31-e4b925b3cd41",
   "status": "active",
   "scope": "Local read-only module and evidence; live trading excluded",
-  "updatedAt": "2026-10-20T19:12:00Z",
+  "updatedAt": "2026-10-20T19:25:08.996Z",
   "tasks": [
-    {"id":"E1","title":"Requirements and isolated worktree","status":"complete","dependsOn":[],"evidence":["tasks/equity-reference-shadow.md","branch feat/equity-reference-shadow; lease wt-b0eda5a9d0814e57"]},
-    {"id":"E2","title":"15-minute pairing review schedule","status":"in_progress","dependsOn":["E1"],"evidence":[]},
-    {"id":"E3","title":"Reconnectable public feed adapter","status":"pending","dependsOn":["E1"],"evidence":[]},
-    {"id":"E4","title":"Normalization and bounded shadow evaluator","status":"pending","dependsOn":["E1"],"evidence":[]},
-    {"id":"E5","title":"Collector, persistence and coverage report","status":"pending","dependsOn":["E3","E4"],"evidence":[]},
-    {"id":"E6","title":"Failure tests and independent review","status":"pending","dependsOn":["E3","E4","E5"],"evidence":[]},
-    {"id":"E7","title":"Local live smoke and operating instructions","status":"pending","dependsOn":["E5","E6"],"evidence":[]},
-    {"id":"E8","title":"Representative 24-hour observation and pilot decision","status":"pending","dependsOn":["E7"],"evidence":[],"blockers":["Actual elapsed healthy coverage and verified asset normalization required"]}
-  ]
+    {
+      "id": "E1",
+      "title": "Requirements and isolated worktree",
+      "status": "complete",
+      "dependsOn": [],
+      "evidence": [
+        "tasks/equity-reference-shadow.md",
+        "branch feat/equity-reference-shadow; lease wt-b0eda5a9d0814e57"
+      ]
+    },
+    {
+      "id": "E2",
+      "title": "15-minute pairing review schedule",
+      "status": "complete",
+      "dependsOn": [
+        "E1"
+      ],
+      "evidence": [
+        "launchd com.dundas.truex-equity-progress; interval 900000ms; localhost:9167/status healthy",
+        "logs/equity-pairing/latest.json: passed true, voiceCount 2",
+        "bun test tests/equity-review-loop.test.ts: 3 pass"
+      ]
+    },
+    {
+      "id": "E3",
+      "title": "Reconnectable public feed adapter",
+      "status": "complete",
+      "dependsOn": [
+        "E1"
+      ],
+      "evidence": [
+        "35 focused tests pass;104 assertions",
+        "narrow TypeScript check passed",
+        "local same-provider review resolved recorder restart gap and stale-lock race; external Claude source review not authorized"
+      ]
+    },
+    {
+      "id": "E4",
+      "title": "Normalization and bounded shadow evaluator",
+      "status": "complete",
+      "dependsOn": [
+        "E1"
+      ],
+      "evidence": [
+        "35 focused tests pass;104 assertions",
+        "narrow TypeScript check passed",
+        "local same-provider review resolved recorder restart gap and stale-lock race; external Claude source review not authorized"
+      ]
+    },
+    {
+      "id": "E5",
+      "title": "Collector, persistence and coverage report",
+      "status": "complete",
+      "dependsOn": [
+        "E3",
+        "E4"
+      ],
+      "evidence": [
+        "35 focused tests pass;104 assertions",
+        "narrow TypeScript check passed",
+        "local same-provider review resolved recorder restart gap and stale-lock race; external Claude source review not authorized"
+      ]
+    },
+    {
+      "id": "E6",
+      "title": "Failure tests and independent review",
+      "status": "complete",
+      "dependsOn": [
+        "E3",
+        "E4",
+        "E5"
+      ],
+      "evidence": [
+        "35 focused tests pass;104 assertions",
+        "narrow TypeScript check passed",
+        "local same-provider review resolved recorder restart gap and stale-lock race; external Claude source review not authorized"
+      ]
+    },
+    {
+      "id": "E7",
+      "title": "Local live smoke and operating instructions",
+      "status": "complete",
+      "dependsOn": [
+        "E5",
+        "E6"
+      ],
+      "evidence": [
+        "logs/equity-shadow/smoke/status.json:60 samples per symbol;zero proposals",
+        "logs/equity-shadow/validated-smoke/status.json:schema2;two persisted runs;zero proposals",
+        "docs/equity-shadow.md",
+        "Bun build and narrow TypeScript check passed"
+      ]
+    },
+    {
+      "id": "E8",
+      "title": "Representative 24-hour observation and pilot decision",
+      "status": "in_progress",
+      "dependsOn": [
+        "E7"
+      ],
+      "evidence": [
+        "launchd com.dundas.truex-equity-observer;read-only25-hour process window",
+        "logs/equity-shadow/current/status.json:live sampling advancing"
+      ],
+      "blockers": [
+        "Actual representative healthy coverage not yet collected",
+        "Token contract, multiplier and source price-unit verification pending",
+        "DROPCOPY topic format and FIX TestReqID behavior need exchange clarification before trading readiness"
+      ]
+    }
+  ],
+  "moduleState": "locally_validated",
+  "delivery_lifecycle": "active"
 }
