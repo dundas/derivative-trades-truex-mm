@@ -3,7 +3,7 @@
   "goalThread": "01a15a8b-a217-7ad1-8c31-e4b925b3cd41",
   "status": "active",
   "scope": "Local read-only module and evidence; live trading excluded",
-  "updatedAt": "2026-10-26T16:01:47.576167+00:00",
+  "updatedAt": "2026-10-26T16:13:12.079518+00:00",
   "tasks": [
     {
       "id": "E1",
@@ -153,6 +153,24 @@
         "SIP access not entitled; requires account subscription change by user",
         "IEX only; observed TSLA380/395.89spread rejected by existing guard",
         "Quote sizes use configured100shares/roundlot per docs; live test is not independent unit verification"
+      ]
+    },
+    {
+      "id": "E11",
+      "title": "Verify existing tastytrade account quote and DXLink access",
+      "status": "complete",
+      "dependsOn": [
+        "E10"
+      ],
+      "evidence": [
+        "scripts/smoke-tastytrade-market-data.ts",
+        "docs/tastytrade-feed-observation.md",
+        "logs/tastytrade-feed-check-2026-10-26/analysis.json:198quotes247lasttradestateevents;connectivitypassed"
+      ],
+      "limitations": [
+        "Streaming quote times returnedzero;sourceageunverified",
+        "NBBOentitlement/fees/sizeunitsemanticsnotindependentlyverified",
+        "Maincollectortastytradeadapterstillpending"
       ]
     }
   ],
