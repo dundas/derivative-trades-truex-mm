@@ -3,7 +3,7 @@
   "goalThread": "01a15a8b-a217-7ad1-8c31-e4b925b3cd41",
   "status": "active",
   "scope": "Local read-only module and evidence; live trading excluded",
-  "updatedAt": "2026-10-26T15:44:42.713785+00:00",
+  "updatedAt": "2026-10-26T15:53:26.143175+00:00",
   "tasks": [
     {
       "id": "E1",
@@ -134,13 +134,31 @@
         "logs/equity-shadow/book-comparison-2026-10-26/comparison-summary.json:180samples/symbol;rawcomparisonlabelledunverified;zeroproposals"
       ],
       "authorization": "User approved directbook observation, USDparity and separation of connection health/quote age"
+    },
+    {
+      "id": "E10",
+      "title": "Alpaca underlying-stock adapter and live verification",
+      "status": "in_progress",
+      "dependsOn": [
+        "E9"
+      ],
+      "evidence": [
+        "config/equity-shadow.alpaca.example.json",
+        "tests/equity-alpaca.test.ts:5adaptertests",
+        "49focusedtests/176assertions;narrowtsc/Bunbuildpassed",
+        "Missingcredentialssubprocessfailsbeforeoutputcreation"
+      ],
+      "blockers": [
+        "User confirms Alpaca account; local key ID and secret awaiting ignored env file",
+        "SIP entitlement and actual NVDA/TSLA quote reception not yet verified"
+      ]
     }
   ],
   "moduleState": "locally_validated",
   "delivery_lifecycle": "active",
   "goalExecution": {
-    "status": "research_unblocked_by_explicit_user_assumption",
-    "remaining": "Verified unit semantics still unresolved for claims of actual equivalence; assumption-based research allowed. Live stock provider selection and current inventory inputs pending."
+    "status": "follow_up_implementation",
+    "nextAction": "Run bounded Alpaca+TrueMarkets observation after user supplies localcredentials; preserve assumption labels"
   },
   "currencyPolicy": {
     "mode": "usd_parity",

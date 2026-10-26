@@ -82,3 +82,21 @@ The CLI additionally observes True Markets DEPTH and TRADE channels and appends 
 The user chose to assume the token tracks the underlying market 1:1 for research. `mapping.mode=market_parity` therefore uses ratio1 for price and size conversion and labels every evaluation `unitAssumption=market_parity`. Existing verification fields stay false. Omit the mode or set `verified` to require the prior documented, fresh unit mapping. This mode does not authorize live trading.
 
 Market-parity research proposals still require verified current inventory, fresh/valid market inputs, active instruments, and all position/capital limits. `eligibleMs` excludes assumed-unit proposals so they cannot be presented as verified normalization evidence. Use a fresh output directory after changing configuration. Current Kraken source symbols remain in the example until a new stock data provider is selected and connected.
+
+## Alpaca underlying-stock source
+
+Use `config/equity-shadow.alpaca.example.json` for NVDA and TSLA underlying equities. It selects consolidated SIP quotes at `wss://stream.data.alpaca.markets/v2/sip`, retains the explicitly approved USD/USDC and market parity assumptions, and observes True Markets depth/trades. An Alpaca account/key with the corresponding data entitlement is required. To research with IEX-only quotes, explicitly change the source URL to `/v2/iex` in a copied config and use a separate output directory; the adapter never silently downgrades a SIP subscription. Endpoint is retained in status.
+
+Fill the git-ignored main-project `.env.alpaca.local` with `APCA_API_KEY_ID` and `APCA_API_SECRET_KEY`. The provided local file is initially empty and mode0600. Config may override environment-variable names, but must not contain credential values. From the feature worktree:
+
+```bash
+bun --env-file=/Users/kefentse/dev_env/true_markets_mm/.env.alpaca.local scripts/run-equity-shadow.ts --config config/equity-shadow.alpaca.example.json --duration-seconds 60 --out logs/equity-shadow/alpaca-smoke
+```
+
+The adapter authenticates, waits for subscription confirmation, parses batched quote frames, and reauthenticates/resubscribes after disconnect. Authentication/entitlement/connection-limit errors stop the source and retain only numeric error codes, not reflected server text or credentials. Missing keys fail before taking an output lock or starting feeds. Only Alpaca's permitted TLS market-data hosts and live/test paths accept the credentials; delayed feeds are rejected.
+
+Alpaca quote `bs`/`as` fields are round lots; `source.quoteUnitsPerLot` converts them to shares per symbol before depth participation limits are applied. The example explicitly uses100 for NVDA and TSLA. Confirm the effective round-lot size when adding symbols or when relevant market conventions change. Trade `s` quantities are retained as delivered shares, without applying the quote lot factor. Stock prices are USD per share.
+
+Local validation:49focusedtests/176assertions, narrowTypeScriptcheck and Bunbuild pass. A subprocess check confirms absent keys cause a nonzero exit before output creation. Live account authentication and actual NVDA/TSLA reception remain pending credentials; local fixture tests are not live-feed evidence.
+
+Sources: [Alpaca real-time stock schemas](https://docs.alpaca.markets/us/docs/real-time-stock-pricing-data), [stream authentication/subscription](https://docs.alpaca.markets/us/docs/streaming-market-data).

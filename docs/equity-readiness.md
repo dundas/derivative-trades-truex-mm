@@ -104,3 +104,7 @@ The user explicitly chose USD≈USDC as the research default. The example sets `
 ## Subsequent user steering: market parity for research
 
 The user authorized a1:1underlying-market/token assumption. The example now sets mapping.mode=market_parity while leaving mapping.verified=false. This removes unit confirmation as a prerequisite for assumption-labelled research output, but does not establish actual token equivalence or pilot readiness. Inventory and stale-input checks still suppress the default configuration. Current underlying-stock provider selection remains pending; no new provider account was created.44focusedtests/152assertions and narrowTypeScriptcheck passed. Assumed proposals do not accrue verified eligibleMs.
+
+## Alpaca adapter prepared
+
+The collector now supports an Alpaca underlying-equity source using the separate `config/equity-shadow.alpaca.example.json` (SIP explicitly selected, NVDA/TSLA, quote lot conversion configured). The original Kraken configuration remains available.49tests/176assertions, narrowTypeScriptcheck and build pass; authentication/subscription/reconnect/round-lot/error-secret-redaction paths have fixture coverage. User confirms an existing Alpaca account. No local credentials were found; an empty ignoredmode0600 env template is prepared and live verification awaits the user populating it. This is an implementation-ready adapter, not a verified live subscription.

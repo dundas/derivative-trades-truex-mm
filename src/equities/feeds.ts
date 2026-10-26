@@ -5,6 +5,7 @@ export interface SocketOptions {
   url: string; connectTimeoutMs: number; silenceTimeoutMs: number;
   reconnectMinMs: number; reconnectMaxMs: number;
   observeActivity?: boolean;
+  alpaca?: {key:string;secret:string;quoteUnitsPerLot:Record<string,number>};
 }
 type Factory = (url: string) => any;
 export class PublicFeed {
@@ -24,10 +25,11 @@ export class PublicFeed {
   private running = false;
   private attempts = 0;
   private lastSourceAt = new Map<string,number>();
+  private authenticated = false;
   private reconnectTimer?: ReturnType<typeof setTimeout>;
   private connectTimer?: ReturnType<typeof setTimeout>;
   private watchdog?: ReturnType<typeof setInterval>;
-  constructor(readonly venue: 'kraken'|'truemarkets', readonly symbols: string[],
+  constructor(readonly venue: 'kraken'|'truemarkets'|'alpaca', readonly symbols: string[],
     private options: SocketOptions,
     private event: (event: any) => void = ()=>{},
     private factory: Factory = url => new WebSocket(url)) {
@@ -36,6 +38,12 @@ export class PublicFeed {
       if (!Number.isFinite(options[field]) || options[field]<=0) throw new Error(`Invalid ${field}`);
     }
     if(options.reconnectMinMs>options.reconnectMaxMs) throw new Error('Reconnect minimum exceeds maximum');
+    if(venue==='alpaca') {
+      const url=new URL(options.url);
+      if(url.protocol!=='wss:' || !['stream.data.alpaca.markets','stream.data.sandbox.alpaca.markets'].includes(url.host) || !['/v2/iex','/v2/sip','/v2/test'].includes(url.pathname) || url.username || url.password || url.search || url.hash) throw new Error('Invalid Alpaca market-data endpoint');
+      if(!options.alpaca?.key || !options.alpaca?.secret)throw new Error('Alpaca market-data credentials required');
+      for(const symbol of symbols)if(!Number.isFinite(options.alpaca.quoteUnitsPerLot[symbol]) || options.alpaca.quoteUnitsPerLot[symbol]<=0)throw new Error('Alpaca quote units per lot required for each symbol');
+    }
   }
   start() {
     if(this.running) return;
@@ -53,7 +61,7 @@ export class PublicFeed {
     this.invalidate('stopped');
   }
   private invalidate(reason: string) {
-    this.connected=false; this.quotes.clear(); this.active.clear(); this.lastSourceAt.clear();
+    this.connected=false; this.authenticated=false; this.quotes.clear(); this.active.clear(); this.lastSourceAt.clear();
     this.event({type:'feed_state',venue:this.venue,connected:false,reason,at:Date.now()});
   }
   private fault(reason: string) {
@@ -75,6 +83,12 @@ export class PublicFeed {
     this.connectTimer=setTimeout(()=>{if(current())this.fault('connect_timeout');},this.options.connectTimeoutMs);
     socket.on('open',()=>{
       if(!current()) return;
+      if(this.venue==='alpaca') {
+        this.lastMessageAt=Date.now();
+        socket.send(JSON.stringify({action:'auth',key:this.options.alpaca!.key,secret:this.options.alpaca!.secret}));
+        // Keep the deadline until authentication and subscription are confirmed.
+        return;
+      }
       clearTimeout(this.connectTimer);
       this.connected=true; this.lastMessageAt=Date.now();
       this.event({type:'feed_state',venue:this.venue,connected:true,at:Date.now()});
@@ -89,6 +103,7 @@ export class PublicFeed {
   ingest(raw: string, receivedAt=Date.now()) {
     let m: any;
     try { m=JSON.parse(raw); } catch { this.fault('malformed_json');return; }
+    if(this.venue==='alpaca') {this.ingestAlpaca(m,receivedAt);return;}
     if (!m || typeof m!=='object' || Array.isArray(m)) {this.fault('malformed_message');return;}
     this.lastMessageAt=receivedAt;
     if (m.success===false || ['ERROR','UNAUTHORIZED'].includes(m.status)) {this.fault('subscription_rejected');return;}
@@ -121,6 +136,37 @@ export class PublicFeed {
         try {if(/^\d+$/.test(d.info?.last_update)) sourceAt=Number(BigInt(d.info.last_update)/1000000n);}catch{}
         this.accept({symbol:d.symbol,bid:Number(d.info?.best_bid?.price),ask:Number(d.info?.best_ask?.price),
           bidSize:Number(d.info?.best_bid?.qty),askSize:Number(d.info?.best_ask?.qty),sourceAt,receivedAt});
+      }
+    }
+  }
+  private ingestAlpaca(messages:any, receivedAt:number) {
+    if(!Array.isArray(messages) || !messages.length) {this.fault('malformed_message');return;}
+    this.lastMessageAt=receivedAt;
+    for(const m of messages) {
+      if(!m || typeof m!=='object' || Array.isArray(m)){this.fault('malformed_message');return;}
+      if(m.T==='error') {
+        // Never retain server-supplied messages: they may reflect credentials.
+        this.event({type:'provider_error',venue:this.venue,code:Number.isInteger(m.code)?m.code:null,at:receivedAt});
+        if([400,401,402,403,404,405,406,409].includes(m.code))this.stop();
+        else this.fault('provider_error');
+        return;
+      }
+      if(m.T==='success' && m.msg==='authenticated') {
+        this.authenticated=true;
+        this.socket?.send(JSON.stringify({action:'subscribe',quotes:this.symbols,trades:this.options.observeActivity?this.symbols:[]}));
+      }
+      if(m.T==='subscription') {
+        if(!this.authenticated || !Array.isArray(m.quotes) || !this.symbols.every(s=>m.quotes.includes(s))) {this.fault('subscription_incomplete');return;}
+        clearTimeout(this.connectTimer);this.connected=true;
+        this.event({type:'feed_state',venue:this.venue,connected:true,at:receivedAt});
+      }
+      if(m.T==='q' && this.connected && this.symbols.includes(m.S)) {
+        const lot=this.options.alpaca!.quoteUnitsPerLot[m.S];
+        this.accept({symbol:m.S,bid:Number(m.bp),ask:Number(m.ap),bidSize:Number(m.bs)*lot,askSize:Number(m.as)*lot,
+          sourceAt:Date.parse(m.t),receivedAt});
+      }
+      if(m.T==='t' && this.connected && this.options.observeActivity && this.symbols.includes(m.S)) {
+        this.event({type:'market_activity',venue:this.venue,at:receivedAt,message:{channel:'TRADE',update:'UPDATE',data:{symbol:m.S,info:{price:m.p,qty:m.s,timestamp:m.t}}}});
       }
     }
   }
