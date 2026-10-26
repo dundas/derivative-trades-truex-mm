@@ -4,8 +4,8 @@ Assessment as of 2026-10-26: **local collection and shadow-evaluation module val
 
 ## Verified implementation and operations
 
-- The public Kraken and True Markets feeds ran locally for both target symbols. The module also subscribes to live USDC/USD rather than assuming parity.
-- The focused suite passed 37 tests/117 assertions. TypeScript checking and Bun builds passed. A separate local same-provider reviewer found two persistence/exclusivity bugs; fixes and regressions passed the follow-up review.
+- The public Kraken and True Markets feeds ran locally for both target symbols. The original observation used live USDC/USD. Following explicit user steering, the example now assumes USD/USDC parity; live FX remains configurable. The original tape is not relabeled as parity evidence.
+- The focused suite passed 40 tests/130 assertions. TypeScript checking and Bun builds passed. A separate local same-provider reviewer found two persistence/exclusivity bugs; fixes and regressions passed the follow-up review.
 - The default configuration suppresses proposals when mappings or inventory are unverified, and on stale, invalid or disconnected inputs. Live smoke runs produced zero proposals. Some valid connections carried stale prices; these intervals did not count as healthy coverage.
 - A bounded local collector completed under `com.dundas.truex-equity-observer`. `logs/equity-shadow/current/status.json` is the current coverage authority. A running process does not prove a completed observation.
 - A 15-minute progress pairing is registered separately. Its last outcome, raw voices and evidence snapshot are under `logs/equity-pairing/latest.json`. It does not authorize trading or complete tasks automatically.
@@ -88,3 +88,15 @@ Machine-readable audit: `logs/equity-shadow/completed-observation-audit.json`. T
 5. Review configured instrument ticks/sizes, quote risk limits, inventory disposition, feed degradation and order reconciliation before a separately authorized pilot. Kraken data access alone does not establish trading or hedging access there.
 
 No messages have been sent to Patrick. This file provides the evidence and questions for that conversation. The separate external Claude source review was not performed after automatic approval rejected private-source transmission; local same-provider review must not be represented as a cross-family release gate.
+
+## Follow-up unit research requested by user
+
+True Markets provides stronger evidence than the earlier summary: its [catalog schema](https://docs.truemarkets.co/api/gateway/list-assets.md) says stock assets quote and execute as ordinary listings, and its [quote schema](https://docs.truemarkets.co/api/gateway/compute-quote.md) defines price per unit of base asset. Combined with current explicit `cefi_instrument` fields, the supported base/quote interpretation is NVDAC quantity with USDC per NVDAC, and TSLAC quantity with USDC per TSLAC. This does not establish shares per token.
+
+The refreshed NVDAC catalog description explicitly states an initial1:1beneficial interest and a share/token ratio that can change with reinvestment, taxes, fees and corporate actions. TSLAC has no description, so do not attribute that text to its record. Both CeFi listings report `settlement=defi`.
+
+Kraken's [FAQ](https://support.kraken.com/articles/xstocks-faq) explicitly relates displayed order quantity to raw token quantity through the multiplier. The [private executions](https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/executions) rebased option distinguishes equity and SPVtoken display. The [public ticker](https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/ticker) still does not explicitly identify that convention for BBO price and size. Applying the multiplier blindly risks double conversion. Source-field convention and fresh target share/token conversion remain unresolved; normalization stays disabled. Full fetched metadata and evidence: `logs/equity-shadow/unit-research-followup.json`.
+
+## User-approved USD/USDC simplification
+
+The user explicitly chose USD≈USDC as the research default. The example sets `fx.mode=usd_parity`; the collector omits the FX subscription and evaluates only source/target market freshness in this mode. Evaluation and feed-status records label the currency assumption. Token/share mapping and inventory verification are unchanged. Live FX mode remains available, and old configurations without an FX policy retain live mode. The old25.2-hour tape retains its original configuration and cannot count as parity-mode coverage.

@@ -60,8 +60,32 @@ test('capital and position limits cannot be exceeded; no naked sells',()=>{
   const r=evaluateShadow(i);expect(r.quotes.some((q:any)=>q.side==='buy')).toBe(false);
   expect(r.quotes.every((q:any)=>q.size<=0.001)).toBe(true);
 });
-test('missing FX is never replaced by a peg assumption',()=>{
+test('live FX mode never silently falls back to parity',()=>{
   const i=fixture();i.fx=undefined as any;expect(evaluateShadow(i).reasons).toContain('fx_missing');
+});
+test('explicit USD parity permits quotes without FX and records the assumption',()=>{
+  const i=fixture();
+  const r=evaluateShadow({...i,fx:undefined,fxPolicy:{mode:'usd_parity'}});
+  expect(r.quotes.length).toBe(2);expect(r.currencyAssumption).toBe('usd_parity');
+  expect(r.reference.bid).toBe(100);expect(r.reference.ask).toBe(101);
+  expect(r.reasons.some((reason:string)=>reason.startsWith('fx_'))).toBe(false);
+  // Parity also ignores an available rate: selecting this mode is deliberate.
+  const changed=evaluateShadow({...i,fx:{...i.fx,bid:0.8,ask:0.9},fxPolicy:{mode:'usd_parity'}});
+  expect(changed.reference).toEqual(r.reference);
+});
+test('parity still applies token conversion and suppresses unverified or stale market inputs',()=>{
+  const i=fixture();i.config.mapping.targetSharesPerToken=2;
+  const r=normalize(i.reference,undefined,i.config.mapping,now,limits,{mode:'usd_parity'});
+  expect('quote' in r).toBe(true);
+  if('quote' in r){expect(r.quote!.bid).toBe(200);expect(r.quote!.bidSize).toBe(5);}
+  i.config.mapping.verified=false;
+  expect(evaluateShadow({...i,fx:undefined,fxPolicy:{mode:'usd_parity'}}).reasons).toContain('mapping_unverified');
+  i.config.mapping.verified=true;i.target.sourceAt=now-16000;
+  expect(evaluateShadow({...i,fx:undefined,fxPolicy:{mode:'usd_parity'}}).reasons).toContain('target_stale');
+});
+test('invalid FX policy fails closed in configuration and evaluator',()=>{
+  expect(()=>validateConfiguration({...example,fx:{mode:'unknown'} as any})).toThrow('Invalid FX mode');
+  expect(evaluateShadow({...fixture(),fxPolicy:{mode:'unknown'} as any}).reasons).toContain('fx_policy_invalid');
 });
 test('configuration rejects unsafe limits and duplicate allocations',()=>{
   const c=structuredClone(example);c.limits.participation=2;expect(()=>validateConfiguration(c)).toThrow();

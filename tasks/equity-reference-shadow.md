@@ -7,7 +7,7 @@ Execution mode: direct (interactive fallback). Planning authority: user instruct
 ## Acceptance
 
 - Public feeds reconnect with bounded backoff, renew subscriptions, invalidate cached quotes on disconnect, and track source and receive timestamps separately. Missing, invalid, stale, or crossed prices suppress shadow proposals.
-- Normalize source token units to target token units and USD to USDC with fresh, explicitly verified multiplier/contract mappings and rate inputs. Never default an unknown multiplier or FX rate to one. Initial unverified mappings collect raw observations but produce suppression records.
+- Normalize source token units to target token units and USD to USDC with fresh, explicitly verified multiplier/contract mappings and rate inputs. Never default an unknown token multiplier to one. User steering on October26 explicitly permits USD/USDC parity as the research default; record that currency assumption and retain configurable live FX mode without silent fallback. Initial unverified mappings collect raw observations but produce suppression records.
 - Configurable spreads, ticks, size, quote capital, and inventory limits. No order-entry, custody, or credential mutations. The module accepts inventory inputs but never assumes it can short.
 - Durable append-only observations plus atomic status/coverage summaries. Coverage measures actual healthy sampling and gaps per symbol, not process uptime, and records market-session coverage in America/New_York.
 - Tests cover disconnect/reconnect, malformed and stale data, normalization, inventory/capital caps, outward tick rounding, and persistence/restart behavior.

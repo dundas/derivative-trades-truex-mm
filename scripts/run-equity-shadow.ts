@@ -25,17 +25,19 @@ const feedOptions={connectTimeoutMs:config.connectTimeoutMs,silenceTimeoutMs:con
   reconnectMinMs:config.reconnectMinMs,reconnectMaxMs:config.reconnectMaxMs};
 let stopping=false;
 const event=(e:any)=>{if(!stopping)recorder.event(e);};
-const kraken=new PublicFeed('kraken',[...config.symbols.map(s=>s.sourceSymbol),'USDC/USD'],{...feedOptions,url:config.krakenUrl},event);
+const fxPolicy=config.fx??{mode:'live'};
+const krakenSymbols=[...config.symbols.map(s=>s.sourceSymbol),...(fxPolicy.mode==='live'?['USDC/USD']:[])];
+const kraken=new PublicFeed('kraken',krakenSymbols,{...feedOptions,url:config.krakenUrl},event);
 const target=new PublicFeed('truemarkets',config.symbols.map(s=>s.symbol),{...feedOptions,url:config.trueMarketsUrl},event);
 const health=()=>({kraken:{connected:kraken.connected,lastMessageAt:kraken.lastMessageAt,reconnects:kraken.reconnects},
-  truemarkets:{connected:target.connected,lastMessageAt:target.lastMessageAt,reconnects:target.reconnects}});
+  truemarkets:{connected:target.connected,lastMessageAt:target.lastMessageAt,reconnects:target.reconnects},currencyAssumption:fxPolicy.mode});
 function sample() {
   const now=Date.now();
   for(const symbol of config.symbols) {
     const reference=kraken.quotes.get(symbol.sourceSymbol), venue=target.quotes.get(symbol.symbol),fx=kraken.quotes.get('USDC/USD');
-    const inputs={reference,target:venue,fx,sourceConnected:kraken.connected,targetConnected:target.connected,targetActive:target.active.has(symbol.symbol)};
+    const inputs={reference,target:venue,fx,fxPolicy,sourceConnected:kraken.connected,targetConnected:target.connected,targetActive:target.active.has(symbol.symbol)};
     const healthy=kraken.connected && target.connected && inputs.targetActive
-      && [reference,venue,fx].every(q=>!bboProblem(q,now,config.limits));
+      && [reference,venue,...(fxPolicy.mode==='live'?[fx]:[])].every(q=>!bboProblem(q,now,config.limits));
     const result=evaluateShadow({...inputs,config:symbol,limits:config.limits,now});
     recorder.sample(symbol.symbol,now,healthy,result,inputs);
   }

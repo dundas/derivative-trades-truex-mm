@@ -19,6 +19,7 @@ export interface Limits {
   maxQuoteAgeMs: number; maxClockSkewMs: number; maxMappingAgeMs: number;
   maxInventoryAgeMs: number; maxReferenceSpreadBps: number; participation: number;
 }
+export interface FxPolicy { mode: 'live' | 'usd_parity' }
 const positive = (v: number) => Number.isFinite(v) && v > 0;
 const nonnegative = (v: number) => Number.isFinite(v) && v >= 0;
 export function bboProblem(q: Bbo | undefined, now: number, limits: Limits): string | null {
@@ -29,7 +30,8 @@ export function bboProblem(q: Bbo | undefined, now: number, limits: Limits): str
   if (now-q.sourceAt > limits.maxQuoteAgeMs || now-q.receivedAt > limits.maxQuoteAgeMs) return 'stale';
   return null;
 }
-export function validateConfiguration(config: { limits: Limits; symbols: SymbolConfig[] }) {
+export function validateConfiguration(config: { limits: Limits; symbols: SymbolConfig[]; fx?: FxPolicy }) {
+  if (config.fx && !['live','usd_parity'].includes(config.fx.mode)) throw new Error('Invalid FX mode');
   if (!config.symbols?.length) throw new Error('At least one symbol is required');
   for (const [key,value] of Object.entries(config.limits ?? {})) if (!positive(value)) throw new Error(`Invalid limit ${key}`);
   for (const key of ['maxQuoteAgeMs','maxClockSkewMs','maxMappingAgeMs','maxInventoryAgeMs','maxReferenceSpreadBps','participation']) {
@@ -44,15 +46,21 @@ export function validateConfiguration(config: { limits: Limits; symbols: SymbolC
     if (s.minSize > s.quoteSize) throw new Error('minSize exceeds quoteSize');
   }
 }
-export function normalize(reference: Bbo, fx: Bbo, mapping: Mapping, now: number, limits: Limits) {
-  for (const [name,q] of [['reference',reference],['fx',fx]] as const) {
+export function normalize(reference: Bbo, fx: Bbo | undefined, mapping: Mapping, now: number, limits: Limits,
+  policy: FxPolicy = {mode:'live'}) {
+  if (!['live','usd_parity'].includes(policy.mode)) return {reason:'fx_policy_invalid'} as const;
+  const quotes: [string,Bbo|undefined][]=[['reference',reference]];
+  if(policy.mode==='live') quotes.push(['fx',fx]);
+  for (const [name,q] of quotes) {
     const problem=bboProblem(q,now,limits); if(problem) return {reason:`${name}_${problem}`} as const;
   }
+  if(policy.mode==='live' && fx!.symbol!=='USDC/USD') return {reason:'symbol_mismatch'} as const;
   if (!mapping.verified || !mapping.evidence?.trim() || !mapping.sourceToken || !mapping.targetToken) return {reason:'mapping_unverified'} as const;
   if (!positive(mapping.verifiedAt) || mapping.verifiedAt > now+limits.maxClockSkewMs || now-mapping.verifiedAt > limits.maxMappingAgeMs) return {reason:'mapping_stale'} as const;
   if (![mapping.sourceSharesPerToken,mapping.targetSharesPerToken].every(positive)) return {reason:'mapping_invalid'} as const;
   const ratio=mapping.targetSharesPerToken/mapping.sourceSharesPerToken;
-  const bid=reference.bid*ratio/fx.ask, ask=reference.ask*ratio/fx.bid;
+  const fxBid=policy.mode==='usd_parity'?1:fx!.bid, fxAsk=policy.mode==='usd_parity'?1:fx!.ask;
+  const bid=reference.bid*ratio/fxAsk, ask=reference.ask*ratio/fxBid;
   if (![bid,ask].every(positive) || bid>=ask) return {reason:'normalized_price_invalid'} as const;
   if ((ask-bid)/((ask+bid)/2)*10000 > limits.maxReferenceSpreadBps) return {reason:'reference_spread_excessive'} as const;
   return {quote:{bid,ask,bidSize:reference.bidSize/ratio,askSize:reference.askSize/ratio,ratio}} as const;
@@ -63,22 +71,27 @@ export const up = (value: number, step: number) => Math.ceil(value/step)*step;
 
 export function evaluateShadow(input: {
   config: SymbolConfig; limits: Limits; reference?: Bbo; target?: Bbo; fx?: Bbo;
+  fxPolicy?: FxPolicy;
   sourceConnected: boolean; targetConnected: boolean; targetActive: boolean; now: number;
 }) {
   const {config:c,limits,now}=input;
   const reasons: string[]=[];
-  const result: any={symbol:c.symbol,at:now,mode:'shadow',reasons,quotes:[]};
+  const fxPolicy=input.fxPolicy??{mode:'live'};
+  const result: any={symbol:c.symbol,at:now,mode:'shadow',currencyAssumption:fxPolicy.mode,reasons,quotes:[]};
+  if (!['live','usd_parity'].includes(fxPolicy.mode)) {reasons.push('fx_policy_invalid');return result;}
   if (!input.sourceConnected) reasons.push('source_disconnected');
   if (!input.targetConnected) reasons.push('target_disconnected');
   if (!input.targetActive) reasons.push('target_not_active');
-  for (const [name,q] of [['reference',input.reference],['target',input.target],['fx',input.fx]] as const) {
+  const quotes: [string,Bbo|undefined][]=[['reference',input.reference],['target',input.target]];
+  if(fxPolicy.mode==='live')quotes.push(['fx',input.fx]);
+  for (const [name,q] of quotes) {
     const problem=bboProblem(q,now,limits); if(problem) reasons.push(`${name}_${problem}`);
   }
   if(reasons.length) return result;
-  if (input.reference!.symbol!==c.sourceSymbol || input.target!.symbol!==c.symbol || input.fx!.symbol!=='USDC/USD') {
+  if (input.reference!.symbol!==c.sourceSymbol || input.target!.symbol!==c.symbol || (fxPolicy.mode==='live' && input.fx!.symbol!=='USDC/USD')) {
     reasons.push('symbol_mismatch'); return result;
   }
-  const normalized=normalize(input.reference!,input.fx!,c.mapping,now,limits);
+  const normalized=normalize(input.reference!,input.fx,c.mapping,now,limits,fxPolicy);
   if('reason' in normalized) { reasons.push(normalized.reason!); return result; }
   result.reference=normalized.quote;
   const inv=c.inventory;

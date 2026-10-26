@@ -1,5 +1,6 @@
 {
   "mode": "shadow",
+  "fx": {"mode":"usd_parity"},
   "krakenUrl": "wss://ws.kraken.com/v2",
   "trueMarketsUrl": "wss://api.truemarkets.co/v1/cefi/market",
   "sampleMs": 1000,

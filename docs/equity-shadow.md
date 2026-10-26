@@ -1,6 +1,6 @@
 # Local equity reference and shadow quotes
 
-This standalone module observes Kraken NVDAx/USD and TSLAx/USD alongside True Markets NVDAC-USDC and TSLAC-USDC. It does not import or start the live market maker. Both feeds are public; no account credentials are needed. Its output is an observation or proposed quote record, never an exchange order.
+This standalone module observes Kraken NVDAx/USD and TSLAx/USD alongside True Markets NVDAC-USDC and TSLAC-USDC. It does not import or start the live market maker. Both feeds are public; no account credentials are needed. The example uses the user-approved USD/USDC parity assumption (`fx.mode: "usd_parity"`). Its output is an observation or proposed quote record, never an exchange order.
 
 ## Run
 
@@ -25,9 +25,10 @@ If a source quote is USD per source token, normalization is:
 ratio = target shares per token / source shares per token
 target-token bid in USDC = source bid × ratio / USDC-USD ask
 target-token ask in USDC = source ask × ratio / USDC-USD bid
+In usd_parity mode both FX divisors are 1.
 ```
 
-Some venues may present rebased/per-share prices. Verify that contract before choosing a multiplier. Kraken's `Assets` endpoint currently exposes `token_multiplier`; Coinbase's tokenized-stock endpoint exposes `multiplier`. Neither field alone proves price-unit equivalence or True Markets' exact contract mapping. Unknown values never default to one. Live Kraken `USDC/USD` supplies both FX sides; no fixed peg is assumed.
+Some venues may present rebased/per-share prices. Verify that contract before choosing a multiplier. Kraken's `Assets` endpoint currently exposes `token_multiplier`; Coinbase's tokenized-stock endpoint exposes `multiplier`. Neither field alone proves price-unit equivalence or True Markets' exact contract mapping. Unknown values never default to one. Set `fx.mode` to `live` to use Kraken `USDC/USD` bid/ask rates. Missing FX configuration retains this live behavior for compatibility; live mode never falls back to parity. The example explicitly selects `usd_parity` at the user’s request: USD and USDC are treated as 1:1, no FX subscription or FX freshness check is required, and every evaluation records `currencyAssumption: "usd_parity"`. This is a research assumption, not a measured exchange rate.
 
 Provide a verified, timestamped inventory snapshot. `availableQuote` is the capital allocated to **that symbol**, not a full account balance repeated for every symbol. Keep the sum of per-symbol allocations within the account's free quote balance. `availableBase` and `positionBase` limit selling to held tokens; there is no shorting or automatic balance refresh. An inventory snapshot expires according to `maxInventoryAgeMs`, so this version does not support unattended proposal generation from a static balance snapshot.
 
@@ -35,7 +36,7 @@ Use a new output directory when changing configuration; its hash prevents poolin
 
 ## Safety and observations
 
-- Both source and receive timestamps must be fresh; transport heartbeats do not refresh a quote's age. Invalid, missing, crossed, out-of-order or disconnected data is invalidated or suppressed.
+- Both source and receive timestamps for the required market inputs must be fresh; transport heartbeats do not refresh a quote's age. Invalid, missing, crossed, out-of-order or disconnected data is invalidated or suppressed.
 - True Markets instruments must report ACTIVE. Proposed buys stay below the target ask and sells above the target bid; prices round outward. Size is capped by reference liquidity participation, per-symbol capital and inventory limits.
 - Each run appends `observations-<run-id>.jsonl`, retaining consumed BBO inputs, proposals and suppression reasons. `status.json` is atomically replaced.
 - Coverage counts only intervals bounded by healthy samples within `maxSampleGapMs`. Restart downtime and unhealthy intervals are gaps. `eligibleMs` additionally requires proposals from verified inputs. Process uptime does not count as healthy coverage.
