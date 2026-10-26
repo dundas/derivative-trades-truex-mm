@@ -25,3 +25,7 @@ Use Kraken public v2 BBO ticker (avoid implementing a second full L2 book) and T
 ## Exclusions and external gaps
 
 No live orders, fund movements, borrowing, deployment, credential changes or messages to Patrick. WebSocket DROPCOPY currently rejects the documented client-ID format; FIX heartbeats omit TestReqID. Neither prevents a public, read-only collector. Token multiplier and contract equivalence must be verified before normalized shadow quotes; do not guess.
+
+## User steering: research assumptions
+
+The user subsequently authorized underlying-market parity as well as USD/USDC parity. Research may use explicit mapping.mode=market_parity with a1:1unit ratio; it must not claim verified equivalence. Connection, freshness, inventory and quote limits remain required. Assumed-unit proposals do not count as verified normalized evidence. Original raw observations retain their original configuration and interpretation.

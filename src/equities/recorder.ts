@@ -65,7 +65,8 @@ export class ObservationRecorder {
   event(record: any) { appendFileSync(this.eventsPath,JSON.stringify(record)+'\n'); }
   sample(symbol: string, at: number, healthy: boolean, evaluation: any, inputs: any) {
     const c=this.state.coverage[symbol]; if(!c)throw new Error('Unconfigured sample symbol');
-    const eligible=healthy && evaluation.quotes.length>0;
+    // Assumption-based proposals are research output, not verified unit evidence.
+    const eligible=healthy && evaluation.quotes.length>0 && evaluation.unitAssumption!=='market_parity';
     const last=this.previous.get(symbol);
     if(last) {
       const dt=at-last.at;

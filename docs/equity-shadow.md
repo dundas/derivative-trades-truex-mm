@@ -13,7 +13,7 @@ bun scripts/run-equity-shadow.ts --config config/equity-shadow.example.json --du
 
 `--duration-seconds` defaults to 60 and accepts a positive value up to seven days. For a longer raw observation, use 86400 and a new output directory. SIGINT/SIGTERM stop the feeds, save status, and release the output lock. Concurrent collectors cannot share an output directory. Dead-owner lock recovery is serialized; an abandoned `collector.acquire` directory requires explicit inspection before removal.
 
-The example is **unverified and suppression-only**. Do not mark a mapping verified to make a smoke run pass. The sample tick/size/limit settings are illustrative research settings, not exchange-certified trading parameters.
+The example uses explicit user-approved `mapping.mode: "market_parity"` and USD/USDC parity. It assumes one source unit equals one target token for research; this is not verified equivalence. Inventory remains unverified, so the example still suppresses proposals. Do not mark a mapping or inventory verified to make a smoke run pass. The sample tick/size/limit settings are illustrative research settings, not exchange-certified trading parameters.
 
 ## Enable research proposals with verified inputs
 
@@ -76,3 +76,9 @@ Each sample now retains `sourceHealth` and `targetHealth`: connection flag, last
 The CLI additionally observes True Markets DEPTH and TRADE channels and appends raw `market_activity` events, including snapshot/update markers. Consumers must exclude trade snapshots from live execution counts. Depth updates are retained as received; this module does not assume undocumented replacement/deletion semantics or reconstruct an L2 book. Heartbeat receipt events are retained so connection activity can be inspected later.
 
 `inputs.rawComparison` records numeric midpoint difference and spreads when both BBOs exist. It carries the currency assumption and freshness flag. These comparisons deliberately ignore unverified token conversion and are diagnostic only, never normalized fair value or executable arbitrage signals. `healthyMs` retains its stricter fresh-input definition; live-but-old quotes are visible separately rather than counted healthy.
+
+## User-approved market parity
+
+The user chose to assume the token tracks the underlying market 1:1 for research. `mapping.mode=market_parity` therefore uses ratio1 for price and size conversion and labels every evaluation `unitAssumption=market_parity`. Existing verification fields stay false. Omit the mode or set `verified` to require the prior documented, fresh unit mapping. This mode does not authorize live trading.
+
+Market-parity research proposals still require verified current inventory, fresh/valid market inputs, active instruments, and all position/capital limits. `eligibleMs` excludes assumed-unit proposals so they cannot be presented as verified normalization evidence. Use a fresh output directory after changing configuration. Current Kraken source symbols remain in the example until a new stock data provider is selected and connected.

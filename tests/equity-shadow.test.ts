@@ -11,10 +11,19 @@ function fixture() {
   return {config,limits,now,reference:quote(config.sourceSymbol),target:{...quote(config.symbol),bid:99,ask:102},
     fx:{...quote('USDC/USD'),bid:0.9999,ask:1.0001},sourceConnected:true,targetConnected:true,targetActive:true};
 }
-test('example config collects raw observations but cannot propose quotes',()=>{
+test('example config still requires inventory despite authorized parity assumptions',()=>{
   validateConfiguration(example);
   const input=fixture();input.config=structuredClone(example.symbols[0]);
-  const r=evaluateShadow(input);expect(r.quotes).toEqual([]);expect(r.reasons).toContain('mapping_unverified');
+  const r=evaluateShadow(input);expect(r.quotes).toEqual([]);expect(r.reasons).toContain('inventory_unverified');
+});
+test('explicit market parity uses ratio one without asserting mapping verification',()=>{
+  const i=fixture();i.config.mapping={...i.config.mapping,mode:'market_parity',verified:false,sourceSharesPerToken:0,targetSharesPerToken:0} as any;
+  const r=evaluateShadow({...i,fx:undefined,fxPolicy:{mode:'usd_parity'}});
+  expect(r.reference.bid).toBe(100);expect(r.reference.bidSize).toBe(10);
+  expect(r.unitAssumption).toBe('market_parity');expect(r.quotes.length).toBe(2);
+  expect(i.config.mapping.verified).toBe(false);
+  i.config.inventory.verified=false;
+  expect(evaluateShadow({...i,fx:undefined,fxPolicy:{mode:'usd_parity'}}).reasons).toContain('inventory_unverified');
 });
 test('normalization uses token ratio and conservative USD/USDC sides',()=>{
   const i=fixture();i.config.mapping.targetSharesPerToken=2;

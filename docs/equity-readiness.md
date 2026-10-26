@@ -100,3 +100,7 @@ Kraken's [FAQ](https://support.kraken.com/articles/xstocks-faq) explicitly relat
 ## User-approved USD/USDC simplification
 
 The user explicitly chose USD≈USDC as the research default. The example sets `fx.mode=usd_parity`; the collector omits the FX subscription and evaluates only source/target market freshness in this mode. Evaluation and feed-status records label the currency assumption. Token/share mapping and inventory verification are unchanged. Live FX mode remains available, and old configurations without an FX policy retain live mode. The old25.2-hour tape retains its original configuration and cannot count as parity-mode coverage.
+
+## Subsequent user steering: market parity for research
+
+The user authorized a1:1underlying-market/token assumption. The example now sets mapping.mode=market_parity while leaving mapping.verified=false. This removes unit confirmation as a prerequisite for assumption-labelled research output, but does not establish actual token equivalence or pilot readiness. Inventory and stale-input checks still suppress the default configuration. Current underlying-stock provider selection remains pending; no new provider account was created.44focusedtests/152assertions and narrowTypeScriptcheck passed. Assumed proposals do not accrue verified eligibleMs.

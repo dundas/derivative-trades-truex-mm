@@ -14,13 +14,13 @@
   "symbols": [
     {
       "symbol":"NVDAC-USDC","sourceSymbol":"NVDAx/USD",
-      "mapping":{"verified":false,"verifiedAt":0,"evidence":"","sourceToken":"NVDAx: contract and unit semantics pending verification","targetToken":"NVDAc: True Markets backing/contract pending verification","sourceSharesPerToken":0,"targetSharesPerToken":0},
+      "mapping":{"mode":"market_parity","verified":false,"verifiedAt":0,"evidence":"","sourceToken":"NVDAx: contract and unit semantics pending verification","targetToken":"NVDAc: True Markets backing/contract pending verification","sourceSharesPerToken":0,"targetSharesPerToken":0},
       "inventory":{"verified":false,"at":0,"availableBase":0,"availableQuote":0,"positionBase":0},
       "tickSize":0.01,"sizeStep":0.001,"quoteSize":0.005,"minSize":0.001,"maxPosition":0.05,"quoteBudget":5,"bufferBps":10,"inventorySkewBps":10
     },
     {
       "symbol":"TSLAC-USDC","sourceSymbol":"TSLAx/USD",
-      "mapping":{"verified":false,"verifiedAt":0,"evidence":"","sourceToken":"TSLAx: contract and unit semantics pending verification","targetToken":"TSLAc: True Markets backing/contract pending verification","sourceSharesPerToken":0,"targetSharesPerToken":0},
+      "mapping":{"mode":"market_parity","verified":false,"verifiedAt":0,"evidence":"","sourceToken":"TSLAx: contract and unit semantics pending verification","targetToken":"TSLAc: True Markets backing/contract pending verification","sourceSharesPerToken":0,"targetSharesPerToken":0},
       "inventory":{"verified":false,"at":0,"availableBase":0,"availableQuote":0,"positionBase":0},
       "tickSize":0.01,"sizeStep":0.001,"quoteSize":0.005,"minSize":0.001,"maxPosition":0.05,"quoteBudget":5,"bufferBps":10,"inventorySkewBps":10
     }

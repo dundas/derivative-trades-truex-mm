@@ -4,6 +4,16 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ObservationRecorder, sessionBand, acquireOutputLock } from '../src/equities/recorder';
 const result={quotes:[],reasons:['mapping_unverified']};
+test('market-parity proposals do not count as verified normalization evidence',()=>{
+  const out=mkdtempSync(join(tmpdir(),'equity-assumed-'));
+  try {
+    const r=new ObservationRecorder(out,['NVDA'],2500,'assumed');
+    const assumed={quotes:[{side:'buy',price:100,size:1}],reasons:[],unitAssumption:'market_parity'};
+    r.sample('NVDA',10000,true,assumed,{});r.sample('NVDA',11000,true,assumed,{});
+    const c=r.save(11000,{},24).coverage.NVDA;
+    expect(c.healthyMs).toBe(1000);expect(c.proposals).toBe(2);expect(c.eligibleMs).toBe(0);
+  } finally {rmSync(out,{recursive:true});}
+});
 test('coverage excludes unhealthy samples, long gaps and restart downtime',()=>{
   const out=mkdtempSync(join(tmpdir(),'equity-observations-'));
   try {

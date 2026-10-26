@@ -3,6 +3,7 @@ export interface Bbo {
   sourceAt: number; receivedAt: number;
 }
 export interface Mapping {
+  mode?: 'verified' | 'market_parity';
   verified: boolean; verifiedAt: number; evidence: string;
   sourceToken: string; targetToken: string;
   sourceSharesPerToken: number; targetSharesPerToken: number;
@@ -41,6 +42,7 @@ export function validateConfiguration(config: { limits: Limits; symbols: SymbolC
   if (new Set(config.symbols.map(s=>s.symbol)).size !== config.symbols.length) throw new Error('Duplicate target symbols');
   for (const s of config.symbols) {
     if (!s.symbol || !s.sourceSymbol || !s.mapping || !s.inventory) throw new Error('Incomplete symbol configuration');
+    if(s.mapping.mode && !['verified','market_parity'].includes(s.mapping.mode)) throw new Error('Invalid mapping mode');
     for (const key of ['tickSize','sizeStep','quoteSize','minSize','maxPosition']) if (!positive(s[key])) throw new Error(`Invalid ${s.symbol}.${key}`);
     for (const key of ['quoteBudget','bufferBps','inventorySkewBps']) if (!nonnegative(s[key])) throw new Error(`Invalid ${s.symbol}.${key}`);
     if (s.minSize > s.quoteSize) throw new Error('minSize exceeds quoteSize');
@@ -55,10 +57,14 @@ export function normalize(reference: Bbo, fx: Bbo | undefined, mapping: Mapping,
     const problem=bboProblem(q,now,limits); if(problem) return {reason:`${name}_${problem}`} as const;
   }
   if(policy.mode==='live' && fx!.symbol!=='USDC/USD') return {reason:'symbol_mismatch'} as const;
-  if (!mapping.verified || !mapping.evidence?.trim() || !mapping.sourceToken || !mapping.targetToken) return {reason:'mapping_unverified'} as const;
-  if (!positive(mapping.verifiedAt) || mapping.verifiedAt > now+limits.maxClockSkewMs || now-mapping.verifiedAt > limits.maxMappingAgeMs) return {reason:'mapping_stale'} as const;
-  if (![mapping.sourceSharesPerToken,mapping.targetSharesPerToken].every(positive)) return {reason:'mapping_invalid'} as const;
-  const ratio=mapping.targetSharesPerToken/mapping.sourceSharesPerToken;
+  if(mapping.mode && !['verified','market_parity'].includes(mapping.mode)) return {reason:'mapping_invalid'} as const;
+  const assumed=mapping.mode==='market_parity';
+  if (!assumed) {
+    if (!mapping.verified || !mapping.evidence?.trim() || !mapping.sourceToken || !mapping.targetToken) return {reason:'mapping_unverified'} as const;
+    if (!positive(mapping.verifiedAt) || mapping.verifiedAt > now+limits.maxClockSkewMs || now-mapping.verifiedAt > limits.maxMappingAgeMs) return {reason:'mapping_stale'} as const;
+    if (![mapping.sourceSharesPerToken,mapping.targetSharesPerToken].every(positive)) return {reason:'mapping_invalid'} as const;
+  }
+  const ratio=assumed?1:mapping.targetSharesPerToken/mapping.sourceSharesPerToken;
   const fxBid=policy.mode==='usd_parity'?1:fx!.bid, fxAsk=policy.mode==='usd_parity'?1:fx!.ask;
   const bid=reference.bid*ratio/fxAsk, ask=reference.ask*ratio/fxBid;
   if (![bid,ask].every(positive) || bid>=ask) return {reason:'normalized_price_invalid'} as const;
@@ -77,7 +83,8 @@ export function evaluateShadow(input: {
   const {config:c,limits,now}=input;
   const reasons: string[]=[];
   const fxPolicy=input.fxPolicy??{mode:'live'};
-  const result: any={symbol:c.symbol,at:now,mode:'shadow',currencyAssumption:fxPolicy.mode,reasons,quotes:[]};
+  const result: any={symbol:c.symbol,at:now,mode:'shadow',currencyAssumption:fxPolicy.mode,
+    unitAssumption:c.mapping.mode==='market_parity'?'market_parity':'verified_mapping_required',reasons,quotes:[]};
   if (!['live','usd_parity'].includes(fxPolicy.mode)) {reasons.push('fx_policy_invalid');return result;}
   if (!input.sourceConnected) reasons.push('source_disconnected');
   if (!input.targetConnected) reasons.push('target_disconnected');

@@ -3,7 +3,7 @@
   "goalThread": "01a15a8b-a217-7ad1-8c31-e4b925b3cd41",
   "status": "active",
   "scope": "Local read-only module and evidence; live trading excluded",
-  "updatedAt": "2026-10-26T15:38:57.614830+00:00",
+  "updatedAt": "2026-10-26T15:44:42.713785+00:00",
   "tasks": [
     {
       "id": "E1",
@@ -139,17 +139,19 @@
   "moduleState": "locally_validated",
   "delivery_lifecycle": "active",
   "goalExecution": {
-    "status": "blocked",
-    "checkedAt": "2026-10-26T14:37:17.174535+00:00",
-    "reason": "Authoritative public BBO price denominator and quantity units remain unverified for the source/target mapping.",
-    "audit": "Fresh resumed audit: same blocker confirmed in resumed completed-tape audit, current primary-documentation check, and this final state check. No venue clarification arrived.",
-    "independentWorkComplete": "Completed raw observation audited, source quote ages analyzed, local implementation tested, readiness decision and unit-evidence matrix saved.",
-    "backgroundWork": "Collector completed normally. Requested15-minute pairing schedule remains active; top-level ledger status is active solely to preserve those ticks.",
-    "resumeWith": "Primary source or written venue confirmation of public price and size units, corporate-action effects, and effective multiplier convention for both source and target instruments."
+    "status": "research_unblocked_by_explicit_user_assumption",
+    "remaining": "Verified unit semantics still unresolved for claims of actual equivalence; assumption-based research allowed. Live stock provider selection and current inventory inputs pending."
   },
   "currencyPolicy": {
     "mode": "usd_parity",
     "authorization": "User explicitly requested USD default treating USD and USDC as approximately equal",
     "historicalObservation": "Original25.2hour tape usedliveFX;notparitycoverage"
+  },
+  "researchUnitPolicy": {
+    "mode": "market_parity",
+    "authorization": "User: lets assume that its the same as market",
+    "ratio": 1,
+    "verifiedEquivalence": false,
+    "nextAction": "Select and connect an underlying stock quote provider; use assumption labels for research"
   }
 }
