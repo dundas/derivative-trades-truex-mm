@@ -108,3 +108,11 @@ The user authorized a1:1underlying-market/token assumption. The example now sets
 ## Alpaca adapter prepared
 
 The collector now supports an Alpaca underlying-equity source using the separate `config/equity-shadow.alpaca.example.json` (SIP explicitly selected, NVDA/TSLA, quote lot conversion configured). The original Kraken configuration remains available.49tests/176assertions, narrowTypeScriptcheck and build pass; authentication/subscription/reconnect/round-lot/error-secret-redaction paths have fixture coverage. User confirms an existing Alpaca account. No local credentials were found; an empty ignoredmode0600 env template is prepared and live verification awaits the user populating it. This is an implementation-ready adapter, not a verified live subscription.
+
+## Alpaca live validation after local key setup
+
+The user populated the ignored0600 local key file; no credentials were displayed or copied to tracked files. Two bounded60second tests completed normally. SIP returned409(insufficientsubscription), so it delivered no quotes. A separately configured IEX connection authenticated and subscribed, with no provider errors or reconnects.
+
+IEX delivered109NVDA trade messages and26TSLA trade messages. NVDA appeared in59/60sampled reference snapshots (59distinct quote times);TSLA56/60(10distinct quote times). True Markets was observed concurrently. The final NVDA quote was215.52/215.55;TSLA380/395.89. TSLA's wide spread triggered reference_spread_excessive; existing safeguards were retained. Zeroproposalswereemitted. Snapshot sizes use the documented round-lot fields and configured100shares/lot conversion; this test does not independently verify quote-size units.
+
+Conclusion: the adapter and credentials work on IEX. IEX is not consolidated NBBO and this sample does not establish adequate reference quality, particularly for Tesla. SIP requires a user account entitlement change; none was made. Keep SIP and IEX datasets/configurations separate. Evidence: `logs/equity-shadow/alpaca-live-validation.json`.

@@ -100,3 +100,5 @@ Alpaca quote `bs`/`as` fields are round lots; `source.quoteUnitsPerLot` converts
 Local validation:49focusedtests/176assertions, narrowTypeScriptcheck and Bunbuild pass. A subprocess check confirms absent keys cause a nonzero exit before output creation. Live account authentication and actual NVDA/TSLA reception remain pending credentials; local fixture tests are not live-feed evidence.
 
 Sources: [Alpaca real-time stock schemas](https://docs.alpaca.markets/us/docs/real-time-stock-pricing-data), [stream authentication/subscription](https://docs.alpaca.markets/us/docs/streaming-market-data).
+
+Live validation now completed: SIP rejected409insufficientsubscription, while a separately configured IEX60secondrun deliveredNVDA/TSLAquotes and109/26trade messages with no reconnects. IEXTSLA380/395.89was rejected by the existing spread guard. See readiness and logs/equity-shadow/alpaca-live-validation.json; IEX success is not SIP entitlement or fullmarket pricing validation.

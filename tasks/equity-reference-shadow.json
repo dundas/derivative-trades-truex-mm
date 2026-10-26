@@ -3,7 +3,7 @@
   "goalThread": "01a15a8b-a217-7ad1-8c31-e4b925b3cd41",
   "status": "active",
   "scope": "Local read-only module and evidence; live trading excluded",
-  "updatedAt": "2026-10-26T15:53:26.143175+00:00",
+  "updatedAt": "2026-10-26T16:01:47.576167+00:00",
   "tasks": [
     {
       "id": "E1",
@@ -137,8 +137,8 @@
     },
     {
       "id": "E10",
-      "title": "Alpaca underlying-stock adapter and live verification",
-      "status": "in_progress",
+      "title": "Alpaca underlying-stock adapter and IEX live verification",
+      "status": "complete",
       "dependsOn": [
         "E9"
       ],
@@ -146,19 +146,21 @@
         "config/equity-shadow.alpaca.example.json",
         "tests/equity-alpaca.test.ts:5adaptertests",
         "49focusedtests/176assertions;narrowtsc/Bunbuildpassed",
-        "Missingcredentialssubprocessfailsbeforeoutputcreation"
+        "Missingcredentialssubprocessfailsbeforeoutputcreation",
+        "logs/equity-shadow/alpaca-live-validation.json:SIP409insufficientsubscription;IEXactualNVDA/TSLAquotes,trades,noerrors/reconnects"
       ],
-      "blockers": [
-        "User confirms Alpaca account; local key ID and secret awaiting ignored env file",
-        "SIP entitlement and actual NVDA/TSLA quote reception not yet verified"
+      "limitations": [
+        "SIP access not entitled; requires account subscription change by user",
+        "IEX only; observed TSLA380/395.89spread rejected by existing guard",
+        "Quote sizes use configured100shares/roundlot per docs; live test is not independent unit verification"
       ]
     }
   ],
   "moduleState": "locally_validated",
   "delivery_lifecycle": "active",
   "goalExecution": {
-    "status": "follow_up_implementation",
-    "nextAction": "Run bounded Alpaca+TrueMarkets observation after user supplies localcredentials; preserve assumption labels"
+    "status": "live_iex_validated",
+    "remaining": "ConsolidatedSIP entitlement unavailable; observed IEX TSLA quotes too wide for configuredreferenceguard. Inventory remainsunverified. No unattendedproposalsauthorized."
   },
   "currencyPolicy": {
     "mode": "usd_parity",
