@@ -34,19 +34,28 @@ const tastytrade=sourceConfig.venue==='tastytrade'?{
   clientSecret:process.env[sourceConfig.clientSecretEnv??'TASTYTRADE_CLIENT_SECRET']??'',
   refreshToken:process.env[sourceConfig.refreshTokenEnv??'TASTYTRADE_REFRESH_TOKEN']??'',
   pollMs:sourceConfig.pollMs,requestTimeoutMs:sourceConfig.requestTimeoutMs,
-  silenceTimeoutMs:config.silenceTimeoutMs,retryMaxMs:sourceConfig.retryMaxMs,
+  silenceTimeoutMs:sourceConfig.silenceTimeoutMs??config.silenceTimeoutMs,retryMaxMs:sourceConfig.retryMaxMs,
   quoteSizeMultiplier:sourceConfig.quoteSizeMultiplier,
 }:undefined;
 if(tastytrade&&(!tastytrade.clientSecret||!tastytrade.refreshToken))throw new Error('Set tastytrade OAuth environment credentials before running');
+const sampleOnPoll=sourceConfig.sampleOnPoll===true;
+if(sampleOnPoll&&(!tastytrade||config.sampleMs!==sourceConfig.pollMs))throw new Error('Poll-triggered sampling requires a matching tastytrade poll/sample interval');
 const releaseLock=acquireOutputLock(out);
 const hash=createHash('sha256').update(JSON.stringify(config)).digest('hex');
 let recorder: ObservationRecorder;
-try {recorder=new ObservationRecorder(out,config.symbols.map(s=>s.symbol),config.maxSampleGapMs,hash);}
+const creditedGapMs=sampleOnPoll?Math.min(config.maxSampleGapMs,config.limits.maxQuoteAgeMs):config.maxSampleGapMs;
+try {recorder=new ObservationRecorder(out,config.symbols.map(s=>s.symbol),creditedGapMs,hash);}
 catch(error){releaseLock();throw error;}
 const feedOptions={connectTimeoutMs:config.connectTimeoutMs,silenceTimeoutMs:config.silenceTimeoutMs,
   reconnectMinMs:config.reconnectMinMs,reconnectMaxMs:config.reconnectMaxMs};
 let stopping=false;
-const event=(e:any)=>{if(!stopping)recorder.event(e);};
+const event=(e:any)=>{
+  if(stopping)return;
+  recorder.event(e);
+  if(sampleOnPoll&&e.type==='quote_poll'){
+    try{sample();}catch(error){console.error(error);stop(true);}
+  }
+};
 const sourceSymbols=[...config.symbols.map(s=>s.sourceSymbol),...(fxPolicy.mode==='live'?['USDC/USD']:[])];
 let sourceFeed:PublicFeed|TastytradeFeed,target:PublicFeed;
 try {
@@ -56,7 +65,7 @@ target=new PublicFeed('truemarkets',config.symbols.map(s=>s.symbol),{...feedOpti
 } catch(error){releaseLock();throw error;}
 const health=()=>({[sourceConfig.venue]:{connected:sourceFeed.connected,lastMessageAt:sourceFeed.lastMessageAt,reconnects:sourceFeed.reconnects,
   endpoint:sourceConfig.venue!=='kraken'?sourceConfig.url:config.krakenUrl},
-  truemarkets:{connected:target.connected,lastMessageAt:target.lastMessageAt,reconnects:target.reconnects},currencyAssumption:fxPolicy.mode});
+  truemarkets:{connected:target.connected,lastMessageAt:target.lastMessageAt,reconnects:target.reconnects},currencyAssumption:fxPolicy.mode,sampling:{mode:sampleOnPoll?'poll_completed_checks':'interval',intervalMs:config.sampleMs,maxCreditedGapMs:creditedGapMs}});
 function sample() {
   const now=Date.now();
   for(const symbol of config.symbols) {
@@ -91,7 +100,7 @@ function stop(failed=false) {
 }
 process.on('SIGINT',()=>stop());process.on('SIGTERM',()=>stop());
 try {
-  sourceFeed.start();target.start();sample();
-  timer=setInterval(()=>{try{sample();}catch(error){console.error(error);stop(true);}},config.sampleMs);
+  sourceFeed.start();target.start();if(!sampleOnPoll)sample();
+  if(!sampleOnPoll)timer=setInterval(()=>{try{sample();}catch(error){console.error(error);stop(true);}},config.sampleMs);
   endTimer=setTimeout(()=>stop(),duration*1000);
 } catch(error) {stop(true);throw error;}

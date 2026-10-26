@@ -4,8 +4,8 @@
     "mode": "usd_parity"
   },
   "trueMarketsUrl": "wss://api.truemarkets.co/v1/cefi/market",
-  "sampleMs": 1000,
-  "maxSampleGapMs": 2500,
+  "sampleMs": 60000,
+  "maxSampleGapMs": 65000,
   "connectTimeoutMs": 10000,
   "silenceTimeoutMs": 30000,
   "reconnectMinMs": 1000,
@@ -85,9 +85,11 @@
     "clientIdEnv": "TASTYTRADE_CLIENT_ID",
     "clientSecretEnv": "TASTYTRADE_CLIENT_SECRET",
     "refreshTokenEnv": "TASTYTRADE_REFRESH_TOKEN",
-    "pollMs": 5000,
+    "pollMs": 60000,
     "requestTimeoutMs": 5000,
-    "retryMaxMs": 30000,
-    "quoteSizeMultiplier": 1
+    "retryMaxMs": 300000,
+    "quoteSizeMultiplier": 1,
+    "sampleOnPoll": true,
+    "silenceTimeoutMs": 75000
   }
 }

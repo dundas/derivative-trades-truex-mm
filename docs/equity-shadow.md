@@ -118,3 +118,15 @@ The existing sibling credentials are read into process memory without copying th
 DXLink activity can be observed separately with `scripts/smoke-tastytrade-market-data.ts`. Its zero-valued quote-side timestamps are not used in the pricing path. Use the raw Quote/Trade event counts as delivered message counts, not a deduplicated trade tape.
 
 Local checks:57tests/202assertions, narrowTypeScriptcheck and Bunbuild pass, including stale provider timestamp, auth401recovery, halted/missing symbols, stopping in-flight requests, credential-redacted error events and official-host validation.
+
+## Initial once-per-minute cadence
+
+At the user's request, the tastytrade example now sets both polling and comparison to60000ms. `source.sampleOnPoll=true` triggers a comparison immediately after a completed batched REST poll, avoiding a race where a fixed timer compares the previous minute's cached source quote. Requests do not overlap; actual spacing is the60second delay plus request/processing time.
+
+True Markets remains subscribed to its public book and heartbeat channels to maintain the latest venue view. Quote comparisons are recorded once per successful poll. Request failures are logged immediately and invalidate the source; a failed poll does not fabricate a comparison. Existing15second quote freshness rules remain. Source REST silence allowance is75seconds; True Markets' separate transport watchdog stays30seconds. Transient request failures can back off up to5minutes.
+
+This mode is periodic observation, not continuous freshness coverage. Credited interval length is capped by maxQuoteAgeMs(15seconds), so two fresh snapshots a minute apart do not imply a continuously fresh minute. Use sample counts, ages and per-check reasons to assess this run.
+
+Local launchd service `com.dundas.truex-equity-minute-observer` runs the current config for a bounded90000seconds(25hours) per process, with no crash auto-restart. It reads the existing sibling env file by path; no credential values are in its plist. Current authority: `logs/equity-shadow/minute-observer-2026-10-26/status.json`. Stop with `launchctl bootout gui/$(id -u)/com.dundas.truex-equity-minute-observer`. Retain this worktree while the service runs.
+
+A75second validation observed2polls and2comparisons per symbol,60146ms apart. Provider-record ages were50–200ms at the checks. No false continuoushealthytime was credited. The background process was then started and its livePID and first observation verified. The15minute pairing cadence is unchanged.

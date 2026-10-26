@@ -3,7 +3,7 @@
   "goalThread": "01a15a8b-a217-7ad1-8c31-e4b925b3cd41",
   "status": "active",
   "scope": "Local read-only module and evidence; live trading excluded",
-  "updatedAt": "2026-10-26T16:30:53.064982+00:00",
+  "updatedAt": "2026-10-26T16:39:44.665690+00:00",
   "tasks": [
     {
       "id": "E1",
@@ -211,13 +211,33 @@
         "Doesnotestablishautomaticreconnectorlongdurationreadiness",
         "Streamingquotebid/asktimeszero;pricingstaysonRESTproviderrecordtimestamps"
       ]
+    },
+    {
+      "id": "E14",
+      "title": "Start once-per-minute tastytrade and True Markets comparison checks",
+      "status": "complete",
+      "dependsOn": [
+        "E12"
+      ],
+      "evidence": [
+        "config/equity-shadow.tastytrade.example.json:pollMs/sampleMs60000;sampleOnPolltrue",
+        "logs/equity-shadow/minute-cadence-check-2026-10-26:2polls/2samplesper symbol60146msapart",
+        "launchdcom.dundas.truex-equity-minute-observer:livePID7488;firstsampleverified",
+        "logs/equity-shadow/minute-observer-2026-10-26/status.json",
+        "57focusedtests/202assertionspassed;narrowtscpassed"
+      ],
+      "limitations": [
+        "Periodicchecksnotcontinuoushealthycoverage",
+        "TrueMarketsWSmaintainsbookcontinuously;comparisonsonceperpoll",
+        "Bounded25hourprocess;noautomaticcrashrestart"
+      ]
     }
   ],
   "moduleState": "locally_validated",
   "delivery_lifecycle": "active",
   "goalExecution": {
-    "status": "tastytrade_rest_integrated_and_bounded_live_validated",
-    "observationAuthority": "logs/equity-shadow/tastytrade-paired-2026-10-26/comparison-summary.json",
+    "status": "minute_observer_running",
+    "observationAuthority": "logs/equity-shadow/minute-observer-2026-10-26/status.json",
     "legacyCollectorStatus": "logs/equity-shadow/current/status.json remains the prior completedKraken/liveFXobservation,not thisrun",
     "remaining": "Defaultinventoryunverified;targetpriceagefrequentlyold;researchunit/currencyparityassumed;noactualverifiedequivalenceorlongtastytradeobservationclaimed"
   },
