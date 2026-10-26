@@ -3,7 +3,7 @@
   "goalThread": "01a15a8b-a217-7ad1-8c31-e4b925b3cd41",
   "status": "active",
   "scope": "Local read-only module and evidence; live trading excluded",
-  "updatedAt": "2026-10-20T19:38:04.388747+00:00",
+  "updatedAt": "2026-10-26T14:35:33.672396+00:00",
   "tasks": [
     {
       "id": "E1",
@@ -109,19 +109,24 @@
       ],
       "evidence": [
         "launchd com.dundas.truex-equity-observer;read-only25-hour process window",
-        "logs/equity-shadow/current/status.json:live sampling advancing",
         "logs/equity-shadow/normalization-evidence.json:target contract identities match venue and issuer",
         "logs/equity-shadow/kraken-unit-comparison.json:bounded source-unit comparison;no guessed mapping enabled",
         "docs/equity-readiness.md:preliminary NO-GO pilot decision",
-        "logs/equity-shadow/raw-checkpoint.json:append-only sample counts match coverage;raw BBO input audit"
+        "logs/equity-shadow/raw-checkpoint.json:append-only sample counts match coverage;raw BBO input audit",
+        "logs/equity-shadow/completed-observation-audit.json:25.2014 elapsed hours;90562 records per symbol reconciled;6.5651/10.1188 healthy hours;zero eligible hours"
       ],
       "blockers": [
-        "Representative healthy coverage not yet collected",
-        "Source price and quantity unit semantics unverified;target catalog identity corroborated",
-        "DROPCOPY topic format and FIX TestReqID behavior need exchange clarification before trading readiness"
+        "Configured24healthy-hours gate unmet:6.5651NVDA/10.1188TSLA",
+        "Source price and quantity unit semantics unverified;target catalog identity corroborated"
       ]
     }
   ],
   "moduleState": "locally_validated",
-  "delivery_lifecycle": "active"
+  "delivery_lifecycle": "active",
+  "goalExecution": {
+    "status": "active",
+    "resumedAt": "2026-10-26T14:35:33.672396+00:00",
+    "nextAction": "Review completed observation; resolve instrument units before any normalized rerun",
+    "backgroundWork": "Observer completed normally; review daemon remains running every15minutes"
+  }
 }

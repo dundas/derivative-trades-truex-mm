@@ -1,24 +1,24 @@
 # Equity module readiness for Patrick
 
-Assessment as of 2026-10-20: **local collection and shadow-evaluation module validated; NO-GO for a live trading pilot.** Representative observation is in progress, not complete. No live trading authorization is implied by this assessment.
+Assessment as of 2026-10-26: **local collection and shadow-evaluation module validated; NO-GO for a live trading pilot.** A representative 25.2-hour elapsed observation is collected; configured healthy coverage and verified normalization remain incomplete. No live trading authorization is implied by this assessment.
 
 ## Verified implementation and operations
 
 - The public Kraken and True Markets feeds ran locally for both target symbols. The module also subscribes to live USDC/USD rather than assuming parity.
 - The focused suite passed 37 tests/117 assertions. TypeScript checking and Bun builds passed. A separate local same-provider reviewer found two persistence/exclusivity bugs; fixes and regressions passed the follow-up review.
 - The default configuration suppresses proposals when mappings or inventory are unverified, and on stale, invalid or disconnected inputs. Live smoke runs produced zero proposals. Some valid connections carried stale prices; these intervals did not count as healthy coverage.
-- A bounded local collector is running under `com.dundas.truex-equity-observer`. `logs/equity-shadow/current/status.json` is the current coverage authority. A running process does not prove a completed observation.
+- A bounded local collector completed under `com.dundas.truex-equity-observer`. `logs/equity-shadow/current/status.json` is the current coverage authority. A running process does not prove a completed observation.
 - A 15-minute progress pairing is registered separately. Its last outcome, raw voices and evidence snapshot are under `logs/equity-pairing/latest.json`. It does not authorize trading or complete tasks automatically.
 
 ## Acceptance audit
 
 | Requirement | Current evidence and limit | Result |
 | --- | --- | --- |
-| Reconnect, resubscribe and freshness safeguards | `tests/equity-feeds.test.ts` exercises socket closure, malformed live frames, silence and consecutive delayed updates; shadow tests reject stale/future/crossed data. Live collector receives both venues. | Locally validated |
+| Reconnect, resubscribe and freshness safeguards | `tests/equity-feeds.test.ts` exercises socket closure, malformed live frames, silence and consecutive delayed updates; shadow tests reject stale/future/crossed data. Completed live run received both venues. | Locally validated |
 | Verified normalization | Fixture tests prove ratio, depth and conservative FX arithmetic. Target token identities are corroborated. Actual source price/quantity units remain unverified, so configuration suppresses output. | Incomplete |
 | Bounded shadow quotes | Fixture tests exercise capital/position caps, held inventory, outward rounding and target crossing checks. No live normalized proposals have been validated. | Logic validated; live evidence pending |
 | Durable collector and coverage | Restart/lock regression tests plus retained raw records and run-ID cutover evidence. Coverage excludes unhealthy intervals and restart gaps. | Locally validated |
-| Representative observation | Current collector is live, but open/close/overnight and a full 24-hour span have not been collected. | In progress |
+| Representative observation | 25.2014 elapsed hours include open, close and overnight; configured 24 healthy hours unmet. | Elapsed observation complete; healthy gate unmet |
 | Recurring scope review | Live local daemon; first scheduled two-voice review completed and facilitator synthesis saved. Reviews cannot mark implementation tasks complete. | Schedule verified; ongoing |
 | Readiness decision | Preliminary NO-GO with unit, coverage and operational questions below. This is a provisional assessment, not a completed evidence review. | Provisional |
 
@@ -45,6 +45,17 @@ The live REST/WebSocket comparison in `logs/equity-shadow/kraken-unit-comparison
 
 Before enabling a mapping, confirm the exact **price and quantity units** of Kraken's v2 BBO, the unit used for each True Markets token, and the correct conversion of both prices and available sizes. Do not mark verification complete merely because a price looks plausible. The example remains unverified; no default values were changed based on the comparison.
 
+## Unit verification checkpoint — October 26
+
+| Source | What the current primary documentation establishes | What remains unproven |
+| --- | --- | --- |
+| [Kraken public ticker](https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/ticker) | BBO prices, quantities, timestamps and change-triggered publication are defined. | Whether xStock BBO prices and quantities use underlying-equity or SPV-token units. No public ticker rebasing selector is documented. |
+| [Kraken private executions](https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/executions) | An explicit rebased selector distinguishes equity from SPV-token display for account reports. | That account-report rule cannot establish public ticker semantics. |
+| [xStocks multiplier guide](https://docs.xstocks.fi/developers/multipliers) | Raw and scaled quantities differ; chain implementations and corporate-action adjustments are described. | Which accounting convention Kraken applies to each public ticker field. |
+| [True Markets WebSocket schema](https://docs.truemarkets.co/api/websocket/institutional.md) | EBBO price levels and aggregate resting quantities are documented. | A stock-specific token/share conversion for these CeFi instruments. |
+
+A sufficient venue answer must identify the price denominator and size unit separately for both symbol pairs, state whether corporate actions rebase those fields, and provide the effective multiplier source/time. Target contract identity alone does not answer these questions. No external message was sent to obtain that answer.
+
 ## Coverage interpretation
 
 The collector reports healthy time separately from elapsed observation time. Its configured completion flags require 24 healthy hours per symbol; a 25-hour process window can end before this threshold is met. A representative 24-hour wall-clock span is also incomplete until open, close and overnight observations actually exist. Preserve both facts rather than lowering thresholds or treating raw records as verified normalized evidence.
@@ -53,9 +64,24 @@ The 19:33Z checkpoint matched 539 append-only samples per symbol to the status c
 
 A separate 45-second Kraken capture received 98 ticker messages and 44 heartbeats and reproduced four backward source timestamps (206–3921 ms). The adapter now retains its last accepted timestamp even after clearing a rejected quote, preventing a second delayed message from restoring an older quote. The collector was gracefully restarted with retained observations; distinguish adapter versions by the run IDs in `logs/equity-shadow/timestamp-fix-cutover.json`. The first diagnostic attempt failed its handshake and received no data; it is retained separately rather than counted as a successful sample. [Kraken ticker timestamp and event trigger documentation](https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/ticker).
 
+## Completed observation audit — October 26
+
+The user resumed the goal. The observer completed normally (launchd exit 0) on October 21; it is stopped, not collecting now. The retained window runs from October 20 19:24:12Z to October 21 20:36:17Z, **25.2014 elapsed hours**. All 90,562 append-only samples per symbol parse and match the status counters.
+
+| Symbol | Healthy hours | Eligible normalized hours | Configured 24-healthy-hour gate |
+| --- | --- | --- | --- |
+| NVDAC-USDC | 6.5651 | 0 | Unmet |
+| TSLAC-USDC | 10.1188 | 0 | Unmet |
+
+Open, close, overnight, premarket, regular and afterhours samples exist. This completes the representative elapsed observation; it does not satisfy the stricter healthy-hour or normalized-evidence flags. Source quote ages explain many suppressions: Nvidia target median 20.26 seconds/p95 274.36 seconds; Tesla target median 7.81 seconds/p95 81.98 seconds; shared FX median 7.79 seconds/p95 40.42 seconds. The configured age limit remains 15 seconds.
+
+Historic heartbeat/message receipts were not retained, so this tape cannot prove transport liveness throughout every stale interval. Heartbeats alone would not establish that an old BBO remains executable. No freshness threshold is relaxed. A new identical run is deferred while units remain unverified; the present NO-GO is supported by collected evidence.
+
+Machine-readable audit: `logs/equity-shadow/completed-observation-audit.json`. The 15-minute review daemon is still active: 488 runs, 371 successes and 117 failures at this checkpoint. A successful review requires two voices; failed reviews are not counted as passes.
+
 ## Remaining gates and questions
 
-1. Complete and inspect the representative observation across market open, close and overnight. Assess actual per-symbol healthy coverage and outages, not elapsed process time. Holiday handling is not implemented; current session labels are weekday time bands.
+1. The completed observation spans market open, close and overnight; assess its inadequate healthy coverage before considering a rerun. Assess actual per-symbol healthy coverage and outages, not elapsed process time. Holiday handling is not implemented; current session labels are weekday time bands.
 2. Verify source price/quantity units and corporate-action handling, record the supporting evidence, and provide fresh inventory allocations before expecting shadow proposals.
 3. Resolve the documented WebSocket DROPCOPY request rejecting a client-ID string with `Invalid DROPCOPY topic pattern`.
 4. Resolve FIX TestRequest responses omitting tag 112 on both tested sessions. Logon, market data and clean logout succeeded, but strict echo checks failed.
