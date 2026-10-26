@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import { PublicFeed } from '../src/equities/feeds';
+import { TastytradeFeed } from '../src/equities/tastytrade';
 import { bboProblem, evaluateShadow, validateConfiguration } from '../src/equities/shadow';
 import { ObservationRecorder, acquireOutputLock } from '../src/equities/recorder';
 
@@ -18,8 +19,8 @@ for(const key of ['sampleMs','maxSampleGapMs','requiredHealthyHours'])if(!Number
 if(config.sampleMs>config.maxSampleGapMs)throw new Error('Sampling interval exceeds maximum gap');
 const fxPolicy=config.fx??{mode:'live'};
 const sourceConfig=config.source??{venue:'kraken'};
-if(!['kraken','alpaca'].includes(sourceConfig.venue))throw new Error('Unsupported source venue');
-if(sourceConfig.venue==='alpaca' && fxPolicy.mode!=='usd_parity')throw new Error('Alpaca source requires explicit usd_parity FX mode');
+if(!['kraken','alpaca','tastytrade'].includes(sourceConfig.venue))throw new Error('Unsupported source venue');
+if(sourceConfig.venue!=='kraken' && fxPolicy.mode!=='usd_parity')throw new Error('Stock sources require explicit usd_parity FX mode');
 const alpaca=sourceConfig.venue==='alpaca'?{
   key:process.env[sourceConfig.keyEnv??'APCA_API_KEY_ID']??'',
   secret:process.env[sourceConfig.secretEnv??'APCA_API_SECRET_KEY']??'',
@@ -27,6 +28,16 @@ const alpaca=sourceConfig.venue==='alpaca'?{
 }:undefined;
 // Reject missing credentials before taking an output lock or starting either feed.
 if(alpaca && (!alpaca.key||!alpaca.secret))throw new Error('Set Alpaca credentials in the configured environment variables before running');
+const tastytrade=sourceConfig.venue==='tastytrade'?{
+  url:sourceConfig.url,
+  clientId:process.env[sourceConfig.clientIdEnv??'TASTYTRADE_CLIENT_ID'],
+  clientSecret:process.env[sourceConfig.clientSecretEnv??'TASTYTRADE_CLIENT_SECRET']??'',
+  refreshToken:process.env[sourceConfig.refreshTokenEnv??'TASTYTRADE_REFRESH_TOKEN']??'',
+  pollMs:sourceConfig.pollMs,requestTimeoutMs:sourceConfig.requestTimeoutMs,
+  silenceTimeoutMs:config.silenceTimeoutMs,retryMaxMs:sourceConfig.retryMaxMs,
+  quoteSizeMultiplier:sourceConfig.quoteSizeMultiplier,
+}:undefined;
+if(tastytrade&&(!tastytrade.clientSecret||!tastytrade.refreshToken))throw new Error('Set tastytrade OAuth environment credentials before running');
 const releaseLock=acquireOutputLock(out);
 const hash=createHash('sha256').update(JSON.stringify(config)).digest('hex');
 let recorder: ObservationRecorder;
@@ -37,14 +48,14 @@ const feedOptions={connectTimeoutMs:config.connectTimeoutMs,silenceTimeoutMs:con
 let stopping=false;
 const event=(e:any)=>{if(!stopping)recorder.event(e);};
 const sourceSymbols=[...config.symbols.map(s=>s.sourceSymbol),...(fxPolicy.mode==='live'?['USDC/USD']:[])];
-let sourceFeed:PublicFeed,target:PublicFeed;
+let sourceFeed:PublicFeed|TastytradeFeed,target:PublicFeed;
 try {
-sourceFeed=new PublicFeed(sourceConfig.venue,sourceSymbols,{...feedOptions,
-  url:sourceConfig.venue==='alpaca'?sourceConfig.url:config.krakenUrl,alpaca,observeActivity:true},event);
+sourceFeed=tastytrade?new TastytradeFeed(sourceSymbols,tastytrade,event):new PublicFeed(sourceConfig.venue,sourceSymbols,{...feedOptions,
+  url:sourceConfig.venue!=='kraken'?sourceConfig.url:config.krakenUrl,alpaca,observeActivity:true},event);
 target=new PublicFeed('truemarkets',config.symbols.map(s=>s.symbol),{...feedOptions,url:config.trueMarketsUrl,observeActivity:true},event);
 } catch(error){releaseLock();throw error;}
 const health=()=>({[sourceConfig.venue]:{connected:sourceFeed.connected,lastMessageAt:sourceFeed.lastMessageAt,reconnects:sourceFeed.reconnects,
-  endpoint:sourceConfig.venue==='alpaca'?sourceConfig.url:config.krakenUrl},
+  endpoint:sourceConfig.venue!=='kraken'?sourceConfig.url:config.krakenUrl},
   truemarkets:{connected:target.connected,lastMessageAt:target.lastMessageAt,reconnects:target.reconnects},currencyAssumption:fxPolicy.mode});
 function sample() {
   const now=Date.now();

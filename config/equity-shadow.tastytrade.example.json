@@ -1,0 +1,93 @@
+{
+  "mode": "shadow",
+  "fx": {
+    "mode": "usd_parity"
+  },
+  "trueMarketsUrl": "wss://api.truemarkets.co/v1/cefi/market",
+  "sampleMs": 1000,
+  "maxSampleGapMs": 2500,
+  "connectTimeoutMs": 10000,
+  "silenceTimeoutMs": 30000,
+  "reconnectMinMs": 1000,
+  "reconnectMaxMs": 30000,
+  "requiredHealthyHours": 24,
+  "limits": {
+    "maxQuoteAgeMs": 15000,
+    "maxClockSkewMs": 1000,
+    "maxMappingAgeMs": 86400000,
+    "maxInventoryAgeMs": 60000,
+    "maxReferenceSpreadBps": 100,
+    "participation": 0.1
+  },
+  "symbols": [
+    {
+      "symbol": "NVDAC-USDC",
+      "sourceSymbol": "NVDA",
+      "mapping": {
+        "mode": "market_parity",
+        "verified": false,
+        "verifiedAt": 0,
+        "evidence": "",
+        "sourceToken": "NVDA underlying equity; REST provider timestamp; configured size multiplier",
+        "targetToken": "NVDAc: True Markets backing/contract pending verification",
+        "sourceSharesPerToken": 0,
+        "targetSharesPerToken": 0
+      },
+      "inventory": {
+        "verified": false,
+        "at": 0,
+        "availableBase": 0,
+        "availableQuote": 0,
+        "positionBase": 0
+      },
+      "tickSize": 0.01,
+      "sizeStep": 0.001,
+      "quoteSize": 0.005,
+      "minSize": 0.001,
+      "maxPosition": 0.05,
+      "quoteBudget": 5,
+      "bufferBps": 10,
+      "inventorySkewBps": 10
+    },
+    {
+      "symbol": "TSLAC-USDC",
+      "sourceSymbol": "TSLA",
+      "mapping": {
+        "mode": "market_parity",
+        "verified": false,
+        "verifiedAt": 0,
+        "evidence": "",
+        "sourceToken": "TSLA underlying equity; REST provider timestamp; configured size multiplier",
+        "targetToken": "TSLAc: True Markets backing/contract pending verification",
+        "sourceSharesPerToken": 0,
+        "targetSharesPerToken": 0
+      },
+      "inventory": {
+        "verified": false,
+        "at": 0,
+        "availableBase": 0,
+        "availableQuote": 0,
+        "positionBase": 0
+      },
+      "tickSize": 0.01,
+      "sizeStep": 0.001,
+      "quoteSize": 0.005,
+      "minSize": 0.001,
+      "maxPosition": 0.05,
+      "quoteBudget": 5,
+      "bufferBps": 10,
+      "inventorySkewBps": 10
+    }
+  ],
+  "source": {
+    "venue": "tastytrade",
+    "url": "https://api.tastyworks.com",
+    "clientIdEnv": "TASTYTRADE_CLIENT_ID",
+    "clientSecretEnv": "TASTYTRADE_CLIENT_SECRET",
+    "refreshTokenEnv": "TASTYTRADE_REFRESH_TOKEN",
+    "pollMs": 5000,
+    "requestTimeoutMs": 5000,
+    "retryMaxMs": 30000,
+    "quoteSizeMultiplier": 1
+  }
+}

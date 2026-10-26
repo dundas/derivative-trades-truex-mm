@@ -102,3 +102,19 @@ Local validation:49focusedtests/176assertions, narrowTypeScriptcheck and Bunbuil
 Sources: [Alpaca real-time stock schemas](https://docs.alpaca.markets/us/docs/real-time-stock-pricing-data), [stream authentication/subscription](https://docs.alpaca.markets/us/docs/streaming-market-data).
 
 Live validation now completed: SIP rejected409insufficientsubscription, while a separately configured IEX60secondrun deliveredNVDA/TSLAquotes and109/26trade messages with no reconnects. IEXTSLA380/395.89was rejected by the existing spread guard. See readiness and logs/equity-shadow/alpaca-live-validation.json; IEX success is not SIP entitlement or fullmarket pricing validation.
+
+## tastytrade REST reference source
+
+Use `config/equity-shadow.tastytrade.example.json`. The source batches NVDA and TSLA through the market-data REST endpoint every5seconds after each completed request. The interval, request deadline, retry ceiling, quote-size multiplier and credential environment names are configurable. This is polling, not tick-by-tick streaming. Prices use the explicitly approved USD/USDC and market-parity assumptions.
+
+```bash
+bun --env-file=/Users/kefentse/dev_env/infinitrade/.env scripts/run-equity-shadow.ts --config config/equity-shadow.tastytrade.example.json --duration-seconds 120 --out logs/equity-shadow/tastytrade-next
+```
+
+The existing sibling credentials are read into process memory without copying them. OAuth requests ask for read scope. Tokens refresh before expiry; a401clears the token for refresh on the next attempt. Requests never overlap, transient failures use bounded exponential delays, and400/403stop the source. All request failures invalidate cached prices. Stopping aborts the request and discards late results. Only the two official REST hosts are allowed, and redirects are refused.
+
+`sourceAt` comes from the provider's `updated-at` field and is labelled `sourceTimeKind=provider_updated_at`. It is the quote record's update timestamp, not a proven exchange bid/ask-change timestamp. `receivedAt` remains separate. A stale or missing provider timestamp does not become fresh merely because the HTTP request succeeds. Missing/duplicate/halted/wrong-instrument-type responses clear the symbol; crossed/invalid or backward-timestamped quotes are rejected. Quote quantities use the configured multiplier1as a research convention, not Alpaca's quote-lot conversion.
+
+DXLink activity can be observed separately with `scripts/smoke-tastytrade-market-data.ts`. Its zero-valued quote-side timestamps are not used in the pricing path. Use the raw Quote/Trade event counts as delivered message counts, not a deduplicated trade tape.
+
+Local checks:57tests/202assertions, narrowTypeScriptcheck and Bunbuild pass, including stale provider timestamp, auth401recovery, halted/missing symbols, stopping in-flight requests, credential-redacted error events and official-host validation.

@@ -21,3 +21,17 @@ Use a fresh output directory each run. Keep credentials out of command arguments
 Primary docs: [OAuth](https://developer.tastytrade.com/docs/authentication/oauth2/), [streaming](https://developer.tastytrade.com/docs/guides/stream-market-data/), [dxFeed Quote](https://docs.dxfeed.com/dxfeed/api/com/dxfeed/event/market/Quote.html).
 
 A subsequent confirmation initially timed out after a probe change waited for field definitions before subscribing. Field definitions actually arrived after subscription. The ordering was corrected: subscribe once after initial FEED_CONFIG, then decode using subsequent field definitions. A fresh20second confirmation passed with71Quote/80Tradelaststate events and the same zeroquote timestamps. All outcomes are retained separately; failedattempt is not counted as successful observation.
+
+## Dedicated streaming resubscription test
+
+A90second run on October26 sent a full NVDA/TSLA subscription reset at35seconds while keeping the same connection open. The capture passed with305Quote events and361Trade last-state events. After the reset request,105NVDA and86TSLAQuote events arrived. The client sent periodic keepalives; two server KEEPALIVE messages were recorded. This verifies continued delivery following the reset request, not automatic reconnect or indefinite session robustness.
+
+Streaming quote-side times remainedzero. The timestamped REST source now supplies the maincollector reference, with streaming activity monitored separately. The source time is explicitly labelled provider quote-record updated-at, not an exchange bid/ask-change time. See [paired comparison](tastytrade-shadow-comparison.md).
+
+Reproduce with a fresh output directory:
+
+```bash
+bun --env-file=/Users/kefentse/dev_env/infinitrade/.env scripts/smoke-tastytrade-market-data.ts --duration-seconds 90 --resubscribe-after-seconds 35 --out logs/tastytrade-stream-next
+```
+
+Evidence: `logs/tastytrade-stream-resubscribe-2026-10-26/summary.json` and rawmarket events. No order endpoints were used.

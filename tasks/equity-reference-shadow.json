@@ -3,7 +3,7 @@
   "goalThread": "01a15a8b-a217-7ad1-8c31-e4b925b3cd41",
   "status": "active",
   "scope": "Local read-only module and evidence; live trading excluded",
-  "updatedAt": "2026-10-26T16:13:12.079518+00:00",
+  "updatedAt": "2026-10-26T16:30:53.064982+00:00",
   "tasks": [
     {
       "id": "E1",
@@ -172,13 +172,54 @@
         "NBBOentitlement/fees/sizeunitsemanticsnotindependentlyverified",
         "Maincollectortastytradeadapterstillpending"
       ]
+    },
+    {
+      "id": "E12",
+      "title": "Integrate timestamped tastytrade REST reference and bounded parallel activity capture",
+      "status": "complete",
+      "dependsOn": [
+        "E11"
+      ],
+      "evidence": [
+        "src/equities/tastytrade.ts",
+        "config/equity-shadow.tastytrade.example.json",
+        "tests/equity-tastytrade.test.ts:8failure/behaviorchecks",
+        "57focusedtests/202assertions;narrowTypeScriptcheck/Bunbuildpassed",
+        "docs/tastytrade-shadow-comparison.md",
+        "logs/equity-shadow/tastytrade-paired-2026-10-26/comparison-summary.json:24successfulpolls119freshsourcesamples/symbol0errors0proposals",
+        "logs/tastytrade-paired-activity-2026-10-26/summary.json:407quotes475lasttradestateevents"
+      ],
+      "limitations": [
+        "Providerupdated-at is recordtimestamp,not provenexchangebid/asktime",
+        "Targetbook freshness and inventory still suppressresearchquotes",
+        "Historical24hourKrakenwindow is not tastytradecoverage"
+      ]
+    },
+    {
+      "id": "E13",
+      "title": "Dedicated tastytrade streaming keepalive and resubscription test",
+      "status": "complete",
+      "dependsOn": [
+        "E11"
+      ],
+      "evidence": [
+        "scripts/smoke-tastytrade-market-data.ts --resubscribe-after-seconds35",
+        "logs/tastytrade-stream-resubscribe-2026-10-26/summary.json:90s305Quote361Tradelaststateevents;postreset105NVDA86TSLAquotes",
+        "docs/tastytrade-feed-observation.md"
+      ],
+      "limitations": [
+        "Doesnotestablishautomaticreconnectorlongdurationreadiness",
+        "Streamingquotebid/asktimeszero;pricingstaysonRESTproviderrecordtimestamps"
+      ]
     }
   ],
   "moduleState": "locally_validated",
   "delivery_lifecycle": "active",
   "goalExecution": {
-    "status": "live_iex_validated",
-    "remaining": "ConsolidatedSIP entitlement unavailable; observed IEX TSLA quotes too wide for configuredreferenceguard. Inventory remainsunverified. No unattendedproposalsauthorized."
+    "status": "tastytrade_rest_integrated_and_bounded_live_validated",
+    "observationAuthority": "logs/equity-shadow/tastytrade-paired-2026-10-26/comparison-summary.json",
+    "legacyCollectorStatus": "logs/equity-shadow/current/status.json remains the prior completedKraken/liveFXobservation,not thisrun",
+    "remaining": "Defaultinventoryunverified;targetpriceagefrequentlyold;researchunit/currencyparityassumed;noactualverifiedequivalenceorlongtastytradeobservationclaimed"
   },
   "currencyPolicy": {
     "mode": "usd_parity",

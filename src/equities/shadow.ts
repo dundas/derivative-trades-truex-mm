@@ -1,6 +1,6 @@
 export interface Bbo {
   symbol: string; bid: number; ask: number; bidSize: number; askSize: number;
-  sourceAt: number; receivedAt: number;
+  sourceAt: number; receivedAt: number; sourceTimeKind?: string;
 }
 export interface Mapping {
   mode?: 'verified' | 'market_parity';

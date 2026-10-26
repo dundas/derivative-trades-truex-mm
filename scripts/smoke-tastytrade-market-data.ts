@@ -8,6 +8,8 @@ const flag=(key:string,fallback:string)=>{const i=args.indexOf(key);return i<0?f
 const out=resolve(flag('--out','logs/tastytrade-feed-check'));
 if(existsSync(join(out,'summary.json'))||existsSync(join(out,'observations.jsonl')))throw new Error('Choose a fresh output directory');
 const duration=Number(flag('--duration-seconds','60'));
+const resubscribeAfter=Number(flag('--resubscribe-after-seconds','0'));
+if(!Number.isFinite(resubscribeAfter)||resubscribeAfter<0||(resubscribeAfter>0&&resubscribeAfter>=duration))throw new Error('Resubscribe time must be zero or less than duration');
 if(!Number.isFinite(duration)||duration<=0||duration>600)throw new Error('Duration must be 1..600 seconds');
 const base=(process.env.TASTYTRADE_API_URL??'https://api.tastyworks.com').replace(/\/$/,'');
 if(!['https://api.tastyworks.com','https://api.cert.tastyworks.com'].includes(base))throw new Error('Unsupported tastytrade API host');
@@ -35,15 +37,19 @@ async function main(){
  mkdirSync(out,{recursive:true});
  const startedAt=Date.now();const counts:Record<string,number>={},latest:any={},fields:Record<string,string[]>={},states:string[]=[];let authorized=false,subscribed=false,authSent=false;
  const ws=new WebSocket(url.toString());
+ let resubscribedAt:number|null=null;const afterResubscribe:Record<string,number>={};
  let failure:string|undefined;let ending=false;let keepalive:ReturnType<typeof setInterval>|undefined;
  const record=(r:any)=>appendFileSync(join(out,'observations.jsonl'),JSON.stringify(r)+'\n');
  const send=(m:any)=>ws.send(JSON.stringify(m));
  const result=await new Promise<any>((done)=>{
- const finish=()=>{if(ending)return;ending=true;clearTimeout(end);clearTimeout(deadline);clearInterval(keepalive);ws.terminate();
-  const report={startedAt:new Date(startedAt).toISOString(),finishedAt:new Date().toISOString(),durationSeconds:(Date.now()-startedAt)/1000,apiHost:base,streamHost:url.origin,entitlementLevel:token.level,restQuotes,instruments,authorized,subscribed,states,counts,fields,latest,failure,passed:!failure&&authorized&&subscribed&&instruments.every(i=>latest[i.streamerSymbol]?.quote),note:'Quote and Trade event messages observed. Trade events represent last-trade state, not an independently deduplicated execution tape. No account/order endpoints called.'};
+ const finish=()=>{if(ending)return;ending=true;clearTimeout(end);clearTimeout(deadline);clearTimeout(resubscribeTimer);clearInterval(keepalive);ws.terminate();
+  const report={resubscribedAt,postResubscriptionQuoteCounts:afterResubscribe,startedAt:new Date(startedAt).toISOString(),finishedAt:new Date().toISOString(),durationSeconds:(Date.now()-startedAt)/1000,apiHost:base,streamHost:url.origin,entitlementLevel:token.level,restQuotes,instruments,authorized,subscribed,states,counts,fields,latest,failure,passed:!failure&&authorized&&subscribed&&instruments.every(i=>latest[i.streamerSymbol]?.quote)&&(resubscribeAfter===0||(resubscribedAt!==null&&instruments.every(i=>(afterResubscribe[i.streamerSymbol]??0)>0))),note:'Quote and Trade event messages observed. Trade events represent last-trade state, not an independently deduplicated execution tape. No account/order endpoints called.'};
   writeFileSync(join(out,'summary.json'),JSON.stringify(report,null,2)+'\n');done(report);
  };
  const end=setTimeout(finish,duration*1000);
+ const resubscribeTimer=resubscribeAfter>0?setTimeout(()=>{
+  if(subscribed&&ws.readyState===WebSocket.OPEN){resubscribedAt=Date.now();send({type:'FEED_SUBSCRIPTION',channel:3,reset:true,add:instruments.flatMap(i=>[{type:'Quote',symbol:i.streamerSymbol},{type:'Trade',symbol:i.streamerSymbol}])});}
+ },resubscribeAfter*1000):undefined;
  const deadline=setTimeout(()=>{failure='Streaming authentication/subscription timeout';finish();},15000);
  ws.on('open',()=>{send({type:'SETUP',channel:0,version:'0.1-DXF-JS/0.3.0',keepaliveTimeout:60,acceptKeepaliveTimeout:60});keepalive=setInterval(()=>send({type:'KEEPALIVE',channel:0}),25000);});
  ws.on('error',()=>{failure='DXLink socket error';finish();});
@@ -61,7 +67,7 @@ async function main(){
   if(m.type==='FEED_DATA'&&m.channel===3){
    const at=Date.now();
    for(let j=0;j<m.data.length;j+=2){const type=m.data[j],values=m.data[j+1],schema=fields[type];if(!schema||!Array.isArray(values)||values.length%schema.length!==0)throw Error('Invalid event format');
-    for(let i=0;i<values.length;i+=schema.length){const data=Object.fromEntries(schema.map((k,index)=>[k,values[i+index]]));if(!instruments.some(v=>v.streamerSymbol===data.eventSymbol))continue;record({at,type,data});counts[type]=(counts[type]??0)+1;latest[data.eventSymbol]??={};latest[data.eventSymbol][type==='Quote'?'quote':'lastTrade']={receivedAt:at,...data};}
+    for(let i=0;i<values.length;i+=schema.length){const data=Object.fromEntries(schema.map((k,index)=>[k,values[i+index]]));if(!instruments.some(v=>v.streamerSymbol===data.eventSymbol))continue;if(type==='Quote'&&resubscribedAt!==null)afterResubscribe[data.eventSymbol]=(afterResubscribe[data.eventSymbol]??0)+1;record({at,type,data});counts[type]=(counts[type]??0)+1;latest[data.eventSymbol]??={};latest[data.eventSymbol][type==='Quote'?'quote':'lastTrade']={receivedAt:at,...data};}
    }
   }
  }catch{failure='Invalid DXLink message';finish();}});
