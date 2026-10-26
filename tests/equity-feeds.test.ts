@@ -1,6 +1,7 @@
 import { test, expect } from 'bun:test';
 import { EventEmitter } from 'node:events';
 import { PublicFeed } from '../src/equities/feeds';
+import example from '../config/equity-shadow.example.json';
 class FakeSocket extends EventEmitter {
   sent:any[]=[];
   send(raw:string){this.sent.push(JSON.parse(raw));}
@@ -59,6 +60,33 @@ test('transport silence reconnects and stop cancels retry timers',async()=>{
   const feed=new PublicFeed('kraken',['NVDAx/USD'],{...settings,silenceTimeoutMs:15},()=>{},()=>{const s=new FakeSocket();sockets.push(s);return s;});
   feed.start();sockets[0].emit('open');await Bun.sleep(40);expect(feed.reconnects).toBeGreaterThan(0);
   feed.stop();const count=sockets.length;await Bun.sleep(20);expect(sockets.length).toBe(count);
+});
+test('heartbeats keep transport live without refreshing an old book or clearing its stale flag',()=>{
+  const socket=new FakeSocket();const events:any[]=[];const at=Date.now();
+  const feed=new PublicFeed('kraken',['NVDAx/USD'],settings,e=>events.push(e),()=>socket);
+  try {
+    feed.start();socket.emit('open');feed.ingest(ticker('NVDAx/USD',at),at);
+    feed.ingest(JSON.stringify({channel:'heartbeat'}),at+20000);
+    const status=feed.observe('NVDAx/USD',at+20001,example.limits);
+    expect(status.connected).toBe(true);expect(status.transportAlive).toBe(true);
+    expect(status.quoteProblem).toBe('stale');expect(status.quoteAgeMs).toBe(20001);
+    expect(status.receiptAgeMs).toBe(20001);expect(events.some(e=>e.type==='heartbeat')).toBe(true);
+    expect(feed.observe('NVDAx/USD',at+22000,example.limits).transportAlive).toBe(false);
+    socket.emit('close');const disconnected=feed.observe('NVDAx/USD',at+22000,example.limits);
+    expect(disconnected.transportAlive).toBe(false);expect(disconnected.quoteProblem).toBe('missing');
+  } finally {feed.stop();}
+});
+test('optional depth and trade observation retains raw updates without treating snapshots as executions',()=>{
+  const socket=new FakeSocket();const events:any[]=[];
+  const feed=new PublicFeed('truemarkets',['NVDAC-USDC'],{...settings,observeActivity:true},e=>events.push(e),()=>socket);
+  try {
+    feed.start();socket.emit('open');
+    expect(socket.sent[0].channels).toContain('DEPTH');expect(socket.sent[0].channels).toContain('TRADE');
+    feed.ingest(JSON.stringify({channel:'DEPTH',update:'UPDATE',data:{symbol:'NVDAC-USDC',bids:[{price:'100',qty:'0'}]}}));
+    feed.ingest(JSON.stringify({channel:'TRADE',update:'SNAPSHOT',data:{symbol:'NVDAC-USDC',info:{price:'100',qty:'1'}}}));
+    expect(events.filter(e=>e.type==='market_activity').map(e=>e.message.update)).toEqual(['UPDATE','SNAPSHOT']);
+    expect(feed.quotes.size).toBe(0);
+  } finally {feed.stop();}
 });
 test('a malformed stream invalidates a live quote and resubscribes on a fresh socket',async()=>{
   const sockets:FakeSocket[]=[];const events:any[]=[];

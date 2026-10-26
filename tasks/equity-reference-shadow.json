@@ -3,7 +3,7 @@
   "goalThread": "01a15a8b-a217-7ad1-8c31-e4b925b3cd41",
   "status": "active",
   "scope": "Local read-only module and evidence; live trading excluded",
-  "updatedAt": "2026-10-26T15:23:21.674539+00:00",
+  "updatedAt": "2026-10-26T15:38:57.614830+00:00",
   "tasks": [
     {
       "id": "E1",
@@ -120,6 +120,20 @@
         "Configured24healthy-hours gate unmet:6.5651NVDA/10.1188TSLA",
         "Source price and quantity unit semantics unverified;target catalog identity corroborated"
       ]
+    },
+    {
+      "id": "E9",
+      "title": "Separate transport liveness from quote age and observe direct book activity",
+      "status": "complete",
+      "dependsOn": [
+        "E7"
+      ],
+      "evidence": [
+        "docs/truemarkets-book-observation.md",
+        "42focusedtests/143assertions;narrowTypeScriptcheckpassed",
+        "logs/equity-shadow/book-comparison-2026-10-26/comparison-summary.json:180samples/symbol;rawcomparisonlabelledunverified;zeroproposals"
+      ],
+      "authorization": "User approved directbook observation, USDparity and separation of connection health/quote age"
     }
   ],
   "moduleState": "locally_validated",

@@ -1,9 +1,10 @@
 import WebSocket from 'ws';
-import type { Bbo } from './shadow';
+import { bboProblem, type Bbo, type Limits } from './shadow';
 
 export interface SocketOptions {
   url: string; connectTimeoutMs: number; silenceTimeoutMs: number;
   reconnectMinMs: number; reconnectMaxMs: number;
+  observeActivity?: boolean;
 }
 type Factory = (url: string) => any;
 export class PublicFeed {
@@ -12,6 +13,13 @@ export class PublicFeed {
   connected = false;
   reconnects = 0;
   lastMessageAt = 0;
+  observe(symbol: string, now: number, limits: Limits) {
+    const q=this.quotes.get(symbol);
+    return {connected:this.connected,lastMessageAt:this.lastMessageAt,
+      transportAlive:this.connected && now-this.lastMessageAt<=this.options.silenceTimeoutMs,
+      quoteProblem:bboProblem(q,now,limits),
+      quoteAgeMs:q?now-q.sourceAt:null,receiptAgeMs:q?now-q.receivedAt:null};
+  }
   private socket: any;
   private running = false;
   private attempts = 0;
@@ -72,7 +80,7 @@ export class PublicFeed {
       this.event({type:'feed_state',venue:this.venue,connected:true,at:Date.now()});
       if(this.venue==='kraken') socket.send(JSON.stringify({method:'subscribe',params:{channel:'ticker',symbol:this.symbols,event_trigger:'bbo',snapshot:true}}));
       else socket.send(JSON.stringify({type:'SUBSCRIBE_NO_AUTH',item_names:this.symbols,
-        channels:['INSTRUMENT','EBBO','HEARTBEAT'],timestamp:String(Math.floor(Date.now()/1000))}));
+        channels:['INSTRUMENT','EBBO','HEARTBEAT',...(this.options.observeActivity?['DEPTH','TRADE']:[])],timestamp:String(Math.floor(Date.now()/1000))}));
     });
     socket.on('message',(raw: any)=>{if(current()){this.lastMessageAt=Date.now();this.ingest(raw.toString());}});
     socket.on('error',()=>{if(current())this.fault('socket_error');});
@@ -82,7 +90,9 @@ export class PublicFeed {
     let m: any;
     try { m=JSON.parse(raw); } catch { this.fault('malformed_json');return; }
     if (!m || typeof m!=='object' || Array.isArray(m)) {this.fault('malformed_message');return;}
+    this.lastMessageAt=receivedAt;
     if (m.success===false || ['ERROR','UNAUTHORIZED'].includes(m.status)) {this.fault('subscription_rejected');return;}
+    if(m.channel==='HEARTBEAT'||m.channel==='heartbeat')this.event({type:'heartbeat',venue:this.venue,at:receivedAt});
     if (this.venue==='kraken') {
       if(m.channel==='status' && m.data?.some((d:any)=>d.system!=='online')) {this.fault('exchange_not_online');return;}
       if(m.channel!=='ticker')return;
@@ -93,6 +103,10 @@ export class PublicFeed {
           sourceAt:Date.parse(d.timestamp),receivedAt});
       }
     } else {
+      if(this.options.observeActivity && ['DEPTH','TRADE'].includes(m.channel)) {
+        const symbol=m.data?.symbol??m.item;
+        if(this.symbols.includes(symbol))this.event({type:'market_activity',venue:this.venue,at:receivedAt,message:m});
+      }
       if(m.channel==='INSTRUMENT' && m.data?.info?.symbol) {
         const symbol=m.data.info.symbol;
         if(this.symbols.includes(symbol)) {

@@ -28,14 +28,24 @@ const event=(e:any)=>{if(!stopping)recorder.event(e);};
 const fxPolicy=config.fx??{mode:'live'};
 const krakenSymbols=[...config.symbols.map(s=>s.sourceSymbol),...(fxPolicy.mode==='live'?['USDC/USD']:[])];
 const kraken=new PublicFeed('kraken',krakenSymbols,{...feedOptions,url:config.krakenUrl},event);
-const target=new PublicFeed('truemarkets',config.symbols.map(s=>s.symbol),{...feedOptions,url:config.trueMarketsUrl},event);
+const target=new PublicFeed('truemarkets',config.symbols.map(s=>s.symbol),{...feedOptions,url:config.trueMarketsUrl,observeActivity:true},event);
 const health=()=>({kraken:{connected:kraken.connected,lastMessageAt:kraken.lastMessageAt,reconnects:kraken.reconnects},
   truemarkets:{connected:target.connected,lastMessageAt:target.lastMessageAt,reconnects:target.reconnects},currencyAssumption:fxPolicy.mode});
 function sample() {
   const now=Date.now();
   for(const symbol of config.symbols) {
     const reference=kraken.quotes.get(symbol.sourceSymbol), venue=target.quotes.get(symbol.symbol),fx=kraken.quotes.get('USDC/USD');
-    const inputs={reference,target:venue,fx,fxPolicy,sourceConnected:kraken.connected,targetConnected:target.connected,targetActive:target.active.has(symbol.symbol)};
+    const sourceHealth=kraken.observe(symbol.sourceSymbol,now,config.limits),targetHealth=target.observe(symbol.symbol,now,config.limits);
+    const rawComparison=reference && venue ? {
+      interpretation:'Raw numeric comparison; token units unverified; not normalized fair value',
+      currencyAssumption:fxPolicy.mode,
+      midpointDifferenceBps:((venue.bid+venue.ask)/(reference.bid+reference.ask)-1)*10000,
+      sourceSpreadBps:(reference.ask-reference.bid)/((reference.ask+reference.bid)/2)*10000,
+      targetSpreadBps:(venue.ask-venue.bid)/((venue.ask+venue.bid)/2)*10000,
+      freshInputs:sourceHealth.quoteProblem===null && targetHealth.quoteProblem===null,
+    }:undefined;
+    const inputs={reference,target:venue,fx,fxPolicy,sourceHealth,targetHealth,rawComparison,
+      sourceConnected:kraken.connected,targetConnected:target.connected,targetActive:target.active.has(symbol.symbol)};
     const healthy=kraken.connected && target.connected && inputs.targetActive
       && [reference,venue,...(fxPolicy.mode==='live'?[fx]:[])].every(q=>!bboProblem(q,now,config.limits));
     const result=evaluateShadow({...inputs,config:symbol,limits:config.limits,now});

@@ -68,3 +68,11 @@ The current raw observer is registered as `com.dundas.truex-equity-observer`, wi
 True Markets WebSocket DROPCOPY rejected the documented client-ID format. FIX sessions authenticated and delivered books but did not echo TestReqID in heartbeat responses. Those findings do not block this public collector; they remain unresolved for unattended trading. Token mapping/price-unit semantics also remain unverified. Do not treat this module or its local test results as a live-trading approval.
 
 References: [Kraken ticker](https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/ticker), [Kraken instruments](https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/instrument), [True Markets WebSocket](https://docs.truemarkets.co/api/websocket/institutional.md).
+
+## Book observation and connection health
+
+Each sample now retains `sourceHealth` and `targetHealth`: connection flag, last message time, `transportAlive`, quote problem, source quote age and receipt age. A heartbeat advances transport liveness only. It does not refresh a resting quote or change the existing freshness gate for proposals. These fields do not certify sequence-complete book synchronization.
+
+The CLI additionally observes True Markets DEPTH and TRADE channels and appends raw `market_activity` events, including snapshot/update markers. Consumers must exclude trade snapshots from live execution counts. Depth updates are retained as received; this module does not assume undocumented replacement/deletion semantics or reconstruct an L2 book. Heartbeat receipt events are retained so connection activity can be inspected later.
+
+`inputs.rawComparison` records numeric midpoint difference and spreads when both BBOs exist. It carries the currency assumption and freshness flag. These comparisons deliberately ignore unverified token conversion and are diagnostic only, never normalized fair value or executable arbitrage signals. `healthyMs` retains its stricter fresh-input definition; live-but-old quotes are visible separately rather than counted healthy.
