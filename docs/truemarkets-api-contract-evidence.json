@@ -1,0 +1,21 @@
+{
+  "checkedAt": "2026-10-26T16:58:41.188740+00:00",
+  "sources": [
+    {
+      "url": "https://docs.truemarkets.co/openapi/auth.yaml",
+      "sha256": "38bf51ecf26cd8277d1d8fb7e59431cf1d3538fe223f19ce975daaf71116c491"
+    },
+    {
+      "url": "https://docs.truemarkets.co/openapi/gateway.yaml",
+      "sha256": "7ea29b15281510d804598d47b35839454f05a920cdb1c3a8593c30238348abaf"
+    },
+    {
+      "url": "https://docs.truemarkets.co/openapi/cefi-direct.yaml",
+      "sha256": "a828c155c8dcc5435af88e5dad29de4d625c961ffc0c0a22e4d60e0ee244059d"
+    },
+    {
+      "url": "https://docs.truemarkets.co/asyncapi/cefi-direct.yaml",
+      "sha256": "3ea5afd91429bfbc19973ad7181333c1b745f5edd7903e36762075544e4081ad"
+    }
+  ]
+}

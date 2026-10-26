@@ -1,0 +1,69 @@
+{
+  "taskRef": "user:2026-10-26-truemarkets-trading-machinery",
+  "account": "User-confirmed app account truemarkets@daviddundas.com",
+  "scope": "Local current-API execution module; no live mutations, deployment or unattended trading",
+  "tasks": [
+    {
+      "id": "T1",
+      "title": "Verify current auth, Gateway and CeFi contracts",
+      "status": "complete"
+    },
+    {
+      "id": "T2",
+      "title": "ES256 identity-checked token lifecycle and current-schema REST client",
+      "status": "complete"
+    },
+    {
+      "id": "T3",
+      "title": "Bounded limit-order submit, replace, owned cancel and recovery journal",
+      "status": "complete"
+    },
+    {
+      "id": "T4",
+      "title": "Live read-only app-account preflight",
+      "status": "complete",
+      "evidence": [
+        "logs/truemarkets-trading/preflight-2026-10-26-final/report.json:11checks passed,noactiveorders",
+        "logs/truemarkets-trading/preview-2026-10-26/report.json:previewonly,noordercreated"
+      ]
+    },
+    {
+      "id": "T5",
+      "title": "Offline execution failure tests and operating runbook",
+      "status": "complete",
+      "evidence": [
+        "101tests335assertions across7files;44newtradingtests",
+        "TradinglibraryTypeScriptcheck andbothCLI Bunbuildspassed",
+        "docs/truemarkets-trading.md"
+      ]
+    },
+    {
+      "id": "T6",
+      "title": "Account eligibility and verified token/share units",
+      "status": "blocked",
+      "reason": "Requires account-specific confirmation; research parity is not verified trading equivalence"
+    },
+    {
+      "id": "T7",
+      "title": "External-reference bridge and serialized stale-feed/shutdown watchdog",
+      "status": "complete",
+      "evidence": "Offline guard tests plus20sreadonlylivewatch;20ticks0errors0orders;zerohealthy-ticksrecorded"
+    },
+    {
+      "id": "T8",
+      "title": "Separately authorized tiny live order lifecycle canary",
+      "status": "pending"
+    },
+    {
+      "id": "T9",
+      "title": "Execution-quality streaming reference timestamps",
+      "status": "blocked",
+      "reason": "DXLink quote times werezero; RESTproviderrecordtimestamp bridge works but is not exchangequote-time verification"
+    }
+  ],
+  "liveOrdersPlaced": false,
+  "fundingMutationsPerformed": false,
+  "updatedAt": "2026-10-26T17:03:24.361785+00:00",
+  "implementationStatus": "local_execution_machinery_validated",
+  "tradingEnabled": false
+}

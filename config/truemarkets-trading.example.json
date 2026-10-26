@@ -1,0 +1,54 @@
+{
+  "authUrl": "https://api.truemarkets.co/v1/auth",
+  "gatewayUrl": "https://api.truemarkets.co/v1/gateway",
+  "cefiUrl": "https://api.truex.co",
+  "schemaVersion": "v2026_01_23",
+  "timeoutMs": 10000,
+  "journalDir": "logs/truemarkets-trading/app-account",
+  "policy": {
+    "enabled": false,
+    "eligibleUntil": "",
+    "maxOpenOrders": 2,
+    "maxQuoteAgeMs": 15000,
+    "maxDeviationBps": 25,
+    "feeReserveBps": 50,
+    "instruments": [
+      {
+        "symbol": "NVDAC-USDC",
+        "instrumentId": "79053265670171223",
+        "baseAssetId": "79053264885836365",
+        "quoteAssetId": "79053264372820547",
+        "tickSize": "0.001",
+        "lotSize": "0.001",
+        "minNotional": "1",
+        "maxOrderNotional": "2",
+        "maxPositionQty": "0.02",
+        "unitsVerified": false,
+        "referenceSymbol": "NVDA",
+        "tokenToShareRatio": "1",
+        "usdToUsdc": "1"
+      },
+      {
+        "symbol": "TSLAC-USDC",
+        "instrumentId": "79058372857184106",
+        "baseAssetId": "79058372686856037",
+        "quoteAssetId": "79053264372820547",
+        "tickSize": "0.001",
+        "lotSize": "0.001",
+        "minNotional": "1",
+        "maxOrderNotional": "2",
+        "maxPositionQty": "0.01",
+        "unitsVerified": false,
+        "referenceSymbol": "TSLA",
+        "tokenToShareRatio": "1",
+        "usdToUsdc": "1"
+      }
+    ]
+  },
+  "watch": {
+    "tickMs": 1000,
+    "referencePollMs": 60000,
+    "tastytradeUrl": "https://api.tastyworks.com",
+    "venueWsUrl": "wss://api.truemarkets.co/v1/cefi/market"
+  }
+}
