@@ -76,13 +76,22 @@ export class TrueMarketsClient {
   }
   balances() { return this.list('cefi', '/v1/cefi/balances'); }
   instruments(symbol: string) { return this.list('cefi', '/v1/cefi/instruments?symbol=' + encodeURIComponent(symbol)); }
-  market(instrumentId: string) { return this.list('cefi', '/v1/cefi/market/quote?instrument_id=' + encodeURIComponent(instrumentId)); }
+  async market(instrumentId: string): Promise<Row[]> {
+    // Public market-data contract is a bare array, independently of account schema version.
+    const body = await this.request('cefi', '/v1/cefi/market/quote?instrument_id=' + encodeURIComponent(instrumentId));
+    if (!Array.isArray(body) || body.some(r => r.id !== instrumentId || !r.info)) throw new Error('Invalid market-data response');
+    return body;
+  }
   activeOrders() { return this.list('cefi', '/v1/cefi/orders/active'); }
   trades(beforeNs = (BigInt((this.options.now ?? Date.now)()) * 1000000n).toString()) {
     return this.list('cefi', '/v1/cefi/orders/trade?timestamp=' + beforeNs + '&size=100');
   }
-  order(externalId: string) {
-    return this.list('cefi', '/v1/cefi/orders/status/' + encodeURIComponent(externalId) + '?id_type=client');
+  async order(externalId: string, exchangeId?: string) {
+    try { return await this.list('cefi', '/v1/cefi/orders/status/' + encodeURIComponent(externalId) + '?id_type=client'); }
+    catch (error) {
+      if (!(error instanceof ApiError) || error.status !== 404 || !exchangeId || !/^[1-9][0-9]*$/.test(exchangeId)) throw error;
+      return this.list('cefi', '/v1/cefi/orders/status/' + exchangeId + '?id_type=exchange');
+    }
   }
   preview(instrumentId: string, side: 'BUY' | 'SELL', qty: string) {
     validateAmount(qty);

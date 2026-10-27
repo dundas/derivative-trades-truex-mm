@@ -21,6 +21,7 @@ export interface InstrumentPolicy {
 }
 export interface TradingPolicy {
   enabled: boolean; eligibleUntil: string; maxOpenOrders: number; maxQuoteAgeMs: number;
+  referenceTimeKind?: 'provider_updated_at' | 'alpaca_overnight_indicative'; maxReferenceSpreadBps?: number;
   pricingMode?: 'venue_bbo' | 'external_maker'; entryDeadline?: number;
   maxDeviationBps: number; feeReserveBps: number; instruments: InstrumentPolicy[];
 }
@@ -95,7 +96,8 @@ export class ExecutionController {
   private observed(state: State, body: any): Row {
     const data = body?.data ?? body;
     const row = Array.isArray(data) ? (data.length === 1 ? data[0] : undefined) : data;
-    if (!row || row.external_id !== state.externalId || row.order_info?.client_id !== this.client.clientId ||
+    const matchesId = row && (row.external_id === state.externalId || (row.external_id === '0' && row.ref_external_id === state.externalId && typeof state.latest?.id === 'string' && /^[1-9][0-9]*$/.test(state.latest.id) && row.id === state.latest.id));
+    if (!row || !matchesId || row.order_info?.client_id !== this.client.clientId ||
       row.order_info?.instrument_id !== state.order.info.instrument_id || row.order_info.side !== state.order.info.side || !knownStatus(row.status)) throw new Error('Order response identity/status mismatch');
     if (state.uncertain && !terminal(row.status)) {
       if (state.action === 'cancel' && row.status !== 'CANCEL_PENDING') throw new Error('Cancellation not yet confirmed');
@@ -113,7 +115,7 @@ export class ExecutionController {
     const results: Row[] = [];
     for (const state of this.journal.states.values()) {
       if (!state.uncertain && state.latest && terminal(state.latest.status)) continue;
-      try { results.push(this.observed(state, await this.client.order(state.externalId))); }
+      try { results.push(this.observed(state, await this.client.order(state.externalId, state.latest?.id))); }
       catch { throw new Error(`Reconciliation incomplete for ${state.externalId}; do not resubmit`); }
     }
     return results;

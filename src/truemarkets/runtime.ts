@@ -36,10 +36,12 @@ export class TradingRuntime {
           }
         }
       }
+      if (source && this.policy.maxReferenceSpreadBps !== undefined &&
+          (source.ask-source.bid)/((source.ask+source.bid)/2)*10000 > this.policy.maxReferenceSpreadBps) issues.push(`${p.symbol}:external_spread_excessive`);
       if (this.venue.active && !this.venue.active.has(p.symbol)) issues.push(`${p.symbol}:instrument_inactive`);
       // Existing tastytrade streaming Quote events returned zero bid/ask times.
-      // Only the validated REST adapter's provider record time is accepted here.
-      if (source && source.sourceTimeKind !== 'provider_updated_at') issues.push(`${p.symbol}:external_timestamp_unverified`);
+      // Timestamp kind must match the explicitly configured feed; indicative remains labelled.
+      if (source && source.sourceTimeKind !== (this.policy.referenceTimeKind ?? 'provider_updated_at')) issues.push(`${p.symbol}:external_timestamp_unverified`);
     }
     return { healthy: issues.length === 0, issues };
   }

@@ -26,3 +26,19 @@ Local tests cover maker sizing, no shorting, capital/position/notional limits, e
 ## Observed attempt
 
 On October 27 at 01:23:31 UTC the explicitly authorized `--live` invocation attempted startup. It exited after the 30-second startup window because external NVDA pricing remained stale. The 15-minute trading window never began. Report: `logs/truemarkets-maker/2026-10-27T01-23-31-148Z/report.json`. Zero submitted/active orders; ending balance10USDC, zeroNVDAC and zeroholds. No conversion occurred and no process remains scheduled to resume. Validation:118tests/378assertions across8files; narrowTypeScriptcheck andBunbuild passed.
+
+## Alpaca overnight reference
+
+The runner also accepts `watch.referenceProvider: alpaca_overnight` with existing `APCA_API_KEY_ID` and `APCA_API_SECRET_KEY` environment values. It requests only `https://data.alpaca.markets/v2/stocks/NVDA/quotes/latest?feed=overnight`. Credentials are never sent to a configurable host or followed through redirects. No Alpaca account/order endpoints are used.
+
+This requires explicit `policy.referenceTimeKind: alpaca_overnight_indicative` and a positive `policy.maxReferenceSpreadBps` no greater than25. The user approved this indicative reference for the bounded canary after its distinction from direct BOATS data was explained. It is not labelled NBBO or an executable hedge price. Quote timestamp `t` is preserved separately from receipt time; invalid, future and backward timestamps clear the quote. Stopped requests cannot restore feed state. Missing/old snapshots remain unavailable for execution.
+
+The live integration exposed a separate contract correction: public CeFi GET `/v1/cefi/market/quote` returns a bare array, as its OpenAPI spec documents, rather than the paginated envelope used by account endpoints. The client and fixture now follow that endpoint-specific contract. No account-endpoint envelope checks were relaxed.
+
+## Live execution and cancellation evidence
+
+With Alpaca overnight selected, the first integration attempt stopped before dispatch on the market-array parsing issue. After that correction, a live bid0.009NVDAC@216.118 was accepted and canceled with zero fills. Cancellation changed the order response's `external_id` to`0` and placed the original UUID in`ref_external_id`; querying by clientUUID then returned404, while the known exchangeID returned the terminal canceled row. Reconciliation now falls back on404 to a previously observed numeric exchangeID, accepts the referenceUUID only with that same known exchangeID, and retains account/instrument/side/fill checks. Missing/mismatched IDs remain errors. Read-only reconciliation recovered the original journal without deleting it.
+
+A second live attempt posted and canceled one further bid, then blocked a replacement before HTTP dispatch when entry health changed. Both accepted orders ended CANCELED with zero fills; account10USDC/0NVDAC/noholds/noactiveorders. The initial run's unresolved report is preserved as historical evidence; later successful reconciliation supersedes its unknown order status.
+
+A follow-up read-only run at01:37:29–01:37:39UTC identified `external_spread_excessive`: indicative NVDA216.36/216.97, approximately28.2bps versus25bps configured maximum. No continuous15minute run completed. No restart scheduled and no spread/freshness limit relaxed. Evidence directories are under `logs/truemarkets-maker/2026-10-27T01-*`.

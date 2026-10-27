@@ -39,7 +39,7 @@ function fixture() {
     ] }]);
     if (path === '/v1/cefi/market/quote') {
       expect(new URL(url).searchParams.get('instrument_id')).toBe('2');
-      return data([{ id: '2', info: { best_bid: { price: '100' }, best_ask: { price: '100.2' }, last_update: String(BigInt(now - bookAge) * 1000000n) } }]);
+      return response([{ id: '2', info: { best_bid: { price: '100' }, best_ask: { price: '100.2' }, last_update: String(BigInt(now - bookAge) * 1000000n) } }]);
     }
     if (path === '/v1/cefi/orders/active') return data([...orders.values()].filter(x => !['CANCELED','FILLED'].includes(x.status)));
     if (path.startsWith('/v1/cefi/orders/status/')) {
@@ -364,3 +364,45 @@ test('entry guard runs after asynchronous token refresh and blocks dispatch whil
     await f.controller.reconcile();
   }finally{f.journal.close();}
  });
+
+test('indicative feed must be explicitly selected and wide references fail health',()=>{
+ const f=fixture();f.policy.pricingMode='external_maker';f.policy.maxReferenceSpreadBps=25;
+ const quote={symbol:'NVDA',bid:100,ask:100.1,sourceAt:NOW,receivedAt:NOW,sourceTimeKind:'alpaca_overnight_indicative'};
+ const external={connected:true,quotes:new Map([['NVDA',quote]])},venue={connected:true,active:new Set(['NVDAC-USDC']),quotes:new Map()};
+ const runtime=new TradingRuntime(f.controller,f.journal,f.policy,external,venue,()=>NOW);
+ try{expect(runtime.health().healthy).toBe(false);f.policy.referenceTimeKind='alpaca_overnight_indicative';expect(runtime.health().healthy).toBe(true);quote.ask=101;expect(runtime.health().issues).toContain('NVDAC-USDC:external_spread_excessive');}finally{f.journal.close();}
+});
+
+test('terminal response may reference original UUID only with matching known exchange identity',async()=>{
+ const f=fixture();try{
+ const placed=await f.controller.submit(f.intent);
+ const row={...placed,external_id:'0',ref_external_id:placed.external_id,status:'CANCELED',leaves_qty:'0'};
+ f.client.order=async()=>[row];await f.controller.reconcile();
+ expect([...f.journal.states.values()][0].latest?.status).toBe('CANCELED');
+ }finally{f.journal.close();}
+});
+test('client-id 404 falls back to known exchange ID, never interprets absence as canceled',async()=>{
+ const requests:string[]=[];
+ const http:Fetcher=async(url)=>{requests.push(url);if(url.includes('/token'))return response({access_token:jwt()});if(url.includes('id_type=client'))return response({},404);return response({data:[{id:'99',status:'CANCELED'}],pagination:{next_cursor:null}});};
+ const auth=tokenManager(http),client=new TrueMarketsClient({auth,gatewayUrl:env.gateway,cefiUrl:env.cefi,expectedClientId:'1',fetch:http});
+ expect((await client.order('abc','99'))[0].status).toBe('CANCELED');expect(requests.some(u=>u.endsWith('/99?id_type=exchange'))).toBe(true);
+ await expect(client.order('unknown')).rejects.toThrow();
+});
+
+test('ref_external_id cannot bind a different exchange order to the journal',async()=>{
+ const f=fixture();try{
+ const placed=await f.controller.submit(f.intent);
+ f.client.order=async()=>[{...placed,id:'123456',external_id:'0',ref_external_id:placed.external_id,status:'CANCELED',leaves_qty:'0'}];
+ await expect(f.controller.reconcile()).rejects.toThrow('Reconciliation incomplete');
+ }finally{f.journal.close();}
+});
+
+for(const bad of ['unknown_exchange_id','wrong_ref'])test('rejects terminal reference identity '+bad,async()=>{
+ const f=fixture();try{
+ const placed=await f.controller.submit(f.intent);
+ const state=[...f.journal.states.values()][0];
+ const row={...placed,external_id:'0',ref_external_id:bad==='wrong_ref'?'foreign':placed.external_id,status:'CANCELED',leaves_qty:'0'};
+ if(bad==='unknown_exchange_id'){delete state.latest!.id;delete row.id;}
+ f.client.order=async()=>[row];await expect(f.controller.reconcile()).rejects.toThrow('Reconciliation incomplete');
+ }finally{f.journal.close();}
+});

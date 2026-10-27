@@ -5,6 +5,7 @@ import {TrueMarketsClient} from '../src/truemarkets/client';
 import {decimal,ExecutionController,OrderJournal, type TradingPolicy} from '../src/truemarkets/execution';
 import {TradingRuntime} from '../src/truemarkets/runtime';
 import {planQuotes,cancelAndConfirm,type MakerLimits} from '../src/truemarkets/maker';
+import {AlpacaOvernightFeed} from '../src/equities/alpaca-overnight';
 import {TastytradeFeed} from '../src/equities/tastytrade';
 import {PublicFeed} from '../src/equities/feeds';
 const args=process.argv.slice(2), flag=(n:string,d:string)=>{const i=args.indexOf(n);return i<0?d:args[i+1];};
@@ -29,8 +30,10 @@ if(existsSync(out))throw Error('Output directory already exists; use a new run d
 mkdirSync(out,{recursive:true,mode:0o700});
 const emit=(data:any)=>appendFileSync(join(out,'events.jsonl'),JSON.stringify({at:new Date().toISOString(),...data})+'\n',{mode:0o600});
 const auth=new TokenManager({baseUrl:c.authUrl,expectedUserId:required('TM_EXPECTED_USER_ID'),expectedClientId:clientId,signer:ApiKeySigner.fromFile(required('TM_KEY_FILE')),timeoutMs:c.timeoutMs});
-const client=new TrueMarketsClient({auth,gatewayUrl:c.gatewayUrl,cefiUrl:c.cefiUrl,expectedClientId:clientId,writesEnabled:live,timeoutMs:c.timeoutMs,entryGuard:()=>{if(stopping || !runtime.health().healthy)throw Error("Entry health changed before dispatch");}});
-const source=new TastytradeFeed([p.referenceSymbol],{url:c.watch.tastytradeUrl,clientSecret:required('TASTYTRADE_CLIENT_SECRET'),refreshToken:required('TASTYTRADE_REFRESH_TOKEN'),clientId:process.env.TASTYTRADE_CLIENT_ID,pollMs:c.watch.referencePollMs,requestTimeoutMs:c.timeoutMs,silenceTimeoutMs:15000,retryMaxMs:30000,quoteSizeMultiplier:1});
+const client=new TrueMarketsClient({auth,gatewayUrl:c.gatewayUrl,cefiUrl:c.cefiUrl,expectedClientId:clientId,writesEnabled:live,timeoutMs:c.timeoutMs,entryGuard:()=>{const health=runtime.health();if(stopping || !health.healthy){emit({type:"dispatch_blocked",stopping,health,reference:source.quotes.get(p.referenceSymbol)});throw Error("Entry health changed before dispatch");}}});
+if(!['tastytrade','alpaca_overnight'].includes(c.watch.referenceProvider??'tastytrade'))throw Error('Unknown reference provider');
+if(c.watch.referenceProvider==='alpaca_overnight' && (policy.referenceTimeKind!=='alpaca_overnight_indicative'||!Number.isFinite(policy.maxReferenceSpreadBps)||policy.maxReferenceSpreadBps!>25||policy.maxReferenceSpreadBps!<=0))throw Error('Indicative feed requires explicit policy and spread cap');
+const source=c.watch.referenceProvider==='alpaca_overnight' ? new AlpacaOvernightFeed(p.referenceSymbol,{key:required('APCA_API_KEY_ID'),secret:required('APCA_API_SECRET_KEY'),pollMs:c.watch.referencePollMs,timeoutMs:c.timeoutMs}) : new TastytradeFeed([p.referenceSymbol],{url:c.watch.tastytradeUrl,clientSecret:required('TASTYTRADE_CLIENT_SECRET'),refreshToken:required('TASTYTRADE_REFRESH_TOKEN'),clientId:process.env.TASTYTRADE_CLIENT_ID,pollMs:c.watch.referencePollMs,requestTimeoutMs:c.timeoutMs,silenceTimeoutMs:15000,retryMaxMs:30000,quoteSizeMultiplier:1});
 if(c.watch.venueWsUrl!=='wss://api.truemarkets.co/v1/cefi/market' || c.cefiUrl!=='https://api.truex.co')throw Error('Unexpected venue/environment');
 const venue=new PublicFeed('truemarkets',[p.symbol],{url:c.watch.venueWsUrl,connectTimeoutMs:10000,silenceTimeoutMs:15000,reconnectMinMs:1000,reconnectMaxMs:5000});
 // Shared account journal prevents concurrent runs. Never discard prior unresolved orders.
@@ -98,7 +101,7 @@ try {
    await Bun.sleep(500);
  }
  if(!stopping)stop('duration_complete');
-} catch(e){stop(e instanceof Error?e.message:'Run failed');emit({type:'stopped',reason});process.exitCode=1;}
+} catch(e){stop(e instanceof Error?e.message:'Run failed');emit({type:'stopped',reason,health:runtime.health(),reference:source.quotes.get(p.referenceSymbol)});process.exitCode=1;}
 finally {
  clearTimeout(timer);policy.enabled=false;
  try{await drain();const active=await client.activeOrders();finalActive=active.length;if(active.some(x=>journal.states.has(x.external_id)))throw Error('Owned active orders remain');}
