@@ -63,7 +63,7 @@ async function main(){
    if(m.state==='AUTHORIZED'){authorized=true;send({type:'CHANNEL_REQUEST',channel:3,service:'FEED',parameters:{contract:'AUTO'}});}
   }
   if(m.type==='CHANNEL_OPENED'&&m.channel===3)send({type:'FEED_SETUP',channel:3,acceptAggregationPeriod:0.1,acceptDataFormat:'COMPACT',acceptEventFields:{Quote:['eventType','eventSymbol','bidPrice','askPrice','bidSize','askSize','bidTime','askTime'],Trade:['eventType','eventSymbol','price','size','time','dayVolume']}});
-  if(m.type==='FEED_CONFIG'&&m.channel===3){for(const name of ['Quote','Trade']){const schema=m.eventFields?.[name];if(schema!==undefined){if(!Array.isArray(schema)||!schema.every((field:unknown)=>typeof field==='string'))throw Error('Invalid field schema');fields[name]=schema;}}if(!subscribed){send({type:'FEED_SUBSCRIPTION',channel:3,reset:true,add:instruments.flatMap(i=>[{type:'Quote',symbol:i.streamerSymbol},{type:'Trade',symbol:i.streamerSymbol}])});subscribed=true;clearTimeout(deadline);}}
+  if(m.type==='FEED_CONFIG'&&m.channel===3){for(const name of ['Quote','Trade']){const schema=m.eventFields?.[name];if(schema!==undefined){if(!Array.isArray(schema)||schema.length===0||!schema.every((field:unknown)=>typeof field==='string'))throw Error('Invalid field schema');fields[name]=schema;}}if(!subscribed){send({type:'FEED_SUBSCRIPTION',channel:3,reset:true,add:instruments.flatMap(i=>[{type:'Quote',symbol:i.streamerSymbol},{type:'Trade',symbol:i.streamerSymbol}])});subscribed=true;clearTimeout(deadline);}}
   if(m.type==='FEED_DATA'&&m.channel===3){
    const at=Date.now();
    for(let j=0;j<m.data.length;j+=2){const type=m.data[j],values=m.data[j+1],schema=fields[type];if(!schema||!Array.isArray(values)||values.length%schema.length!==0)throw Error('Invalid event format');
