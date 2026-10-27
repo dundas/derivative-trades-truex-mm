@@ -406,3 +406,29 @@ for(const bad of ['unknown_exchange_id','wrong_ref'])test('rejects terminal refe
  f.client.order=async()=>[row];await expect(f.controller.reconcile()).rejects.toThrow('Reconciliation incomplete');
  }finally{f.journal.close();}
 });
+
+test('external maker price band spans wide reference spread without bypassing fat-finger check',async()=>{
+ const f=fixture();f.policy.pricingMode='external_maker';f.intent.reference.bid='99';f.intent.reference.ask='101';f.intent.price='98.9';
+ try{await f.controller.submit(f.intent);expect(f.orders.size).toBe(1);
+ await expect(f.controller.submit({...f.intent,price:'90'})).rejects.toThrow('reference band');
+ }finally{f.journal.close();}
+});
+
+test('stale pricing cancels owned quotes and can resume fresh within the original deadline',async()=>{
+ const f=fixture();f.policy.pricingMode='external_maker';f.policy.entryDeadline=NOW+900000;
+ const q={symbol:'NVDA',bid:99.9,ask:100.1,sourceAt:NOW,receivedAt:NOW,sourceTimeKind:'provider_updated_at'};
+ const external={connected:true,quotes:new Map([['NVDA',q]])},venue={connected:true,active:new Set(['NVDAC-USDC']),quotes:new Map()};
+ let time=NOW;
+ const runtime=new TradingRuntime(f.controller,f.journal,f.policy,external,venue,()=>time);
+ const signal={symbol:'NVDAC-USDC',side:'BUY' as const,qty:'0.02',price:'99.9'};
+ try{
+ await runtime.tick();await runtime.submit(signal);
+ time=NOW+16000;f.setNow(time);expect((await runtime.tick())!.healthy).toBe(false);
+ expect([...f.orders.values()].every(o=>o.status==='CANCELED')).toBe(true);
+ await expect(runtime.submit(signal)).rejects.toThrow('not accepting');
+ q.sourceAt=time;q.receivedAt=time;await runtime.tick();await runtime.submit(signal);
+ expect(f.orders.size).toBe(2);expect(f.policy.entryDeadline).toBe(NOW+900000);
+ time=NOW+900000;f.setNow(time);q.sourceAt=time;q.receivedAt=time;
+ await runtime.tick();await expect(runtime.submit(signal)).rejects.toThrow('deadline');
+ }finally{f.journal.close();}
+});

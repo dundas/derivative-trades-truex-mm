@@ -1,7 +1,7 @@
 import {mkdirSync,appendFileSync,writeFileSync,existsSync} from 'node:fs';
 import {resolve,join} from 'node:path';
 import {ApiKeySigner,TokenManager} from '../src/truemarkets/auth';
-import {TrueMarketsClient} from '../src/truemarkets/client';
+import {TrueMarketsClient,EntryNotDispatched} from '../src/truemarkets/client';
 import {decimal,ExecutionController,OrderJournal, type TradingPolicy} from '../src/truemarkets/execution';
 import {TradingRuntime} from '../src/truemarkets/runtime';
 import {planQuotes,cancelAndConfirm,type MakerLimits} from '../src/truemarkets/maker';
@@ -32,7 +32,8 @@ const emit=(data:any)=>appendFileSync(join(out,'events.jsonl'),JSON.stringify({a
 const auth=new TokenManager({baseUrl:c.authUrl,expectedUserId:required('TM_EXPECTED_USER_ID'),expectedClientId:clientId,signer:ApiKeySigner.fromFile(required('TM_KEY_FILE')),timeoutMs:c.timeoutMs});
 const client=new TrueMarketsClient({auth,gatewayUrl:c.gatewayUrl,cefiUrl:c.cefiUrl,expectedClientId:clientId,writesEnabled:live,timeoutMs:c.timeoutMs,entryGuard:()=>{const health=runtime.health();if(stopping || !health.healthy){emit({type:"dispatch_blocked",stopping,health,reference:source.quotes.get(p.referenceSymbol)});throw Error("Entry health changed before dispatch");}}});
 if(!['tastytrade','alpaca_overnight'].includes(c.watch.referenceProvider??'tastytrade'))throw Error('Unknown reference provider');
-if(c.watch.referenceProvider==='alpaca_overnight' && (policy.referenceTimeKind!=='alpaca_overnight_indicative'||!Number.isFinite(policy.maxReferenceSpreadBps)||policy.maxReferenceSpreadBps!>25||policy.maxReferenceSpreadBps!<=0))throw Error('Indicative feed requires explicit policy and spread cap');
+if(c.watch.referenceProvider==='alpaca_overnight' && policy.referenceTimeKind!=='alpaca_overnight_indicative')throw Error('Indicative feed requires explicit policy');
+if(policy.maxReferenceSpreadBps!==undefined)throw Error('This maker uses spread-aware pricing, not a reference spread cutoff');
 const source=c.watch.referenceProvider==='alpaca_overnight' ? new AlpacaOvernightFeed(p.referenceSymbol,{key:required('APCA_API_KEY_ID'),secret:required('APCA_API_SECRET_KEY'),pollMs:c.watch.referencePollMs,timeoutMs:c.timeoutMs}) : new TastytradeFeed([p.referenceSymbol],{url:c.watch.tastytradeUrl,clientSecret:required('TASTYTRADE_CLIENT_SECRET'),refreshToken:required('TASTYTRADE_REFRESH_TOKEN'),clientId:process.env.TASTYTRADE_CLIENT_ID,pollMs:c.watch.referencePollMs,requestTimeoutMs:c.timeoutMs,silenceTimeoutMs:15000,retryMaxMs:30000,quoteSizeMultiplier:1});
 if(c.watch.venueWsUrl!=='wss://api.truemarkets.co/v1/cefi/market' || c.cefiUrl!=='https://api.truex.co')throw Error('Unexpected venue/environment');
 const venue=new PublicFeed('truemarkets',[p.symbol],{url:c.watch.venueWsUrl,connectTimeoutMs:10000,silenceTimeoutMs:15000,reconnectMinMs:1000,reconnectMaxMs:5000});
@@ -66,12 +67,18 @@ try {
  started=Date.now();policy.entryDeadline=started+c.durationSeconds*1000;
  timer=setTimeout(()=>stop('duration_complete'),c.durationSeconds*1000);
  emit({type:'started',live,limits,durationSeconds:c.durationSeconds,mappingAssumption:p.mappingAssumption});
- let nextQuote=0;
- while(!stopping && Date.now()<policy.entryDeadline){
+ let nextQuote=0, paused=false;
+ const pauseQuotes=async()=>{
+   await drain();
+   if(!paused)emit({type:'quotes_paused',health:runtime.health(),reference:source.quotes.get(p.referenceSymbol)});
+   paused=true;nextQuote=0;await Bun.sleep(500);
+ };
+ sessionLoop: while(!stopping && Date.now()<policy.entryDeadline){
    const health=await runtime.tick();
-   if(!health?.healthy)throw Error('Feed health failed; stopping');
+   if(!health?.healthy){await pauseQuotes();continue;}
+   if(paused){emit({type:'quotes_resumed'});paused=false;}
    const funds=await balances();
-   if(!runtime.health().healthy)throw Error('Reference expired during balance read');
+   if(!runtime.health().healthy){await pauseQuotes();continue;}
    const q=source.quotes.get(p.referenceSymbol)!;
    const marked=planQuotes(p,limits,funds.cash.balance,funds.base.balance,String(q.bid),String(q.ask));
    lastPnl=marked.pnl;
@@ -82,7 +89,7 @@ try {
      const clean=await balances();
      if(decimal(clean.cash.order_hold)!==0n||decimal(clean.base.order_hold)!==0n)throw Error('Order holds remain after cancellation');
      const fresh=source.quotes.get(p.referenceSymbol)!;
-     if(!runtime.health().healthy)throw Error('Reference expired before quoting');
+     if(!runtime.health().healthy){await pauseQuotes();continue;}
      const plan=planQuotes(p,limits,clean.cash.balance,clean.base.balance,String(fresh.bid),String(fresh.ask));
      lastPnl=plan.pnl;
      if(plan.stop){stop('loss_stop');break;}
@@ -90,11 +97,18 @@ try {
      for(const order of plan.orders){if(stopping||Date.now()>=policy.entryDeadline)break;
        if(live){
          const before=await balances();
-         if(stopping||!runtime.health().healthy)throw Error('Entry stopped before submission');
+         if(stopping)break sessionLoop;
+         if(!runtime.health().healthy){await pauseQuotes();continue sessionLoop;}
          const reference=source.quotes.get(p.referenceSymbol)!;
          const check=planQuotes(p,limits,before.cash.balance,before.base.balance,String(reference.bid),String(reference.ask));
          if(check.stop){stop('loss_stop');break;}
-         await runtime.submit({symbol:p.symbol,...order,postOnly:true,tif:'GTC'});submitted++;emit({type:'submitted',order});}
+         try{await runtime.submit({symbol:p.symbol,...order,postOnly:true,tif:'GTC'});}
+         catch(error){
+           // Only proven unsent health/deadline rejections may resume. Network outcomes never replay.
+           if(error instanceof EntryNotDispatched){await pauseQuotes();continue sessionLoop;}
+           throw error;
+         }
+         submitted++;emit({type:'submitted',order});}
      }
      nextQuote=Date.now()+c.requoteMs;
    }

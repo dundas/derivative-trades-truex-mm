@@ -145,7 +145,12 @@ export class ExecutionController {
     if (r.tokenToShareRatio !== p.tokenToShareRatio || r.usdToUsdc !== p.usdToUsdc) throw new Error('Reference conversion differs from configured policy');
     const ratio = positive(p.tokenToShareRatio), fx = positive(p.usdToUsdc);
     const mid = ((bid + ask) / 2n) * ratio / SCALE * fx / SCALE;
-    if (mid <= 0n || (price > mid ? price - mid : mid - price) * 10000n > mid * BigInt(Math.floor(this.policy.maxDeviationBps)))
+    const lower = this.policy.pricingMode === 'external_maker' ? bid * ratio / SCALE * fx / SCALE : mid;
+    const upper = this.policy.pricingMode === 'external_maker' ? ask * ratio / SCALE * fx / SCALE : mid;
+    const band = mid * BigInt(Math.floor(this.policy.maxDeviationBps)) / 10000n;
+    // External maker prices may span the whole reference spread plus configured margin.
+    // Keep the fat-finger bound; do not reintroduce a fixed maximum reference spread.
+    if (mid <= 0n || price < lower - band || price > upper + band)
       throw new Error('Price outside external reference band');
     const [availability, instruments, accounts, active, fees, markets] = await Promise.all([
       this.client.availability(), this.client.instruments(p.symbol), this.client.balances(), this.client.activeOrders(), this.client.fees(), this.client.market(p.instrumentId),

@@ -42,3 +42,21 @@ With Alpaca overnight selected, the first integration attempt stopped before dis
 A second live attempt posted and canceled one further bid, then blocked a replacement before HTTP dispatch when entry health changed. Both accepted orders ended CANCELED with zero fills; account10USDC/0NVDAC/noholds/noactiveorders. The initial run's unresolved report is preserved as historical evidence; later successful reconciliation supersedes its unknown order status.
 
 A follow-up read-only run at01:37:29–01:37:39UTC identified `external_spread_excessive`: indicative NVDA216.36/216.97, approximately28.2bps versus25bps configured maximum. No continuous15minute run completed. No restart scheduled and no spread/freshness limit relaxed. Evidence directories are under `logs/truemarkets-maker/2026-10-27T01-*`.
+
+## Spread-aware quoting (supersedes the earlier 25 bps cutoff)
+
+The user corrected the premise: this strategy supplies liquidity on a quiet venue. Reference spread is now a quote-width and size input, not an arbitrary hard stop. The canary rejects any configuration retaining `maxReferenceSpreadBps`. Its indicative-feed label and timestamp checks remain mandatory.
+
+Bid = external bid minus configurable margin minus long-inventory skew. Ask = external ask plus margin minus skew, floored at the external ask. Current margin is10bps of reference midpoint, inventory skew up to5bps. Quotes round outward to venue ticks. Notional scales down with reference width, bounded by configured2USDCmaximum and the smallest tradable lot/minimum-notional combination. No short sales are introduced.
+
+External-maker price validation now permits the full external bid/ask interval plus the configured deviation allowance on either side. This retains a fat-finger check without making wide references fail an implicit midpoint-spread cutoff. Legacy mode retains its midpoint band. Capital10USDC, lossstop1USDC,900seconds, source/receipt15sfreshness, healthytransport, account/order identity and terminal cancellation remain unchanged.
+
+### Transient feed gaps within the bounded session
+
+A spread-aware attempt submitted and canceled3bids with nofills, then stopped when the source timestamp aged past15seconds. The runner now cancels and confirms all owned quotes during transient feed-health failures, records `quotes_paused`, and resumes only when the same freshness checks pass. The original900second deadline keeps running while paused. Loss-stop, balance/settlement faults, uncertain order outcomes and failed cleanup still end the run. A typed pre-dispatch rejection proves no HTTP mutation occurred and may pause/resume; an unknown network outcome never does. This supersedes the earlier exit-on-any-feed-gap behavior, without changing freshness or money limits.
+
+## Completed 15-minute live session
+
+The revised runner completed its900-second session on October27,01:44:03.833–01:59:04.668UTC (including final cancellation). It submitted151post-only bids; all151ended CANCELED with zero executed quantity. Final marked PnL0USDC; cash10USDC, inventory0NVDAC, holds0, activeorders0. Ten feed-health pause/resume cycles preserved the original deadline. Observed reference spreads ranged0.461–26.307bps, including two quote plans above the removed25bps cutoff.
+
+Evidence: `logs/truemarkets-maker/2026-10-27T01-44-02-746Z/report.json`, `summary.json`, `events.jsonl`, and the retained account order journal. This establishes bounded live bid placement, cancellation, repricing and cleanup. It does not establish customer demand, profit, or live two-sided fill handling. No restart is scheduled. Validation:131tests/421assertions, narrow TypeScript check and Bun build passed.

@@ -13,18 +13,23 @@ export function planQuotes(p: InstrumentPolicy, limits: MakerLimits, cash: strin
   const maxPosition = positive(p.maxPositionQty), tick = positive(p.tickSize), lot = positive(p.lotSize);
   const mid = (b + a) / 2n;
   const skew = mid * BigInt(limits.inventorySkewBps) * (q > maxPosition ? maxPosition : q) / maxPosition / 10000n;
-  const center = mid - skew;
-  // Stay outside the external executable spread as well as the configured width.
-  const rawBid = center * BigInt(10000 - limits.halfSpreadBps) / 10000n;
-  const rawAsk = center * BigInt(10000 + limits.halfSpreadBps) / 10000n;
-  const buy = (rawBid < b ? rawBid : b) / tick * tick;
+  // Reference spread is a pricing input, not a stop threshold. Preserve an outward margin.
+  const margin = mid * BigInt(limits.halfSpreadBps) / 10000n;
+  const rawBid = b - margin - skew;
+  const rawAsk = a + margin - skew;
+  const buy = rawBid / tick * tick;
   const sell = ((rawAsk > a ? rawAsk : a) + tick - 1n) / tick * tick;
   if (buy <= 0n || sell <= buy) throw new Error('Invalid computed prices');
   const min = (...ns: bigint[]) => ns.reduce((a,b)=>a<b?a:b);
+  // Scale down as the reference widens, bounded below by a tradable lot/minimum notional.
+  const baseline = margin * 2n;
+  const scaled = maxOrder * baseline / (baseline + a - b);
+  const minimumBudget = positive(p.minNotional) + (lot * sell + S - 1n) / S;
+  const adaptiveBudget = min(maxOrder, scaled > minimumBudget ? scaled : minimumBudget);
   const remainingCapital = capital - q * buy / S;
-  const buyBudget = min(money, remainingCapital, maxOrder, positive(p.maxOrderNotional));
+  const buyBudget = min(money, remainingCapital, adaptiveBudget, positive(p.maxOrderNotional));
   const buyQty = min(buyBudget > 0n ? buyBudget * S / buy : 0n, maxPosition > q ? maxPosition - q : 0n) / lot * lot;
-  const sellQty = min(q, min(maxOrder, positive(p.maxOrderNotional)) * S / sell) / lot * lot;
+  const sellQty = min(q, min(adaptiveBudget, positive(p.maxOrderNotional)) * S / sell) / lot * lot;
   const orders: {side:'BUY'|'SELL';qty:string;price:string}[]=[];
   for (const [side, qty, price] of [['BUY',buyQty,buy],['SELL',sellQty,sell]] as const) {
     if (qty > 0n && qty * price / S >= positive(p.minNotional)) orders.push({side,qty:format(qty),price:format(price)});

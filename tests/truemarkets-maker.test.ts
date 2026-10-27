@@ -34,3 +34,14 @@ test('cleanup never declares success while an order might still rest',async()=>{
  await expect(cancelAndConfirm({cancelOwned:async()=>{cancels++;throw Error('timeout');},reconcile:async()=>{reads++;throw Error('unreachable');}},()=>[{uncertain:true}],3,async()=>{})).rejects.toThrow('unresolved');
  expect(reads).toBe(3);expect(cancels).toBe(3);
 });
+
+test('wide reference widens quotes and reduces size without blocking market making',()=>{
+ const tight=planQuotes(p,l,'10','0','216.49','216.51');
+ const wide=planQuotes(p,l,'10','0','216','217');
+ expect(wide.stop).toBe(false);expect(wide.orders.length).toBe(1);
+ expect(Number(wide.orders[0].price)).toBeLessThan(216);
+ expect(Number(wide.orders[0].qty)).toBeLessThanOrEqual(Number(tight.orders[0].qty));
+ expect(Number(wide.orders[0].qty)*Number(wide.orders[0].price)).toBeGreaterThanOrEqual(1);
+ const sell=planQuotes(p,l,'8.05','0.009','216','217').orders.find(o=>o.side==='SELL')!;
+ expect(Number(sell.price)).toBeGreaterThan(217);expect(Number(sell.qty)).toBeLessThanOrEqual(.009);
+});
