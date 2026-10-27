@@ -1,10 +1,11 @@
 import { ApiError, officialBase, readResponse, TokenManager, type Fetcher } from './auth';
 
+export class EntryNotDispatched extends Error { constructor(){ super('Entry blocked before HTTP dispatch'); } }
 export type Row = Record<string, any>;
 export interface ClientOptions {
   auth: TokenManager; gatewayUrl: string; cefiUrl: string; expectedClientId: string;
   schemaVersion?: string; fetch?: Fetcher; now?: () => number; timeoutMs?: number;
-  writesEnabled?: boolean;
+  writesEnabled?: boolean; entryGuard?: () => void;
 }
 export interface LimitOrder {
   external_id: string;
@@ -23,13 +24,14 @@ export class TrueMarketsClient {
     if (options.schemaVersion && options.schemaVersion !== 'v2026_01_23') throw new Error('Unsupported CeFi schema version');
   }
   get clientId() { return this.options.expectedClientId; }
-  private async request(area: 'gateway' | 'cefi', path: string, method = 'GET', body?: any, preview = false): Promise<any> {
+  private async request(area: 'gateway' | 'cefi', path: string, method = 'GET', body?: any, preview = false, entryGuard?: () => void): Promise<any> {
     if (method !== 'GET' && !preview && this.options.writesEnabled !== true) throw new Error('Trading/account writes are disabled');
     const token = await this.options.auth.token();
     if (area === 'cefi' && this.options.auth.identity?.clientId !== this.clientId) throw new Error('CeFi client identity mismatch');
     const headers: Record<string, string> = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
     if (area === 'cefi') Object.assign(headers, { 'X-Truex-Version': 'v2026_01_23',
       'x-truex-auth-timestamp': String(Math.floor((this.options.now ?? Date.now)() / 1000)) });
+    if (entryGuard) { try { this.options.entryGuard?.(); entryGuard(); } catch { throw new EntryNotDispatched(); } }
     try {
       return await readResponse(await (this.options.fetch ?? fetch)((area === 'gateway' ? this.gateway : this.cefi) + path, {
         method, headers, ...(body === undefined ? {} : { body: JSON.stringify(body) }),
@@ -87,13 +89,13 @@ export class TrueMarketsClient {
     if (!/^[1-9][0-9]*$/.test(instrumentId) || !['BUY','SELL'].includes(side)) throw new Error('Invalid preview instrument/side');
     return this.request('cefi', '/v1/cefi/markets/quote', 'POST', { instrument_id: instrumentId, side, qty, qty_unit: 'BASE' }, true);
   }
-  create(order: LimitOrder) {
+  create(order: LimitOrder, entryGuard?: () => void) {
     if (order.info.client_id !== this.clientId || order.info.type !== 'LIMIT') throw new Error('Wrong client or unsupported order type');
-    return this.request('cefi', '/v1/cefi/orders', 'POST', order);
+    return this.request('cefi', '/v1/cefi/orders', 'POST', order, false, entryGuard);
   }
-  modify(externalId: string, qty: string, price: string) {
+  modify(externalId: string, qty: string, price: string, entryGuard?: () => void) {
     return this.request('cefi', '/v1/cefi/orders', 'PATCH', { external_id: externalId,
-      info: { client_id: this.clientId, new_qty: qty, new_price: price } });
+      info: { client_id: this.clientId, new_qty: qty, new_price: price } }, false, entryGuard);
   }
   cancel(externalId: string) {
     return this.request('cefi', '/v1/cefi/orders/' + encodeURIComponent(externalId) + '?id_type=client', 'DELETE');

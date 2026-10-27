@@ -68,3 +68,6 @@ fix-logs/
 
 # Brain - secret key stored after registration
 brain/config.json
+
+# Private bounded canary configuration
+config/truemarkets-maker.local.json

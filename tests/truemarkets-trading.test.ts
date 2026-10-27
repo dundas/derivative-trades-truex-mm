@@ -314,3 +314,53 @@ describe('feed bridge and runtime watchdog', () => {
     } finally { f.journal.close(); }
   });
 });
+
+describe('external maker policy',()=>{
+ test('old venue BBO is allowed with explicit maker mode and exchange post-only',async()=>{
+  const f=fixture();f.policy.pricingMode='external_maker';f.setBookAge(3600000);
+  try{await f.controller.submit(f.intent);expect([...f.orders.values()][0].order_info.exec_inst_flags).toEqual(['ALO']);}finally{f.journal.close();}
+ });
+ test('maker mode cannot submit taker orders',async()=>{
+  const f=fixture();f.policy.pricingMode='external_maker';try{await expect(f.controller.submit({...f.intent,postOnly:false})).rejects.toThrow('requires post-only');expect(f.orders.size).toBe(0);}finally{f.journal.close();}
+ });
+ test('expired deadline forbids any new order',async()=>{
+  const f=fixture();f.policy.entryDeadline=NOW;try{await expect(f.controller.submit(f.intent)).rejects.toThrow('deadline');expect(f.orders.size).toBe(0);}finally{f.journal.close();}
+ });
+ test('explicit user parity assumption does not mislabel units as verified',async()=>{
+  const f=fixture();f.policy.instruments[0].unitsVerified=false;f.policy.instruments[0].mappingAssumption='market_parity';
+  try{await f.controller.submit(f.intent);expect(f.policy.instruments[0].unitsVerified).toBe(false);}finally{f.journal.close();}
+ });
+ test('empty venue quote allowed only with live connection and active instrument',()=>{
+  const f=fixture();f.policy.pricingMode='external_maker';
+  const external={connected:true,quotes:new Map([['NVDA',{symbol:'NVDA',bid:100,ask:100.1,sourceAt:NOW,receivedAt:NOW,sourceTimeKind:'provider_updated_at'}]])};
+  const venue={connected:true,active:new Set(['NVDAC-USDC']),quotes:new Map()};
+  const runtime=new TradingRuntime(f.controller,f.journal,f.policy,external,venue,()=>NOW);
+  try{expect(runtime.health().healthy).toBe(true);venue.connected=false;expect(runtime.health().healthy).toBe(false);venue.connected=true;venue.active.clear();expect(runtime.health().healthy).toBe(false);}finally{f.journal.close();}
+ });
+});
+
+test('entry guard runs after asynchronous token refresh and blocks dispatch while cancel remains possible',async()=>{
+ const requests:string[]=[];
+ const auth=tokenManager(async(url)=>{requests.push(url);return response({access_token:jwt()});});
+ let expired=false;
+ auth.token=async()=>{await Promise.resolve();expired=true;return jwt();};
+ const client=new TrueMarketsClient({auth,gatewayUrl:env.gateway,cefiUrl:env.cefi,expectedClientId:'1',writesEnabled:true,
+   fetch:async(url)=>{requests.push(url);return response({data:[]});}});
+ // Account identity is ordinarily established by token(); isolate the asynchronous dispatch race.
+ Object.defineProperty(auth,'identity',{value:{userId:'user',clientId:'1'}});
+ const order:LimitOrder={external_id:'test',info:{client_id:'1',instrument_id:'2',qty:'0.01',price:'100',side:'BUY',type:'LIMIT',tif:'GTC',stp:'CANCEL_AGGRESSIVE'}};
+ await expect(client.create(order,()=>{if(expired)throw Error('deadline');})).rejects.toThrow('before HTTP dispatch');
+ expect(requests).toEqual([]);
+ await client.cancel('test');expect(requests.length).toBe(1);
+});
+
+ test('proven pre-dispatch rejection does not poison the durable journal',async()=>{
+  const f=fixture();
+  (f.client as any).options.entryGuard=()=>{throw Error('deadline');};
+  try {
+    await expect(f.controller.submit(f.intent)).rejects.toThrow('before HTTP dispatch');
+    expect(f.orders.size).toBe(0);
+    expect([...f.journal.states.values()].every(s=>!s.uncertain&&s.latest?.status==='REJECTED'&&s.latest.local_not_sent)).toBe(true);
+    await f.controller.reconcile();
+  }finally{f.journal.close();}
+ });

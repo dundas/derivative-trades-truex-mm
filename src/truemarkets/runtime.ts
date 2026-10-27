@@ -20,9 +20,13 @@ export class TradingRuntime {
     const issues: string[] = [];
     if (this.policy.enabled && !(Date.parse(this.policy.eligibleUntil) > this.now())) issues.push('account_eligibility_expired');
     for (const p of this.policy.instruments) {
-      if (this.policy.enabled && !p.unitsVerified) issues.push(`${p.symbol}:units_unverified`);
+      if (this.policy.enabled && !p.unitsVerified && !(p.mappingAssumption === 'market_parity' && p.tokenToShareRatio === '1' && p.usdToUsdc === '1')) issues.push(`${p.symbol}:units_unverified`);
       const source = this.external.quotes.get(p.referenceSymbol), target = this.venue.quotes.get(p.symbol);
       for (const [label, feed, quote] of [['external', this.external, source], ['venue', this.venue, target]] as const) {
+        if (label === 'venue' && this.policy.pricingMode === 'external_maker') {
+          if (!feed.connected) issues.push(`${p.symbol}:venue_disconnected`);
+          continue;
+        }
         if (!feed.connected || !quote) { issues.push(`${p.symbol}:${label}_disconnected_or_missing`); continue; }
         if (![quote.bid, quote.ask].every(v => Number.isFinite(v) && v > 0) || quote.bid >= quote.ask)
           issues.push(`${p.symbol}:${label}_invalid_bbo`);

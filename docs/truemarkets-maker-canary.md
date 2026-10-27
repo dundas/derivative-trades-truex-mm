@@ -1,0 +1,28 @@
+# Bounded NVDAC maker canary
+
+User authorization on October 26: app account truemarkets@daviddundas.com, NVDAC-USDC only, 900 seconds, existing 10 USDC capital, 1 USDC marked-loss stop, no PYUSD conversion. Stop cancels owned orders and retains inventory. It does not guarantee a maximum realized loss. Ben's supplied message confirms this app account is enabled for equity trading; institutional wind-down work remains separate.
+
+The runner `scripts/run-truemarkets-maker.ts` uses the existing authenticated client, durable account journal and controller. With `--live` it can submit real post-only orders. Without that flag it only observes and calculates quotes. A new output directory is required for each run. Configuration is the ignored `config/truemarkets-maker.local.json`; credentials remain in existing ignored env files. Config includes a short-lived account-eligibility confirmation and must not be silently extended into unattended future runs.
+
+The approved canary uses 2 USDC maximum per order, 10 bps half-spread, up to 5 bps inventory skew, 0.04 maximum token inventory and 5-second cancellation/requote intervals. It polls tastytrade REST every 2 seconds, checks every loop and requires both source and receipt ages within 15 seconds. Initial cash must equal the configured capital and initial stock inventory must be zero. Fees, unsettled balances or foreign active orders cause rejection. Successful account reads do not imply permission to convert or transfer funds.
+
+External-maker mode deliberately does not require a competing venue BBO. The venue WebSocket must stay connected and report the instrument active; REST instrument, market and account requests must succeed. Server-enforced ALO prevents crossing. Other execution callers retain the old BBO guard unless this mode is explicitly selected. User-approved share/token and USD/USDC parity is recorded as `mappingAssumption: market_parity`, not falsely marked as verified units.
+
+Loss is marked using the external bid against the original 10 USDC. Quotes begin buy-only and add offers after actual inventory is acquired. Dust below venue minimum notional remains unquoted. All entries recheck deadline, enabled state and reference freshness after authentication immediately before dispatch. Missing/old/zero external timestamps never become fresh on receipt. Health failure stops the run instead of waiting indefinitely for recovery.
+
+Startup allows 30 seconds to establish healthy inputs, then starts the 900-second window. If startup fails, the report says no run started. Shutdown cancels and polls journal-owned order status, including after ambiguous cancellation responses; unresolved cleanup is an explicit failure. Network failure/process death can prevent cancellation. Final balances are recorded when available, and final PnL is omitted if a fresh reference is unavailable. Nothing auto-liquidates or auto-resumes.
+
+Example from this worktree:
+
+```bash
+TM_EXPECTED_CLIENT_ID=79059325798366905 bun \
+  --env-file=/Users/kefentse/dev_env/true_markets_mm/.env.truemarkets.local \
+  --env-file=/Users/kefentse/dev_env/infinitrade/.env \
+  scripts/run-truemarkets-maker.ts --config config/truemarkets-maker.local.json --live
+```
+
+Local tests cover maker sizing, no shorting, capital/position/notional limits, exact loss-stop boundary, dust, ambiguous cancellation and unresolved cleanup, maker-mode book independence, stale external-reference rejection, and a token-refresh/deadline dispatch race. The runner is a local canary, not an unattended production service.
+
+## Observed attempt
+
+On October 27 at 01:23:31 UTC the explicitly authorized `--live` invocation attempted startup. It exited after the 30-second startup window because external NVDA pricing remained stale. The 15-minute trading window never began. Report: `logs/truemarkets-maker/2026-10-27T01-23-31-148Z/report.json`. Zero submitted/active orders; ending balance10USDC, zeroNVDAC and zeroholds. No conversion occurred and no process remains scheduled to resume. Validation:118tests/378assertions across8files; narrowTypeScriptcheck andBunbuild passed.
